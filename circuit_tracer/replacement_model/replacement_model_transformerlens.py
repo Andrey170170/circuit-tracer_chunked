@@ -3,7 +3,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import partial
-from typing import Callable, Literal
+from typing import Callable, Literal, cast
 
 import torch
 import torch.nn.functional as F
@@ -460,6 +460,9 @@ class TransformerLensReplacementModel(HookedTransformer):
 
         error_vectors[:, self.zero_positions] = 0
         token_vectors = self.W_E[tokens].detach()  # (n_pos, d_model)
+        chunked_decoder_state = cast(
+            dict[str, torch.Tensor] | None, attribution_data.get("chunked_decoder_state")
+        )
 
         return AttributionContext(
             activation_matrix=attribution_data["activation_matrix"],
@@ -470,6 +473,10 @@ class TransformerLensReplacementModel(HookedTransformer):
             encoder_vecs=attribution_data["encoder_vecs"],
             encoder_to_decoder_map=attribution_data["encoder_to_decoder_map"],
             decoder_locations=attribution_data["decoder_locations"],
+            decoder_provider=self.transcoders
+            if getattr(self.transcoders, "exact_chunked_decoder", False)
+            else None,
+            chunked_decoder_state=chunked_decoder_state,
         )
 
     def setup_intervention_with_freeze(

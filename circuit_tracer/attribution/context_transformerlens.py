@@ -53,6 +53,8 @@ class AttributionContext:
         encoder_to_decoder_map: torch.Tensor,
         decoder_locations: torch.Tensor,
         logits: torch.Tensor,
+        decoder_provider=None,
+        chunked_decoder_state: dict[str, torch.Tensor] | None = None,
     ) -> None:
         n_layers, n_pos, _ = activation_matrix.shape
 
@@ -70,9 +72,54 @@ class AttributionContext:
 
         self.encoder_to_decoder_map = encoder_to_decoder_map
         self.decoder_locations = decoder_locations
+        self.decoder_provider = decoder_provider
+        self.chunked_decoder_state = chunked_decoder_state
 
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
+
+    def _compute_chunked_feature_attributions(self, layer: int, grads: torch.Tensor) -> None:
+        assert self.chunked_decoder_state is not None
+        assert self.decoder_provider is not None
+        assert self._batch_buffer is not None
+
+        source_layers = self.chunked_decoder_state["source_layers"]
+        positions = self.chunked_decoder_state["positions"]
+        feature_ids = self.chunked_decoder_state["feature_ids"]
+        activation_values = self.chunked_decoder_state["activation_values"]
+        chunk_size = getattr(self.decoder_provider, "decoder_chunk_size", 256)
+
+        for source_layer in range(layer + 1):
+            layer_mask = source_layers == source_layer
+            if not layer_mask.any():
+                continue
+
+            layer_indices = torch.where(layer_mask)[0]
+            for start in range(0, len(layer_indices), chunk_size):
+                chunk_indices = layer_indices[start : start + chunk_size]
+                chunk_feature_ids = feature_ids[chunk_indices]
+                unique_feats, inv = chunk_feature_ids.unique(return_inverse=True)
+                decoder_vecs = self.decoder_provider.get_decoder_vectors_for_output_layer(
+                    source_layer, layer, unique_feats.cpu()
+                )
+                scaled_decoders = decoder_vecs[inv].to(device=grads.device) * activation_values[
+                    chunk_indices, None
+                ].to(device=grads.device, dtype=decoder_vecs.dtype)
+
+                selected_grads = grads.to(scaled_decoders.dtype)[:, positions[chunk_indices]]
+                self._batch_buffer[chunk_indices] += einsum(
+                    selected_grads,
+                    scaled_decoders,
+                    "batch position d_model, position d_model -> position batch",
+                )
+
+    def _make_chunked_feature_hook(self, hook_name: str, layer: int) -> tuple[str, Callable]:
+        proxy = weakref.proxy(self)
+
+        def _hook_fn(grads: torch.Tensor, hook: HookPoint) -> None:
+            proxy._compute_chunked_feature_attributions(layer, grads)
+
+        return hook_name, _hook_fn
 
     def _caching_hooks(self, feature_input_hook: str) -> list[tuple[str, Callable]]:
         """Return hooks that store residual activations layer-by-layer."""
@@ -120,16 +167,22 @@ class AttributionContext:
         nnz_layers, nnz_positions = self.decoder_locations
 
         # Feature nodes
-        feature_hooks = [
-            self._compute_score_hook(
-                f"blocks.{layer}.{feature_output_hook}",
-                self.decoder_vecs[layer_mask],
-                write_index=self.encoder_to_decoder_map[layer_mask],  # type: ignore
-                read_index=np.s_[:, nnz_positions[layer_mask]],  # type: ignore
-            )
-            for layer in range(n_layers)
-            if (layer_mask := nnz_layers == layer).any()
-        ]
+        if self.chunked_decoder_state is not None:
+            feature_hooks = [
+                self._make_chunked_feature_hook(f"blocks.{layer}.{feature_output_hook}", layer)
+                for layer in range(n_layers)
+            ]
+        else:
+            feature_hooks = [
+                self._compute_score_hook(
+                    f"blocks.{layer}.{feature_output_hook}",
+                    self.decoder_vecs[layer_mask],
+                    write_index=self.encoder_to_decoder_map[layer_mask],  # type: ignore
+                    read_index=np.s_[:, nnz_positions[layer_mask]],  # type: ignore
+                )
+                for layer in range(n_layers)
+                if (layer_mask := nnz_layers == layer).any()
+            ]
 
         # Error nodes
         def error_offset(layer: int) -> int:  # starting row for this layer

@@ -165,6 +165,7 @@ def create_graph_files(
     scan=None,
     node_threshold=0.8,
     edge_threshold=0.98,
+    prune_device: str | torch.device | None = None,
 ):
     # Import Graph/prune_graph locally to avoid circular import at module import time
     from circuit_tracer.graph import Graph, prune_graph
@@ -189,8 +190,9 @@ def create_graph_files(
             )
         scan = graph.scan
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    graph.to(device)
+    original_device = graph.adjacency_matrix.device
+    target_device = prune_device or original_device
+    graph.to(target_device)
     node_mask, edge_mask, cumulative_scores = (
         el.cpu() for el in prune_graph(graph, node_threshold, edge_threshold)
     )
@@ -206,6 +208,9 @@ def create_graph_files(
         f.write(model.model_dump_json(indent=2))
     add_graph_metadata(model.metadata.model_dump(), output_path)
     logger.info(f"Graph data written to {output_path}")
+
+    if isinstance(original_device, torch.device) and original_device.type != "cpu":
+        graph.to(original_device)
 
     total_time_ms = (time.time() - total_start_time) * 1000
     logger.info(f"Total execution time: {total_time_ms=:.2f} ms")

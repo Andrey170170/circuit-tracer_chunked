@@ -28,14 +28,14 @@ We encourage contributions! Here's how you can help:
 ## Installing with dev dependencies
 
 ```bash
-pip install -e ".[dev]"
+uv sync --extra dev
 ```
 
 ## Linting / formatting
 
 We use `ruff check` and `ruff format` for code quality. When contributing:
 
-- Run `ruff check` and `ruff format` on your changes
+- Run `uv run ruff check` and `uv run ruff format` on your changes
 - Run existing tests to ensure nothing breaks
 - Check that relevant demo notebooks still execute correctly, particularly:
   - `demos/circuit_tracing_tutorial.ipynb`
@@ -47,13 +47,14 @@ We use `ruff check` and `ruff format` for code quality. When contributing:
 We use `pytest` for testing. When contributing:
 
 - Add tests for new functionality where possible
-- Run `pytest` before submitting a PR
+- Run `uv run pytest` before submitting a PR
+- Do not run CPU/GPU-heavy tests on shared login nodes; prefer SLURM jobs for large-model or GPU validation
 
 ## Type checking
 
 We use `pyright` for type checking. When contributing:
 
-- Run `pyright` before submitting a PR
+- Run `uv run pyright` before submitting a PR
 
 ## What We're Looking For
 

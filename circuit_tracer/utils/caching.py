@@ -427,6 +427,7 @@ def load_transcoders_from_cache(
             lazy_decoder=lazy_decoder,
         )
     elif model_kind == "cross_layer_transcoder":
+        exact_chunked_decoder = "gemma-scope-2" in str(config.get("scan", cache_path))
         transcoder = load_clt(
             str(cache_path),
             feature_input_hook=config["feature_input_hook"],
@@ -436,6 +437,7 @@ def load_transcoders_from_cache(
             dtype=dtype,
             lazy_decoder=lazy_decoder,
             lazy_encoder=lazy_encoder,
+            exact_chunked_decoder=exact_chunked_decoder,
         )
     else:
         raise ValueError(f"Unknown model kind: {model_kind}")

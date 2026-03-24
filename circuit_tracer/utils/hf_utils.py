@@ -165,29 +165,39 @@ def load_transcoders(
         if "gemma-scope-2" in config["repo_id"] and "transcoders" in config:
             transcoder_paths = resolve_transcoder_paths(config)
             local_path = transcoder_paths
-
-            load_fn = load_gemma_scope_2_clt
-
-        else:
-            subfolder = config.get("subfolder")
-            if subfolder:
-                allow_patterns = [f"{subfolder}/*.safetensors"]
-            else:
-                allow_patterns = ["*.safetensors"]
-
-            local_path = snapshot_download(
-                config["repo_id"],
-                revision=config.get("revision", "main"),
-                allow_patterns=allow_patterns,
+            return load_gemma_scope_2_clt(
+                local_path,  # type:ignore
+                scan=config["scan"],
+                feature_input_hook=config["feature_input_hook"],
+                feature_output_hook=config["feature_output_hook"],
+                lazy_decoder=lazy_decoder,
+                lazy_encoder=lazy_encoder,
+                dtype=dtype,
+                device=device,
             )
 
-            if subfolder:
-                local_path = os.path.join(local_path, subfolder)
+        subfolder = config.get("subfolder")
+        if subfolder:
+            allow_patterns = [f"{subfolder}/*.safetensors"]
+        else:
+            allow_patterns = ["*.safetensors"]
 
-            load_fn = load_clt
+        local_path = snapshot_download(
+            config["repo_id"],
+            revision=config.get("revision", "main"),
+            allow_patterns=allow_patterns,
+        )
 
-        return load_fn(
-            local_path,  # type:ignore
+        if subfolder:
+            local_path = os.path.join(local_path, subfolder)
+
+        exact_chunked_decoder = bool(
+            "gemma-scope-2" in str(config.get("repo_id", ""))
+            or "gemma-scope-2" in str(config.get("scan", ""))
+        )
+
+        return load_clt(
+            local_path,
             scan=config["scan"],
             feature_input_hook=config["feature_input_hook"],
             feature_output_hook=config["feature_output_hook"],
@@ -195,6 +205,7 @@ def load_transcoders(
             lazy_encoder=lazy_encoder,
             dtype=dtype,
             device=device,
+            exact_chunked_decoder=exact_chunked_decoder,
         )
     else:
         raise ValueError(f"Unknown model kind: {model_kind}")

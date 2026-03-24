@@ -11,7 +11,6 @@ from circuit_tracer.utils.tl_nnsight_mapping import (
     convert_nnsight_config_to_transformerlens,
     UnifiedConfig,
 )
-from circuit_tracer.utils import get_default_device
 from circuit_tracer.attribution.targets import LogitTarget
 
 
@@ -364,6 +363,7 @@ def compute_partial_influences(
     row_to_node_index: torch.Tensor,
     max_iter: int = 128,
     device=None,
+    row_chunk_size: int = 4096,
 ):
     """Compute partial influences using power iteration method.
 
@@ -383,18 +383,33 @@ def compute_partial_influences(
     Raises:
         RuntimeError: If computation fails to converge within max_iter.
     """
-    device = device or get_default_device()
+    device = device or edge_matrix.device
+    working_matrix = edge_matrix if edge_matrix.device == device else edge_matrix.to(device)
+    working_row_index = (
+        row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
+    ).long()
+    working_logit_p = logit_p if logit_p.device == device else logit_p.to(device)
 
-    normalized_matrix = torch.empty_like(edge_matrix, device=device).copy_(edge_matrix)
-    normalized_matrix = normalized_matrix.abs_()
-    normalized_matrix /= normalized_matrix.sum(dim=1, keepdim=True).clamp(min=1e-8)
-
-    influences = torch.zeros(edge_matrix.shape[1], device=normalized_matrix.device)
-    prod = torch.zeros(edge_matrix.shape[1], device=normalized_matrix.device)
-    prod[-len(logit_p) :] = logit_p
+    influences = torch.zeros(working_matrix.shape[1], device=device, dtype=working_matrix.dtype)
+    prod = torch.zeros(working_matrix.shape[1], device=device, dtype=working_matrix.dtype)
+    prod[-len(working_logit_p) :] = working_logit_p.to(dtype=working_matrix.dtype)
 
     for _ in range(max_iter):
-        prod = prod[row_to_node_index] @ normalized_matrix
+        next_prod = torch.zeros_like(prod)
+        for start in range(0, working_matrix.shape[0], row_chunk_size):
+            end = min(start + row_chunk_size, working_matrix.shape[0])
+            chunk = working_matrix[start:end].abs()
+            if not chunk.numel():
+                continue
+
+            row_weights = prod[working_row_index[start:end]]
+            if not row_weights.any():
+                continue
+
+            chunk /= chunk.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            next_prod += row_weights @ chunk
+
+        prod = next_prod
         if not prod.any():
             break
         influences += prod

@@ -10,6 +10,8 @@ Our library performs three main tasks.
 ## Getting Started
 One quick way to start is to try our [tutorial notebook](https://github.com/safety-research/circuit-tracer/blob/main/demos/circuit_tracing_tutorial.ipynb)! 
 
+If you are using this fork specifically for memory-bounded GemmaScope-2 CLT tracing, see [RESEARCH_USAGE.md](RESEARCH_USAGE.md).
+
 You can also find circuits and visualize them in one of three ways:
 1. Use `circuit-tracer` on [Neuronpedia](https://www.neuronpedia.org/gemma-2-2b/graph?slug=gemma-fact-dallas-austin&pinnedIds=27_22605_10%2C20_15589_10%2CE_26865_9%2C21_5943_10%2C23_12237_10%2C20_15589_9%2C16_25_9%2C14_2268_9%2C18_8959_10%2C4_13154_9%2C7_6861_9%2C19_1445_10%2CE_2329_7%2CE_6037_4%2C0_13727_7%2C6_4012_7%2C17_7178_10%2C15_4494_4%2C6_4662_4%2C4_7671_4%2C3_13984_4%2C1_1000_4%2C19_7477_9%2C18_6101_10%2C16_4298_10%2C7_691_10&supernodes=%5B%5B%22state%22%2C%226_4012_7%22%2C%220_13727_7%22%5D%2C%5B%22preposition+followed+by+place+name%22%2C%2219_1445_10%22%2C%2218_6101_10%22%5D%2C%5B%22Texas%22%2C%2220_15589_10%22%2C%2220_15589_9%22%2C%2219_7477_9%22%2C%2216_25_9%22%2C%224_13154_9%22%2C%2214_2268_9%22%2C%227_6861_9%22%5D%2C%5B%22capital+%2F+capital+cities%22%2C%2215_4494_4%22%2C%226_4662_4%22%2C%224_7671_4%22%2C%223_13984_4%22%2C%221_1000_4%22%2C%2221_5943_10%22%2C%2217_7178_10%22%2C%227_691_10%22%2C%2216_4298_10%22%5D%5D&pruningThreshold=0.6&clickedId=21_5943_10&densityThreshold=0.99) - no installation required! Just click on `+ New Graph` to create your own, or use the drop-down menu to select an existing graph.
 2. Run `circuit-tracer` via a Python script or Jupyter notebook. Start with our [tutorial notebook](https://github.com/safety-research/circuit-tracer/blob/main/demos/circuit_tracing_tutorial.ipynb). This will work on Colab with the GPU resources provided for free by default - just click on the Colab badge! Check out the **Demos** section below for more tutorials. You can also run these demo notebooks locally, with your own compute.
@@ -20,7 +22,17 @@ Working with Gemma-2 (2B) is possible with relatively limited GPU resources; Col
 Currently, intervening on models with respect to the transcoder features you discover in your graphs is possible both when using `circuit-tracer` in a script or notebook, or on Neuronpedia for Gemma-2 (2B). To perform interventions on Neuronpedia, ensure at least one node is pinned, then click "Steer" in the subgraph.
 
 ### Installation
-To install this library, clone it and run the command  `pip install .` in its directory.
+We recommend using [`uv`](https://docs.astral.sh/uv/) for local development and reproducible environments.
+
+```bash
+uv sync
+```
+
+For editable/dev installs, use:
+
+```bash
+uv sync --extra dev
+```
 
 ### Demos
 We include some demos showing how to use our library in the `demos` folder. The main demo is [`demos/circuit_tracing_tutorial.ipynb`](https://github.com/safety-research/circuit-tracer/blob/main/demos/circuit_tracing_tutorial.ipynb), which replicates two of the findings from [this paper](https://transformer-circuits.pub/2025/attribution-graphs/biology.html) using Gemma 2 (2B). All demos except for the Llama demo can be run on Colab.
@@ -46,6 +58,50 @@ The following transcoders are available for use with `circuit-tracer`; this mean
 - [GPT-OSS (20B) CLT](https://huggingface.co/mntss/clt-131k)
 - Gemma-3 PLTs (originally from [GemmaScope-2](https://huggingface.co/google/gemma-scope-2)) can be found [here for models of size 270M, 1B, 4B, 12B, and 27B, PT and IT](https://huggingface.co/collections/mwhanna/gemma-scope-2-transcoders-circuit-tracer). These require using the `nnsight` backend.
 
+### GemmaScope-2 CLT usage in this fork
+This fork adds a memory-bounded, exact tracing path for GemmaScope-2 cross-layer transcoders (CLTs) on a single GPU.
+
+- `attribute(...)` and `ReplacementModel.from_pretrained(...)` stay the same at the call site.
+- For GemmaScope-2 CLTs, exact chunked decoder handling is enabled automatically.
+- This preserves full active feature sets until the normal Phase-4 feature selection step; there is no early feature top-K pruning in the fork path.
+- GemmaScope-2 CLTs should be used with `backend="nnsight"`.
+- The loader also tolerates the duplicated final shard path present in some GemmaScope-2 configs.
+
+Recommended single-GPU starting point for GemmaScope-2 CLTs:
+
+```python
+import torch
+
+from circuit_tracer import ReplacementModel
+from circuit_tracer.attribution.attribute_nnsight import attribute
+
+model = ReplacementModel.from_pretrained(
+    "google/gemma-3-1b-pt",
+    "mwhanna/gemma-scope-2-1b-pt/clt/width_262k_l0_medium_affine",
+    backend="nnsight",
+    dtype=torch.bfloat16,
+    lazy_encoder=True,
+    lazy_decoder=True,
+)
+
+graph = attribute(
+    "If Alice has 3 apples and buys 2 more, she has",
+    model,
+    max_n_logits=4,
+    batch_size=16,
+    max_feature_nodes=128,
+    offload="cpu",
+    verbose=True,
+)
+```
+
+Operational notes for this forked path:
+
+- `lazy_encoder=True` and `lazy_decoder=True` are recommended for GemmaScope-2 CLTs.
+- `offload="cpu"` or `offload="disk"` can still help for model components, but transcoder offload is intentionally skipped during exact chunked decoder attribution so decoder slices remain readable during backward scoring.
+- With `verbose=True`, phase-level runtime and memory telemetry is emitted to logs (RSS plus CUDA allocated/reserved where available), which is useful for SLURM debugging.
+- `create_graph_files(...)` now accepts `prune_device=...` if you want pruning to happen on a specific device explicitly.
+
 
 ### Choosing a Backend
 By default, `circuit-tracer` creates a `ReplacementModel` that inherits from the `TransformerLens` `HookedTransformer` class. However, `TransformerLens` does not support all HuggingFace models; it only supports those implemented in `TransformerLens`. 
@@ -64,6 +120,8 @@ save_transcoders_to_cache(hf_ref, cache_dir=cache_dir)
 ```
 
 You can also empty the cache using `circuit_tracer.utils.caching.empty_cache`.
+
+For GemmaScope-2 CLTs, cached loads keep the fork's exact chunked decoder behavior enabled automatically.
 
 ## Command-Line Interface
 
@@ -115,6 +173,8 @@ You must set `--slug` and `--graph_file_dir`, or `--graph_output_path`, or both!
 - `--dtype`: Datatype in which to load the model / transcoders (allowed: `float32/fp32`, `float16/fp16`, `bfloat16/bf16`)
 - `--offload`: Memory optimization option (`cpu`, `disk`, or `None`)
 - `--verbose`: Display detailed progress information
+
+For GemmaScope-2 CLTs in this fork, `--verbose` is especially useful because it emits phase-level timing and memory telemetry to the console / SLURM logs.
 
 **Graph Pruning Parameters:**
 - `--node_threshold` (default: 0.8): Keeps minimum nodes with cumulative influence ≥ threshold

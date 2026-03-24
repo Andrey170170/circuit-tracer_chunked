@@ -528,6 +528,9 @@ class NNSightReplacementModel(LanguageModel):
         token_vectors = self.embed_weight[  # type: ignore
             tokens
         ].detach()  # (n_pos, d_model)  # type: ignore
+        chunked_decoder_state = cast(
+            dict[str, torch.Tensor] | None, attribution_data.get("chunked_decoder_state")
+        )
 
         return AttributionContext(
             activation_matrix=attribution_data["activation_matrix"],
@@ -538,6 +541,10 @@ class NNSightReplacementModel(LanguageModel):
             encoder_vecs=attribution_data["encoder_vecs"],
             encoder_to_decoder_map=attribution_data["encoder_to_decoder_map"],
             decoder_locations=attribution_data["decoder_locations"],
+            decoder_provider=transcoders
+            if getattr(transcoders, "exact_chunked_decoder", False)
+            else None,
+            chunked_decoder_state=chunked_decoder_state,
         )
 
     def setup_intervention_with_freeze(
