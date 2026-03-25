@@ -30,8 +30,5 @@ uv --version
 echo "== gpu info =="
 nvidia-smi || true
 
-echo "== running targeted GemmaScope-2 chunked tests =="
-uv run pytest -vv -s --log-cli-level=INFO \
-  tests/test_partial_influences.py \
-  tests/test_gemmascope2_chunked.py \
-  tests/test_gemmascope2_chunked_gpu.py::test_gemmascope2_exact_chunked_nnsight_smoke
+echo "== running full test suite =="
+uv run pytest -vv -s --log-cli-level=INFO
