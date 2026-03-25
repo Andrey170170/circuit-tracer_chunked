@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00
+#SBATCH --time=00:30:00
 #SBATCH --gpus=1
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
@@ -30,5 +30,13 @@ uv --version
 echo "== gpu info =="
 nvidia-smi || true
 
-echo "== running full test suite =="
-uv run pytest -vv -s --log-cli-level=INFO
+echo "== running fast chunking correctness tests =="
+uv run pytest -vv -s --log-cli-level=INFO \
+  tests/test_chunked_decoder_optimizations.py \
+  tests/test_double_pass_sparsification.py \
+  tests/test_gemmascope2_chunked.py \
+  tests/test_cross_layer_transcoder.py
+
+echo "== running short GPU smoke tests =="
+uv run pytest -vv -s --log-cli-level=INFO \
+  tests/test_gemmascope2_chunked_gpu.py

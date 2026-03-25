@@ -207,6 +207,19 @@ class CrossLayerTranscoder(torch.nn.Module):
         layer_stats = cast(dict[int, float], self._diagnostic_stats.setdefault(key, {}))
         layer_stats[layer_id] = layer_stats.get(layer_id, 0.0) + value
 
+    def _move_lazy_slice_to_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device == self.device and tensor.dtype == self.dtype:
+            return tensor
+
+        if tensor.device.type == "cpu" and self.device.type == "cuda":
+            try:
+                tensor = tensor.pin_memory()
+            except RuntimeError:
+                pass
+            return tensor.to(device=self.device, dtype=self.dtype, non_blocking=True)
+
+        return tensor.to(device=self.device, dtype=self.dtype)
+
     def _get_encoder_weights(self, layer_id=None):
         """Get encoder weights, loading from disk if lazy."""
         if not self.lazy_encoder:
@@ -395,9 +408,9 @@ class CrossLayerTranscoder(torch.nn.Module):
             path = self.layer_paths[layer_id]
             if isinstance(to_read, torch.Tensor):
                 to_read = to_read.cpu()
-            with safe_open(path, framework="pt", device=str(self.device)) as f:
-                decoder_block = f.get_slice("w_dec")[to_read].to(dtype=self.dtype)
-                result = decoder_block[:, layer_id:, :]
+            with safe_open(path, framework="pt", device="cpu") as f:
+                decoder_block = f.get_slice("w_dec")[to_read]
+                result = self._move_lazy_slice_to_device(decoder_block[:, layer_id:, :])
             elapsed = time.perf_counter() - start
             self._add_diagnostic_value("decoder_load_count", 1)
             self._add_diagnostic_value("decoder_load_seconds", elapsed)
@@ -417,8 +430,8 @@ class CrossLayerTranscoder(torch.nn.Module):
         path = os.path.join(self.clt_path, f"W_dec_{layer_id}.safetensors")
         if isinstance(to_read, torch.Tensor):
             to_read = to_read.cpu()
-        with safe_open(path, framework="pt", device=str(self.device)) as f:
-            result = f.get_slice(f"W_dec_{layer_id}")[to_read].to(dtype=self.dtype)
+        with safe_open(path, framework="pt", device="cpu") as f:
+            result = self._move_lazy_slice_to_device(f.get_slice(f"W_dec_{layer_id}")[to_read])
         elapsed = time.perf_counter() - start
         self._add_diagnostic_value("decoder_load_count", 1)
         self._add_diagnostic_value("decoder_load_seconds", elapsed)
@@ -434,6 +447,9 @@ class CrossLayerTranscoder(torch.nn.Module):
             )
         return result
 
+    def get_decoder_block(self, layer_id, feat_ids=None):
+        return self._get_decoder_vectors(layer_id, feat_ids)
+
     def get_decoder_vectors_for_output_layer(self, layer_id, output_layer, feat_ids=None):
         if output_layer < layer_id:
             raise ValueError(
@@ -441,7 +457,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             )
 
         relative_output_layer = output_layer - layer_id
-        decoder_block = self._get_decoder_vectors(layer_id, feat_ids)
+        decoder_block = self.get_decoder_block(layer_id, feat_ids)
         return decoder_block[:, relative_output_layer].to(dtype=self.dtype)
 
     def select_decoder_vectors(self, features):
@@ -498,19 +514,24 @@ class CrossLayerTranscoder(torch.nn.Module):
     ):
         n_pos = pos_ids.max() + 1
         flat_idx = layer_ids * n_pos + pos_ids
+        accumulation_dtype = (
+            torch.float32 if self.dtype in (torch.float16, torch.bfloat16) else self.dtype
+        )
         recon = torch.zeros(
             n_pos * self.n_layers,
             self.d_model,
             device=decoder_vectors.device,
-            dtype=decoder_vectors.dtype,
-        ).index_add_(0, flat_idx, decoder_vectors)
-        recon = recon.reshape(self.n_layers, n_pos, self.d_model) + self.b_dec[:, None]
+            dtype=accumulation_dtype,
+        ).index_add_(0, flat_idx, decoder_vectors.to(dtype=accumulation_dtype))
+        recon = recon.reshape(self.n_layers, n_pos, self.d_model) + self.b_dec[:, None].to(
+            dtype=accumulation_dtype
+        )
         if self.W_skip is not None:
             assert input_acts is not None, (
                 "Transcoder has skip connection but no input_acts were provided"
             )
-            recon = recon + input_acts @ self.W_skip
-        return recon
+            recon = recon + (input_acts @ self.W_skip).to(dtype=accumulation_dtype)
+        return recon.to(dtype=self.dtype)
 
     def compute_reconstruction_chunked(
         self,
@@ -525,14 +546,16 @@ class CrossLayerTranscoder(torch.nn.Module):
         source_layers, positions, feat_ids = features.indices()
         activations = features.values()
         _, n_pos, _ = features.shape
-
+        accumulation_dtype = (
+            torch.float32 if self.dtype in (torch.float16, torch.bfloat16) else self.dtype
+        )
         recon = torch.zeros(
-            self.n_layers,
-            n_pos,
+            self.n_layers * n_pos,
             self.d_model,
             device=features.device,
-            dtype=self.dtype,
+            dtype=accumulation_dtype,
         )
+
         reconstruction_start = time.perf_counter()
         self.emit_trace_event(
             "phase0.reconstruction.start",
@@ -554,22 +577,29 @@ class CrossLayerTranscoder(torch.nn.Module):
                 layer=layer_id,
                 active_features=len(layer_indices),
             )
+            output_layers = torch.arange(layer_id, self.n_layers, device=positions.device)
+            n_output_layers = len(output_layers)
             for start in range(0, len(layer_indices), chunk_size):
                 chunk_indices = layer_indices[start : start + chunk_size]
                 layer_chunk_count += 1
                 chunk_feat_ids = feat_ids[chunk_indices]
                 unique_feats, inv = chunk_feat_ids.unique(return_inverse=True)
-                decoder_block = self._get_decoder_vectors(layer_id, unique_feats.cpu())
+                decoder_block = self.get_decoder_block(layer_id, unique_feats.cpu())
                 scaled_decoders = decoder_block[inv] * activations[chunk_indices, None, None].to(
-                    decoder_block.dtype
+                    device=decoder_block.device,
+                    dtype=decoder_block.dtype,
+                    non_blocking=decoder_block.device.type == "cuda",
                 )
 
                 chunk_positions = positions[chunk_indices]
-                for relative_output_layer in range(scaled_decoders.shape[1]):
-                    output_layer = layer_id + relative_output_layer
-                    recon[output_layer].index_add_(
-                        0, chunk_positions, scaled_decoders[:, relative_output_layer]
-                    )
+                flat_idx = output_layers.repeat(
+                    len(chunk_indices)
+                ) * n_pos + chunk_positions.repeat_interleave(n_output_layers)
+                recon.index_add_(
+                    0,
+                    flat_idx,
+                    scaled_decoders.reshape(-1, self.d_model).to(dtype=accumulation_dtype),
+                )
 
                 if layer_chunk_count <= 2 or layer_chunk_count % self._trace_chunk_interval == 0:
                     self.emit_trace_event(
@@ -593,12 +623,14 @@ class CrossLayerTranscoder(torch.nn.Module):
                 elapsed_s=f"{layer_elapsed:.2f}",
             )
 
-        recon = recon + self.b_dec[:, None]
+        recon = recon.reshape(self.n_layers, n_pos, self.d_model) + self.b_dec[:, None].to(
+            dtype=accumulation_dtype
+        )
         if self.W_skip is not None:
             assert input_acts is not None, (
                 "Transcoder has skip connection but no input_acts were provided"
             )
-            recon = recon + input_acts @ self.W_skip
+            recon = recon + (input_acts @ self.W_skip).to(dtype=accumulation_dtype)
         reconstruction_elapsed = time.perf_counter() - reconstruction_start
         self._add_diagnostic_value("reconstruction_seconds", reconstruction_elapsed)
         self.emit_trace_event(
@@ -606,7 +638,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             total_chunks=int(cast(float, self._diagnostic_stats["reconstruction_chunk_count"])),
             elapsed_s=f"{reconstruction_elapsed:.2f}",
         )
-        return recon
+        return recon.to(dtype=self.dtype)
 
     def decode(self, features, input_acts: torch.Tensor | None = None):
         if self.exact_chunked_decoder:
