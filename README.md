@@ -100,7 +100,7 @@ Operational notes for this forked path:
 - `lazy_encoder=True` and `lazy_decoder=True` are recommended for GemmaScope-2 CLTs.
 - `offload="cpu"` or `offload="disk"` can still help for model components, but transcoder offload is intentionally skipped during exact chunked decoder attribution so decoder slices remain readable during backward scoring.
 - With `verbose=True`, phase-level runtime and memory telemetry is emitted to logs (RSS plus CUDA allocated/reserved where available), which is useful for SLURM debugging.
-- For deeper profiling, `attribute(..., profile=True, profile_log_interval=1)` emits setup/precompute diagnostics plus batch-level diagnostics including decoder load counts/timing and chunked attribution timing.
+- For deeper profiling, `attribute(..., profile=True, profile_log_interval=1)` emits setup/precompute diagnostics, live `TRACE ...` progress lines for long-running work, and batch-level diagnostics including decoder load counts/timing and chunked attribution timing.
 - For scaling experiments only, `attribute(..., diagnostic_feature_cap=K)` applies a debug-only early active-feature cap before attribution rows are computed. This changes semantics and should not be used for final scientific traces.
 - `create_graph_files(...)` now accepts `prune_device=...` if you want pruning to happen on a specific device explicitly.
 

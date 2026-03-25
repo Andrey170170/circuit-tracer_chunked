@@ -101,6 +101,7 @@ And to test whether lazy decoder loading is the dominant cost, compare otherwise
 The profiling logs report, where applicable:
 
 - setup/precompute timing inside `setup_attribution`
+- live `TRACE ...` progress lines during long-running setup/reconstruction/chunked attribution work
 - per-batch timing in Phases 3 and 4
 - `compute_batch` cumulative timing
 - per-layer feature/error attribution timing

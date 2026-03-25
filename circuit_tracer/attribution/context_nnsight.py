@@ -76,6 +76,8 @@ class AttributionContext:
         self.chunked_decoder_state = chunked_decoder_state
         self.setup_diagnostic_stats: dict[str, object] | None = None
         self.diagnostic_mode = False
+        self._trace_logger = None
+        self._trace_chunk_interval = 16
         self._diagnostic_stats: dict[str, object] = {
             "compute_batch_calls": 0.0,
             "compute_batch_seconds": 0.0,
@@ -93,6 +95,19 @@ class AttributionContext:
 
     def set_diagnostic_mode(self, enabled: bool) -> None:
         self.diagnostic_mode = enabled
+
+    def configure_trace_logging(self, logger=None, *, chunk_interval: int = 16) -> None:
+        self._trace_logger = logger
+        self._trace_chunk_interval = max(1, chunk_interval)
+
+    def _emit_trace(self, event: str, **fields: object) -> None:
+        if self._trace_logger is None:
+            return
+        payload = ", ".join(f"{key}={value}" for key, value in fields.items())
+        message = f"TRACE {event}"
+        if payload:
+            message = f"{message} | {payload}"
+        self._trace_logger(message)
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:
         snapshot: dict[str, object] = {}
@@ -165,6 +180,11 @@ class AttributionContext:
         chunk_size = getattr(self.decoder_provider, "decoder_chunk_size", 256)
         output_layer_start = time.perf_counter()
         chunk_count = 0
+        self._emit_trace(
+            "phase3.chunked_attr.output_layer_start",
+            output_layer=layer,
+            total_sources=layer + 1,
+        )
 
         for source_layer in range(layer + 1):
             source_layer_start = time.perf_counter()
@@ -192,6 +212,16 @@ class AttributionContext:
                     "batch position d_model, position d_model -> position batch",
                 )
 
+                if chunk_count <= 2 or chunk_count % self._trace_chunk_interval == 0:
+                    self._emit_trace(
+                        "phase3.chunked_attr.chunk",
+                        output_layer=layer,
+                        source_layer=source_layer,
+                        chunk=chunk_count,
+                        processed=min(start + len(chunk_indices), len(layer_indices)),
+                        total=len(layer_indices),
+                    )
+
             if self.diagnostic_mode:
                 self._add_layer_stat(
                     "chunked_attr_seconds_by_source_layer",
@@ -206,6 +236,12 @@ class AttributionContext:
                 layer,
                 time.perf_counter() - output_layer_start,
             )
+        self._emit_trace(
+            "phase3.chunked_attr.output_layer_done",
+            output_layer=layer,
+            chunks=chunk_count,
+            elapsed_s=f"{time.perf_counter() - output_layer_start:.2f}",
+        )
 
     def cache_residual(self, model: "NNSightReplacementModel", tracer, barrier=None):
         """Cache the model's residual for use in the attribution context."""
@@ -311,6 +347,13 @@ class AttributionContext:
 
         batch_size = self._resid_activations[0].shape[0]
         batch_start = time.perf_counter()
+        self._emit_trace(
+            "compute_batch.start",
+            phase=phase_label,
+            batch_nodes=len(layers),
+            unique_layers=len(layers.unique()),
+            retain_graph=retain_graph,
+        )
         self._batch_buffer = torch.zeros(
             self._row_size,
             batch_size,
@@ -375,4 +418,10 @@ class AttributionContext:
                 self._diagnostic_stats.setdefault("compute_batch_seconds_by_phase", {}),
             )
             phase_bucket[phase_label] = phase_bucket.get(phase_label, 0.0) + elapsed
+        self._emit_trace(
+            "compute_batch.done",
+            phase=phase_label,
+            batch_nodes=len(layers),
+            elapsed_s=f"{time.perf_counter() - batch_start:.2f}",
+        )
         return buf.T[: len(layers)]

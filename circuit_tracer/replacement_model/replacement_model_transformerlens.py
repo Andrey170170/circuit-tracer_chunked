@@ -448,7 +448,14 @@ class TransformerLensReplacementModel(HookedTransformer):
         mlp_out_cache, mlp_out_caching_hooks, _ = self.get_caching_hooks(
             lambda name: self.feature_output_hook in name
         )
+        trace_event = getattr(self.transcoders, "emit_trace_event", None)
         trace_start = time.perf_counter()
+        if callable(trace_event):
+            trace_event(
+                "phase0.setup.trace_start",
+                backend="transformerlens",
+                token_count=int(tokens.numel()),
+            )
         logits = self.run_with_hooks(tokens, fwd_hooks=mlp_in_caching_hooks + mlp_out_caching_hooks)
         trace_seconds = time.perf_counter() - trace_start
 
@@ -456,20 +463,46 @@ class TransformerLensReplacementModel(HookedTransformer):
         mlp_in_cache = torch.cat(list(mlp_in_cache.values()), dim=0)
         mlp_out_cache = torch.cat(list(mlp_out_cache.values()), dim=0)
         concat_seconds = time.perf_counter() - concat_start
+        if callable(trace_event):
+            trace_event(
+                "phase0.setup.trace_done",
+                backend="transformerlens",
+                elapsed_s=f"{trace_seconds:.2f}",
+                cache_concat_s=f"{concat_seconds:.2f}",
+                mlp_in_shape=tuple(mlp_in_cache.shape),
+                mlp_out_shape=tuple(mlp_out_cache.shape),
+            )
 
         component_start = time.perf_counter()
+        if callable(trace_event):
+            trace_event("phase0.setup.components_start", backend="transformerlens")
         attribution_data = self.transcoders.compute_attribution_components(
             mlp_in_cache, self.zero_positions
         )
         component_seconds = time.perf_counter() - component_start
+        if callable(trace_event):
+            trace_event(
+                "phase0.setup.components_done",
+                backend="transformerlens",
+                elapsed_s=f"{component_seconds:.2f}",
+                active_features=int(attribution_data["activation_matrix"]._nnz()),
+            )
 
         # Compute error vectors
         error_start = time.perf_counter()
+        if callable(trace_event):
+            trace_event("phase0.setup.error_start", backend="transformerlens")
         error_vectors = mlp_out_cache - attribution_data["reconstruction"]
 
         error_vectors[:, self.zero_positions] = 0
         token_vectors = self.W_E[tokens].detach()  # (n_pos, d_model)
         error_seconds = time.perf_counter() - error_start
+        if callable(trace_event):
+            trace_event(
+                "phase0.setup.error_done",
+                backend="transformerlens",
+                elapsed_s=f"{error_seconds:.2f}",
+            )
         chunked_decoder_state = cast(
             dict[str, torch.Tensor] | None, attribution_data.get("chunked_decoder_state")
         )

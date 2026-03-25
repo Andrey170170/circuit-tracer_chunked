@@ -501,7 +501,12 @@ class NNSightReplacementModel(LanguageModel):
         mlp_out_cache = [None] * self.cfg.n_layers
 
         transcoders = self.transcoders
+        trace_event = getattr(transcoders, "emit_trace_event", None)
         trace_start = time.perf_counter()
+        if callable(trace_event):
+            trace_event(
+                "phase0.setup.trace_start", backend="nnsight", token_count=int(tokens.numel())
+            )
 
         with self.trace(tokens):
             mlp_in_cache, mlp_out_cache = [], []
@@ -520,15 +525,34 @@ class NNSightReplacementModel(LanguageModel):
             mlp_out_cache = save(torch.cat(mlp_out_cache, dim=0))  # type: ignore
             logits = save(self.output.logits)
         trace_seconds = time.perf_counter() - trace_start
+        if callable(trace_event):
+            trace_event(
+                "phase0.setup.trace_done",
+                backend="nnsight",
+                elapsed_s=f"{trace_seconds:.2f}",
+                mlp_in_shape=tuple(mlp_in_cache.shape),
+                mlp_out_shape=tuple(mlp_out_cache.shape),
+            )
 
         component_start = time.perf_counter()
+        if callable(trace_event):
+            trace_event("phase0.setup.components_start", backend="nnsight")
         attribution_data = transcoders.compute_attribution_components(
             mlp_in_cache, self.zero_positions
         )  # type: ignore
         component_seconds = time.perf_counter() - component_start
+        if callable(trace_event):
+            trace_event(
+                "phase0.setup.components_done",
+                backend="nnsight",
+                elapsed_s=f"{component_seconds:.2f}",
+                active_features=int(attribution_data["activation_matrix"]._nnz()),
+            )
 
         # Compute error vectors
         error_start = time.perf_counter()
+        if callable(trace_event):
+            trace_event("phase0.setup.error_start", backend="nnsight")
         error_vectors = mlp_out_cache - attribution_data["reconstruction"]
 
         error_vectors[:, self.zero_positions] = 0
@@ -536,6 +560,12 @@ class NNSightReplacementModel(LanguageModel):
             tokens
         ].detach()  # (n_pos, d_model)  # type: ignore
         error_seconds = time.perf_counter() - error_start
+        if callable(trace_event):
+            trace_event(
+                "phase0.setup.error_done",
+                backend="nnsight",
+                elapsed_s=f"{error_seconds:.2f}",
+            )
         chunked_decoder_state = cast(
             dict[str, torch.Tensor] | None, attribution_data.get("chunked_decoder_state")
         )

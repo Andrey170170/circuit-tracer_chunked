@@ -84,6 +84,9 @@ class CrossLayerTranscoder(torch.nn.Module):
         self.exact_chunked_decoder = exact_chunked_decoder
         self.decoder_chunk_size = decoder_chunk_size
         self._diagnostic_stats = self._make_empty_diagnostic_stats()
+        self._trace_logger = None
+        self._trace_chunk_interval = 16
+        self._trace_decoder_load_interval = 32
 
         self.feature_input_hook = feature_input_hook
         self.feature_output_hook = feature_output_hook
@@ -164,6 +167,26 @@ class CrossLayerTranscoder(torch.nn.Module):
 
     def reset_diagnostic_stats(self) -> None:
         self._diagnostic_stats = self._make_empty_diagnostic_stats()
+
+    def configure_trace_logging(
+        self,
+        logger=None,
+        *,
+        chunk_interval: int = 16,
+        decoder_load_interval: int = 32,
+    ) -> None:
+        self._trace_logger = logger
+        self._trace_chunk_interval = max(1, chunk_interval)
+        self._trace_decoder_load_interval = max(1, decoder_load_interval)
+
+    def emit_trace_event(self, event: str, **fields: object) -> None:
+        if self._trace_logger is None:
+            return
+        payload = ", ".join(f"{key}={value}" for key, value in fields.items())
+        message = f"TRACE {event}"
+        if payload:
+            message = f"{message} | {payload}"
+        self._trace_logger(message)
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:
         snapshot: dict[str, object] = {}
@@ -283,6 +306,13 @@ class CrossLayerTranscoder(torch.nn.Module):
         sparse_layers = []
         encoder_vectors = []
         encode_start = time.perf_counter()
+        self.emit_trace_event(
+            "phase0.encode_sparse.start",
+            n_layers=self.n_layers,
+            n_pos=x.shape[1],
+            d_model=self.d_model,
+            lazy_encoder=self.lazy_encoder,
+        )
 
         for layer_id in range(self.n_layers):
             layer_start = time.perf_counter()
@@ -306,10 +336,22 @@ class CrossLayerTranscoder(torch.nn.Module):
             self._add_diagnostic_layer_value(
                 "encode_sparse_active_features_by_layer", layer_id, float(len(feat_idx))
             )
+            self.emit_trace_event(
+                "phase0.encode_sparse.layer_done",
+                layer=layer_id,
+                active_features=len(feat_idx),
+                elapsed_s=f"{time.perf_counter() - layer_start:.2f}",
+            )
 
         sparse_features = torch.stack(sparse_layers).coalesce()
         active_encoders = torch.cat(encoder_vectors, dim=0)
-        self._add_diagnostic_value("encode_sparse_seconds", time.perf_counter() - encode_start)
+        encode_elapsed = time.perf_counter() - encode_start
+        self._add_diagnostic_value("encode_sparse_seconds", encode_elapsed)
+        self.emit_trace_event(
+            "phase0.encode_sparse.done",
+            total_active_features=sparse_features._nnz(),
+            elapsed_s=f"{encode_elapsed:.2f}",
+        )
         return sparse_features, active_encoders
 
     def _get_decoder_vectors(self, layer_id, feat_ids=None):
@@ -332,6 +374,15 @@ class CrossLayerTranscoder(torch.nn.Module):
             self._add_diagnostic_value("decoder_load_count", 1)
             self._add_diagnostic_value("decoder_load_seconds", elapsed)
             self._add_diagnostic_layer_value("decoder_load_by_layer", layer_id, elapsed)
+            load_count = int(cast(float, self._diagnostic_stats["decoder_load_count"]))
+            if load_count <= 3 or load_count % self._trace_decoder_load_interval == 0:
+                self.emit_trace_event(
+                    "decoder.load",
+                    source_layer=layer_id,
+                    load_count=load_count,
+                    elapsed_s=f"{elapsed:.2f}",
+                    lazy_decoder=self.lazy_decoder,
+                )
             return result
 
         assert self.clt_path is not None, "CLT path is not set"
@@ -344,6 +395,15 @@ class CrossLayerTranscoder(torch.nn.Module):
         self._add_diagnostic_value("decoder_load_count", 1)
         self._add_diagnostic_value("decoder_load_seconds", elapsed)
         self._add_diagnostic_layer_value("decoder_load_by_layer", layer_id, elapsed)
+        load_count = int(cast(float, self._diagnostic_stats["decoder_load_count"]))
+        if load_count <= 3 or load_count % self._trace_decoder_load_interval == 0:
+            self.emit_trace_event(
+                "decoder.load",
+                source_layer=layer_id,
+                load_count=load_count,
+                elapsed_s=f"{elapsed:.2f}",
+                lazy_decoder=self.lazy_decoder,
+            )
         return result
 
     def get_decoder_vectors_for_output_layer(self, layer_id, output_layer, feat_ids=None):
@@ -446,6 +506,12 @@ class CrossLayerTranscoder(torch.nn.Module):
             dtype=self.dtype,
         )
         reconstruction_start = time.perf_counter()
+        self.emit_trace_event(
+            "phase0.reconstruction.start",
+            n_layers=self.n_layers,
+            nnz=features._nnz(),
+            chunk_size=chunk_size,
+        )
 
         for layer_id in range(self.n_layers):
             layer_start = time.perf_counter()
@@ -455,6 +521,11 @@ class CrossLayerTranscoder(torch.nn.Module):
                 continue
 
             layer_indices = torch.where(layer_mask)[0]
+            self.emit_trace_event(
+                "phase0.reconstruction.layer_start",
+                layer=layer_id,
+                active_features=len(layer_indices),
+            )
             for start in range(0, len(layer_indices), chunk_size):
                 chunk_indices = layer_indices[start : start + chunk_size]
                 layer_chunk_count += 1
@@ -472,13 +543,27 @@ class CrossLayerTranscoder(torch.nn.Module):
                         0, chunk_positions, scaled_decoders[:, relative_output_layer]
                     )
 
-            self._add_diagnostic_layer_value(
-                "reconstruction_by_layer", layer_id, time.perf_counter() - layer_start
-            )
+                if layer_chunk_count <= 2 or layer_chunk_count % self._trace_chunk_interval == 0:
+                    self.emit_trace_event(
+                        "phase0.reconstruction.chunk",
+                        layer=layer_id,
+                        chunk=layer_chunk_count,
+                        processed=min(start + len(chunk_indices), len(layer_indices)),
+                        total=len(layer_indices),
+                    )
+
+            layer_elapsed = time.perf_counter() - layer_start
+            self._add_diagnostic_layer_value("reconstruction_by_layer", layer_id, layer_elapsed)
             self._add_diagnostic_layer_value(
                 "reconstruction_chunks_by_layer", layer_id, float(layer_chunk_count)
             )
             self._add_diagnostic_value("reconstruction_chunk_count", layer_chunk_count)
+            self.emit_trace_event(
+                "phase0.reconstruction.layer_done",
+                layer=layer_id,
+                chunks=layer_chunk_count,
+                elapsed_s=f"{layer_elapsed:.2f}",
+            )
 
         recon = recon + self.b_dec[:, None]
         if self.W_skip is not None:
@@ -486,8 +571,12 @@ class CrossLayerTranscoder(torch.nn.Module):
                 "Transcoder has skip connection but no input_acts were provided"
             )
             recon = recon + input_acts @ self.W_skip
-        self._add_diagnostic_value(
-            "reconstruction_seconds", time.perf_counter() - reconstruction_start
+        reconstruction_elapsed = time.perf_counter() - reconstruction_start
+        self._add_diagnostic_value("reconstruction_seconds", reconstruction_elapsed)
+        self.emit_trace_event(
+            "phase0.reconstruction.done",
+            total_chunks=int(cast(float, self._diagnostic_stats["reconstruction_chunk_count"])),
+            elapsed_s=f"{reconstruction_elapsed:.2f}",
         )
         return recon
 
@@ -528,6 +617,12 @@ class CrossLayerTranscoder(torch.nn.Module):
                 - decoder_vecs: Concatenated decoder vectors (scaled by activations)
                 - encoder_to_decoder_map: Mapping from encoder to decoder indices
         """
+        self.emit_trace_event(
+            "phase0.components.start",
+            input_shape=tuple(inputs.shape),
+            exact_chunked_decoder=self.exact_chunked_decoder,
+        )
+        component_start = time.perf_counter()
         features, encoder_vectors = self.encode_sparse(inputs, zero_positions=zero_positions)
 
         if self.exact_chunked_decoder:
@@ -562,6 +657,12 @@ class CrossLayerTranscoder(torch.nn.Module):
                 "feature_ids": feat_ids,
                 "activation_values": features.values(),
             }
+
+        self.emit_trace_event(
+            "phase0.components.done",
+            active_features=features._nnz(),
+            elapsed_s=f"{time.perf_counter() - component_start:.2f}",
+        )
 
         return attribution_data
 

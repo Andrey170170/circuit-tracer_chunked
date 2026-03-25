@@ -194,6 +194,9 @@ def _run_attribution(
         reset_diagnostics = getattr(model.transcoders, "reset_diagnostic_stats", None)
         if callable(reset_diagnostics):
             reset_diagnostics()
+        configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
+        if callable(configure_trace_logging):
+            configure_trace_logging(logger.info)
         logger.info(
             "Profiling enabled | "
             f"lazy_encoder={getattr(model.transcoders, 'lazy_encoder', 'n/a')} | "
@@ -206,6 +209,9 @@ def _run_attribution(
     ctx = model.setup_attribution(input_ids)
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
+    configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
+    if callable(configure_ctx_trace_logging):
+        configure_ctx_trace_logging(logger.info if profile else None)
 
     if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
         before_cap, after_cap = ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
