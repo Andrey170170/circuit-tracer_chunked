@@ -6,6 +6,7 @@ This fork is tuned for **single-GPU, memory-bounded, exact tracing** of **GemmaS
 
 - GemmaScope-2 CLTs use an **exact chunked decoder** path automatically.
 - Full decoder expansion is avoided during attribution setup.
+- Optional double-pass sparsification can screen feature candidates before reconstruction and later attribution.
 - Phase 4 partial-influence computation no longer performs an implicit full dense CUDA copy.
 - Verbose attribution runs emit phase-level time and memory telemetry.
 
@@ -32,6 +33,7 @@ Example:
 import torch
 
 from circuit_tracer import ReplacementModel
+from circuit_tracer import SparsificationConfig
 from circuit_tracer.attribution.attribute_nnsight import attribute
 
 model = ReplacementModel.from_pretrained(
@@ -53,6 +55,23 @@ graph = attribute(
     verbose=True,
 )
 ```
+
+To enable early screening on retained candidates, pass a sparsification config:
+
+```python
+graph = attribute(
+    prompt,
+    model,
+    batch_size=16,
+    max_feature_nodes=128,
+    sparsification=SparsificationConfig(
+        per_layer_position_topk=4,
+        global_cap=512,
+    ),
+)
+```
+
+This keeps `attribute(...)` backward compatible when sparsification is omitted, while allowing phase 0 reconstruction and later attribution to reuse the same retained candidate set.
 
 ## Offload behavior
 
@@ -79,6 +98,7 @@ For deeper bottleneck-finding runs, this fork also supports:
 - `profile=True`: emit batch-level profiling logs for attribution
 - `profile_log_interval=N`: log every N batches while profiling
 - `diagnostic_feature_cap=K`: debug-only early active-feature cap for scaling experiments
+- `sparsification=SparsificationConfig(...)`: early candidate screening before reconstruction
 
 Example diagnostic comparison:
 
@@ -107,6 +127,7 @@ The profiling logs report, where applicable:
 - per-layer feature/error attribution timing
 - decoder load count and decoder load time
 - chunk counts and chunked attribution timing by layer
+- sparsification candidate counts, per-layer retained counts, and retained activation-mass proxy
 
 ## HPC guidance
 

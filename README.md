@@ -63,7 +63,7 @@ This fork adds a memory-bounded, exact tracing path for GemmaScope-2 cross-layer
 
 - `attribute(...)` and `ReplacementModel.from_pretrained(...)` stay the same at the call site.
 - For GemmaScope-2 CLTs, exact chunked decoder handling is enabled automatically.
-- This preserves full active feature sets until the normal Phase-4 feature selection step; there is no early feature top-K pruning in the fork path.
+- Optional double-pass sparsification can now screen candidates before reconstruction and reuse the same retained set during later attribution.
 - GemmaScope-2 CLTs should be used with `backend="nnsight"`.
 - The loader also tolerates the duplicated final shard path present in some GemmaScope-2 configs.
 
@@ -95,12 +95,33 @@ graph = attribute(
 )
 ```
 
+Optional early sparsification example:
+
+```python
+from circuit_tracer import SparsificationConfig
+
+graph = attribute(
+    "If Alice has 3 apples and buys 2 more, she has",
+    model,
+    max_n_logits=4,
+    batch_size=16,
+    max_feature_nodes=128,
+    sparsification=SparsificationConfig(
+        per_layer_position_topk=4,
+        global_cap=512,
+    ),
+    offload="cpu",
+    verbose=True,
+)
+```
+
 Operational notes for this forked path:
 
 - `lazy_encoder=True` and `lazy_decoder=True` are recommended for GemmaScope-2 CLTs.
 - `offload="cpu"` or `offload="disk"` can still help for model components, but transcoder offload is intentionally skipped during exact chunked decoder attribution so decoder slices remain readable during backward scoring.
 - With `verbose=True`, phase-level runtime and memory telemetry is emitted to logs (RSS plus CUDA allocated/reserved where available), which is useful for SLURM debugging.
-- For deeper profiling, `attribute(..., profile=True, profile_log_interval=1)` emits setup/precompute diagnostics, live `TRACE ...` progress lines for long-running work, and batch-level diagnostics including decoder load counts/timing and chunked attribution timing.
+- `SparsificationConfig(per_layer_position_topk=..., global_cap=...)` uses a per-layer-per-position activation screen first, then an optional global cap as a safety valve.
+- For deeper profiling, `attribute(..., profile=True, profile_log_interval=1)` emits setup/precompute diagnostics, live `TRACE ...` progress lines for long-running work, batch-level diagnostics including decoder load counts/timing and chunked attribution timing, and sparsification retention summaries when sparsification is enabled.
 - For scaling experiments only, `attribute(..., diagnostic_feature_cap=K)` applies a debug-only early active-feature cap before attribution rows are computed. This changes semantics and should not be used for final scientific traces.
 - `create_graph_files(...)` now accepts `prune_device=...` if you want pruning to happen on a specific device explicitly.
 

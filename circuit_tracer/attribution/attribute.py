@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.graph import Graph
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ def attribute(
     profile: bool = False,
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
+    sparsification: SparsificationConfig | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -63,6 +65,9 @@ def attribute(
         diagnostic_feature_cap: Optional debug-only early cap on active features before
             attribution rows are computed. This changes attribution semantics and should
             only be used for profiling/scaling experiments.
+        sparsification: Optional candidate-screening config. When provided, phase 0
+            keeps only retained feature candidates before reconstruction, and later
+            attribution phases reuse the same candidate set.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -85,6 +90,7 @@ def attribute(
             profile=profile,
             profile_log_interval=profile_log_interval,
             diagnostic_feature_cap=diagnostic_feature_cap,
+            sparsification=sparsification,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens
@@ -103,4 +109,5 @@ def attribute(
             profile=profile,
             profile_log_interval=profile_log_interval,
             diagnostic_feature_cap=diagnostic_feature_cap,
+            sparsification=sparsification,
         )

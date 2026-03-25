@@ -9,6 +9,11 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.nn import functional as F
 
+from circuit_tracer.attribution.sparsification import (
+    SparsificationConfig,
+    filter_sparse_activations,
+    select_candidate_feature_indices,
+)
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.utils import get_default_device
 
@@ -289,7 +294,13 @@ class CrossLayerTranscoder(torch.nn.Module):
 
         return self.apply_activation_function(layer_id, features)
 
-    def encode_sparse(self, x, zero_positions: slice = slice(0, 1)):
+    def encode_sparse(
+        self,
+        x,
+        zero_positions: slice = slice(0, 1),
+        *,
+        return_encoder_vectors: bool = True,
+    ):
         """Encode input to sparse activations, processing one layer at a time for memory efficiency.
 
         This method processes layers sequentially and converts to sparse format immediately
@@ -304,7 +315,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             active_encoders: Encoder vectors for active features only
         """
         sparse_layers = []
-        encoder_vectors = []
+        encoder_vectors = [] if return_encoder_vectors else None
         encode_start = time.perf_counter()
         self.emit_trace_event(
             "phase0.encode_sparse.start",
@@ -329,7 +340,8 @@ class CrossLayerTranscoder(torch.nn.Module):
             sparse_layers.append(sparse_layer)
 
             _, feat_idx = sparse_layer.indices()
-            encoder_vectors.append(W_enc_layer[feat_idx])
+            if encoder_vectors is not None:
+                encoder_vectors.append(W_enc_layer[feat_idx])
             self._add_diagnostic_layer_value(
                 "encode_sparse_by_layer", layer_id, time.perf_counter() - layer_start
             )
@@ -344,7 +356,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             )
 
         sparse_features = torch.stack(sparse_layers).coalesce()
-        active_encoders = torch.cat(encoder_vectors, dim=0)
+        active_encoders = torch.cat(encoder_vectors, dim=0) if encoder_vectors is not None else None
         encode_elapsed = time.perf_counter() - encode_start
         self._add_diagnostic_value("encode_sparse_seconds", encode_elapsed)
         self.emit_trace_event(
@@ -353,6 +365,22 @@ class CrossLayerTranscoder(torch.nn.Module):
             elapsed_s=f"{encode_elapsed:.2f}",
         )
         return sparse_features, active_encoders
+
+    def gather_encoder_vectors(self, features: torch.Tensor) -> torch.Tensor:
+        if not features.is_sparse:
+            features = features.to_sparse()
+
+        source_layers, _, feat_ids = features.indices()
+        encoder_vectors = []
+        for layer_id in range(self.n_layers):
+            layer_mask = source_layers == layer_id
+            if not layer_mask.any():
+                continue
+            encoder_vectors.append(self._get_encoder_weights(layer_id)[feat_ids[layer_mask]])
+
+        if encoder_vectors:
+            return torch.cat(encoder_vectors, dim=0)
+        return torch.empty((0, self.d_model), device=features.device, dtype=self.dtype)
 
     def _get_decoder_vectors(self, layer_id, feat_ids=None):
         to_read = feat_ids if feat_ids is not None else np.s_[:]
@@ -603,7 +631,12 @@ class CrossLayerTranscoder(torch.nn.Module):
 
         return decoded
 
-    def compute_attribution_components(self, inputs, zero_positions: slice = slice(0, 1)):
+    def compute_attribution_components(
+        self,
+        inputs,
+        zero_positions: slice = slice(0, 1),
+        sparsification: SparsificationConfig | None = None,
+    ):
         """Extract active features and their encoder/decoder vectors for attribution.
 
         Args:
@@ -623,7 +656,21 @@ class CrossLayerTranscoder(torch.nn.Module):
             exact_chunked_decoder=self.exact_chunked_decoder,
         )
         component_start = time.perf_counter()
-        features, encoder_vectors = self.encode_sparse(inputs, zero_positions=zero_positions)
+        features, encoder_vectors = self.encode_sparse(
+            inputs,
+            zero_positions=zero_positions,
+            return_encoder_vectors=sparsification is None,
+        )
+        sparsification_stats = None
+
+        if sparsification is not None:
+            selected_indices, sparsification_stats = select_candidate_feature_indices(
+                features, sparsification
+            )
+            features = filter_sparse_activations(features, selected_indices)
+            encoder_vectors = self.gather_encoder_vectors(features)
+        elif encoder_vectors is None:
+            encoder_vectors = self.gather_encoder_vectors(features)
 
         if self.exact_chunked_decoder:
             reconstruction = self.compute_reconstruction_chunked(features, inputs)
@@ -631,6 +678,12 @@ class CrossLayerTranscoder(torch.nn.Module):
             decoder_vectors = torch.empty((0, self.d_model), dtype=self.dtype, device=inputs.device)
             encoder_to_decoder_map = empty_long
             decoder_locations = torch.empty((2, 0), dtype=torch.long, device=inputs.device)
+            chunked_decoder_state = {
+                "source_layers": features.indices()[0],
+                "positions": features.indices()[1],
+                "feature_ids": features.indices()[2],
+                "activation_values": features.values(),
+            }
         else:
             pos_ids, layer_ids, feat_ids, decoder_vectors, encoder_to_decoder_map = (
                 self.select_decoder_vectors(features)
@@ -639,6 +692,7 @@ class CrossLayerTranscoder(torch.nn.Module):
                 pos_ids, layer_ids, decoder_vectors, inputs
             )
             decoder_locations = torch.stack((layer_ids, pos_ids))
+            chunked_decoder_state = None
 
         attribution_data = {
             "activation_matrix": features,
@@ -649,14 +703,10 @@ class CrossLayerTranscoder(torch.nn.Module):
             "decoder_locations": decoder_locations,
         }
 
-        if self.exact_chunked_decoder:
-            source_layers, positions, feat_ids = features.indices()
-            attribution_data["chunked_decoder_state"] = {
-                "source_layers": source_layers,
-                "positions": positions,
-                "feature_ids": feat_ids,
-                "activation_values": features.values(),
-            }
+        if chunked_decoder_state is not None:
+            attribution_data["chunked_decoder_state"] = chunked_decoder_state
+        if sparsification_stats is not None:
+            attribution_data["sparsification_stats"] = sparsification_stats
 
         self.emit_trace_event(
             "phase0.components.done",

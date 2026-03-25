@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from circuit_tracer.attribution.attribute import attribute
+    from circuit_tracer.attribution.sparsification import SparsificationConfig
     from circuit_tracer.graph import Graph
     from circuit_tracer.replacement_model import ReplacementModel
 
@@ -9,12 +10,17 @@ __all__ = [
     "ReplacementModel",
     "Graph",
     "attribute",
+    "SparsificationConfig",
 ]
 
 
 def __getattr__(name):
     _lazy_imports = {
         "attribute": ("circuit_tracer.attribution.attribute", "attribute"),
+        "SparsificationConfig": (
+            "circuit_tracer.attribution.sparsification",
+            "SparsificationConfig",
+        ),
         "Graph": ("circuit_tracer.graph", "Graph"),
         "ReplacementModel": ("circuit_tracer.replacement_model", "ReplacementModel"),
     }

@@ -33,6 +33,7 @@ from circuit_tracer.attribution.targets import (
     TargetSpec,
     log_attribution_target_info,
 )
+from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.graph import Graph, compute_partial_influences
 from circuit_tracer.replacement_model.replacement_model_transformerlens import (
     TransformerLensReplacementModel,
@@ -83,6 +84,19 @@ def _log_batch_profile(
     logger.info(" | ".join(parts))
 
 
+def _log_sparsification_profile(logger, stats: dict[str, object]) -> None:
+    retained = stats.get("per_layer_retained_counts", {})
+    logger.info(
+        "Sparsification screening | "
+        f"candidates={stats.get('candidate_count_before')}->{stats.get('candidate_count_after')} | "
+        f"per_layer_position_topk={stats.get('per_layer_position_topk')} | "
+        f"global_cap={stats.get('global_cap')} | "
+        f"retained_activation_mass={stats.get('retained_activation_mass', 1.0):.4f} | "
+        f"screen_seconds={stats.get('screen_seconds', 0.0):.4f} | "
+        f"per_layer_retained={retained}"
+    )
+
+
 def attribute(
     prompt: str | torch.Tensor | list[int],
     model: TransformerLensReplacementModel,
@@ -98,6 +112,7 @@ def attribute(
     profile: bool = False,
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
+    sparsification: SparsificationConfig | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using TransformerLens backend.
 
@@ -125,6 +140,8 @@ def attribute(
         profile_log_interval: Log every N batches when profiling.
         diagnostic_feature_cap: Optional debug-only early cap on active features.
             This changes attribution semantics and should only be used for profiling.
+        sparsification: Optional candidate-screening config applied before
+            reconstruction and reused by later attribution phases.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -159,6 +176,7 @@ def attribute(
             profile=profile,
             profile_log_interval=profile_log_interval,
             diagnostic_feature_cap=diagnostic_feature_cap,
+            sparsification=sparsification,
             logger=logger,
         )
     finally:
@@ -185,6 +203,7 @@ def _run_attribution(
     profile: bool = False,
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
+    sparsification: SparsificationConfig | None = None,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -192,13 +211,14 @@ def _run_attribution(
     phase_start = time.time()
     input_ids = model.ensure_tokenized(prompt)
 
+    configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
+    if callable(configure_trace_logging):
+        configure_trace_logging(logger.info if profile else None)
+
     if profile:
         reset_diagnostics = getattr(model.transcoders, "reset_diagnostic_stats", None)
         if callable(reset_diagnostics):
             reset_diagnostics()
-        configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
-        if callable(configure_trace_logging):
-            configure_trace_logging(logger.info)
         logger.info(
             "Profiling enabled | "
             f"lazy_encoder={getattr(model.transcoders, 'lazy_encoder', 'n/a')} | "
@@ -208,7 +228,7 @@ def _run_attribution(
             f"prompt_tokens={input_ids.shape[-1]} | attribution_batch_size={batch_size}"
         )
 
-    ctx = model.setup_attribution(input_ids)
+    ctx = model.setup_attribution(input_ids, sparsification=sparsification)
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
     configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
@@ -220,6 +240,8 @@ def _run_attribution(
         logger.info(
             f"Diagnostic feature cap applied before attribution rows: {before_cap} -> {after_cap} active features"
         )
+    if profile and getattr(ctx, "sparsification_stats", None):
+        _log_sparsification_profile(logger, ctx.sparsification_stats)
     activation_matrix = ctx.activation_matrix
 
     _log_phase_metrics(

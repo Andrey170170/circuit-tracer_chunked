@@ -75,6 +75,7 @@ class AttributionContext:
         self.decoder_provider = decoder_provider
         self.chunked_decoder_state = chunked_decoder_state
         self.setup_diagnostic_stats: dict[str, object] | None = None
+        self.sparsification_stats: dict[str, object] | None = None
         self.diagnostic_mode = False
         self._trace_logger = None
         self._trace_chunk_interval = 16

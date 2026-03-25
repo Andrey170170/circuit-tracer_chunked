@@ -12,6 +12,11 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 
+from circuit_tracer.attribution.sparsification import (
+    SparsificationConfig,
+    filter_sparse_activations,
+    select_candidate_feature_indices,
+)
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.utils import get_default_device
 
@@ -336,8 +341,11 @@ class TranscoderSet(nn.Module):
         )
 
     def compute_attribution_components(
-        self, mlp_inputs: torch.Tensor, zero_positions: slice = slice(0, 1)
-    ) -> dict[str, torch.Tensor]:
+        self,
+        mlp_inputs: torch.Tensor,
+        zero_positions: slice = slice(0, 1),
+        sparsification: SparsificationConfig | None = None,
+    ) -> dict[str, object]:
         """Extract active features and their encoder/decoder vectors for attribution.
 
         Args:
@@ -354,26 +362,46 @@ class TranscoderSet(nn.Module):
         """
         device = mlp_inputs.device
 
-        reconstruction = torch.zeros_like(mlp_inputs)
-        encoder_vectors = []
-        decoder_vectors = []
         sparse_acts_list = []
 
         for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
-            sparse_acts, active_encoders = transcoder.encode_sparse(
+            sparse_acts, _ = transcoder.encode_sparse(
                 mlp_inputs[layer], zero_positions=zero_positions
             )
-            reconstruction[layer], active_decoders = transcoder.decode_sparse(
-                sparse_acts, mlp_inputs[layer]
-            )
-            encoder_vectors.append(active_encoders)
-            decoder_vectors.append(active_decoders)
             sparse_acts_list.append(sparse_acts)
 
         activation_matrix = torch.stack(sparse_acts_list).coalesce()
+        sparsification_stats = None
+        if sparsification is not None:
+            selected_indices, sparsification_stats = select_candidate_feature_indices(
+                activation_matrix, sparsification
+            )
+            activation_matrix = filter_sparse_activations(activation_matrix, selected_indices)
+
+        reconstruction = torch.zeros_like(mlp_inputs)
+        encoder_vectors = []
+        decoder_vectors = []
+        layer_ids, pos_ids, feat_ids = activation_matrix.indices()
+
+        for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
+            layer_mask = layer_ids == layer
+            layer_sparse = torch.sparse_coo_tensor(
+                torch.stack((pos_ids[layer_mask], feat_ids[layer_mask])),
+                activation_matrix.values()[layer_mask],
+                size=(mlp_inputs.shape[1], transcoder.d_transcoder),
+                device=device,
+                dtype=activation_matrix.dtype,
+            ).coalesce()
+            _, layer_feat_ids = layer_sparse.indices()
+            encoder_vectors.append(transcoder.W_enc[layer_feat_ids])
+            reconstruction[layer], active_decoders = transcoder.decode_sparse(
+                layer_sparse, mlp_inputs[layer]
+            )
+            decoder_vectors.append(active_decoders)
+
         encoder_to_decoder_map = torch.arange(activation_matrix._nnz(), device=device)
 
-        return {
+        attribution_data = {
             "activation_matrix": activation_matrix,
             "reconstruction": reconstruction,
             "encoder_vecs": torch.cat(encoder_vectors, dim=0),
@@ -381,6 +409,9 @@ class TranscoderSet(nn.Module):
             "encoder_to_decoder_map": encoder_to_decoder_map,
             "decoder_locations": activation_matrix.indices()[:2],
         }
+        if sparsification_stats is not None:
+            attribution_data["sparsification_stats"] = sparsification_stats
+        return attribution_data
 
     def encode_layer(self, x, layer_id, apply_activation_function=True):
         return self.transcoders[layer_id].encode(

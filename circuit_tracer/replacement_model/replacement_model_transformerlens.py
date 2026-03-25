@@ -13,6 +13,7 @@ from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
 from circuit_tracer.attribution.context_transformerlens import AttributionContext
+from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 from circuit_tracer.utils import get_default_device
@@ -423,7 +424,12 @@ class TransformerLensReplacementModel(HookedTransformer):
         return tokens.to(self.cfg.device)
 
     @torch.no_grad()
-    def setup_attribution(self, inputs: str | torch.Tensor):
+    def setup_attribution(
+        self,
+        inputs: str | torch.Tensor,
+        *,
+        sparsification: SparsificationConfig | None = None,
+    ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
 
@@ -477,7 +483,9 @@ class TransformerLensReplacementModel(HookedTransformer):
         if callable(trace_event):
             trace_event("phase0.setup.components_start", backend="transformerlens")
         attribution_data = self.transcoders.compute_attribution_components(
-            mlp_in_cache, self.zero_positions
+            mlp_in_cache,
+            self.zero_positions,
+            sparsification=sparsification,
         )
         component_seconds = time.perf_counter() - component_start
         if callable(trace_event):
@@ -534,6 +542,7 @@ class TransformerLensReplacementModel(HookedTransformer):
             "reconstruction_shape": tuple(attribution_data["reconstruction"].shape),
             "active_features": int(attribution_data["activation_matrix"]._nnz()),
         }
+        ctx.sparsification_stats = attribution_data.get("sparsification_stats")
         return ctx
 
     def setup_intervention_with_freeze(
