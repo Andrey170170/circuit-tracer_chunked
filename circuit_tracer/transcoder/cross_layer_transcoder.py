@@ -1,5 +1,6 @@
 import glob
 import os
+import time
 from typing import cast
 
 import numpy as np
@@ -82,6 +83,7 @@ class CrossLayerTranscoder(torch.nn.Module):
         self.weight_format = weight_format
         self.exact_chunked_decoder = exact_chunked_decoder
         self.decoder_chunk_size = decoder_chunk_size
+        self._diagnostic_stats = self._make_empty_diagnostic_stats()
 
         self.feature_input_hook = feature_input_hook
         self.feature_output_hook = feature_output_hook
@@ -142,17 +144,62 @@ class CrossLayerTranscoder(torch.nn.Module):
         """Get the dtype of the module's parameters."""
         return self.b_enc.dtype
 
+    @staticmethod
+    def _make_empty_diagnostic_stats() -> dict[str, object]:
+        return {
+            "encoder_load_count": 0,
+            "encoder_load_seconds": 0.0,
+            "encoder_load_by_layer": {},
+            "decoder_load_count": 0,
+            "decoder_load_seconds": 0.0,
+            "decoder_load_by_layer": {},
+            "encode_sparse_seconds": 0.0,
+            "encode_sparse_by_layer": {},
+            "encode_sparse_active_features_by_layer": {},
+            "reconstruction_chunk_count": 0,
+            "reconstruction_seconds": 0.0,
+            "reconstruction_by_layer": {},
+            "reconstruction_chunks_by_layer": {},
+        }
+
+    def reset_diagnostic_stats(self) -> None:
+        self._diagnostic_stats = self._make_empty_diagnostic_stats()
+
+    def get_diagnostic_snapshot(self) -> dict[str, object]:
+        snapshot: dict[str, object] = {}
+        for key, value in self._diagnostic_stats.items():
+            snapshot[key] = dict(value) if isinstance(value, dict) else value
+        return snapshot
+
+    def _add_diagnostic_value(self, key: str, value: float) -> None:
+        current = cast(float, self._diagnostic_stats.get(key, 0.0))
+        self._diagnostic_stats[key] = current + value
+
+    def _add_diagnostic_layer_value(self, key: str, layer_id: int, value: float) -> None:
+        layer_stats = cast(dict[int, float], self._diagnostic_stats.setdefault(key, {}))
+        layer_stats[layer_id] = layer_stats.get(layer_id, 0.0) + value
+
     def _get_encoder_weights(self, layer_id=None):
         """Get encoder weights, loading from disk if lazy."""
         if not self.lazy_encoder:
             return self.W_enc if layer_id is None else self.W_enc[layer_id]
+
+        start = time.perf_counter()
 
         if self.layer_paths is not None:
             if layer_id is not None:
                 with safe_open(
                     self.layer_paths[layer_id], framework="pt", device=str(self.device)
                 ) as f:
-                    return f.get_tensor("w_enc").transpose(-1, -2).to(dtype=self.dtype).contiguous()
+                    result = (
+                        f.get_tensor("w_enc").transpose(-1, -2).to(dtype=self.dtype).contiguous()
+                    )
+                self._add_diagnostic_value("encoder_load_count", 1)
+                self._add_diagnostic_value("encoder_load_seconds", time.perf_counter() - start)
+                self._add_diagnostic_layer_value(
+                    "encoder_load_by_layer", layer_id, time.perf_counter() - start
+                )
+                return result
 
             W_enc = torch.zeros(
                 self.n_layers,
@@ -164,6 +211,8 @@ class CrossLayerTranscoder(torch.nn.Module):
             for i in range(self.n_layers):
                 with safe_open(self.layer_paths[i], framework="pt", device=str(self.device)) as f:
                     W_enc[i] = f.get_tensor("w_enc").transpose(-1, -2).to(dtype=self.dtype)
+            self._add_diagnostic_value("encoder_load_count", self.n_layers)
+            self._add_diagnostic_value("encoder_load_seconds", time.perf_counter() - start)
             return W_enc
 
         assert self.clt_path is not None, "CLT path is not set"
@@ -171,7 +220,13 @@ class CrossLayerTranscoder(torch.nn.Module):
             # Load single layer encoder
             enc_file = os.path.join(self.clt_path, f"W_enc_{layer_id}.safetensors")
             with safe_open(enc_file, framework="pt", device=str(self.device)) as f:
-                return f.get_tensor(f"W_enc_{layer_id}").to(dtype=self.dtype)
+                result = f.get_tensor(f"W_enc_{layer_id}").to(dtype=self.dtype)
+            self._add_diagnostic_value("encoder_load_count", 1)
+            self._add_diagnostic_value("encoder_load_seconds", time.perf_counter() - start)
+            self._add_diagnostic_layer_value(
+                "encoder_load_by_layer", layer_id, time.perf_counter() - start
+            )
+            return result
 
         # Load all encoder weights
         W_enc = torch.zeros(
@@ -185,6 +240,8 @@ class CrossLayerTranscoder(torch.nn.Module):
             enc_file = os.path.join(self.clt_path, f"W_enc_{i}.safetensors")
             with safe_open(enc_file, framework="pt", device=str(self.device)) as f:
                 W_enc[i] = f.get_tensor(f"W_enc_{i}").to(dtype=self.dtype)
+        self._add_diagnostic_value("encoder_load_count", self.n_layers)
+        self._add_diagnostic_value("encoder_load_seconds", time.perf_counter() - start)
         return W_enc
 
     def encode(self, x):
@@ -225,8 +282,10 @@ class CrossLayerTranscoder(torch.nn.Module):
         """
         sparse_layers = []
         encoder_vectors = []
+        encode_start = time.perf_counter()
 
         for layer_id in range(self.n_layers):
+            layer_start = time.perf_counter()
             W_enc_layer = self._get_encoder_weights(layer_id)
             layer_features = (
                 torch.einsum("bd,fd->bf", x[layer_id], W_enc_layer) + self.b_enc[layer_id]
@@ -241,9 +300,16 @@ class CrossLayerTranscoder(torch.nn.Module):
 
             _, feat_idx = sparse_layer.indices()
             encoder_vectors.append(W_enc_layer[feat_idx])
+            self._add_diagnostic_layer_value(
+                "encode_sparse_by_layer", layer_id, time.perf_counter() - layer_start
+            )
+            self._add_diagnostic_layer_value(
+                "encode_sparse_active_features_by_layer", layer_id, float(len(feat_idx))
+            )
 
         sparse_features = torch.stack(sparse_layers).coalesce()
         active_encoders = torch.cat(encoder_vectors, dim=0)
+        self._add_diagnostic_value("encode_sparse_seconds", time.perf_counter() - encode_start)
         return sparse_features, active_encoders
 
     def _get_decoder_vectors(self, layer_id, feat_ids=None):
@@ -253,20 +319,32 @@ class CrossLayerTranscoder(torch.nn.Module):
             assert self.W_dec is not None, "Decoder weights are not set"
             return self.W_dec[layer_id][to_read].to(dtype=self.dtype)
 
+        start = time.perf_counter()
+
         if self.layer_paths is not None:
             path = self.layer_paths[layer_id]
             if isinstance(to_read, torch.Tensor):
                 to_read = to_read.cpu()
             with safe_open(path, framework="pt", device=str(self.device)) as f:
                 decoder_block = f.get_slice("w_dec")[to_read].to(dtype=self.dtype)
-                return decoder_block[:, layer_id:, :]
+                result = decoder_block[:, layer_id:, :]
+            elapsed = time.perf_counter() - start
+            self._add_diagnostic_value("decoder_load_count", 1)
+            self._add_diagnostic_value("decoder_load_seconds", elapsed)
+            self._add_diagnostic_layer_value("decoder_load_by_layer", layer_id, elapsed)
+            return result
 
         assert self.clt_path is not None, "CLT path is not set"
         path = os.path.join(self.clt_path, f"W_dec_{layer_id}.safetensors")
         if isinstance(to_read, torch.Tensor):
             to_read = to_read.cpu()
         with safe_open(path, framework="pt", device=str(self.device)) as f:
-            return f.get_slice(f"W_dec_{layer_id}")[to_read].to(dtype=self.dtype)
+            result = f.get_slice(f"W_dec_{layer_id}")[to_read].to(dtype=self.dtype)
+        elapsed = time.perf_counter() - start
+        self._add_diagnostic_value("decoder_load_count", 1)
+        self._add_diagnostic_value("decoder_load_seconds", elapsed)
+        self._add_diagnostic_layer_value("decoder_load_by_layer", layer_id, elapsed)
+        return result
 
     def get_decoder_vectors_for_output_layer(self, layer_id, output_layer, feat_ids=None):
         if output_layer < layer_id:
@@ -367,8 +445,11 @@ class CrossLayerTranscoder(torch.nn.Module):
             device=features.device,
             dtype=self.dtype,
         )
+        reconstruction_start = time.perf_counter()
 
         for layer_id in range(self.n_layers):
+            layer_start = time.perf_counter()
+            layer_chunk_count = 0
             layer_mask = source_layers == layer_id
             if not layer_mask.any():
                 continue
@@ -376,6 +457,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             layer_indices = torch.where(layer_mask)[0]
             for start in range(0, len(layer_indices), chunk_size):
                 chunk_indices = layer_indices[start : start + chunk_size]
+                layer_chunk_count += 1
                 chunk_feat_ids = feat_ids[chunk_indices]
                 unique_feats, inv = chunk_feat_ids.unique(return_inverse=True)
                 decoder_block = self._get_decoder_vectors(layer_id, unique_feats.cpu())
@@ -390,12 +472,23 @@ class CrossLayerTranscoder(torch.nn.Module):
                         0, chunk_positions, scaled_decoders[:, relative_output_layer]
                     )
 
+            self._add_diagnostic_layer_value(
+                "reconstruction_by_layer", layer_id, time.perf_counter() - layer_start
+            )
+            self._add_diagnostic_layer_value(
+                "reconstruction_chunks_by_layer", layer_id, float(layer_chunk_count)
+            )
+            self._add_diagnostic_value("reconstruction_chunk_count", layer_chunk_count)
+
         recon = recon + self.b_dec[:, None]
         if self.W_skip is not None:
             assert input_acts is not None, (
                 "Transcoder has skip connection but no input_acts were provided"
             )
             recon = recon + input_acts @ self.W_skip
+        self._add_diagnostic_value(
+            "reconstruction_seconds", time.perf_counter() - reconstruction_start
+        )
         return recon
 
     def decode(self, features, input_acts: torch.Tensor | None = None):

@@ -3,9 +3,10 @@ Attribution context for managing hooks during attribution computation.
 """
 
 import contextlib
+import time
 import weakref
 from functools import partial
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, cast
 
 import numpy as np
 import torch
@@ -74,9 +75,81 @@ class AttributionContext:
         self.decoder_locations = decoder_locations
         self.decoder_provider = decoder_provider
         self.chunked_decoder_state = chunked_decoder_state
+        self.setup_diagnostic_stats: dict[str, object] | None = None
+        self.diagnostic_mode = False
+        self._diagnostic_stats: dict[str, object] = {
+            "compute_batch_calls": 0.0,
+            "compute_batch_seconds": 0.0,
+            "compute_batch_seconds_by_phase": {},
+            "chunked_attr_chunks_by_output_layer": {},
+            "chunked_attr_seconds_by_output_layer": {},
+            "chunked_attr_seconds_by_source_layer": {},
+        }
 
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
+
+    def set_diagnostic_mode(self, enabled: bool) -> None:
+        self.diagnostic_mode = enabled
+
+    def get_diagnostic_snapshot(self) -> dict[str, object]:
+        snapshot: dict[str, object] = {}
+        for key, value in self._diagnostic_stats.items():
+            snapshot[key] = dict(value) if isinstance(value, dict) else value
+        return snapshot
+
+    def _add_stat(self, key: str, value: float) -> None:
+        current = cast(float, self._diagnostic_stats.get(key, 0.0))
+        self._diagnostic_stats[key] = current + value
+
+    def _add_layer_stat(self, key: str, layer: int, value: float) -> None:
+        bucket = cast(dict[int, float], self._diagnostic_stats.setdefault(key, {}))
+        bucket[layer] = bucket.get(layer, 0.0) + value
+
+    def apply_diagnostic_feature_cap(self, max_features: int) -> tuple[int, int]:
+        total_active_feats = self.activation_matrix._nnz()
+        if max_features >= total_active_feats:
+            return total_active_feats, total_active_feats
+
+        selected = (
+            torch.topk(self.activation_matrix.values().abs(), k=max_features, sorted=False)
+            .indices.sort()
+            .values
+        )
+
+        self.activation_matrix = torch.sparse_coo_tensor(
+            self.activation_matrix.indices()[:, selected],
+            self.activation_matrix.values()[selected],
+            size=self.activation_matrix.shape,
+            device=self.activation_matrix.device,
+            dtype=self.activation_matrix.dtype,
+        ).coalesce()
+        self.encoder_vecs = self.encoder_vecs[selected]
+
+        if self.chunked_decoder_state is not None:
+            for key in self.chunked_decoder_state:
+                self.chunked_decoder_state[key] = self.chunked_decoder_state[key][selected]
+        elif self.encoder_to_decoder_map.numel():
+            old_to_new = torch.full(
+                (total_active_feats,),
+                -1,
+                device=self.encoder_to_decoder_map.device,
+                dtype=torch.long,
+            )
+            selected_on_map_device = selected.to(device=old_to_new.device)
+            old_to_new[selected_on_map_device] = torch.arange(
+                max_features, device=old_to_new.device
+            )
+            keep_decoder = old_to_new[self.encoder_to_decoder_map.long()] >= 0
+            self.decoder_vecs = self.decoder_vecs[keep_decoder]
+            self.decoder_locations = self.decoder_locations[:, keep_decoder]
+            self.encoder_to_decoder_map = old_to_new[
+                self.encoder_to_decoder_map[keep_decoder].long()
+            ]
+
+        n_layers, n_pos, _ = self.activation_matrix.shape
+        self._row_size = self.activation_matrix._nnz() + (n_layers + 1) * n_pos
+        return total_active_feats, self.activation_matrix._nnz()
 
     def _compute_chunked_feature_attributions(self, layer: int, grads: torch.Tensor) -> None:
         assert self.chunked_decoder_state is not None
@@ -88,8 +161,11 @@ class AttributionContext:
         feature_ids = self.chunked_decoder_state["feature_ids"]
         activation_values = self.chunked_decoder_state["activation_values"]
         chunk_size = getattr(self.decoder_provider, "decoder_chunk_size", 256)
+        output_layer_start = time.perf_counter()
+        chunk_count = 0
 
         for source_layer in range(layer + 1):
+            source_layer_start = time.perf_counter()
             layer_mask = source_layers == source_layer
             if not layer_mask.any():
                 continue
@@ -97,6 +173,7 @@ class AttributionContext:
             layer_indices = torch.where(layer_mask)[0]
             for start in range(0, len(layer_indices), chunk_size):
                 chunk_indices = layer_indices[start : start + chunk_size]
+                chunk_count += 1
                 chunk_feature_ids = feature_ids[chunk_indices]
                 unique_feats, inv = chunk_feature_ids.unique(return_inverse=True)
                 decoder_vecs = self.decoder_provider.get_decoder_vectors_for_output_layer(
@@ -112,6 +189,21 @@ class AttributionContext:
                     scaled_decoders,
                     "batch position d_model, position d_model -> position batch",
                 )
+
+            if self.diagnostic_mode:
+                self._add_layer_stat(
+                    "chunked_attr_seconds_by_source_layer",
+                    source_layer,
+                    time.perf_counter() - source_layer_start,
+                )
+
+        if self.diagnostic_mode:
+            self._add_layer_stat("chunked_attr_chunks_by_output_layer", layer, float(chunk_count))
+            self._add_layer_stat(
+                "chunked_attr_seconds_by_output_layer",
+                layer,
+                time.perf_counter() - output_layer_start,
+            )
 
     def _make_chunked_feature_hook(self, hook_name: str, layer: int) -> tuple[str, Callable]:
         proxy = weakref.proxy(self)
@@ -224,6 +316,7 @@ class AttributionContext:
         positions: torch.Tensor,
         inject_values: torch.Tensor,
         retain_graph: bool = True,
+        phase_label: str = "unknown",
     ) -> torch.Tensor:
         """Return attribution rows for a batch of (layer, pos) nodes.
 
@@ -241,6 +334,7 @@ class AttributionContext:
         """
 
         batch_size = self._resid_activations[0].shape[0]  # type: ignore
+        batch_start = time.perf_counter()
         self._batch_buffer = torch.zeros(
             self._row_size,
             batch_size,
@@ -282,4 +376,13 @@ class AttributionContext:
                 h.remove()
 
         buf, self._batch_buffer = self._batch_buffer, None
+        if self.diagnostic_mode:
+            self._add_stat("compute_batch_calls", 1)
+            elapsed = time.perf_counter() - batch_start
+            self._add_stat("compute_batch_seconds", elapsed)
+            phase_bucket = cast(
+                dict[str, float],
+                self._diagnostic_stats.setdefault("compute_batch_seconds_by_phase", {}),
+            )
+            phase_bucket[phase_label] = phase_bucket.get(phase_label, 0.0) + elapsed
         return buf.T[: len(layers)]

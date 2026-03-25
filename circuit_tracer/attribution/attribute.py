@@ -29,6 +29,9 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    profile: bool = False,
+    profile_log_interval: int = 1,
+    diagnostic_feature_cap: int | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -55,6 +58,11 @@ def attribute(
                  or None (no offloading).
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
+        profile: Whether to emit batch-level diagnostic profiling logs.
+        profile_log_interval: Log every N attribution batches when profiling.
+        diagnostic_feature_cap: Optional debug-only early cap on active features before
+            attribution rows are computed. This changes attribution semantics and should
+            only be used for profiling/scaling experiments.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -74,6 +82,9 @@ def attribute(
             offload=offload,
             verbose=verbose,
             update_interval=update_interval,
+            profile=profile,
+            profile_log_interval=profile_log_interval,
+            diagnostic_feature_cap=diagnostic_feature_cap,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens
@@ -89,4 +100,7 @@ def attribute(
             offload=offload,
             verbose=verbose,
             update_interval=update_interval,
+            profile=profile,
+            profile_log_interval=profile_log_interval,
+            diagnostic_feature_cap=diagnostic_feature_cap,
         )

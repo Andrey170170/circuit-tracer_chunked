@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from numbers import Number
+from typing import cast
 
 import torch
 
@@ -55,3 +57,44 @@ def format_memory_snapshot(
     if extra:
         parts.extend(f"{key}={value}" for key, value in extra.items())
     return ", ".join(parts)
+
+
+def flatten_numeric_metrics(
+    metrics: Mapping[str, object], prefix: str = ""
+) -> dict[str, float | int]:
+    flat: dict[str, float | int] = {}
+    for key, value in metrics.items():
+        full_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, Mapping):
+            flat.update(flatten_numeric_metrics(cast(Mapping[str, object], value), full_key))
+        elif isinstance(value, Number) and not isinstance(value, bool):
+            flat[full_key] = cast(float | int, value)
+    return flat
+
+
+def diff_numeric_metrics(
+    before: Mapping[str, object] | None, after: Mapping[str, object]
+) -> dict[str, float | int]:
+    after_flat = flatten_numeric_metrics(after)
+    if before is None:
+        return after_flat
+
+    before_flat = flatten_numeric_metrics(before)
+    diff: dict[str, float | int] = {}
+    for key, value in after_flat.items():
+        baseline = before_flat.get(key, 0)
+        delta = value - baseline
+        if delta:
+            diff[key] = delta
+    return diff
+
+
+def format_numeric_metrics(metrics: Mapping[str, object], limit: int | None = None) -> str:
+    flat = flatten_numeric_metrics(metrics)
+    items = list(flat.items())
+    if limit is not None:
+        items = items[:limit]
+    return ", ".join(
+        f"{key}={value:.4f}" if isinstance(value, float) else f"{key}={value}"
+        for key, value in items
+    )

@@ -3,6 +3,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import partial
+import time
 from typing import Callable, Literal, cast
 
 import torch
@@ -431,6 +432,7 @@ class TransformerLensReplacementModel(HookedTransformer):
                 batching) for now
         """
 
+        setup_start = time.perf_counter()
         if isinstance(inputs, str):
             tokens = self.ensure_tokenized(inputs)
         else:
@@ -446,25 +448,33 @@ class TransformerLensReplacementModel(HookedTransformer):
         mlp_out_cache, mlp_out_caching_hooks, _ = self.get_caching_hooks(
             lambda name: self.feature_output_hook in name
         )
+        trace_start = time.perf_counter()
         logits = self.run_with_hooks(tokens, fwd_hooks=mlp_in_caching_hooks + mlp_out_caching_hooks)
+        trace_seconds = time.perf_counter() - trace_start
 
+        concat_start = time.perf_counter()
         mlp_in_cache = torch.cat(list(mlp_in_cache.values()), dim=0)
         mlp_out_cache = torch.cat(list(mlp_out_cache.values()), dim=0)
+        concat_seconds = time.perf_counter() - concat_start
 
+        component_start = time.perf_counter()
         attribution_data = self.transcoders.compute_attribution_components(
             mlp_in_cache, self.zero_positions
         )
+        component_seconds = time.perf_counter() - component_start
 
         # Compute error vectors
+        error_start = time.perf_counter()
         error_vectors = mlp_out_cache - attribution_data["reconstruction"]
 
         error_vectors[:, self.zero_positions] = 0
         token_vectors = self.W_E[tokens].detach()  # (n_pos, d_model)
+        error_seconds = time.perf_counter() - error_start
         chunked_decoder_state = cast(
             dict[str, torch.Tensor] | None, attribution_data.get("chunked_decoder_state")
         )
 
-        return AttributionContext(
+        ctx = AttributionContext(
             activation_matrix=attribution_data["activation_matrix"],
             logits=logits,
             error_vectors=error_vectors,
@@ -478,6 +488,20 @@ class TransformerLensReplacementModel(HookedTransformer):
             else None,
             chunked_decoder_state=chunked_decoder_state,
         )
+        ctx.setup_diagnostic_stats = {
+            "backend": "transformerlens",
+            "token_count": int(tokens.numel()),
+            "trace_seconds": trace_seconds,
+            "cache_concat_seconds": concat_seconds,
+            "component_seconds": component_seconds,
+            "error_seconds": error_seconds,
+            "setup_total_seconds": time.perf_counter() - setup_start,
+            "mlp_in_shape": tuple(mlp_in_cache.shape),
+            "mlp_out_shape": tuple(mlp_out_cache.shape),
+            "reconstruction_shape": tuple(attribution_data["reconstruction"].shape),
+            "active_features": int(attribution_data["activation_matrix"]._nnz()),
+        }
+        return ctx
 
     def setup_intervention_with_freeze(
         self,

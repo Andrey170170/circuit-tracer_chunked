@@ -74,6 +74,39 @@ With `verbose=True`, attribution logs include:
 
 This is intended for SLURM/HPC debugging.
 
+For deeper bottleneck-finding runs, this fork also supports:
+
+- `profile=True`: emit batch-level profiling logs for attribution
+- `profile_log_interval=N`: log every N batches while profiling
+- `diagnostic_feature_cap=K`: debug-only early active-feature cap for scaling experiments
+
+Example diagnostic comparison:
+
+```python
+graph = attribute(
+    prompt,
+    model,
+    batch_size=16,
+    max_feature_nodes=128,
+    profile=True,
+    profile_log_interval=1,
+)
+```
+
+And to test whether lazy decoder loading is the dominant cost, compare otherwise identical runs with:
+
+- `lazy_decoder=True`
+- `lazy_decoder=False`
+
+The profiling logs report, where applicable:
+
+- setup/precompute timing inside `setup_attribution`
+- per-batch timing in Phases 3 and 4
+- `compute_batch` cumulative timing
+- per-layer feature/error attribution timing
+- decoder load count and decoder load time
+- chunk counts and chunked attribution timing by layer
+
 ## HPC guidance
 
 - Do **not** run large-model or GPU-heavy validation on shared login nodes.
@@ -90,6 +123,22 @@ Example:
 
 ```bash
 uv run pytest -q tests/test_partial_influences.py tests/test_gemmascope2_chunked.py
+```
+
+CLI profiling example:
+
+```bash
+uv run circuit-tracer attribute \
+  --prompt "The capital of France is" \
+  --transcoder_set "mwhanna/gemma-scope-2-1b-pt/clt/width_262k_l0_medium_affine" \
+  --backend nnsight \
+  --dtype bf16 \
+  --lazy-encoder \
+  --profile \
+  --profile-log-interval 1 \
+  --no-lazy-decoder \
+  --diagnostic-feature-cap 256 \
+  --graph_output_path /tmp/debug_graph.pt
 ```
 
 ## Known fork-specific caveats

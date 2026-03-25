@@ -79,15 +79,42 @@ def main():
     )
     attr_parser.add_argument("--verbose", action="store_true", help="Display progress information.")
     attr_parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Emit batch-level diagnostic profiling logs for attribution.",
+    )
+    attr_parser.add_argument(
+        "--profile-log-interval",
+        type=int,
+        default=1,
+        help="Log every N batches when --profile is enabled.",
+    )
+    attr_parser.add_argument(
+        "--diagnostic-feature-cap",
+        type=int,
+        default=None,
+        help=(
+            "Debug-only early cap on active features before attribution rows are computed. "
+            "This changes semantics and should only be used for profiling."
+        ),
+    )
+    attr_parser.add_argument(
         "--lazy-encoder",
         action="store_true",
         help="Enable lazy loading for encoder weights to save memory.",
     )
+    attr_parser.set_defaults(lazy_decoder=True)
     attr_parser.add_argument(
         "--lazy-decoder",
+        dest="lazy_decoder",
         action="store_true",
-        default=True,
         help="Enable lazy loading for decoder weights to save memory (default: True).",
+    )
+    attr_parser.add_argument(
+        "--no-lazy-decoder",
+        dest="lazy_decoder",
+        action="store_false",
+        help="Disable lazy loading for decoder weights for profiling/comparison runs.",
     )
     attr_parser.add_argument(
         "--backend",
@@ -236,6 +263,9 @@ def run_attribution(args, parser):
         desired_logit_prob=args.desired_logit_prob,
         batch_size=args.batch_size,
         verbose=args.verbose,
+        profile=args.profile,
+        profile_log_interval=args.profile_log_interval,
+        diagnostic_feature_cap=args.diagnostic_feature_cap,
         offload=args.offload,
         max_feature_nodes=args.max_feature_nodes,
     )

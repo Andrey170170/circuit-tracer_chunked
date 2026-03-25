@@ -38,7 +38,11 @@ from circuit_tracer.replacement_model.replacement_model_transformerlens import (
     TransformerLensReplacementModel,
 )
 from circuit_tracer.utils.disk_offload import offload_modules
-from circuit_tracer.utils.telemetry import format_memory_snapshot
+from circuit_tracer.utils.telemetry import (
+    diff_numeric_metrics,
+    format_memory_snapshot,
+    format_numeric_metrics,
+)
 
 
 def _log_phase_metrics(logger, label: str, phase_start: float, device, **extra):
@@ -46,6 +50,37 @@ def _log_phase_metrics(logger, label: str, phase_start: float, device, **extra):
         f"{label} completed in {time.time() - phase_start:.2f}s | "
         f"{format_memory_snapshot(device=device, extra=extra)}"
     )
+
+
+def _snapshot_diagnostics(obj) -> dict[str, object] | None:
+    if obj is None or not hasattr(obj, "get_diagnostic_snapshot"):
+        return None
+    return obj.get_diagnostic_snapshot()
+
+
+def _log_batch_profile(
+    logger,
+    label: str,
+    batch_idx: int,
+    total_batches: int,
+    elapsed: float,
+    ctx_before: dict[str, object] | None,
+    ctx_after: dict[str, object] | None,
+    transcoder_before: dict[str, object] | None,
+    transcoder_after: dict[str, object] | None,
+):
+    parts = [f"{label} batch {batch_idx}/{total_batches} in {elapsed:.2f}s"]
+    ctx_delta = diff_numeric_metrics(ctx_before, ctx_after) if ctx_after is not None else {}
+    transcoder_delta = (
+        diff_numeric_metrics(transcoder_before, transcoder_after)
+        if transcoder_after is not None
+        else {}
+    )
+    if ctx_delta:
+        parts.append(f"ctx[{format_numeric_metrics(ctx_delta, limit=12)}]")
+    if transcoder_delta:
+        parts.append(f"transcoder[{format_numeric_metrics(transcoder_delta, limit=12)}]")
+    logger.info(" | ".join(parts))
 
 
 def attribute(
@@ -60,6 +95,9 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    profile: bool = False,
+    profile_log_interval: int = 1,
+    diagnostic_feature_cap: int | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using TransformerLens backend.
 
@@ -83,6 +121,10 @@ def attribute(
                  or None (no offloading).
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
+        profile: Whether to emit batch-level diagnostic profiling logs.
+        profile_log_interval: Log every N batches when profiling.
+        diagnostic_feature_cap: Optional debug-only early cap on active features.
+            This changes attribution semantics and should only be used for profiling.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -91,7 +133,7 @@ def attribute(
     logger = logging.getLogger("attribution")
     logger.propagate = False
     handler = None
-    if verbose and not logger.handlers:
+    if (verbose or profile) and not logger.handlers:
         handler = logging.StreamHandler()
         formatter = logging.Formatter("%(message)s")
         handler.setFormatter(formatter)
@@ -114,6 +156,9 @@ def attribute(
             verbose=verbose,
             offload_handles=offload_handles,
             update_interval=update_interval,
+            profile=profile,
+            profile_log_interval=profile_log_interval,
+            diagnostic_feature_cap=diagnostic_feature_cap,
             logger=logger,
         )
     finally:
@@ -137,6 +182,9 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval=4,
+    profile: bool = False,
+    profile_log_interval: int = 1,
+    diagnostic_feature_cap: int | None = None,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -144,7 +192,28 @@ def _run_attribution(
     phase_start = time.time()
     input_ids = model.ensure_tokenized(prompt)
 
+    if profile:
+        reset_diagnostics = getattr(model.transcoders, "reset_diagnostic_stats", None)
+        if callable(reset_diagnostics):
+            reset_diagnostics()
+        logger.info(
+            "Profiling enabled | "
+            f"lazy_encoder={getattr(model.transcoders, 'lazy_encoder', 'n/a')} | "
+            f"lazy_decoder={getattr(model.transcoders, 'lazy_decoder', 'n/a')} | "
+            f"exact_chunked_decoder={getattr(model.transcoders, 'exact_chunked_decoder', False)} | "
+            f"decoder_chunk_size={getattr(model.transcoders, 'decoder_chunk_size', 'n/a')} | "
+            f"prompt_tokens={input_ids.shape[-1]} | attribution_batch_size={batch_size}"
+        )
+
     ctx = model.setup_attribution(input_ids)
+    if hasattr(ctx, "set_diagnostic_mode"):
+        ctx.set_diagnostic_mode(profile)
+
+    if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
+        before_cap, after_cap = ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
+        logger.info(
+            f"Diagnostic feature cap applied before attribution rows: {before_cap} -> {after_cap} active features"
+        )
     activation_matrix = ctx.activation_matrix
 
     _log_phase_metrics(
@@ -154,6 +223,16 @@ def _run_attribution(
         model.cfg.device,
         active_features=ctx.activation_matrix._nnz(),
     )
+    if profile:
+        if getattr(ctx, "setup_diagnostic_stats", None):
+            logger.info(
+                f"Phase 0 setup diagnostics | {format_numeric_metrics(ctx.setup_diagnostic_stats, limit=20)}"
+            )
+        transcoder_snapshot = _snapshot_diagnostics(model.transcoders)
+        if transcoder_snapshot:
+            logger.info(
+                f"Precompute diagnostics | {format_numeric_metrics(transcoder_snapshot, limit=20)}"
+            )
     logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
 
     if offload and not getattr(model.transcoders, "exact_chunked_decoder", False):
@@ -214,17 +293,34 @@ def _run_attribution(
     # Phase 3: logit attribution
     logger.info("Phase 3: Computing logit attributions")
     phase_start = time.time()
+    total_logit_batches = max((len(targets) + batch_size - 1) // batch_size, 1)
     for i in range(0, len(targets), batch_size):
         batch = targets.logit_vectors[i : i + batch_size]
+        ctx_before = _snapshot_diagnostics(ctx) if profile else None
+        transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
+        batch_start = time.perf_counter()
         rows = ctx.compute_batch(
             layers=torch.full((batch.shape[0],), n_layers),
             positions=torch.full((batch.shape[0],), n_pos - 1),
             inject_values=batch,
+            phase_label="phase3_logits",
         )
         edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()
         row_to_node_index[i : i + batch.shape[0]] = (
             torch.arange(i, i + batch.shape[0]) + logit_offset
         )
+        if profile and ((i // batch_size) + 1) % profile_log_interval == 0:
+            _log_batch_profile(
+                logger,
+                "Phase 3",
+                (i // batch_size) + 1,
+                total_logit_batches,
+                time.perf_counter() - batch_start,
+                ctx_before,
+                _snapshot_diagnostics(ctx),
+                transcoder_before,
+                _snapshot_diagnostics(model.transcoders),
+            )
     _log_phase_metrics(logger, "Logit attributions", phase_start, model.cfg.device)
 
     # Phase 4: feature attribution
@@ -255,11 +351,15 @@ def _run_attribution(
         for idx_batch in queue:
             n_visited += len(idx_batch)
 
+            ctx_before = _snapshot_diagnostics(ctx) if profile else None
+            transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
+            batch_start = time.perf_counter()
             rows = ctx.compute_batch(
                 layers=feat_layers[idx_batch],
                 positions=feat_pos[idx_batch],
                 inject_values=ctx.encoder_vecs[idx_batch],
                 retain_graph=n_visited < max_feature_nodes,
+                phase_label="phase4_features",
             )
 
             end = min(st + batch_size, st + rows.shape[0])
@@ -268,6 +368,20 @@ def _run_attribution(
             visited[idx_batch] = True
             st = end
             pbar.update(len(idx_batch))
+            if profile:
+                batch_number = max(1, (n_visited + batch_size - 1) // batch_size)
+                if batch_number % profile_log_interval == 0:
+                    _log_batch_profile(
+                        logger,
+                        "Phase 4",
+                        batch_number,
+                        max((max_feature_nodes + batch_size - 1) // batch_size, 1),
+                        time.perf_counter() - batch_start,
+                        ctx_before,
+                        _snapshot_diagnostics(ctx),
+                        transcoder_before,
+                        _snapshot_diagnostics(model.transcoders),
+                    )
 
     pbar.close()
     _log_phase_metrics(
