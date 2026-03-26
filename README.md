@@ -95,6 +95,57 @@ graph = attribute(
 )
 ```
 
+Optional Phase 4 cross-batch decoder cache:
+
+- available for the exact chunked GemmaScope-2 CLT path
+- **disabled by default**
+- requires an explicit `cross_batch_decoder_cache_bytes` budget
+- intended for repeated-batch Phase 4 runs where decoder reloads dominate
+
+Script example:
+
+```python
+import torch
+
+from circuit_tracer import ReplacementModel
+from circuit_tracer.transcoder.cross_layer_transcoder import load_gemma_scope_2_clt
+from circuit_tracer.utils.hf_utils import resolve_transcoder_paths
+
+config = {
+    "repo_id": "mwhanna/gemma-scope-2-1b-pt",
+    "subfolder": "clt/width_262k_l0_medium_affine",
+    "scan": "mwhanna/gemma-scope-2-1b-pt/clt/width_262k_l0_medium_affine",
+    "feature_input_hook": "hook_resid_mid",
+    "feature_output_hook": "hook_mlp_out",
+}
+
+transcoders = load_gemma_scope_2_clt(
+    resolve_transcoder_paths(config),
+    device=torch.device("cuda"),
+    dtype=torch.bfloat16,
+    lazy_encoder=True,
+    lazy_decoder=True,
+    decoder_chunk_size=1024,
+    cross_batch_decoder_cache_bytes=2 * 1024**3,
+)
+
+model = ReplacementModel.from_pretrained_and_transcoders(
+    "google/gemma-3-1b-pt",
+    transcoders,
+    backend="nnsight",
+    device=torch.device("cuda"),
+    dtype=torch.bfloat16,
+)
+```
+
+If you maintain a transcoder `config.yaml`, you can also set:
+
+```yaml
+cross_batch_decoder_cache_bytes: 2147483648
+```
+
+See [RESEARCH_USAGE.md](RESEARCH_USAGE.md) for operational guidance and profiling notes.
+
 Optional early sparsification example:
 
 ```python
@@ -122,6 +173,7 @@ Operational notes for this forked path:
 - With `verbose=True`, phase-level runtime and memory telemetry is emitted to logs (RSS plus CUDA allocated/reserved where available), which is useful for SLURM debugging.
 - `SparsificationConfig(per_layer_position_topk=..., global_cap=...)` uses a per-layer-per-position activation screen first, then an optional global cap as a safety valve.
 - For deeper profiling, `attribute(..., profile=True, profile_log_interval=1)` emits setup/precompute diagnostics, live `TRACE ...` progress lines for long-running work, batch-level diagnostics including decoder load counts/timing and chunked attribution timing, and sparsification retention summaries when sparsification is enabled.
+- When the cross-batch decoder cache is enabled, profiling also reports decoder cache hits, misses, evictions, and resident bytes.
 - For scaling experiments only, `attribute(..., diagnostic_feature_cap=K)` applies a debug-only early active-feature cap before attribution rows are computed. This changes semantics and should not be used for final scientific traces.
 - `create_graph_files(...)` now accepts `prune_device=...` if you want pruning to happen on a specific device explicitly.
 

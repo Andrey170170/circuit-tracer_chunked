@@ -75,6 +75,7 @@ class AttributionContext:
         self.decoder_locations = decoder_locations
         self.decoder_provider = decoder_provider
         self.chunked_decoder_state = chunked_decoder_state
+        self.decoder_chunk_cache = None
         self._chunked_layer_spans: list[tuple[int, int] | None] | None = None
         self._chunked_feature_grads: list[torch.Tensor | None] | None = None
         self.setup_diagnostic_stats: dict[str, object] | None = None
@@ -89,11 +90,13 @@ class AttributionContext:
             "chunked_attr_chunks_by_output_layer": {},
             "chunked_attr_seconds_by_output_layer": {},
             "chunked_attr_seconds_by_source_layer": {},
+            "chunked_attr_replay_seconds": 0.0,
         }
 
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
         self._refresh_chunked_layer_spans()
+        self.decoder_chunk_cache = self._create_decoder_cache()
 
     def set_diagnostic_mode(self, enabled: bool) -> None:
         self.diagnostic_mode = enabled
@@ -149,6 +152,22 @@ class AttributionContext:
             self._chunked_layer_spans = None
             return
         self._chunked_layer_spans = self._build_chunked_layer_spans()
+
+    def _create_decoder_cache(self):
+        init_decoder_cache = getattr(self.decoder_provider, "create_decoder_block_cache", None)
+        if self.chunked_decoder_state is None or not callable(init_decoder_cache):
+            return None
+        return init_decoder_cache()
+
+    def clear_decoder_cache(self) -> None:
+        clear_decoder_cache = getattr(self.decoder_provider, "clear_decoder_block_cache", None)
+        if callable(clear_decoder_cache):
+            clear_decoder_cache(self.decoder_chunk_cache)
+        self.decoder_chunk_cache = None
+
+    def reset_decoder_cache(self) -> None:
+        self.clear_decoder_cache()
+        self.decoder_chunk_cache = self._create_decoder_cache()
 
     def apply_diagnostic_feature_cap(self, max_features: int) -> tuple[int, int]:
         total_active_feats = self.activation_matrix._nnz()
@@ -208,6 +227,7 @@ class AttributionContext:
         feature_ids = self.chunked_decoder_state["feature_ids"]
         activation_values = self.chunked_decoder_state["activation_values"]
         chunk_size = getattr(self.decoder_provider, "decoder_chunk_size", 256)
+        row_subchunk_size = max(1, int(chunk_size))
         active_output_layers = [
             layer for layer, grads in enumerate(output_layer_grads) if grads is not None
         ]
@@ -217,6 +237,7 @@ class AttributionContext:
         output_layer_seconds = {layer: 0.0 for layer in active_output_layers}
         chunk_counts = {layer: 0 for layer in active_output_layers}
         grad_cache: dict[int, torch.Tensor] = {}
+        replay_start = time.perf_counter()
 
         for layer in active_output_layers:
             self._emit_trace(
@@ -238,21 +259,32 @@ class AttributionContext:
                 continue
 
             layer_start, layer_end = span
-            layer_total = layer_end - layer_start
-            for start in range(layer_start, layer_end, chunk_size):
-                stop = min(start + chunk_size, layer_end)
-                chunk_slice = slice(start, stop)
-                chunk_feature_ids = feature_ids[chunk_slice]
-                unique_feats, inv = chunk_feature_ids.unique(return_inverse=True)
-                decoder_block = self.decoder_provider.get_decoder_block(
-                    source_layer, unique_feats.cpu()
+            layer_rows = torch.arange(layer_start, layer_end, device=feature_ids.device)
+            layer_feature_ids = feature_ids[layer_start:layer_end]
+            layer_chunk_ids = torch.div(layer_feature_ids, chunk_size, rounding_mode="floor")
+            unique_chunk_ids = torch.unique(layer_chunk_ids, sorted=True)
+            for chunk_position, chunk_id_tensor in enumerate(unique_chunk_ids, start=1):
+                chunk_id = int(chunk_id_tensor.item())
+                chunk_mask = layer_chunk_ids == chunk_id_tensor
+                chunk_rows = layer_rows[chunk_mask]
+                chunk_positions = positions[chunk_rows]
+                chunk_local_feat_ids = (
+                    layer_feature_ids[chunk_mask] - (chunk_id * chunk_size)
+                ).long()
+                decoder_chunk = self.decoder_provider.get_decoder_chunk(
+                    source_layer,
+                    chunk_id,
+                    decoder_cache=self.decoder_chunk_cache,
                 )
-                chunk_positions = positions[chunk_slice]
-                chunk_activations = activation_values[chunk_slice].to(
-                    device=decoder_block.device,
-                    dtype=decoder_block.dtype,
-                    non_blocking=decoder_block.device.type == "cuda",
+                chunk_activations = activation_values[chunk_rows].to(
+                    device=decoder_chunk.device,
+                    dtype=decoder_chunk.dtype,
+                    non_blocking=decoder_chunk.device.type == "cuda",
                 )[:, None]
+                total_row_subchunks = max(
+                    (len(chunk_rows) + row_subchunk_size - 1) // row_subchunk_size,
+                    1,
+                )
 
                 for output_layer in relevant_output_layers:
                     output_layer_start = time.perf_counter()
@@ -261,36 +293,51 @@ class AttributionContext:
                         grads = output_layer_grads[output_layer]
                         assert grads is not None
                         typed_grads = grads.to(
-                            device=decoder_block.device,
-                            dtype=decoder_block.dtype,
-                            non_blocking=decoder_block.device.type == "cuda",
+                            device=decoder_chunk.device,
+                            dtype=decoder_chunk.dtype,
+                            non_blocking=decoder_chunk.device.type == "cuda",
                         )
                         grad_cache[output_layer] = typed_grads
 
-                    scaled_decoders = (
-                        decoder_block[:, output_layer - source_layer][inv] * chunk_activations
-                    )
-                    selected_grads = typed_grads[:, chunk_positions]
-                    self._batch_buffer[chunk_slice] += einsum(
-                        selected_grads,
-                        scaled_decoders,
-                        "batch position d_model, position d_model -> position batch",
-                    )
-                    output_layer_seconds[output_layer] += time.perf_counter() - output_layer_start
-                    chunk_counts[output_layer] += 1
-
-                    if (
-                        chunk_counts[output_layer] <= 2
-                        or chunk_counts[output_layer] % self._trace_chunk_interval == 0
+                    decoder_vectors = decoder_chunk[:, output_layer - source_layer]
+                    for row_subchunk_idx, row_start in enumerate(
+                        range(0, len(chunk_rows), row_subchunk_size),
+                        start=1,
                     ):
-                        self._emit_trace(
-                            "phase3.chunked_attr.chunk",
-                            output_layer=output_layer,
-                            source_layer=source_layer,
-                            chunk=chunk_counts[output_layer],
-                            processed=min(stop - layer_start, layer_total),
-                            total=layer_total,
+                        row_stop = row_start + row_subchunk_size
+                        row_slice = slice(row_start, row_stop)
+                        row_chunk_rows = chunk_rows[row_slice]
+                        row_chunk_positions = chunk_positions[row_slice]
+                        row_chunk_local_feat_ids = chunk_local_feat_ids[row_slice]
+                        row_chunk_activations = chunk_activations[row_slice]
+                        scaled_decoders = (
+                            decoder_vectors[row_chunk_local_feat_ids] * row_chunk_activations
                         )
+                        selected_grads = typed_grads[:, row_chunk_positions]
+                        self._batch_buffer[row_chunk_rows] += einsum(
+                            selected_grads,
+                            scaled_decoders,
+                            "batch position d_model, position d_model -> position batch",
+                        )
+                        chunk_counts[output_layer] += 1
+
+                        if (
+                            chunk_counts[output_layer] <= 2
+                            or chunk_counts[output_layer] % self._trace_chunk_interval == 0
+                        ):
+                            self._emit_trace(
+                                "phase3.chunked_attr.chunk",
+                                output_layer=output_layer,
+                                source_layer=source_layer,
+                                chunk=chunk_counts[output_layer],
+                                decoder_chunk_id=chunk_id,
+                                processed_chunks=min(chunk_position, len(unique_chunk_ids)),
+                                total_chunks=len(unique_chunk_ids),
+                                row_subchunk=row_subchunk_idx,
+                                total_row_subchunks=total_row_subchunks,
+                            )
+
+                    output_layer_seconds[output_layer] += time.perf_counter() - output_layer_start
 
             if self.diagnostic_mode:
                 self._add_layer_stat(
@@ -314,6 +361,8 @@ class AttributionContext:
                 chunks=chunk_counts[output_layer],
                 elapsed_s=f"{elapsed:.2f}",
             )
+        if self.diagnostic_mode:
+            self._add_stat("chunked_attr_replay_seconds", time.perf_counter() - replay_start)
 
     def _compute_chunked_feature_attributions(self, layer: int, grads: torch.Tensor) -> None:
         self._compute_chunked_feature_attributions_from_grads(

@@ -438,6 +438,7 @@ def load_transcoders_from_cache(
             lazy_decoder=lazy_decoder,
             lazy_encoder=lazy_encoder,
             exact_chunked_decoder=exact_chunked_decoder,
+            cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
     else:
         raise ValueError(f"Unknown model kind: {model_kind}")

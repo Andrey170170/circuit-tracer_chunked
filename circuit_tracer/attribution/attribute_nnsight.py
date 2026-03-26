@@ -223,6 +223,7 @@ def _run_attribution(
             f"lazy_decoder={getattr(model.transcoders, 'lazy_decoder', 'n/a')} | "
             f"exact_chunked_decoder={getattr(model.transcoders, 'exact_chunked_decoder', False)} | "
             f"decoder_chunk_size={getattr(model.transcoders, 'decoder_chunk_size', 'n/a')} | "
+            f"decoder_cache_bytes={getattr(model.transcoders, 'cross_batch_decoder_cache_bytes', 0)} | "
             f"prompt_tokens={input_ids.shape[-1]} | attribution_batch_size={batch_size}"
         )
 
@@ -241,250 +242,262 @@ def _run_attribution(
     if profile and getattr(ctx, "sparsification_stats", None):
         _log_sparsification_profile(logger, ctx.sparsification_stats)
 
-    activation_matrix = ctx.activation_matrix
+    try:
+        activation_matrix = ctx.activation_matrix
 
-    _log_phase_metrics(
-        logger,
-        "Precomputation",
-        phase_start,
-        model.device,
-        active_features=ctx.activation_matrix._nnz(),
-    )
-    if profile:
-        if getattr(ctx, "setup_diagnostic_stats", None):
-            logger.info(
-                f"Phase 0 setup diagnostics | {format_numeric_metrics(ctx.setup_diagnostic_stats, limit=20)}"
-            )
-        transcoder_snapshot = _snapshot_diagnostics(model.transcoders)
-        if transcoder_snapshot:
-            logger.info(
-                f"Precompute diagnostics | {format_numeric_metrics(transcoder_snapshot, limit=20)}"
-            )
-    logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
-
-    if (
-        offload
-        and not model.skip_transcoder
-        and not getattr(model.transcoders, "exact_chunked_decoder", False)
-    ):
-        offload_handles += offload_modules(model.transcoders, offload)
-
-    # Phase 1: forward pass
-    logger.info("Phase 1: Running forward pass")
-    phase_start = time.time()
-    with model.trace() as tracer:
-        with tracer.invoke(input_ids.expand(batch_size, -1)):
-            pass
-
-        detach_barrier = tracer.barrier(2)
-
-        model.configure_gradient_flow(tracer)
-        model.configure_skip_connection(tracer, barrier=detach_barrier)
-        ctx.cache_residual(model, tracer, barrier=detach_barrier)
-
-    _log_phase_metrics(logger, "Forward pass", phase_start, model.device)
-
-    if offload:
-        offload_handles += offload_modules(
-            [layer.mlp for layer in getattr(model.pre_logit_location, "layers")], offload
+        _log_phase_metrics(
+            logger,
+            "Precomputation",
+            phase_start,
+            model.device,
+            active_features=ctx.activation_matrix._nnz(),
         )
-        if model.skip_transcoder and not getattr(model.transcoders, "exact_chunked_decoder", False):
+        if profile:
+            if getattr(ctx, "setup_diagnostic_stats", None):
+                logger.info(
+                    f"Phase 0 setup diagnostics | {format_numeric_metrics(ctx.setup_diagnostic_stats, limit=20)}"
+                )
+            transcoder_snapshot = _snapshot_diagnostics(model.transcoders)
+            if transcoder_snapshot:
+                logger.info(
+                    f"Precompute diagnostics | {format_numeric_metrics(transcoder_snapshot, limit=20)}"
+                )
+        logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
+
+        if (
+            offload
+            and not model.skip_transcoder
+            and not getattr(model.transcoders, "exact_chunked_decoder", False)
+        ):
             offload_handles += offload_modules(model.transcoders, offload)
 
-    # Phase 2: build input vector list
-    logger.info("Phase 2: Building input vectors")
-    phase2_start = time.time()
-    feat_layers, feat_pos, _ = activation_matrix.indices()
-    n_layers, n_pos, _ = activation_matrix.shape
-    total_active_feats = activation_matrix._nnz()
+        # Phase 1: forward pass
+        logger.info("Phase 1: Running forward pass")
+        phase_start = time.time()
+        with model.trace() as tracer:
+            with tracer.invoke(input_ids.expand(batch_size, -1)):
+                pass
 
-    # Create AttributionTargets using NNSight's unembed_weight accessor
-    targets = AttributionTargets(
-        attribution_targets=attribution_targets,
-        logits=ctx.logits[0, -1],
-        unembed_proj=cast(torch.Tensor, model.unembed_weight),  # NNSight uses unembed_weight
-        tokenizer=model.tokenizer,
-        max_n_logits=max_n_logits,
-        desired_logit_prob=desired_logit_prob,
-    )
+            detach_barrier = tracer.barrier(2)
 
-    log_attribution_target_info(targets, attribution_targets, logger)
+            model.configure_gradient_flow(tracer)
+            model.configure_skip_connection(tracer, barrier=detach_barrier)
+            ctx.cache_residual(model, tracer, barrier=detach_barrier)
 
-    if offload:
-        offload_handles += offload_modules([model.embed_location], offload)
-        tied_embeds = (
-            model.embed_weight.untyped_storage().data_ptr()  # type:ignore
-            == model.unembed_weight.untyped_storage().data_ptr()  # type:ignore
-        )
-        if not tied_embeds:
-            offload_handles += offload_modules([model.lm_head], offload)
+        _log_phase_metrics(logger, "Forward pass", phase_start, model.device)
 
-    logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
-    n_logits = len(targets)
-    total_nodes = logit_offset + n_logits
-
-    actual_max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
-    logger.info(f"Will include {actual_max_feature_nodes} of {total_active_feats} feature nodes")
-
-    edge_matrix = torch.zeros(actual_max_feature_nodes + n_logits, total_nodes)
-    # Maps row indices in edge_matrix to original feature/node indices
-    # First populated with logit node IDs, then feature IDs in attribution order
-    row_to_node_index = torch.zeros(actual_max_feature_nodes + n_logits, dtype=torch.int32)
-    _log_phase_metrics(
-        logger,
-        "Input vector build",
-        phase2_start,
-        model.device,
-        edge_matrix_shape=f"{tuple(edge_matrix.shape)}",
-        edge_matrix_dtype=edge_matrix.dtype,
-    )
-
-    # Phase 3: logit attribution
-    logger.info("Phase 3: Computing logit attributions")
-    phase3_start = time.time()
-    i = -1
-    total_logit_batches = max((len(targets) + batch_size - 1) // batch_size, 1)
-    for i in range(0, len(targets), batch_size):
-        batch = targets.logit_vectors[i : i + batch_size]
-        ctx_before = _snapshot_diagnostics(ctx) if profile else None
-        transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
-        batch_start = time.perf_counter()
-        rows = ctx.compute_batch(
-            layers=torch.full((batch.shape[0],), n_layers),
-            positions=torch.full((batch.shape[0],), n_pos - 1),
-            inject_values=batch,
-            phase_label="phase3_logits",
-        )
-        edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()
-        row_to_node_index[i : i + batch.shape[0]] = (
-            torch.arange(i, i + batch.shape[0]) + logit_offset
-        )
-        if profile and ((i // batch_size) + 1) % profile_log_interval == 0:
-            _log_batch_profile(
-                logger,
-                "Phase 3",
-                (i // batch_size) + 1,
-                total_logit_batches,
-                time.perf_counter() - batch_start,
-                ctx_before,
-                _snapshot_diagnostics(ctx),
-                transcoder_before,
-                _snapshot_diagnostics(model.transcoders),
+        if offload:
+            offload_handles += offload_modules(
+                [layer.mlp for layer in getattr(model.pre_logit_location, "layers")], offload
             )
+            if model.skip_transcoder and not getattr(
+                model.transcoders, "exact_chunked_decoder", False
+            ):
+                offload_handles += offload_modules(model.transcoders, offload)
 
-    _log_phase_metrics(
-        logger,
-        f"{i + 1} logit attribution(s)",
-        phase3_start,
-        model.device,
-    )
+        # Phase 2: build input vector list
+        logger.info("Phase 2: Building input vectors")
+        phase2_start = time.time()
+        feat_layers, feat_pos, _ = activation_matrix.indices()
+        n_layers, n_pos, _ = activation_matrix.shape
+        total_active_feats = activation_matrix._nnz()
 
-    # Phase 4: feature attribution
-    logger.info("Phase 4: Computing feature attributions")
-    phase4_start = time.time()
-    st = n_logits
-    visited = torch.zeros(total_active_feats, dtype=torch.bool)
-    n_visited = 0
+        # Create AttributionTargets using NNSight's unembed_weight accessor
+        targets = AttributionTargets(
+            attribution_targets=attribution_targets,
+            logits=ctx.logits[0, -1],
+            unembed_proj=cast(torch.Tensor, model.unembed_weight),  # NNSight uses unembed_weight
+            tokenizer=model.tokenizer,
+            max_n_logits=max_n_logits,
+            desired_logit_prob=desired_logit_prob,
+        )
 
-    pbar = tqdm(
-        total=actual_max_feature_nodes,
-        desc="Feature influence computation",
-        disable=not verbose,
-    )
+        log_attribution_target_info(targets, attribution_targets, logger)
 
-    while n_visited < actual_max_feature_nodes:
-        if actual_max_feature_nodes == total_active_feats:
-            pending = torch.arange(total_active_feats)
-        else:
-            influences = compute_partial_influences(
-                edge_matrix[:st],
-                targets.logit_probabilities,
-                row_to_node_index[:st],
-                device=edge_matrix.device,
+        if offload:
+            offload_handles += offload_modules([model.embed_location], offload)
+            tied_embeds = (
+                model.embed_weight.untyped_storage().data_ptr()  # type:ignore
+                == model.unembed_weight.untyped_storage().data_ptr()  # type:ignore
             )
-            feature_rank = torch.argsort(influences[:total_active_feats], descending=True).cpu()
-            queue_size = min(update_interval * batch_size, actual_max_feature_nodes - n_visited)
-            pending = feature_rank[~visited[feature_rank]][:queue_size]
+            if not tied_embeds:
+                offload_handles += offload_modules([model.lm_head], offload)
 
-        queue = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
+        logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
+        n_logits = len(targets)
+        total_nodes = logit_offset + n_logits
 
-        for idx_batch in queue:
-            n_visited += len(idx_batch)
+        actual_max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
+        logger.info(
+            f"Will include {actual_max_feature_nodes} of {total_active_feats} feature nodes"
+        )
 
+        edge_matrix = torch.zeros(actual_max_feature_nodes + n_logits, total_nodes)
+        # Maps row indices in edge_matrix to original feature/node indices
+        # First populated with logit node IDs, then feature IDs in attribution order
+        row_to_node_index = torch.zeros(actual_max_feature_nodes + n_logits, dtype=torch.int32)
+        _log_phase_metrics(
+            logger,
+            "Input vector build",
+            phase2_start,
+            model.device,
+            edge_matrix_shape=f"{tuple(edge_matrix.shape)}",
+            edge_matrix_dtype=edge_matrix.dtype,
+        )
+
+        # Phase 3: logit attribution
+        logger.info("Phase 3: Computing logit attributions")
+        phase3_start = time.time()
+        i = -1
+        total_logit_batches = max((len(targets) + batch_size - 1) // batch_size, 1)
+        for i in range(0, len(targets), batch_size):
+            batch = targets.logit_vectors[i : i + batch_size]
             ctx_before = _snapshot_diagnostics(ctx) if profile else None
             transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
             batch_start = time.perf_counter()
             rows = ctx.compute_batch(
-                layers=feat_layers[idx_batch],
-                positions=feat_pos[idx_batch],
-                inject_values=ctx.encoder_vecs[idx_batch],
-                retain_graph=n_visited < actual_max_feature_nodes,
-                phase_label="phase4_features",
+                layers=torch.full((batch.shape[0],), n_layers),
+                positions=torch.full((batch.shape[0],), n_pos - 1),
+                inject_values=batch,
+                phase_label="phase3_logits",
             )
+            edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()
+            row_to_node_index[i : i + batch.shape[0]] = (
+                torch.arange(i, i + batch.shape[0]) + logit_offset
+            )
+            if profile and ((i // batch_size) + 1) % profile_log_interval == 0:
+                _log_batch_profile(
+                    logger,
+                    "Phase 3",
+                    (i // batch_size) + 1,
+                    total_logit_batches,
+                    time.perf_counter() - batch_start,
+                    ctx_before,
+                    _snapshot_diagnostics(ctx),
+                    transcoder_before,
+                    _snapshot_diagnostics(model.transcoders),
+                )
 
-            end = min(st + batch_size, st + rows.shape[0])
-            edge_matrix[st:end, :logit_offset] = rows.cpu()
-            row_to_node_index[st:end] = idx_batch
-            visited[idx_batch] = True
-            st = end
-            pbar.update(len(idx_batch))
-            if profile:
-                batch_number = max(1, (n_visited + batch_size - 1) // batch_size)
-                if batch_number % profile_log_interval == 0:
-                    _log_batch_profile(
-                        logger,
-                        "Phase 4",
-                        batch_number,
-                        max((actual_max_feature_nodes + batch_size - 1) // batch_size, 1),
-                        time.perf_counter() - batch_start,
-                        ctx_before,
-                        _snapshot_diagnostics(ctx),
-                        transcoder_before,
-                        _snapshot_diagnostics(model.transcoders),
-                    )
+        _log_phase_metrics(
+            logger,
+            f"{i + 1} logit attribution(s)",
+            phase3_start,
+            model.device,
+        )
+        reset_decoder_cache = getattr(ctx, "reset_decoder_cache", None)
+        if callable(reset_decoder_cache):
+            reset_decoder_cache()
 
-    pbar.close()
-    _log_phase_metrics(
-        logger,
-        "Feature attributions",
-        phase4_start,
-        model.device,
-        selected_features=int(visited.sum().item()),
-    )
+        # Phase 4: feature attribution
+        logger.info("Phase 4: Computing feature attributions")
+        phase4_start = time.time()
+        st = n_logits
+        visited = torch.zeros(total_active_feats, dtype=torch.bool)
+        n_visited = 0
 
-    # Phase 5: packaging graph
-    selected_features = torch.where(visited)[0]
-    non_feature_nodes = torch.arange(total_active_feats, total_nodes)
-    if actual_max_feature_nodes < total_active_feats:
-        col_read = torch.cat([selected_features, non_feature_nodes])
-    else:
-        col_read = torch.arange(total_nodes)
+        pbar = tqdm(
+            total=actual_max_feature_nodes,
+            desc="Feature influence computation",
+            disable=not verbose,
+        )
 
-    final_node_count = len(col_read)
-    full_edge_matrix = torch.zeros(final_node_count, final_node_count, dtype=edge_matrix.dtype)
-    feature_row_order = row_to_node_index[n_logits:st].argsort()
-    full_edge_matrix[:actual_max_feature_nodes] = edge_matrix[n_logits:st][feature_row_order][
-        :, col_read
-    ]
-    full_edge_matrix[-n_logits:] = edge_matrix[:n_logits, :][:, col_read]
+        while n_visited < actual_max_feature_nodes:
+            if actual_max_feature_nodes == total_active_feats:
+                pending = torch.arange(total_active_feats)
+            else:
+                influences = compute_partial_influences(
+                    edge_matrix[:st],
+                    targets.logit_probabilities,
+                    row_to_node_index[:st],
+                    device=edge_matrix.device,
+                )
+                feature_rank = torch.argsort(influences[:total_active_feats], descending=True).cpu()
+                queue_size = min(update_interval * batch_size, actual_max_feature_nodes - n_visited)
+                pending = feature_rank[~visited[feature_rank]][:queue_size]
 
-    graph = Graph(
-        input_string=model.tokenizer.decode(input_ids),
-        input_tokens=input_ids,
-        logit_targets=targets.logit_targets,
-        logit_probabilities=targets.logit_probabilities,
-        vocab_size=targets.vocab_size,
-        active_features=activation_matrix.indices().T,
-        activation_values=activation_matrix.values(),
-        selected_features=selected_features,
-        adjacency_matrix=full_edge_matrix.detach(),
-        cfg=model.config,
-        scan=model.scan,
-    )
+            queue = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
 
-    logger.info(
-        f"Attribution completed in {time.time() - start_time:.2f}s | "
-        f"{format_memory_snapshot(device=model.device, extra={'adjacency_shape': tuple(full_edge_matrix.shape)})}"
-    )
+            for idx_batch in queue:
+                n_visited += len(idx_batch)
 
-    return graph
+                ctx_before = _snapshot_diagnostics(ctx) if profile else None
+                transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
+                batch_start = time.perf_counter()
+                rows = ctx.compute_batch(
+                    layers=feat_layers[idx_batch],
+                    positions=feat_pos[idx_batch],
+                    inject_values=ctx.encoder_vecs[idx_batch],
+                    retain_graph=n_visited < actual_max_feature_nodes,
+                    phase_label="phase4_features",
+                )
+
+                end = min(st + batch_size, st + rows.shape[0])
+                edge_matrix[st:end, :logit_offset] = rows.cpu()
+                row_to_node_index[st:end] = idx_batch
+                visited[idx_batch] = True
+                st = end
+                pbar.update(len(idx_batch))
+                if profile:
+                    batch_number = max(1, (n_visited + batch_size - 1) // batch_size)
+                    if batch_number % profile_log_interval == 0:
+                        _log_batch_profile(
+                            logger,
+                            "Phase 4",
+                            batch_number,
+                            max((actual_max_feature_nodes + batch_size - 1) // batch_size, 1),
+                            time.perf_counter() - batch_start,
+                            ctx_before,
+                            _snapshot_diagnostics(ctx),
+                            transcoder_before,
+                            _snapshot_diagnostics(model.transcoders),
+                        )
+
+        pbar.close()
+        _log_phase_metrics(
+            logger,
+            "Feature attributions",
+            phase4_start,
+            model.device,
+            selected_features=int(visited.sum().item()),
+        )
+
+        # Phase 5: packaging graph
+        selected_features = torch.where(visited)[0]
+        non_feature_nodes = torch.arange(total_active_feats, total_nodes)
+        if actual_max_feature_nodes < total_active_feats:
+            col_read = torch.cat([selected_features, non_feature_nodes])
+        else:
+            col_read = torch.arange(total_nodes)
+
+        final_node_count = len(col_read)
+        full_edge_matrix = torch.zeros(final_node_count, final_node_count, dtype=edge_matrix.dtype)
+        feature_row_order = row_to_node_index[n_logits:st].argsort()
+        full_edge_matrix[:actual_max_feature_nodes] = edge_matrix[n_logits:st][feature_row_order][
+            :, col_read
+        ]
+        full_edge_matrix[-n_logits:] = edge_matrix[:n_logits, :][:, col_read]
+
+        graph = Graph(
+            input_string=model.tokenizer.decode(input_ids),
+            input_tokens=input_ids,
+            logit_targets=targets.logit_targets,
+            logit_probabilities=targets.logit_probabilities,
+            vocab_size=targets.vocab_size,
+            active_features=activation_matrix.indices().T,
+            activation_values=activation_matrix.values(),
+            selected_features=selected_features,
+            adjacency_matrix=full_edge_matrix.detach(),
+            cfg=model.config,
+            scan=model.scan,
+        )
+
+        logger.info(
+            f"Attribution completed in {time.time() - start_time:.2f}s | "
+            f"{format_memory_snapshot(device=model.device, extra={'adjacency_shape': tuple(full_edge_matrix.shape)})}"
+        )
+
+        return graph
+    finally:
+        clear_decoder_cache = getattr(ctx, "clear_decoder_cache", None)
+        if callable(clear_decoder_cache):
+            clear_decoder_cache()

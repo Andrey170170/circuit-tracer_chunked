@@ -1,6 +1,7 @@
 import glob
 import os
 import time
+from collections import OrderedDict
 from typing import cast
 
 import numpy as np
@@ -16,6 +17,51 @@ from circuit_tracer.attribution.sparsification import (
 )
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.utils import get_default_device
+
+
+DEFAULT_EXACT_DECODER_CHUNK_SIZE = 1024
+
+
+class DecoderChunkCache:
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max(0, int(max_bytes))
+        self.bytes_resident = 0
+        self._entries: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+
+    @staticmethod
+    def _tensor_nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    def get(self, key: tuple[int, int]) -> torch.Tensor | None:
+        value = self._entries.get(key)
+        if value is None:
+            return None
+        self._entries.move_to_end(key)
+        return value
+
+    def put(self, key: tuple[int, int], value: torch.Tensor) -> list[tuple[tuple[int, int], int]]:
+        value_nbytes = self._tensor_nbytes(value)
+        evicted: list[tuple[tuple[int, int], int]] = []
+        existing = self._entries.pop(key, None)
+        if existing is not None:
+            self.bytes_resident -= self._tensor_nbytes(existing)
+
+        if self.max_bytes <= 0 or value_nbytes > self.max_bytes:
+            return evicted
+
+        while self._entries and self.bytes_resident + value_nbytes > self.max_bytes:
+            evicted_key, evicted_value = self._entries.popitem(last=False)
+            evicted_nbytes = self._tensor_nbytes(evicted_value)
+            self.bytes_resident -= evicted_nbytes
+            evicted.append((evicted_key, evicted_nbytes))
+
+        self._entries[key] = value
+        self.bytes_resident += value_nbytes
+        return evicted
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self.bytes_resident = 0
 
 
 class CrossLayerTranscoder(torch.nn.Module):
@@ -71,7 +117,8 @@ class CrossLayerTranscoder(torch.nn.Module):
         layer_paths: dict[int, str] | None = None,
         weight_format: str = "standard",
         exact_chunked_decoder: bool = False,
-        decoder_chunk_size: int = 256,
+        decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
+        cross_batch_decoder_cache_bytes: int | None = None,
     ):
         super().__init__()
 
@@ -88,6 +135,9 @@ class CrossLayerTranscoder(torch.nn.Module):
         self.weight_format = weight_format
         self.exact_chunked_decoder = exact_chunked_decoder
         self.decoder_chunk_size = decoder_chunk_size
+        if cross_batch_decoder_cache_bytes is None:
+            cross_batch_decoder_cache_bytes = 0
+        self.cross_batch_decoder_cache_bytes = max(0, int(cross_batch_decoder_cache_bytes))
         self._diagnostic_stats = self._make_empty_diagnostic_stats()
         self._trace_logger = None
         self._trace_chunk_interval = 16
@@ -161,6 +211,12 @@ class CrossLayerTranscoder(torch.nn.Module):
             "decoder_load_count": 0,
             "decoder_load_seconds": 0.0,
             "decoder_load_by_layer": {},
+            "decoder_cache_hit_count": 0,
+            "decoder_cache_miss_count": 0,
+            "decoder_cache_eviction_count": 0,
+            "decoder_cache_skip_count": 0,
+            "decoder_cache_bytes_resident": 0,
+            "decoder_cache_max_bytes": 0,
             "encode_sparse_seconds": 0.0,
             "encode_sparse_by_layer": {},
             "encode_sparse_active_features_by_layer": {},
@@ -219,6 +275,110 @@ class CrossLayerTranscoder(torch.nn.Module):
             return tensor.to(device=self.device, dtype=self.dtype, non_blocking=True)
 
         return tensor.to(device=self.device, dtype=self.dtype)
+
+    def create_decoder_block_cache(self, max_bytes: int | None = None) -> DecoderChunkCache | None:
+        if not self.lazy_decoder:
+            return None
+
+        cache_budget = self.cross_batch_decoder_cache_bytes if max_bytes is None else max_bytes
+        cache_budget = max(0, int(cache_budget))
+        self._diagnostic_stats["decoder_cache_max_bytes"] = cache_budget
+        self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
+        if cache_budget <= 0:
+            return None
+
+        self.emit_trace_event("decoder.cache.init", max_bytes=cache_budget)
+        return DecoderChunkCache(cache_budget)
+
+    def clear_decoder_block_cache(self, cache: DecoderChunkCache | None) -> None:
+        if cache is None:
+            self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
+            return
+
+        cache.clear()
+        self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
+        self.emit_trace_event("decoder.cache.clear", max_bytes=cache.max_bytes)
+
+    def _record_decoder_cache_resident_bytes(self, cache: DecoderChunkCache | None) -> None:
+        self._diagnostic_stats["decoder_cache_bytes_resident"] = (
+            0 if cache is None else cache.bytes_resident
+        )
+
+    def _record_decoder_cache_hit(
+        self, cache: DecoderChunkCache | None, *, layer_id: int, chunk_id: int
+    ) -> None:
+        self._add_diagnostic_value("decoder_cache_hit_count", 1)
+        self._record_decoder_cache_resident_bytes(cache)
+        hit_count = int(cast(float, self._diagnostic_stats["decoder_cache_hit_count"]))
+        if hit_count <= 3 or hit_count % self._trace_decoder_load_interval == 0:
+            self.emit_trace_event(
+                "decoder.cache.hit",
+                source_layer=layer_id,
+                chunk_id=chunk_id,
+                hit_count=hit_count,
+                resident_bytes=self._diagnostic_stats["decoder_cache_bytes_resident"],
+            )
+
+    def _record_decoder_cache_miss(
+        self,
+        cache: DecoderChunkCache | None,
+        *,
+        layer_id: int,
+        chunk_id: int,
+    ) -> None:
+        self._add_diagnostic_value("decoder_cache_miss_count", 1)
+        self._record_decoder_cache_resident_bytes(cache)
+        miss_count = int(cast(float, self._diagnostic_stats["decoder_cache_miss_count"]))
+        if miss_count <= 3 or miss_count % self._trace_decoder_load_interval == 0:
+            self.emit_trace_event(
+                "decoder.cache.miss",
+                source_layer=layer_id,
+                chunk_id=chunk_id,
+                miss_count=miss_count,
+            )
+
+    def _record_decoder_cache_skip(
+        self,
+        cache: DecoderChunkCache | None,
+        *,
+        layer_id: int,
+        chunk_id: int,
+        chunk_bytes: int,
+    ) -> None:
+        self._add_diagnostic_value("decoder_cache_skip_count", 1)
+        self._record_decoder_cache_resident_bytes(cache)
+        self.emit_trace_event(
+            "decoder.cache.skip",
+            source_layer=layer_id,
+            chunk_id=chunk_id,
+            chunk_bytes=chunk_bytes,
+            max_bytes=0 if cache is None else cache.max_bytes,
+        )
+
+    def _record_decoder_cache_put(
+        self,
+        cache: DecoderChunkCache | None,
+        *,
+        layer_id: int,
+        chunk_id: int,
+        evicted: list[tuple[tuple[int, int], int]],
+    ) -> None:
+        if evicted:
+            self._add_diagnostic_value("decoder_cache_eviction_count", len(evicted))
+            for (evicted_layer, evicted_chunk), evicted_nbytes in evicted:
+                self.emit_trace_event(
+                    "decoder.cache.evict",
+                    source_layer=evicted_layer,
+                    chunk_id=evicted_chunk,
+                    evicted_bytes=evicted_nbytes,
+                )
+        self._record_decoder_cache_resident_bytes(cache)
+        self.emit_trace_event(
+            "decoder.cache.store",
+            source_layer=layer_id,
+            chunk_id=chunk_id,
+            resident_bytes=self._diagnostic_stats["decoder_cache_bytes_resident"],
+        )
 
     def _get_encoder_weights(self, layer_id=None):
         """Get encoder weights, loading from disk if lazy."""
@@ -445,6 +605,83 @@ class CrossLayerTranscoder(torch.nn.Module):
                 elapsed_s=f"{elapsed:.2f}",
                 lazy_decoder=self.lazy_decoder,
             )
+        return result
+
+    def _get_decoder_chunk_uncached(self, layer_id: int, chunk_id: int) -> torch.Tensor:
+        start_idx = chunk_id * self.decoder_chunk_size
+        stop_idx = min(start_idx + self.decoder_chunk_size, self.d_transcoder)
+        if start_idx >= self.d_transcoder or stop_idx <= start_idx:
+            raise IndexError(f"Decoder chunk {chunk_id} out of range for source layer {layer_id}")
+
+        if not self.lazy_decoder:
+            assert self.W_dec is not None, "Decoder weights are not set"
+            return self.W_dec[layer_id][start_idx:stop_idx].to(dtype=self.dtype)
+
+        start = time.perf_counter()
+        if self.layer_paths is not None:
+            path = self.layer_paths[layer_id]
+            with safe_open(path, framework="pt", device="cpu") as f:
+                decoder_block = f.get_slice("w_dec")[start_idx:stop_idx]
+                result = self._move_lazy_slice_to_device(decoder_block[:, layer_id:, :])
+        else:
+            assert self.clt_path is not None, "CLT path is not set"
+            path = os.path.join(self.clt_path, f"W_dec_{layer_id}.safetensors")
+            with safe_open(path, framework="pt", device="cpu") as f:
+                result = self._move_lazy_slice_to_device(
+                    f.get_slice(f"W_dec_{layer_id}")[start_idx:stop_idx]
+                )
+
+        elapsed = time.perf_counter() - start
+        self._add_diagnostic_value("decoder_load_count", 1)
+        self._add_diagnostic_value("decoder_load_seconds", elapsed)
+        self._add_diagnostic_layer_value("decoder_load_by_layer", layer_id, elapsed)
+        load_count = int(cast(float, self._diagnostic_stats["decoder_load_count"]))
+        if load_count <= 3 or load_count % self._trace_decoder_load_interval == 0:
+            self.emit_trace_event(
+                "decoder.load",
+                source_layer=layer_id,
+                chunk_id=chunk_id,
+                load_count=load_count,
+                elapsed_s=f"{elapsed:.2f}",
+                lazy_decoder=self.lazy_decoder,
+            )
+        return result
+
+    def get_decoder_chunk(
+        self,
+        layer_id: int,
+        chunk_id: int,
+        decoder_cache: DecoderChunkCache | None = None,
+    ) -> torch.Tensor:
+        cache_key = (layer_id, chunk_id)
+        if decoder_cache is not None:
+            cached = decoder_cache.get(cache_key)
+            if cached is not None:
+                self._record_decoder_cache_hit(decoder_cache, layer_id=layer_id, chunk_id=chunk_id)
+                return cached
+            self._record_decoder_cache_miss(decoder_cache, layer_id=layer_id, chunk_id=chunk_id)
+
+        result = self._get_decoder_chunk_uncached(layer_id, chunk_id)
+        if decoder_cache is None:
+            return result
+
+        chunk_bytes = DecoderChunkCache._tensor_nbytes(result)
+        if chunk_bytes > decoder_cache.max_bytes:
+            self._record_decoder_cache_skip(
+                decoder_cache,
+                layer_id=layer_id,
+                chunk_id=chunk_id,
+                chunk_bytes=chunk_bytes,
+            )
+            return result
+
+        evicted = decoder_cache.put(cache_key, result)
+        self._record_decoder_cache_put(
+            decoder_cache,
+            layer_id=layer_id,
+            chunk_id=chunk_id,
+            evicted=evicted,
+        )
         return result
 
     def get_decoder_block(self, layer_id, feat_ids=None):
@@ -800,7 +1037,8 @@ def load_clt(
     lazy_decoder: bool = True,
     lazy_encoder: bool = False,
     exact_chunked_decoder: bool = False,
-    decoder_chunk_size: int = 256,
+    decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
+    cross_batch_decoder_cache_bytes: int | None = None,
 ) -> CrossLayerTranscoder:
     """Load a cross-layer transcoder from safetensors files.
 
@@ -847,6 +1085,7 @@ def load_clt(
             clt_path=clt_path,
             exact_chunked_decoder=exact_chunked_decoder,
             decoder_chunk_size=decoder_chunk_size,
+            cross_batch_decoder_cache_bytes=cross_batch_decoder_cache_bytes,
         )
 
     instance.load_state_dict(state_dict, assign=True)
@@ -863,7 +1102,8 @@ def load_gemma_scope_2_clt(
     dtype: torch.dtype = torch.bfloat16,
     lazy_decoder: bool = True,
     lazy_encoder: bool = False,
-    decoder_chunk_size: int = 256,
+    decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
+    cross_batch_decoder_cache_bytes: int | None = None,
 ) -> CrossLayerTranscoder:
     """Load a CrossLayerTranscoder from a GemmaScope2 JumpReLUMultiLayerSAE checkpoint.
 
@@ -953,6 +1193,7 @@ def load_gemma_scope_2_clt(
             weight_format="gemmascope2",
             exact_chunked_decoder=True,
             decoder_chunk_size=decoder_chunk_size,
+            cross_batch_decoder_cache_bytes=cross_batch_decoder_cache_bytes,
         )
 
     instance.load_state_dict(state_dict, assign=True)

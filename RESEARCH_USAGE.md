@@ -56,6 +56,72 @@ graph = attribute(
 )
 ```
 
+## Enabling Phase 4 cross-batch decoder caching
+
+The exact chunked GemmaScope-2 path now supports an optional **run-scoped cross-batch decoder cache** for Phase 4.
+
+- The cache is **disabled by default**.
+- You must set an explicit budget with `cross_batch_decoder_cache_bytes`.
+- The cache is created once per prompt/run, reused across Phase 4 batches, and cleared on teardown.
+- Telemetry includes cache hits, misses, evictions, resident bytes, and decoder load timing/counts.
+
+### Recommended script-level usage
+
+There is currently **no CLI flag** and no direct `ReplacementModel.from_pretrained(...)` kwarg for this budget.
+To enable it in scripts, load the GemmaScope-2 CLT explicitly and then build the replacement model from that transcoder object:
+
+```python
+import torch
+
+from circuit_tracer import ReplacementModel
+from circuit_tracer.transcoder.cross_layer_transcoder import load_gemma_scope_2_clt
+from circuit_tracer.utils.hf_utils import resolve_transcoder_paths
+
+config = {
+    "repo_id": "mwhanna/gemma-scope-2-1b-pt",
+    "subfolder": "clt/width_262k_l0_medium_affine",
+    "scan": "mwhanna/gemma-scope-2-1b-pt/clt/width_262k_l0_medium_affine",
+    "feature_input_hook": "hook_resid_mid",
+    "feature_output_hook": "hook_mlp_out",
+}
+
+layer_paths = resolve_transcoder_paths(config)
+transcoders = load_gemma_scope_2_clt(
+    layer_paths,
+    device=torch.device("cuda"),
+    dtype=torch.bfloat16,
+    lazy_encoder=True,
+    lazy_decoder=True,
+    decoder_chunk_size=1024,
+    cross_batch_decoder_cache_bytes=2 * 1024**3,  # 2 GiB budget
+)
+
+model = ReplacementModel.from_pretrained_and_transcoders(
+    "google/gemma-3-1b-pt",
+    transcoders,
+    backend="nnsight",
+    device=torch.device("cuda"),
+    dtype=torch.bfloat16,
+)
+```
+
+### Config-driven usage
+
+If you maintain your own transcoder `config.yaml` (for example in a private HuggingFace repo or local cache metadata), you can add:
+
+```yaml
+cross_batch_decoder_cache_bytes: 2147483648
+```
+
+The hub/cache loaders will pass that through automatically.
+
+### Budget guidance
+
+- Start around **1-2 GiB** on single-GPU GemmaScope-2 exact runs.
+- Too-small budgets can cause churn and reduce benefit.
+- If you are tight on memory, set the value to `0` or omit it to disable the cache.
+- Keep `decoder_chunk_size=1024` as the baseline unless you have a strong reason to change it.
+
 To enable early screening on retained candidates, pass a sparsification config:
 
 ```python
@@ -126,6 +192,7 @@ The profiling logs report, where applicable:
 - `compute_batch` cumulative timing
 - per-layer feature/error attribution timing
 - decoder load count and decoder load time
+- decoder cache hit/miss/eviction counts and resident bytes
 - chunk counts and chunked attribution timing by layer
 - sparsification candidate counts, per-layer retained counts, and retained activation-mass proxy
 

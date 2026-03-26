@@ -174,6 +174,7 @@ def load_transcoders(
                 lazy_encoder=lazy_encoder,
                 dtype=dtype,
                 device=device,
+                cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
             )
 
         subfolder = config.get("subfolder")
@@ -206,6 +207,7 @@ def load_transcoders(
             dtype=dtype,
             device=device,
             exact_chunked_decoder=exact_chunked_decoder,
+            cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
     else:
         raise ValueError(f"Unknown model kind: {model_kind}")
