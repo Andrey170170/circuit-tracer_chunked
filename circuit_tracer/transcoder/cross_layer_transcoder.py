@@ -215,6 +215,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             "decoder_cache_miss_count": 0,
             "decoder_cache_eviction_count": 0,
             "decoder_cache_skip_count": 0,
+            "decoder_cache_auto_disable_count": 0,
             "decoder_cache_bytes_resident": 0,
             "decoder_cache_max_bytes": 0,
             "encode_sparse_seconds": 0.0,
@@ -298,6 +299,11 @@ class CrossLayerTranscoder(torch.nn.Module):
         cache.clear()
         self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
         self.emit_trace_event("decoder.cache.clear", max_bytes=cache.max_bytes)
+
+    def note_decoder_cache_auto_disabled(self, reason: str) -> None:
+        self._add_diagnostic_value("decoder_cache_auto_disable_count", 1)
+        self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
+        self.emit_trace_event("decoder.cache.auto_disabled", reason=reason)
 
     def _record_decoder_cache_resident_bytes(self, cache: DecoderChunkCache | None) -> None:
         self._diagnostic_stats["decoder_cache_bytes_resident"] = (

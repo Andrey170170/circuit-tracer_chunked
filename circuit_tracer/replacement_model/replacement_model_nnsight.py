@@ -485,6 +485,7 @@ class NNSightReplacementModel(LanguageModel):
         inputs: str | torch.Tensor,
         *,
         sparsification: SparsificationConfig | None = None,
+        retain_full_logits: bool = False,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
@@ -548,25 +549,40 @@ class NNSightReplacementModel(LanguageModel):
             self.zero_positions,
             sparsification=sparsification,
         )  # type: ignore
+        activation_matrix = cast(torch.Tensor, attribution_data["activation_matrix"])
+        reconstruction = cast(torch.Tensor, attribution_data["reconstruction"])
+        decoder_vecs = cast(torch.Tensor, attribution_data["decoder_vecs"])
+        encoder_vecs = cast(torch.Tensor, attribution_data["encoder_vecs"])
+        encoder_to_decoder_map = cast(torch.Tensor, attribution_data["encoder_to_decoder_map"])
+        decoder_locations = cast(torch.Tensor, attribution_data["decoder_locations"])
+        active_features = int(activation_matrix._nnz())
+        mlp_in_shape = tuple(mlp_in_cache.shape)
+        mlp_out_shape = tuple(mlp_out_cache.shape)
+        reconstruction_shape = tuple(reconstruction.shape)
         component_seconds = time.perf_counter() - component_start
         if callable(trace_event):
             trace_event(
                 "phase0.setup.components_done",
                 backend="nnsight",
                 elapsed_s=f"{component_seconds:.2f}",
-                active_features=int(attribution_data["activation_matrix"]._nnz()),
+                active_features=active_features,
             )
 
         # Compute error vectors
         error_start = time.perf_counter()
         if callable(trace_event):
             trace_event("phase0.setup.error_start", backend="nnsight")
-        error_vectors = mlp_out_cache - attribution_data["reconstruction"]
+        error_vectors = mlp_out_cache - reconstruction
 
         error_vectors[:, self.zero_positions] = 0
         token_vectors = self.embed_weight[  # type: ignore
             tokens
         ].detach()  # (n_pos, d_model)  # type: ignore
+        exact_chunked_decoder = getattr(transcoders, "exact_chunked_decoder", False)
+        retained_logits = logits
+        full_logits = logits if retain_full_logits else None
+        if exact_chunked_decoder and not retain_full_logits:
+            retained_logits = logits[:, -1:, :].contiguous()
         error_seconds = time.perf_counter() - error_start
         if callable(trace_event):
             trace_event(
@@ -579,19 +595,26 @@ class NNSightReplacementModel(LanguageModel):
         )
 
         ctx = AttributionContext(
-            activation_matrix=attribution_data["activation_matrix"],
-            logits=logits,
+            activation_matrix=activation_matrix,
+            logits=retained_logits,
+            full_logits=full_logits,
             error_vectors=error_vectors,
             token_vectors=token_vectors,
-            decoder_vecs=attribution_data["decoder_vecs"],
-            encoder_vecs=attribution_data["encoder_vecs"],
-            encoder_to_decoder_map=attribution_data["encoder_to_decoder_map"],
-            decoder_locations=attribution_data["decoder_locations"],
-            decoder_provider=transcoders
-            if getattr(transcoders, "exact_chunked_decoder", False)
-            else None,
+            decoder_vecs=decoder_vecs,
+            encoder_vecs=encoder_vecs,
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=decoder_locations,
+            decoder_provider=transcoders if exact_chunked_decoder else None,
             chunked_decoder_state=chunked_decoder_state,
         )
+        del reconstruction
+        del attribution_data["reconstruction"]
+        del mlp_in_cache
+        del mlp_out_cache
+        del logits
+        del retained_logits
+        if full_logits is not None:
+            del full_logits
         ctx.setup_diagnostic_stats = {
             "backend": "nnsight",
             "token_count": int(tokens.numel()),
@@ -599,12 +622,15 @@ class NNSightReplacementModel(LanguageModel):
             "component_seconds": component_seconds,
             "error_seconds": error_seconds,
             "setup_total_seconds": time.perf_counter() - setup_start,
-            "mlp_in_shape": tuple(mlp_in_cache.shape),
-            "mlp_out_shape": tuple(mlp_out_cache.shape),
-            "reconstruction_shape": tuple(attribution_data["reconstruction"].shape),
-            "active_features": int(attribution_data["activation_matrix"]._nnz()),
+            "mlp_in_shape": mlp_in_shape,
+            "mlp_out_shape": mlp_out_shape,
+            "reconstruction_shape": reconstruction_shape,
+            "active_features": active_features,
+            "logit_retention": ctx.logit_retention,
         }
-        ctx.sparsification_stats = attribution_data.get("sparsification_stats")
+        ctx.sparsification_stats = cast(
+            dict[str, object] | None, attribution_data.get("sparsification_stats")
+        )
         return ctx
 
     def setup_intervention_with_freeze(

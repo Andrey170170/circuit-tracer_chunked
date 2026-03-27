@@ -61,11 +61,15 @@ The following transcoders are available for use with `circuit-tracer`; this mean
 ### GemmaScope-2 CLT usage in this fork
 This fork adds a memory-bounded, exact tracing path for GemmaScope-2 cross-layer transcoders (CLTs) on a single GPU.
 
-- `attribute(...)` and `ReplacementModel.from_pretrained(...)` stay the same at the call site.
+- `attribute(...)` and `ReplacementModel.from_pretrained(...)` remain backwards compatible at the call site.
 - For GemmaScope-2 CLTs, exact chunked decoder handling is enabled automatically.
+- The exact chunked NNSight path now stages large run-scoped attribution tensors more aggressively and accumulates attribution scores in `float32` for better split-batch numerical stability.
+- By default, exact chunked `setup_attribution(...)` now retains only last-token logits; use `retain_full_logits=True` only if you explicitly need the full sequence logits from that internal setup call.
 - Optional double-pass sparsification can now screen candidates before reconstruction and reuse the same retained set during later attribution.
 - GemmaScope-2 CLTs should be used with `backend="nnsight"`.
 - The loader also tolerates the duplicated final shard path present in some GemmaScope-2 configs.
+
+No activation flag is required for the new VRAM policy changes: if you are using a GemmaScope-2 CLT with `backend="nnsight"`, the memory-saving path is already active.
 
 Recommended single-GPU starting point for GemmaScope-2 CLTs:
 
@@ -94,6 +98,26 @@ graph = attribute(
     verbose=True,
 )
 ```
+
+Optional split-batch tuning for the exact chunked path:
+
+```python
+graph = attribute(
+    "If Alice has 3 apples and buys 2 more, she has",
+    model,
+    max_n_logits=4,
+    batch_size=16,
+    feature_batch_size=8,
+    logit_batch_size=4,
+    max_feature_nodes=128,
+    offload="cpu",
+)
+```
+
+- `batch_size` still controls the main trace width and remains the default for both phases.
+- `feature_batch_size` optionally shrinks only Phase 4 feature batches.
+- `logit_batch_size` optionally shrinks only Phase 3 logit batches.
+- You only need these new knobs when tuning memory/runtime tradeoffs; existing calls keep working unchanged.
 
 Optional Phase 4 cross-batch decoder cache:
 
@@ -171,6 +195,7 @@ Operational notes for this forked path:
 - `lazy_encoder=True` and `lazy_decoder=True` are recommended for GemmaScope-2 CLTs.
 - `offload="cpu"` or `offload="disk"` can still help for model components, but transcoder offload is intentionally skipped during exact chunked decoder attribution so decoder slices remain readable during backward scoring.
 - With `verbose=True`, phase-level runtime and memory telemetry is emitted to logs (RSS plus CUDA allocated/reserved where available), which is useful for SLURM debugging.
+- The exact chunked path now keeps only last-token logits by default during `setup_attribution(...)`, stages `encoder_vecs`/`error_vectors` more conservatively, and cleans up run-scoped attribution buffers/caches during teardown automatically.
 - `SparsificationConfig(per_layer_position_topk=..., global_cap=...)` uses a per-layer-per-position activation screen first, then an optional global cap as a safety valve.
 - For deeper profiling, `attribute(..., profile=True, profile_log_interval=1)` emits setup/precompute diagnostics, live `TRACE ...` progress lines for long-running work, batch-level diagnostics including decoder load counts/timing and chunked attribution timing, and sparsification retention summaries when sparsification is enabled.
 - When the cross-batch decoder cache is enabled, profiling also reports decoder cache hits, misses, evictions, and resident bytes.

@@ -4,6 +4,7 @@ Attribution context for managing hooks during attribution computation.
 
 import time
 import weakref
+import warnings
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -52,8 +53,13 @@ class AttributionContext:
         encoder_to_decoder_map: torch.Tensor,
         decoder_locations: torch.Tensor,
         logits: torch.Tensor,
+        full_logits: torch.Tensor | None = None,
         decoder_provider=None,
         chunked_decoder_state: dict[str, torch.Tensor] | None = None,
+        stage_encoder_vecs_on_cpu: bool | None = None,
+        stage_error_vectors_on_cpu: bool | None = None,
+        error_vector_prefetch_lookahead: int = 2,
+        chunked_feature_replay_window: int = 4,
     ) -> None:
         n_layers, n_pos, _ = activation_matrix.shape
 
@@ -63,12 +69,43 @@ class AttributionContext:
         self._batch_buffer: torch.Tensor | None = None
         self.n_layers: int = n_layers
 
+        exact_chunked_mode = chunked_decoder_state is not None
+        if stage_encoder_vecs_on_cpu is None:
+            stage_encoder_vecs_on_cpu = exact_chunked_mode and encoder_vecs.numel() > 0
+        if stage_error_vectors_on_cpu is None:
+            stage_error_vectors_on_cpu = exact_chunked_mode and error_vectors.numel() > 0
+
+        self._execution_device = token_vectors.device
+        self._stage_encoder_vecs_on_cpu = bool(stage_encoder_vecs_on_cpu)
+        self._stage_error_vectors_on_cpu = bool(stage_error_vectors_on_cpu)
+        self._error_vector_prefetch_lookahead = max(1, int(error_vector_prefetch_lookahead))
+        self._chunked_feature_replay_window = max(1, int(chunked_feature_replay_window))
+        self._materialized_error_vector_layers: dict[int, torch.Tensor] = {}
+        self._cleanup_complete = False
+        self._decoder_cache_guardrail_disabled = False
+        self._decoder_cache_disable_reason: str | None = None
+        self._decoder_cache_guardrail_min_lookups = 16
+        self._decoder_cache_guardrail_min_hit_rate = 0.05
+
         self.logits = logits
+        self.full_logits = full_logits
+        self.logit_retention = (
+            "full"
+            if full_logits is not None or (logits.ndim >= 2 and logits.shape[1] != 1)
+            else "last_token"
+        )
+        self.logit_source_shape = tuple((full_logits if full_logits is not None else logits).shape)
         self.activation_matrix = activation_matrix
-        self.error_vectors = error_vectors
+        if self._stage_error_vectors_on_cpu:
+            self.error_vectors = self._stage_tensor_on_cpu(error_vectors)
+        else:
+            self.error_vectors = error_vectors
         self.token_vectors = token_vectors
         self.decoder_vecs = decoder_vecs
-        self.encoder_vecs = encoder_vecs
+        if self._stage_encoder_vecs_on_cpu:
+            self.encoder_vecs = self._stage_tensor_on_cpu(encoder_vecs)
+        else:
+            self.encoder_vecs = encoder_vecs
 
         self.encoder_to_decoder_map = encoder_to_decoder_map
         self.decoder_locations = decoder_locations
@@ -92,12 +129,195 @@ class AttributionContext:
             "chunked_attr_seconds_by_output_layer": {},
             "chunked_attr_seconds_by_source_layer": {},
             "chunked_attr_replay_seconds": 0.0,
+            "chunked_attr_grad_window_peak": 0.0,
+            "error_vector_layers_resident_peak": 0.0,
+            "decoder_cache_auto_disabled": 0.0,
         }
 
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
         self._refresh_chunked_layer_spans()
         self.decoder_chunk_cache = self._create_decoder_cache()
+
+    @staticmethod
+    def _stage_tensor_on_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        staged = tensor.detach()
+        if staged.device.type != "cpu":
+            staged = staged.to(device="cpu", non_blocking=staged.device.type == "cuda")
+        staged = staged.contiguous()
+        try:
+            staged = staged.pin_memory()
+        except RuntimeError:
+            pass
+        return staged
+
+    def _materialize_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        target_device = self._execution_device if device is None else device
+        target_dtype = tensor.dtype if dtype is None else dtype
+        if tensor.device == target_device and tensor.dtype == target_dtype:
+            return tensor
+        return tensor.to(
+            device=target_device,
+            dtype=target_dtype,
+            non_blocking=tensor.device.type == "cpu" and target_device.type == "cuda",
+        )
+
+    def get_last_token_logits(self) -> torch.Tensor:
+        if self.logits.ndim >= 2 and self.logits.shape[1] == 1:
+            return self.logits[:, 0]
+        if self.logits.ndim >= 2:
+            return self.logits[:, -1]
+        return self.logits
+
+    def materialize_encoder_vectors(
+        self,
+        indices: torch.Tensor | slice,
+        *,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        if isinstance(indices, slice):
+            encoder_slice = self.encoder_vecs[indices]
+        else:
+            encoder_slice = self.encoder_vecs[
+                indices.to(device=self.encoder_vecs.device, dtype=torch.long)
+            ]
+        return self._materialize_tensor(encoder_slice, device=device, dtype=self.encoder_vecs.dtype)
+
+    def _prepare_error_vector_window(
+        self, layer: int, *, device: torch.device | None = None
+    ) -> None:
+        if not self._stage_error_vectors_on_cpu:
+            return
+
+        start_layer = max(0, layer - self._error_vector_prefetch_lookahead + 1)
+        keep_layers = set(range(start_layer, layer + 1))
+        for cached_layer in list(self._materialized_error_vector_layers):
+            if cached_layer not in keep_layers:
+                del self._materialized_error_vector_layers[cached_layer]
+
+        for layer_id in range(layer, start_layer - 1, -1):
+            if layer_id in self._materialized_error_vector_layers:
+                continue
+            self._materialized_error_vector_layers[layer_id] = self._materialize_tensor(
+                self.error_vectors[layer_id],
+                device=device,
+                dtype=self.error_vectors.dtype,
+            )
+
+        if self.diagnostic_mode:
+            peak = cast(float, self._diagnostic_stats["error_vector_layers_resident_peak"])
+            self._diagnostic_stats["error_vector_layers_resident_peak"] = max(
+                peak,
+                float(len(self._materialized_error_vector_layers)),
+            )
+
+    def get_error_vectors_for_layer(
+        self, layer: int, *, device: torch.device | None = None
+    ) -> torch.Tensor:
+        if not self._stage_error_vectors_on_cpu:
+            return self.error_vectors[layer]
+        self._prepare_error_vector_window(layer, device=device)
+        return self._materialized_error_vector_layers[layer]
+
+    def _flush_chunked_feature_grad_window(
+        self,
+        grad_window: dict[int, torch.Tensor],
+        window_layers: list[int],
+    ) -> None:
+        if not window_layers:
+            return
+        grads_to_replay: list[torch.Tensor | None] = [None] * self.n_layers
+        for layer in window_layers:
+            grads_to_replay[layer] = grad_window.pop(layer)
+        self._compute_chunked_feature_attributions_from_grads(grads_to_replay)
+        window_layers.clear()
+
+    def _should_disable_decoder_cache(self) -> tuple[bool, str | None]:
+        if self.decoder_chunk_cache is None or self._decoder_cache_guardrail_disabled:
+            return False, None
+
+        snapshot_fn = getattr(self.decoder_provider, "get_diagnostic_snapshot", None)
+        if not callable(snapshot_fn):
+            return False, None
+
+        snapshot = snapshot_fn()
+        hits = int(snapshot.get("decoder_cache_hit_count", 0))
+        misses = int(snapshot.get("decoder_cache_miss_count", 0))
+        evictions = int(snapshot.get("decoder_cache_eviction_count", 0))
+        total_lookups = hits + misses
+        if total_lookups < self._decoder_cache_guardrail_min_lookups:
+            return False, None
+
+        hit_rate = hits / total_lookups if total_lookups else 0.0
+        if hits == 0:
+            return True, (
+                f"Decoder chunk cache auto-disabled after {total_lookups} lookups with zero hits"
+            )
+        if evictions > 0 and hit_rate < self._decoder_cache_guardrail_min_hit_rate:
+            return True, (
+                "Decoder chunk cache auto-disabled due to low reuse "
+                f"(hits={hits}, misses={misses}, evictions={evictions}, hit_rate={hit_rate:.3f})"
+            )
+        return False, None
+
+    def _maybe_disable_decoder_cache(self) -> None:
+        should_disable, reason = self._should_disable_decoder_cache()
+        if not should_disable or reason is None:
+            return
+
+        warnings.warn(reason, stacklevel=2)
+        self._emit_trace("decoder.cache.auto_disable", reason=reason)
+        note_auto_disable = getattr(self.decoder_provider, "note_decoder_cache_auto_disabled", None)
+        if callable(note_auto_disable):
+            note_auto_disable(reason)
+        self.clear_decoder_cache()
+        self._decoder_cache_guardrail_disabled = True
+        self._decoder_cache_disable_reason = reason
+        self._diagnostic_stats["decoder_cache_auto_disabled"] = 1.0
+
+    @staticmethod
+    def _empty_like_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.is_sparse:
+            return torch.sparse_coo_tensor(
+                torch.empty((tensor.sparse_dim(), 0), dtype=torch.long),
+                torch.empty((0,), dtype=tensor.dtype),
+                size=tensor.shape,
+            ).coalesce()
+        empty_shape = (0, *tensor.shape[1:]) if tensor.ndim > 0 else (0,)
+        return torch.empty(empty_shape, dtype=tensor.dtype)
+
+    def cleanup(self) -> None:
+        if self._cleanup_complete:
+            return
+
+        self.clear_decoder_cache()
+        self._clear_saved_grads()
+        self._materialized_error_vector_layers.clear()
+        self._resid_activations.clear()
+        self._feature_output_activations.clear()
+        self._batch_buffer = None
+        self.activation_matrix = cast(torch.Tensor, self._empty_like_tensor(self.activation_matrix))
+        self.error_vectors = self._empty_like_tensor(self.error_vectors)
+        self.token_vectors = self._empty_like_tensor(self.token_vectors)
+        self.decoder_vecs = self._empty_like_tensor(self.decoder_vecs)
+        self.encoder_vecs = self._empty_like_tensor(self.encoder_vecs)
+        self.encoder_to_decoder_map = self._empty_like_tensor(self.encoder_to_decoder_map)
+        self.decoder_locations = self._empty_like_tensor(self.decoder_locations)
+        self.logits = self._empty_like_tensor(self.logits)
+        if self.full_logits is not None:
+            self.full_logits = self._empty_like_tensor(self.full_logits)
+        if self.chunked_decoder_state is not None:
+            for key, value in list(self.chunked_decoder_state.items()):
+                self.chunked_decoder_state[key] = self._empty_like_tensor(value)
+        self.chunked_decoder_state = None
+        self._chunked_layer_spans = None
+        self._cleanup_complete = True
 
     def set_diagnostic_mode(self, enabled: bool) -> None:
         self.diagnostic_mode = enabled
@@ -119,6 +339,17 @@ class AttributionContext:
         snapshot: dict[str, object] = {}
         for key, value in self._diagnostic_stats.items():
             snapshot[key] = dict(value) if isinstance(value, dict) else value
+        snapshot["encoder_vecs_staged_on_cpu"] = float(self._stage_encoder_vecs_on_cpu)
+        snapshot["error_vectors_staged_on_cpu"] = float(self._stage_error_vectors_on_cpu)
+        snapshot["error_vector_prefetch_lookahead"] = float(self._error_vector_prefetch_lookahead)
+        snapshot["error_vector_layers_resident"] = float(
+            len(self._materialized_error_vector_layers)
+        )
+        snapshot["chunked_feature_replay_window"] = float(self._chunked_feature_replay_window)
+        snapshot["decoder_cache_guardrail_disabled"] = float(self._decoder_cache_guardrail_disabled)
+        if self._decoder_cache_disable_reason is not None:
+            snapshot["decoder_cache_disable_reason"] = self._decoder_cache_disable_reason
+        snapshot["logit_retention"] = self.logit_retention
         return snapshot
 
     def _add_stat(self, key: str, value: float) -> None:
@@ -154,6 +385,19 @@ class AttributionContext:
             return
         self._chunked_layer_spans = self._build_chunked_layer_spans()
 
+    @staticmethod
+    def _clear_grad_list(grad_points: list[object]) -> None:
+        for grad_point in grad_points:
+            proxy = cast(object, grad_point)
+            try:
+                setattr(proxy, "grad", None)
+            except Exception:
+                continue
+
+    def _clear_saved_grads(self) -> None:
+        self._clear_grad_list(cast(list[object], self._resid_activations))
+        self._clear_grad_list(cast(list[object], self._feature_output_activations))
+
     def _create_decoder_cache(self):
         init_decoder_cache = getattr(self.decoder_provider, "create_decoder_block_cache", None)
         if self.chunked_decoder_state is None or not callable(init_decoder_cache):
@@ -168,6 +412,8 @@ class AttributionContext:
 
     def reset_decoder_cache(self) -> None:
         self.clear_decoder_cache()
+        if self._decoder_cache_guardrail_disabled:
+            return
         self.decoder_chunk_cache = self._create_decoder_cache()
 
     def apply_diagnostic_feature_cap(self, max_features: int) -> tuple[int, int]:
@@ -188,7 +434,7 @@ class AttributionContext:
             device=self.activation_matrix.device,
             dtype=self.activation_matrix.dtype,
         ).coalesce()
-        self.encoder_vecs = self.encoder_vecs[selected]
+        self.encoder_vecs = self.encoder_vecs[selected.to(device=self.encoder_vecs.device)]
 
         if self.chunked_decoder_state is not None:
             for key in self.chunked_decoder_state:
@@ -279,7 +525,7 @@ class AttributionContext:
                 )
                 chunk_activations = activation_values[chunk_rows].to(
                     device=decoder_chunk.device,
-                    dtype=decoder_chunk.dtype,
+                    dtype=self._batch_buffer.dtype,
                     non_blocking=decoder_chunk.device.type == "cuda",
                 )[:, None]
                 total_row_subchunks = max(
@@ -295,12 +541,14 @@ class AttributionContext:
                         assert grads is not None
                         typed_grads = grads.to(
                             device=decoder_chunk.device,
-                            dtype=decoder_chunk.dtype,
+                            dtype=self._batch_buffer.dtype,
                             non_blocking=decoder_chunk.device.type == "cuda",
                         )
                         grad_cache[output_layer] = typed_grads
 
-                    decoder_vectors = decoder_chunk[:, output_layer - source_layer]
+                    decoder_vectors = decoder_chunk[:, output_layer - source_layer].to(
+                        dtype=self._batch_buffer.dtype
+                    )
                     for row_subchunk_idx, row_start in enumerate(
                         range(0, len(chunk_rows), row_subchunk_size),
                         start=1,
@@ -365,6 +613,7 @@ class AttributionContext:
             )
         if self.diagnostic_mode:
             self._add_stat("chunked_attr_replay_seconds", time.perf_counter() - replay_start)
+        self._maybe_disable_decoder_cache()
 
     def _compute_chunked_feature_attributions(self, layer: int, grads: torch.Tensor):
         self._compute_chunked_feature_attributions_from_grads(
@@ -400,9 +649,10 @@ class AttributionContext:
         """
 
         proxy = weakref.proxy(self)
+        acc_dtype = proxy._batch_buffer.dtype
         proxy._batch_buffer[write_index] += einsum(
-            grads.to(output_vecs.dtype)[read_index],
-            output_vecs,
+            grads.to(dtype=acc_dtype)[read_index],
+            output_vecs.to(dtype=acc_dtype),
             "batch position d_model, position d_model -> position batch",
         )
 
@@ -432,7 +682,7 @@ class AttributionContext:
 
         self.compute_score(
             grads,
-            self.error_vectors[layer],
+            self.get_error_vectors_for_layer(layer, device=grads.device),
             write_index=np.s_[error_offset(layer) : error_offset(layer + 1)],
         )
 
@@ -482,10 +732,27 @@ class AttributionContext:
             unique_layers=len(layers.unique()),
             retain_graph=retain_graph,
         )
+        self._clear_saved_grads()
+        execution_device = self._resid_activations[0].device
+        layers = layers.to(
+            device=execution_device,
+            dtype=torch.long,
+            non_blocking=layers.device.type == "cpu" and execution_device.type == "cuda",
+        )
+        positions = positions.to(
+            device=execution_device,
+            dtype=torch.long,
+            non_blocking=positions.device.type == "cpu" and execution_device.type == "cuda",
+        )
+        inject_values = self._materialize_tensor(
+            inject_values,
+            device=execution_device,
+            dtype=inject_values.dtype,
+        )
         self._batch_buffer = torch.zeros(
             self._row_size,
             batch_size,
-            dtype=inject_values.dtype,
+            dtype=torch.float32,
             device=inject_values.device,
         )
 
@@ -494,56 +761,99 @@ class AttributionContext:
 
         def _inject(grad_point, *, batch_indices, pos_indices, values):
             grads_out = grad_point.grad.clone()
-            grads_out.index_put_((batch_indices, pos_indices), values.to(grads_out.dtype))
+            target_device = grads_out.device
+            grads_out.index_put_(
+                (
+                    batch_indices.to(
+                        device=target_device,
+                        non_blocking=batch_indices.device.type == "cpu"
+                        and target_device.type == "cuda",
+                    ),
+                    pos_indices.to(
+                        device=target_device,
+                        non_blocking=pos_indices.device.type == "cpu"
+                        and target_device.type == "cuda",
+                    ),
+                ),
+                values.to(
+                    device=target_device,
+                    dtype=grads_out.dtype,
+                    non_blocking=values.device.type == "cpu" and target_device.type == "cuda",
+                ),
+            )
             grad_point.grad = grads_out
 
         layers_in_batch = sorted(layers.unique().tolist(), reverse=True)
-        chunked_feature_grads = (
-            [None] * self.n_layers if self.chunked_decoder_state is not None else None
-        )
+        chunked_feature_grads = {} if self.chunked_decoder_state is not None else None
+        chunked_feature_grad_layers: list[int] = []
 
         last_layer = max(layers_in_batch)
-        with self._resid_activations[last_layer].backward(
-            gradient=torch.zeros_like(self._resid_activations[last_layer]),
-            retain_graph=retain_graph,
-        ):
-            for layer in reversed(range(last_layer + 1)):
-                if layer != last_layer:
-                    grad = self._feature_output_activations[layer + 1].grad.detach()  # type:ignore
-                    feature_start = time.perf_counter()
-                    if chunked_feature_grads is None:
-                        self.compute_feature_attributions(layer, grad)
+        try:
+            with self._resid_activations[last_layer].backward(
+                gradient=torch.zeros_like(self._resid_activations[last_layer]),
+                retain_graph=retain_graph,
+            ):
+                for layer in reversed(range(last_layer + 1)):
+                    if layer != last_layer:
+                        grad = self._feature_output_activations[layer + 1].grad.detach()  # type:ignore
+                        feature_start = time.perf_counter()
+                        if chunked_feature_grads is None:
+                            self.compute_feature_attributions(layer, grad)
+                            if self.diagnostic_mode:
+                                self._add_layer_stat(
+                                    "feature_attr_seconds_by_layer",
+                                    layer,
+                                    time.perf_counter() - feature_start,
+                                )
+                        else:
+                            chunked_feature_grads[layer] = grad
+                            chunked_feature_grad_layers.append(layer)
+                            if self.diagnostic_mode:
+                                peak = cast(
+                                    float, self._diagnostic_stats["chunked_attr_grad_window_peak"]
+                                )
+                                self._diagnostic_stats["chunked_attr_grad_window_peak"] = max(
+                                    peak,
+                                    float(len(chunked_feature_grad_layers)),
+                                )
+                            if (
+                                len(chunked_feature_grad_layers)
+                                >= self._chunked_feature_replay_window
+                            ):
+                                self._flush_chunked_feature_grad_window(
+                                    chunked_feature_grads,
+                                    chunked_feature_grad_layers,
+                                )
+                        error_start = time.perf_counter()
+                        self.compute_error_attributions(layer, grad)
                         if self.diagnostic_mode:
                             self._add_layer_stat(
-                                "feature_attr_seconds_by_layer",
+                                "error_attr_seconds_by_layer",
                                 layer,
-                                time.perf_counter() - feature_start,
+                                time.perf_counter() - error_start,
                             )
-                    else:
-                        chunked_feature_grads[layer] = grad
-                    error_start = time.perf_counter()
-                    self.compute_error_attributions(layer, grad)
-                    if self.diagnostic_mode:
-                        self._add_layer_stat(
-                            "error_attr_seconds_by_layer", layer, time.perf_counter() - error_start
+
+                    mask = layers == layer
+                    if mask.any():
+                        _inject(
+                            grad_point=self._resid_activations[layer],
+                            batch_indices=batch_idx[mask],
+                            pos_indices=positions[mask],
+                            values=inject_values[mask],
                         )
 
-                mask = layers == layer
-                if mask.any():
-                    _inject(
-                        grad_point=self._resid_activations[layer],
-                        batch_indices=batch_idx[mask],
-                        pos_indices=positions[mask],
-                        values=inject_values[mask],
+                token_start = time.perf_counter()
+                self.compute_token_attributions(self._feature_output_activations[0].grad)
+                if self.diagnostic_mode:
+                    self._add_stat("token_attr_seconds", time.perf_counter() - token_start)
+
+                if chunked_feature_grads is not None:
+                    self._flush_chunked_feature_grad_window(
+                        chunked_feature_grads,
+                        chunked_feature_grad_layers,
                     )
-
-            token_start = time.perf_counter()
-            self.compute_token_attributions(self._feature_output_activations[0].grad)
-            if self.diagnostic_mode:
-                self._add_stat("token_attr_seconds", time.perf_counter() - token_start)
-
-            if chunked_feature_grads is not None:
-                self._compute_chunked_feature_attributions_from_grads(chunked_feature_grads)
+        finally:
+            self._clear_saved_grads()
 
         buf, self._batch_buffer = self._batch_buffer, None
         if self.diagnostic_mode:

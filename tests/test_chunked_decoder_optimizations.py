@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import cast
+import warnings
 
 import pytest
 import torch
@@ -8,7 +9,11 @@ from safetensors.torch import save_file
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
 )
-from circuit_tracer.transcoder.cross_layer_transcoder import load_clt, load_gemma_scope_2_clt
+from circuit_tracer.transcoder.cross_layer_transcoder import (
+    DecoderChunkCache,
+    load_clt,
+    load_gemma_scope_2_clt,
+)
 
 
 class FakeDecoderProvider:
@@ -23,11 +28,13 @@ class FakeDecoderProvider:
         self.decoder_chunk_size = chunk_size
         self.enable_cache = enable_cache
         self.load_calls: list[tuple[int, int]] = []
+        self.clear_calls = 0
 
     def create_decoder_block_cache(self):
         return {} if self.enable_cache else None
 
     def clear_decoder_block_cache(self, cache) -> None:
+        self.clear_calls += 1
         if cache is not None:
             cache.clear()
 
@@ -42,6 +49,64 @@ class FakeDecoderProvider:
         result = self.blocks[layer_id][start:stop]
         if decoder_cache is not None:
             decoder_cache[cache_key] = result
+        return result
+
+
+class GuardrailDecoderProvider:
+    def __init__(
+        self,
+        blocks: dict[int, torch.Tensor],
+        *,
+        chunk_size: int = 1,
+        cache_max_bytes: int = 16,
+    ) -> None:
+        self.blocks = blocks
+        self.decoder_chunk_size = chunk_size
+        self.cache_max_bytes = cache_max_bytes
+        self.auto_disable_reasons: list[str] = []
+        self.stats = {
+            "decoder_cache_hit_count": 0,
+            "decoder_cache_miss_count": 0,
+            "decoder_cache_eviction_count": 0,
+            "decoder_cache_skip_count": 0,
+            "decoder_cache_auto_disable_count": 0,
+            "decoder_cache_bytes_resident": 0,
+            "decoder_cache_max_bytes": cache_max_bytes,
+        }
+
+    def create_decoder_block_cache(self):
+        return DecoderChunkCache(self.cache_max_bytes)
+
+    def clear_decoder_block_cache(self, cache) -> None:
+        if cache is not None:
+            cache.clear()
+        self.stats["decoder_cache_bytes_resident"] = 0
+
+    def get_diagnostic_snapshot(self):
+        return dict(self.stats)
+
+    def note_decoder_cache_auto_disabled(self, reason: str) -> None:
+        self.auto_disable_reasons.append(reason)
+        self.stats["decoder_cache_auto_disable_count"] += 1
+        self.stats["decoder_cache_bytes_resident"] = 0
+
+    def get_decoder_chunk(self, layer_id: int, chunk_id: int, decoder_cache=None) -> torch.Tensor:
+        cache_key = (layer_id, chunk_id)
+        if decoder_cache is not None:
+            cached = decoder_cache.get(cache_key)
+            if cached is not None:
+                self.stats["decoder_cache_hit_count"] += 1
+                self.stats["decoder_cache_bytes_resident"] = decoder_cache.bytes_resident
+                return cached
+
+        self.stats["decoder_cache_miss_count"] += 1
+        start = chunk_id * self.decoder_chunk_size
+        stop = min(start + self.decoder_chunk_size, self.blocks[layer_id].shape[0])
+        result = self.blocks[layer_id][start:stop]
+        if decoder_cache is not None:
+            evicted = decoder_cache.put(cache_key, result)
+            self.stats["decoder_cache_eviction_count"] += len(evicted)
+            self.stats["decoder_cache_bytes_resident"] = decoder_cache.bytes_resident
         return result
 
 
@@ -373,3 +438,213 @@ def test_decoder_chunk_cache_is_bounded_and_observable(tmp_path: Path) -> None:
     clt.clear_decoder_block_cache(cache)
     cleared_stats = clt.get_diagnostic_snapshot()
     assert cleared_stats["decoder_cache_bytes_resident"] == 0
+
+
+def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalently() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 1], [0, 1, 1], [0, 1, 0]]),
+        values=torch.tensor([1.0, 2.0, 3.0]),
+        size=(2, 2, 2),
+        check_invariants=True,
+    ).coalesce()
+    encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 2, 4),
+        token_vectors=torch.zeros(2, 4),
+        decoder_vecs=torch.empty((0, 4)),
+        encoder_vecs=encoder_vecs.clone(),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1, 1, 5),
+        decoder_provider=FakeDecoderProvider({0: torch.zeros(2, 2, 4), 1: torch.zeros(1, 1, 4)}),
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+
+    assert ctx.encoder_vecs.device.type == "cpu"
+    batch = ctx.materialize_encoder_vectors(torch.tensor([2, 0]), device=torch.device("cpu"))
+    assert torch.equal(batch, encoder_vecs[torch.tensor([2, 0])])
+
+
+def test_exact_chunked_error_vector_prefetch_window_stays_bounded() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 1, 2, 3], [0, 0, 0, 0], [0, 0, 0, 0]]),
+        values=torch.ones(4),
+        size=(4, 1, 1),
+        check_invariants=True,
+    ).coalesce()
+    error_vectors = torch.arange(32, dtype=torch.float32).reshape(4, 1, 8)
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=error_vectors,
+        token_vectors=torch.zeros(1, 8),
+        decoder_vecs=torch.empty((0, 8)),
+        encoder_vecs=torch.ones((activation_matrix._nnz(), 8)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1, 1, 5),
+        decoder_provider=FakeDecoderProvider({0: torch.zeros(1, 4, 8)}),
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+        error_vector_prefetch_lookahead=2,
+    )
+
+    assert torch.equal(
+        ctx.get_error_vectors_for_layer(3, device=torch.device("cpu")), error_vectors[3]
+    )
+    assert set(ctx._materialized_error_vector_layers) == {2, 3}
+
+    assert torch.equal(
+        ctx.get_error_vectors_for_layer(1, device=torch.device("cpu")), error_vectors[1]
+    )
+    assert set(ctx._materialized_error_vector_layers) == {0, 1}
+
+
+def test_chunked_feature_replay_windows_match_full_replay() -> None:
+    grads_by_output_layer = [
+        torch.tensor(
+            [
+                [[1.0, 10.0], [2.0, 20.0]],
+                [[3.0, 30.0], [4.0, 40.0]],
+            ]
+        ),
+        torch.tensor(
+            [
+                [[5.0, 50.0], [6.0, 60.0]],
+                [[7.0, 70.0], [8.0, 80.0]],
+            ]
+        ),
+        None,
+    ]
+
+    full_ctx, _ = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    full_ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+    expected = full_ctx._batch_buffer.clone()
+
+    windowed_ctx, _ = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    windowed_ctx._compute_chunked_feature_attributions_from_grads(
+        [grads_by_output_layer[0], None, None]
+    )
+    windowed_ctx._compute_chunked_feature_attributions_from_grads(
+        [None, grads_by_output_layer[1], None]
+    )
+
+    assert torch.allclose(windowed_ctx._batch_buffer, expected)
+
+
+def test_decoder_cache_guardrail_auto_disables_on_churn() -> None:
+    n_chunks = 16
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.stack(
+            [
+                torch.zeros(n_chunks, dtype=torch.long),
+                torch.arange(n_chunks, dtype=torch.long),
+                torch.arange(n_chunks, dtype=torch.long),
+            ]
+        ),
+        values=torch.ones(n_chunks),
+        size=(1, n_chunks, n_chunks),
+        check_invariants=True,
+    ).coalesce()
+    provider = GuardrailDecoderProvider(
+        {0: torch.ones(n_chunks, 1, 2, dtype=torch.float32)},
+        cache_max_bytes=8,
+    )
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(1, n_chunks, 2),
+        token_vectors=torch.zeros(n_chunks, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1, 1, 5),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+    ctx._batch_buffer = torch.zeros(ctx._row_size, 1)
+    grads = [torch.ones(1, n_chunks, 2)]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ctx._compute_chunked_feature_attributions_from_grads(grads)
+
+    assert ctx.decoder_chunk_cache is None
+    assert provider.auto_disable_reasons
+    assert caught
+    assert ctx.get_diagnostic_snapshot()["decoder_cache_guardrail_disabled"] == 1.0
+
+
+def test_decoder_cache_guardrail_keeps_useful_cache_enabled() -> None:
+    n_chunks = 8
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.stack(
+            [
+                torch.zeros(n_chunks, dtype=torch.long),
+                torch.arange(n_chunks, dtype=torch.long),
+                torch.arange(n_chunks, dtype=torch.long),
+            ]
+        ),
+        values=torch.ones(n_chunks),
+        size=(1, n_chunks, n_chunks),
+        check_invariants=True,
+    ).coalesce()
+    provider = GuardrailDecoderProvider(
+        {0: torch.ones(n_chunks, 1, 2, dtype=torch.float32)},
+        cache_max_bytes=64,
+    )
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(1, n_chunks, 2),
+        token_vectors=torch.zeros(n_chunks, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1, 1, 5),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+    ctx._batch_buffer = torch.zeros(ctx._row_size, 1)
+    grads = [torch.ones(1, n_chunks, 2)]
+
+    ctx._compute_chunked_feature_attributions_from_grads(grads)
+    ctx._batch_buffer.zero_()
+    ctx._compute_chunked_feature_attributions_from_grads(grads)
+
+    assert ctx.decoder_chunk_cache is not None
+    assert not provider.auto_disable_reasons
+    assert provider.stats["decoder_cache_hit_count"] == n_chunks
+
+
+def test_context_cleanup_is_idempotent_and_clears_buffers() -> None:
+    ctx, provider = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    ctx.get_error_vectors_for_layer(1, device=torch.device("cpu"))
+    ctx.cleanup()
+    ctx.cleanup()
+
+    assert provider.clear_calls >= 1
+    assert ctx.decoder_chunk_cache is None
+    assert ctx.encoder_vecs.numel() == 0
+    assert ctx.error_vectors.numel() == 0
+    assert ctx.token_vectors.numel() == 0
+    assert ctx.logits.numel() == 0

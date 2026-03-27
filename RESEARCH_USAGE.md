@@ -165,6 +165,8 @@ For deeper bottleneck-finding runs, this fork also supports:
 - `profile_log_interval=N`: log every N batches while profiling
 - `diagnostic_feature_cap=K`: debug-only early active-feature cap for scaling experiments
 - `sparsification=SparsificationConfig(...)`: early candidate screening before reconstruction
+- `feature_batch_size=...`: optional Phase 4-only feature microbatch override
+- `logit_batch_size=...`: optional Phase 3-only logit microbatch override
 
 Example diagnostic comparison:
 
@@ -173,11 +175,19 @@ graph = attribute(
     prompt,
     model,
     batch_size=16,
+    feature_batch_size=8,
+    logit_batch_size=4,
     max_feature_nodes=128,
     profile=True,
     profile_log_interval=1,
 )
 ```
+
+Notes:
+
+- You do **not** need to opt in to the new GemmaScope-2 VRAM behavior separately; it is automatic for GemmaScope-2 CLTs on `backend="nnsight"`.
+- `batch_size` still sets the main trace width; use the split batch knobs only when you want smaller Phase 3/Phase 4 work chunks without changing the legacy call shape.
+- Internal NNSight `setup_attribution(...)` now keeps only last-token logits by default on the exact chunked path. If you explicitly call that method and need full-sequence logits, pass `retain_full_logits=True`.
 
 And to test whether lazy decoder loading is the dominant cost, compare otherwise identical runs with:
 
@@ -195,6 +205,7 @@ The profiling logs report, where applicable:
 - decoder cache hit/miss/eviction counts and resident bytes
 - chunk counts and chunked attribution timing by layer
 - sparsification candidate counts, per-layer retained counts, and retained activation-mass proxy
+- whether exact chunked teardown completed and phase-boundary memory stayed bounded
 
 ## HPC guidance
 
@@ -204,6 +215,12 @@ The profiling logs report, where applicable:
 
 ```bash
 scripts/slurm/test_gemmascope2_chunked_a100.sbatch
+```
+
+- The expanded VRAM/memory-policy regression job added for this work is:
+
+```bash
+scripts/slurm/test_gemmascope2_chunked_memory_policy_a100.sbatch
 ```
 
 - Prefer `uv` commands in jobs and local environments.

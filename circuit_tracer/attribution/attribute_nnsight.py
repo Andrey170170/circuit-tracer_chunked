@@ -51,6 +51,10 @@ def _log_phase_metrics(logger, label: str, phase_start: float, device, **extra):
     )
 
 
+def _log_memory_boundary(logger, label: str, device, **extra) -> None:
+    logger.info(f"{label} | {format_memory_snapshot(device=device, extra=extra)}")
+
+
 def _snapshot_diagnostics(obj) -> dict[str, object] | None:
     if obj is None or not hasattr(obj, "get_diagnostic_snapshot"):
         return None
@@ -103,6 +107,8 @@ def attribute(
     max_n_logits: int = 10,
     desired_logit_prob: float = 0.95,
     batch_size: int = 512,
+    feature_batch_size: int | None = None,
+    logit_batch_size: int | None = None,
     max_feature_nodes: int | None = None,
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
@@ -128,6 +134,10 @@ def attribute(
         desired_logit_prob: Keep logits until cumulative prob >= this value
                            (used when attribution_targets is None).
         batch_size: How many source nodes to process per backward pass.
+        feature_batch_size: Optional override for feature-attribution batches.
+            Defaults to ``batch_size`` when omitted.
+        logit_batch_size: Optional override for logit-attribution batches.
+            Defaults to ``batch_size`` when omitted.
         max_feature_nodes: Max number of feature nodes to include in the graph.
         offload: Method for offloading model parameters to save memory.
                  Options are "cpu" (move to CPU), "disk" (save to disk),
@@ -166,6 +176,8 @@ def attribute(
             max_n_logits=max_n_logits,
             desired_logit_prob=desired_logit_prob,
             batch_size=batch_size,
+            feature_batch_size=feature_batch_size,
+            logit_batch_size=logit_batch_size,
             max_feature_nodes=max_feature_nodes,
             offload=offload,
             verbose=verbose,
@@ -192,6 +204,8 @@ def _run_attribution(
     max_n_logits: int,
     desired_logit_prob: float,
     batch_size: int,
+    feature_batch_size: int | None,
+    logit_batch_size: int | None,
     max_feature_nodes: int | None,
     offload: Literal["cpu", "disk", None],
     verbose: bool,
@@ -204,19 +218,33 @@ def _run_attribution(
     sparsification: SparsificationConfig | None = None,
 ):
     start_time = time.time()
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    if feature_batch_size is not None and feature_batch_size <= 0:
+        raise ValueError("feature_batch_size must be > 0 when provided")
+    if logit_batch_size is not None and logit_batch_size <= 0:
+        raise ValueError("logit_batch_size must be > 0 when provided")
+
+    effective_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
+    effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
+    trace_batch_size = max(batch_size, effective_feature_batch_size, effective_logit_batch_size)
+    ctx = None
+
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
     phase_start = time.time()
     input_ids = model.ensure_tokenized(prompt)
+    _log_memory_boundary(logger, "Phase 0 start", model.device)
 
     configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
     if callable(configure_trace_logging):
         configure_trace_logging(logger.info if profile else None)
 
+    reset_diagnostics = getattr(model.transcoders, "reset_diagnostic_stats", None)
+    if callable(reset_diagnostics):
+        reset_diagnostics()
+
     if profile:
-        reset_diagnostics = getattr(model.transcoders, "reset_diagnostic_stats", None)
-        if callable(reset_diagnostics):
-            reset_diagnostics()
         logger.info(
             "Profiling enabled | "
             f"lazy_encoder={getattr(model.transcoders, 'lazy_encoder', 'n/a')} | "
@@ -224,10 +252,15 @@ def _run_attribution(
             f"exact_chunked_decoder={getattr(model.transcoders, 'exact_chunked_decoder', False)} | "
             f"decoder_chunk_size={getattr(model.transcoders, 'decoder_chunk_size', 'n/a')} | "
             f"decoder_cache_bytes={getattr(model.transcoders, 'cross_batch_decoder_cache_bytes', 0)} | "
-            f"prompt_tokens={input_ids.shape[-1]} | attribution_batch_size={batch_size}"
+            f"prompt_tokens={input_ids.shape[-1]} | feature_batch_size={effective_feature_batch_size} | "
+            f"logit_batch_size={effective_logit_batch_size}"
         )
 
-    ctx = model.setup_attribution(input_ids, sparsification=sparsification)
+    ctx = model.setup_attribution(
+        input_ids,
+        sparsification=sparsification,
+        retain_full_logits=False,
+    )
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
     configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
@@ -251,6 +284,7 @@ def _run_attribution(
             phase_start,
             model.device,
             active_features=ctx.activation_matrix._nnz(),
+            logit_retention=getattr(ctx, "logit_retention", "full"),
         )
         if profile:
             if getattr(ctx, "setup_diagnostic_stats", None):
@@ -274,8 +308,9 @@ def _run_attribution(
         # Phase 1: forward pass
         logger.info("Phase 1: Running forward pass")
         phase_start = time.time()
+        _log_memory_boundary(logger, "Phase 1 start", model.device)
         with model.trace() as tracer:
-            with tracer.invoke(input_ids.expand(batch_size, -1)):
+            with tracer.invoke(input_ids.expand(trace_batch_size, -1)):
                 pass
 
             detach_barrier = tracer.barrier(2)
@@ -298,6 +333,7 @@ def _run_attribution(
         # Phase 2: build input vector list
         logger.info("Phase 2: Building input vectors")
         phase2_start = time.time()
+        _log_memory_boundary(logger, "Phase 2 start", model.device)
         feat_layers, feat_pos, _ = activation_matrix.indices()
         n_layers, n_pos, _ = activation_matrix.shape
         total_active_feats = activation_matrix._nnz()
@@ -305,7 +341,7 @@ def _run_attribution(
         # Create AttributionTargets using NNSight's unembed_weight accessor
         targets = AttributionTargets(
             attribution_targets=attribution_targets,
-            logits=ctx.logits[0, -1],
+            logits=ctx.get_last_token_logits()[0],
             unembed_proj=cast(torch.Tensor, model.unembed_weight),  # NNSight uses unembed_weight
             tokenizer=model.tokenizer,
             max_n_logits=max_n_logits,
@@ -348,10 +384,14 @@ def _run_attribution(
         # Phase 3: logit attribution
         logger.info("Phase 3: Computing logit attributions")
         phase3_start = time.time()
+        _log_memory_boundary(logger, "Phase 3 start", model.device)
         i = -1
-        total_logit_batches = max((len(targets) + batch_size - 1) // batch_size, 1)
-        for i in range(0, len(targets), batch_size):
-            batch = targets.logit_vectors[i : i + batch_size]
+        total_logit_batches = max(
+            (len(targets) + effective_logit_batch_size - 1) // effective_logit_batch_size,
+            1,
+        )
+        for i in range(0, len(targets), effective_logit_batch_size):
+            batch = targets.logit_vectors[i : i + effective_logit_batch_size]
             ctx_before = _snapshot_diagnostics(ctx) if profile else None
             transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
             batch_start = time.perf_counter()
@@ -365,11 +405,11 @@ def _run_attribution(
             row_to_node_index[i : i + batch.shape[0]] = (
                 torch.arange(i, i + batch.shape[0]) + logit_offset
             )
-            if profile and ((i // batch_size) + 1) % profile_log_interval == 0:
+            if profile and ((i // effective_logit_batch_size) + 1) % profile_log_interval == 0:
                 _log_batch_profile(
                     logger,
                     "Phase 3",
-                    (i // batch_size) + 1,
+                    (i // effective_logit_batch_size) + 1,
                     total_logit_batches,
                     time.perf_counter() - batch_start,
                     ctx_before,
@@ -391,6 +431,7 @@ def _run_attribution(
         # Phase 4: feature attribution
         logger.info("Phase 4: Computing feature attributions")
         phase4_start = time.time()
+        _log_memory_boundary(logger, "Phase 4 start", model.device)
         st = n_logits
         visited = torch.zeros(total_active_feats, dtype=torch.bool)
         n_visited = 0
@@ -412,10 +453,16 @@ def _run_attribution(
                     device=edge_matrix.device,
                 )
                 feature_rank = torch.argsort(influences[:total_active_feats], descending=True).cpu()
-                queue_size = min(update_interval * batch_size, actual_max_feature_nodes - n_visited)
+                queue_size = min(
+                    update_interval * effective_feature_batch_size,
+                    actual_max_feature_nodes - n_visited,
+                )
                 pending = feature_rank[~visited[feature_rank]][:queue_size]
 
-            queue = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
+            queue = [
+                pending[i : i + effective_feature_batch_size]
+                for i in range(0, len(pending), effective_feature_batch_size)
+            ]
 
             for idx_batch in queue:
                 n_visited += len(idx_batch)
@@ -426,25 +473,33 @@ def _run_attribution(
                 rows = ctx.compute_batch(
                     layers=feat_layers[idx_batch],
                     positions=feat_pos[idx_batch],
-                    inject_values=ctx.encoder_vecs[idx_batch],
+                    inject_values=ctx.materialize_encoder_vectors(idx_batch),
                     retain_graph=n_visited < actual_max_feature_nodes,
                     phase_label="phase4_features",
                 )
 
-                end = min(st + batch_size, st + rows.shape[0])
+                end = min(st + effective_feature_batch_size, st + rows.shape[0])
                 edge_matrix[st:end, :logit_offset] = rows.cpu()
                 row_to_node_index[st:end] = idx_batch
                 visited[idx_batch] = True
                 st = end
                 pbar.update(len(idx_batch))
                 if profile:
-                    batch_number = max(1, (n_visited + batch_size - 1) // batch_size)
+                    batch_number = max(
+                        1,
+                        (n_visited + effective_feature_batch_size - 1)
+                        // effective_feature_batch_size,
+                    )
                     if batch_number % profile_log_interval == 0:
                         _log_batch_profile(
                             logger,
                             "Phase 4",
                             batch_number,
-                            max((actual_max_feature_nodes + batch_size - 1) // batch_size, 1),
+                            max(
+                                (actual_max_feature_nodes + effective_feature_batch_size - 1)
+                                // effective_feature_batch_size,
+                                1,
+                            ),
                             time.perf_counter() - batch_start,
                             ctx_before,
                             _snapshot_diagnostics(ctx),
@@ -498,6 +553,13 @@ def _run_attribution(
 
         return graph
     finally:
-        clear_decoder_cache = getattr(ctx, "clear_decoder_cache", None)
-        if callable(clear_decoder_cache):
-            clear_decoder_cache()
+        if ctx is not None:
+            _log_memory_boundary(logger, "Teardown start", model.device)
+            cleanup = getattr(ctx, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+            else:
+                clear_decoder_cache = getattr(ctx, "clear_decoder_cache", None)
+                if callable(clear_decoder_cache):
+                    clear_decoder_cache()
+            _log_memory_boundary(logger, "Teardown done", model.device)

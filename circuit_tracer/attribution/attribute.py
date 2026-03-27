@@ -26,6 +26,8 @@ def attribute(
     max_n_logits: int = 10,
     desired_logit_prob: float = 0.95,
     batch_size: int = 512,
+    feature_batch_size: int | None = None,
+    logit_batch_size: int | None = None,
     max_feature_nodes: int | None = None,
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
@@ -54,6 +56,8 @@ def attribute(
         desired_logit_prob: Keep logits until cumulative prob >= this value
                            (used when attribution_targets is None).
         batch_size: How many source nodes to process per backward pass.
+        feature_batch_size: Optional override for NNSight feature-attribution batches.
+        logit_batch_size: Optional override for NNSight logit-attribution batches.
         max_feature_nodes: Max number of feature nodes to include in the graph.
         offload: Method for offloading model parameters to save memory.
                  Options are "cpu" (move to CPU), "disk" (save to disk),
@@ -83,6 +87,8 @@ def attribute(
             max_n_logits=max_n_logits,
             desired_logit_prob=desired_logit_prob,
             batch_size=batch_size,
+            feature_batch_size=feature_batch_size,
+            logit_batch_size=logit_batch_size,
             max_feature_nodes=max_feature_nodes,
             offload=offload,
             verbose=verbose,
