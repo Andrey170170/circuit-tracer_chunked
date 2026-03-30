@@ -125,6 +125,7 @@ Optional Phase 4 cross-batch decoder cache:
 - **disabled by default**
 - requires an explicit `cross_batch_decoder_cache_bytes` budget
 - intended for repeated-batch Phase 4 runs where decoder reloads dominate
+- once enabled, it remains active for the full attribution run unless you explicitly reset/clear it
 
 Script example:
 

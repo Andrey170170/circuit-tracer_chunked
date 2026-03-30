@@ -207,6 +207,8 @@ The profiling logs report, where applicable:
 - sparsification candidate counts, per-layer retained counts, and retained activation-mass proxy
 - whether exact chunked teardown completed and phase-boundary memory stayed bounded
 
+If you set `cross_batch_decoder_cache_bytes > 0`, the decoder cache now stays enabled for the full attribution run; interpret hit/miss/eviction counts directly rather than expecting an auto-disable guardrail.
+
 ## HPC guidance
 
 - Do **not** run large-model or GPU-heavy validation on shared login nodes.

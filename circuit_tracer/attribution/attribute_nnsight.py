@@ -117,6 +117,7 @@ def attribute(
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
+    compact_output: bool = False,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -187,6 +188,7 @@ def attribute(
             profile_log_interval=profile_log_interval,
             diagnostic_feature_cap=diagnostic_feature_cap,
             sparsification=sparsification,
+            compact_output=compact_output,
             logger=logger,
         )
     finally:
@@ -216,6 +218,7 @@ def _run_attribution(
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
+    compact_output: bool = False,
 ):
     start_time = time.time()
     if batch_size <= 0:
@@ -516,8 +519,34 @@ def _run_attribution(
             selected_features=int(visited.sum().item()),
         )
 
-        # Phase 5: packaging graph
+        # Phase 5: packaging graph / compact output
         selected_features = torch.where(visited)[0]
+        if compact_output:
+            compact_output_result = {
+                "input_string": model.tokenizer.decode(input_ids),
+                "input_tokens": input_ids.detach().cpu(),
+                "logit_targets": targets.logit_targets,
+                "logit_probabilities": targets.logit_probabilities.detach().cpu(),
+                "vocab_size": targets.vocab_size,
+                "active_features": activation_matrix.indices().T.detach().cpu(),
+                "activation_values": activation_matrix.values().detach().cpu(),
+                "selected_features": selected_features.detach().cpu(),
+                "feature_row_node_indices": row_to_node_index[n_logits:st].detach().cpu(),
+                "logit_row_node_indices": row_to_node_index[:n_logits].detach().cpu(),
+                "feature_feature_edges": edge_matrix[n_logits:st, selected_features].detach().cpu(),
+                "logit_feature_edges": edge_matrix[:n_logits, selected_features].detach().cpu(),
+                "cfg": model.config,
+                "scan": model.scan,
+            }
+            del edge_matrix
+            logger.info(
+                "Attribution completed in "
+                f"{time.time() - start_time:.2f}s | "
+                f"compact_feature_edge_shape={tuple(compact_output_result['feature_feature_edges'].shape)} | "
+                f"compact_logit_edge_shape={tuple(compact_output_result['logit_feature_edges'].shape)}"
+            )
+            return compact_output_result
+
         non_feature_nodes = torch.arange(total_active_feats, total_nodes)
         if actual_max_feature_nodes < total_active_feats:
             col_read = torch.cat([selected_features, non_feature_nodes])

@@ -1,6 +1,5 @@
 from pathlib import Path
 from typing import cast
-import warnings
 
 import pytest
 import torch
@@ -541,7 +540,7 @@ def test_chunked_feature_replay_windows_match_full_replay() -> None:
     assert torch.allclose(windowed_ctx._batch_buffer, expected)
 
 
-def test_decoder_cache_guardrail_auto_disables_on_churn() -> None:
+def test_decoder_cache_stays_enabled_on_churn() -> None:
     n_chunks = 16
     activation_matrix = torch.sparse_coo_tensor(
         indices=torch.stack(
@@ -579,14 +578,11 @@ def test_decoder_cache_guardrail_auto_disables_on_churn() -> None:
     ctx._batch_buffer = torch.zeros(ctx._row_size, 1)
     grads = [torch.ones(1, n_chunks, 2)]
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        ctx._compute_chunked_feature_attributions_from_grads(grads)
+    ctx._compute_chunked_feature_attributions_from_grads(grads)
 
-    assert ctx.decoder_chunk_cache is None
-    assert provider.auto_disable_reasons
-    assert caught
-    assert ctx.get_diagnostic_snapshot()["decoder_cache_guardrail_disabled"] == 1.0
+    assert ctx.decoder_chunk_cache is not None
+    assert not provider.auto_disable_reasons
+    assert provider.stats["decoder_cache_eviction_count"] > 0
 
 
 def test_decoder_cache_guardrail_keeps_useful_cache_enabled() -> None:

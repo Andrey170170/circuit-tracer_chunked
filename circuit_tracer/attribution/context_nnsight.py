@@ -4,7 +4,6 @@ Attribution context for managing hooks during attribution computation.
 
 import time
 import weakref
-import warnings
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -82,10 +81,6 @@ class AttributionContext:
         self._chunked_feature_replay_window = max(1, int(chunked_feature_replay_window))
         self._materialized_error_vector_layers: dict[int, torch.Tensor] = {}
         self._cleanup_complete = False
-        self._decoder_cache_guardrail_disabled = False
-        self._decoder_cache_disable_reason: str | None = None
-        self._decoder_cache_guardrail_min_lookups = 16
-        self._decoder_cache_guardrail_min_hit_rate = 0.05
 
         self.logits = logits
         self.full_logits = full_logits
@@ -131,7 +126,6 @@ class AttributionContext:
             "chunked_attr_replay_seconds": 0.0,
             "chunked_attr_grad_window_peak": 0.0,
             "error_vector_layers_resident_peak": 0.0,
-            "decoder_cache_auto_disabled": 0.0,
         }
 
         total_active_feats = activation_matrix._nnz()
@@ -238,49 +232,6 @@ class AttributionContext:
         self._compute_chunked_feature_attributions_from_grads(grads_to_replay)
         window_layers.clear()
 
-    def _should_disable_decoder_cache(self) -> tuple[bool, str | None]:
-        if self.decoder_chunk_cache is None or self._decoder_cache_guardrail_disabled:
-            return False, None
-
-        snapshot_fn = getattr(self.decoder_provider, "get_diagnostic_snapshot", None)
-        if not callable(snapshot_fn):
-            return False, None
-
-        snapshot = snapshot_fn()
-        hits = int(snapshot.get("decoder_cache_hit_count", 0))
-        misses = int(snapshot.get("decoder_cache_miss_count", 0))
-        evictions = int(snapshot.get("decoder_cache_eviction_count", 0))
-        total_lookups = hits + misses
-        if total_lookups < self._decoder_cache_guardrail_min_lookups:
-            return False, None
-
-        hit_rate = hits / total_lookups if total_lookups else 0.0
-        if hits == 0:
-            return True, (
-                f"Decoder chunk cache auto-disabled after {total_lookups} lookups with zero hits"
-            )
-        if evictions > 0 and hit_rate < self._decoder_cache_guardrail_min_hit_rate:
-            return True, (
-                "Decoder chunk cache auto-disabled due to low reuse "
-                f"(hits={hits}, misses={misses}, evictions={evictions}, hit_rate={hit_rate:.3f})"
-            )
-        return False, None
-
-    def _maybe_disable_decoder_cache(self) -> None:
-        should_disable, reason = self._should_disable_decoder_cache()
-        if not should_disable or reason is None:
-            return
-
-        warnings.warn(reason, stacklevel=2)
-        self._emit_trace("decoder.cache.auto_disable", reason=reason)
-        note_auto_disable = getattr(self.decoder_provider, "note_decoder_cache_auto_disabled", None)
-        if callable(note_auto_disable):
-            note_auto_disable(reason)
-        self.clear_decoder_cache()
-        self._decoder_cache_guardrail_disabled = True
-        self._decoder_cache_disable_reason = reason
-        self._diagnostic_stats["decoder_cache_auto_disabled"] = 1.0
-
     @staticmethod
     def _empty_like_tensor(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.is_sparse:
@@ -346,9 +297,6 @@ class AttributionContext:
             len(self._materialized_error_vector_layers)
         )
         snapshot["chunked_feature_replay_window"] = float(self._chunked_feature_replay_window)
-        snapshot["decoder_cache_guardrail_disabled"] = float(self._decoder_cache_guardrail_disabled)
-        if self._decoder_cache_disable_reason is not None:
-            snapshot["decoder_cache_disable_reason"] = self._decoder_cache_disable_reason
         snapshot["logit_retention"] = self.logit_retention
         return snapshot
 
@@ -412,8 +360,6 @@ class AttributionContext:
 
     def reset_decoder_cache(self) -> None:
         self.clear_decoder_cache()
-        if self._decoder_cache_guardrail_disabled:
-            return
         self.decoder_chunk_cache = self._create_decoder_cache()
 
     def apply_diagnostic_feature_cap(self, max_features: int) -> tuple[int, int]:
@@ -613,7 +559,6 @@ class AttributionContext:
             )
         if self.diagnostic_mode:
             self._add_stat("chunked_attr_replay_seconds", time.perf_counter() - replay_start)
-        self._maybe_disable_decoder_cache()
 
     def _compute_chunked_feature_attributions(self, layer: int, grads: torch.Tensor):
         self._compute_chunked_feature_attributions_from_grads(
