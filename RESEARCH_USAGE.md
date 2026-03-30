@@ -14,6 +14,7 @@ The repo-facing API is intentionally kept close to upstream:
 
 - `ReplacementModel.from_pretrained(...)` still works as before.
 - `attribute(...)` still works as before.
+- `attribute_phase0_stats(...)` now exposes a compact Phase-0-only count/timing API.
 - Existing graph consumers should continue to work with the produced `Graph` objects.
 
 ## Recommended usage for GemmaScope-2 CLTs
@@ -147,6 +148,30 @@ This keeps `attribute(...)` backward compatible when sparsification is omitted, 
 
 So if you pass `offload="cpu"` or `offload="disk"`, expect it to help with model memory pressure, but not by moving the active GemmaScope-2 transcoder itself away during attribution.
 
+## Phase 0 count-only analysis
+
+If you want prompt-level feature-count scaling data without tracing the full graph, use:
+
+```python
+from circuit_tracer import attribute_phase0_stats
+
+stats = attribute_phase0_stats(prompt, model)
+```
+
+This returns a compact dict with:
+
+- `token_count`
+- `prompt_token_count`
+- `total_active_features`
+- `active_features_by_layer`
+- `active_features_by_token`
+- `phase0_encode_seconds`
+- `phase0_reconstruction_seconds`
+
+This is the recommended path for Phase-0-only scaling studies, because it avoids Phases 1-4 and does not build a full `Graph` object.
+
+The CLT setup path in this fork also reduces Phase 0 VRAM spikes by replacing the previous list-plus-`torch.cat(...)` active-encoder assembly with a single final allocation plus layer-wise writes.
+
 ## Telemetry and logging
 
 With `verbose=True`, attribution logs include:
@@ -223,6 +248,12 @@ scripts/slurm/test_gemmascope2_chunked_a100.sbatch
 
 ```bash
 scripts/slurm/test_gemmascope2_chunked_memory_policy_a100.sbatch
+```
+
+- A focused Phase 0 stats / encoder-gather regression job is included at:
+
+```bash
+scripts/slurm/test_phase0_stats_a100.sbatch
 ```
 
 - Prefer `uv` commands in jobs and local environments.

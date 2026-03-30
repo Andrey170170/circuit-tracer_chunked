@@ -119,6 +119,35 @@ graph = attribute(
 - `logit_batch_size` optionally shrinks only Phase 3 logit batches.
 - You only need these new knobs when tuning memory/runtime tradeoffs; existing calls keep working unchanged.
 
+Phase 0 stats-only helper:
+
+```python
+from circuit_tracer import attribute_phase0_stats
+
+phase0_stats = attribute_phase0_stats(
+    "If Alice has 3 apples and buys 2 more, she has",
+    model,
+)
+
+print(phase0_stats)
+```
+
+This runs only the setup / Phase 0 portion of the pipeline and returns a compact dict:
+
+```python
+{
+    "token_count": 10,
+    "prompt_token_count": 10,
+    "total_active_features": 123456,
+    "active_features_by_layer": [...],
+    "active_features_by_token": [...],
+    "phase0_encode_seconds": 1.23,
+    "phase0_reconstruction_seconds": 4.56,
+}
+```
+
+Use this when you want prompt-level scaling/count analysis without running Phases 1-4 or building a full attribution graph.
+
 Optional Phase 4 cross-batch decoder cache:
 
 - available for the exact chunked GemmaScope-2 CLT path
@@ -196,7 +225,7 @@ Operational notes for this forked path:
 - `lazy_encoder=True` and `lazy_decoder=True` are recommended for GemmaScope-2 CLTs.
 - `offload="cpu"` or `offload="disk"` can still help for model components, but transcoder offload is intentionally skipped during exact chunked decoder attribution so decoder slices remain readable during backward scoring.
 - With `verbose=True`, phase-level runtime and memory telemetry is emitted to logs (RSS plus CUDA allocated/reserved where available), which is useful for SLURM debugging.
-- The exact chunked path now keeps only last-token logits by default during `setup_attribution(...)`, stages `encoder_vecs`/`error_vectors` more conservatively, and cleans up run-scoped attribution buffers/caches during teardown automatically.
+- The exact chunked path now keeps only last-token logits by default during `setup_attribution(...)`, stages `encoder_vecs`/`error_vectors` more conservatively, avoids the previous `torch.cat(...)` encoder-vector peak during Phase 0, and cleans up run-scoped attribution buffers/caches during teardown automatically.
 - `SparsificationConfig(per_layer_position_topk=..., global_cap=...)` uses a per-layer-per-position activation screen first, then an optional global cap as a safety valve.
 - For deeper profiling, `attribute(..., profile=True, profile_log_interval=1)` emits setup/precompute diagnostics, live `TRACE ...` progress lines for long-running work, batch-level diagnostics including decoder load counts/timing and chunked attribution timing, and sparsification retention summaries when sparsification is enabled.
 - When the cross-batch decoder cache is enabled, profiling also reports decoder cache hits, misses, evictions, and resident bytes.

@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from circuit_tracer.attribution.attribute import attribute
+    from circuit_tracer.attribution.attribute import attribute_phase0_stats
     from circuit_tracer.attribution.sparsification import SparsificationConfig
     from circuit_tracer.graph import Graph
     from circuit_tracer.replacement_model import ReplacementModel
@@ -10,6 +11,7 @@ __all__ = [
     "ReplacementModel",
     "Graph",
     "attribute",
+    "attribute_phase0_stats",
     "SparsificationConfig",
 ]
 
@@ -17,6 +19,10 @@ __all__ = [
 def __getattr__(name):
     _lazy_imports = {
         "attribute": ("circuit_tracer.attribution.attribute", "attribute"),
+        "attribute_phase0_stats": (
+            "circuit_tracer.attribution.attribute",
+            "attribute_phase0_stats",
+        ),
         "SparsificationConfig": (
             "circuit_tracer.attribution.sparsification",
             "SparsificationConfig",

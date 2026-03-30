@@ -296,3 +296,26 @@ def test_forward_pass_consistency(create_test_clt_files):
     # Outputs should be identical
     assert torch.allclose(eager_output, lazy_output, rtol=1e-5)
     assert eager_output.shape == (eager_clt.n_layers, n_pos, eager_clt.d_model)
+
+
+def test_gather_encoder_vectors_preserves_sparse_order(create_test_clt_files):
+    clt_path = create_test_clt_files(n_layers=3, d_model=32, d_transcoder=64)
+    clt = load_clt(
+        clt_path,
+        device=torch.device("cpu"),
+        lazy_encoder=True,
+        lazy_decoder=True,
+    )
+
+    inputs = torch.randn(clt.n_layers, 6, clt.d_model, dtype=clt.b_enc.dtype)
+    features, _ = clt.encode_sparse(inputs, return_encoder_vectors=False)
+    gathered = clt.gather_encoder_vectors(features)
+
+    source_layers, _, feat_ids = features.indices()
+    expected = torch.empty_like(gathered)
+    for idx, (layer_id, feat_id) in enumerate(
+        zip(source_layers.tolist(), feat_ids.tolist(), strict=True)
+    ):
+        expected[idx] = clt._get_encoder_weights(layer_id)[feat_id]
+
+    assert torch.allclose(gathered, expected)

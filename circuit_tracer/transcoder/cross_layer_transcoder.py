@@ -494,7 +494,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             active_encoders: Encoder vectors for active features only
         """
         sparse_layers = []
-        encoder_vectors = [] if return_encoder_vectors else None
+        feature_ids_by_layer = [] if return_encoder_vectors else None
         encode_start = time.perf_counter()
         self.emit_trace_event(
             "phase0.encode_sparse.start",
@@ -515,12 +515,12 @@ class CrossLayerTranscoder(torch.nn.Module):
 
             layer_features[zero_positions] = 0
 
-            sparse_layer = layer_features.to_sparse()
+            sparse_layer = layer_features.to_sparse().coalesce()
             sparse_layers.append(sparse_layer)
 
             _, feat_idx = sparse_layer.indices()
-            if encoder_vectors is not None:
-                encoder_vectors.append(W_enc_layer[feat_idx])
+            if feature_ids_by_layer is not None:
+                feature_ids_by_layer.append(feat_idx)
             self._add_diagnostic_layer_value(
                 "encode_sparse_by_layer", layer_id, time.perf_counter() - layer_start
             )
@@ -535,7 +535,11 @@ class CrossLayerTranscoder(torch.nn.Module):
             )
 
         sparse_features = torch.stack(sparse_layers).coalesce()
-        active_encoders = torch.cat(encoder_vectors, dim=0) if encoder_vectors is not None else None
+        active_encoders = (
+            self._gather_encoder_vectors_by_layer(feature_ids_by_layer, device=x.device)
+            if feature_ids_by_layer is not None
+            else None
+        )
         encode_elapsed = time.perf_counter() - encode_start
         self._add_diagnostic_value("encode_sparse_seconds", encode_elapsed)
         self.emit_trace_event(
@@ -545,21 +549,44 @@ class CrossLayerTranscoder(torch.nn.Module):
         )
         return sparse_features, active_encoders
 
+    def _gather_encoder_vectors_by_layer(
+        self,
+        feature_ids_by_layer: list[torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        total_active_features = sum(int(feat_ids.numel()) for feat_ids in feature_ids_by_layer)
+        if total_active_features == 0:
+            return torch.empty((0, self.d_model), device=device, dtype=self.dtype)
+
+        active_encoders = torch.empty(
+            (total_active_features, self.d_model),
+            device=device,
+            dtype=self.dtype,
+        )
+        offset = 0
+        for layer_id, feat_ids in enumerate(feature_ids_by_layer):
+            count = int(feat_ids.numel())
+            if count == 0:
+                continue
+            active_encoders[offset : offset + count] = self._get_encoder_weights(layer_id)[feat_ids]
+            offset += count
+        return active_encoders
+
     def gather_encoder_vectors(self, features: torch.Tensor) -> torch.Tensor:
         if not features.is_sparse:
             features = features.to_sparse()
+        features = features.coalesce()
 
         source_layers, _, feat_ids = features.indices()
-        encoder_vectors = []
-        for layer_id in range(self.n_layers):
-            layer_mask = source_layers == layer_id
-            if not layer_mask.any():
-                continue
-            encoder_vectors.append(self._get_encoder_weights(layer_id)[feat_ids[layer_mask]])
+        layer_counts = torch.bincount(source_layers, minlength=self.n_layers).tolist()
+        feature_ids_by_layer: list[torch.Tensor] = []
+        offset = 0
+        for count in layer_counts:
+            feature_ids_by_layer.append(feat_ids[offset : offset + count])
+            offset += count
 
-        if encoder_vectors:
-            return torch.cat(encoder_vectors, dim=0)
-        return torch.empty((0, self.d_model), device=features.device, dtype=self.dtype)
+        return self._gather_encoder_vectors_by_layer(feature_ids_by_layer, device=features.device)
 
     def _get_decoder_vectors(self, layer_id, feat_ids=None):
         to_read = feat_ids if feat_ids is not None else np.s_[:]
