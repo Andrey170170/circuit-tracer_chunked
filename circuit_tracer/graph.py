@@ -417,3 +417,120 @@ def compute_partial_influences(
         raise RuntimeError("Failed to converge")
 
     return influences
+
+
+def compute_partial_feature_influences(
+    feature_edge_matrix: torch.Tensor,
+    row_abs_sums: torch.Tensor,
+    logit_p: torch.Tensor,
+    row_to_node_index: torch.Tensor,
+    *,
+    n_feature_nodes: int,
+    n_logits: int,
+    max_iter: int = 128,
+    device=None,
+    row_chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Compute feature-only partial influences from compact row storage.
+
+    This is mathematically equivalent to ``compute_partial_influences(...)[ :n_feature_nodes ]``
+    when:
+      - rows correspond to logit + feature source nodes,
+      - only feature-column edges are materialized, and
+      - ``row_abs_sums`` stores exact L1 row sums over *all* original columns.
+
+    Args:
+        feature_edge_matrix: Dense matrix of shape ``(n_rows, n_feature_nodes)`` containing
+            feature-column edge values for each stored row.
+        row_abs_sums: Exact absolute row sums over the original full edge rows
+            (shape ``(n_rows,)``). These preserve normalization semantics even when
+            non-feature columns are not materialized.
+        logit_p: Logit probabilities / weights for the first ``n_logits`` rows.
+        row_to_node_index: Mapping from row index to original node index.
+        n_feature_nodes: Number of active feature columns in the original graph.
+        n_logits: Number of logit rows at the start of the stored rows.
+        max_iter: Maximum number of power-iteration steps.
+        device: Device to run computation on.
+        row_chunk_size: Row chunk size for batched matrix-vector products.
+
+    Returns:
+        Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
+
+    Raises:
+        ValueError: If inputs are inconsistent.
+        RuntimeError: If computation fails to converge within ``max_iter``.
+    """
+
+    if n_feature_nodes < 0:
+        raise ValueError("n_feature_nodes must be >= 0")
+    if n_logits < 0:
+        raise ValueError("n_logits must be >= 0")
+    if feature_edge_matrix.ndim != 2:
+        raise ValueError("feature_edge_matrix must be rank-2")
+
+    n_rows, feature_cols = feature_edge_matrix.shape
+    if feature_cols != n_feature_nodes:
+        raise ValueError(
+            "feature_edge_matrix second dimension must equal n_feature_nodes "
+            f"({feature_cols} != {n_feature_nodes})"
+        )
+    if row_abs_sums.numel() != n_rows:
+        raise ValueError("row_abs_sums length must equal number of rows")
+    if row_to_node_index.numel() != n_rows:
+        raise ValueError("row_to_node_index length must equal number of rows")
+    if n_logits > n_rows:
+        raise ValueError("n_logits must be <= number of rows")
+    if logit_p.numel() != n_logits:
+        raise ValueError("logit_p length must equal n_logits")
+
+    device = device or feature_edge_matrix.device
+    working_feature_matrix = (
+        feature_edge_matrix
+        if feature_edge_matrix.device == device
+        else feature_edge_matrix.to(device)
+    )
+    working_row_abs_sums = (
+        row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
+    ).to(dtype=working_feature_matrix.dtype)
+    working_row_index = (
+        row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
+    ).long()
+    working_logit_p = logit_p if logit_p.device == device else logit_p.to(device)
+
+    feature_row_node_index = working_row_index[n_logits:]
+    if feature_row_node_index.numel():
+        if feature_row_node_index.min() < 0 or feature_row_node_index.max() >= n_feature_nodes:
+            raise ValueError(
+                "feature row node indices must be in [0, n_feature_nodes) for compact influences"
+            )
+
+    influences = torch.zeros(n_feature_nodes, device=device, dtype=working_feature_matrix.dtype)
+    row_weights = torch.zeros(n_rows, device=device, dtype=working_feature_matrix.dtype)
+    row_weights[:n_logits] = working_logit_p.to(dtype=working_feature_matrix.dtype)
+
+    for _ in range(max_iter):
+        next_feature_prod = torch.zeros_like(influences)
+        for start in range(0, n_rows, row_chunk_size):
+            end = min(start + row_chunk_size, n_rows)
+            chunk = working_feature_matrix[start:end].abs()
+            if not chunk.numel():
+                continue
+
+            chunk_row_weights = row_weights[start:end]
+            if not chunk_row_weights.any():
+                continue
+
+            denom = working_row_abs_sums[start:end].clamp(min=1e-8)
+            next_feature_prod += (chunk_row_weights / denom) @ chunk
+
+        if not next_feature_prod.any():
+            break
+
+        influences += next_feature_prod
+        row_weights.zero_()
+        if feature_row_node_index.numel():
+            row_weights[n_logits:] = next_feature_prod[feature_row_node_index]
+    else:
+        raise RuntimeError("Failed to converge")
+
+    return influences

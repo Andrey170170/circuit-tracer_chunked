@@ -1,6 +1,6 @@
 import torch
 
-from circuit_tracer.graph import compute_partial_influences
+from circuit_tracer.graph import compute_partial_feature_influences, compute_partial_influences
 
 
 def compute_partial_influences_reference(
@@ -58,3 +58,81 @@ def test_compute_partial_influences_keeps_cpu_ownership_by_default():
     influences = compute_partial_influences(edge_matrix, logit_p, row_to_node_index)
 
     assert influences.device.type == "cpu"
+
+
+def test_compute_partial_feature_influences_matches_dense_feature_slice():
+    n_features = 4
+    n_sinks = 3
+    n_logits = 2
+    total_nodes = n_features + n_sinks + n_logits
+
+    edge_matrix = torch.tensor(
+        [
+            # logit rows
+            [0.2, -0.1, 0.0, 0.3, 0.7, 0.0, -0.2, 0.0, 0.0],
+            [0.1, 0.0, -0.2, 0.0, 0.2, -0.4, 0.3, 0.0, 0.0],
+            # feature rows
+            [0.4, -0.1, 0.2, 0.0, 0.6, -0.2, 0.0, 0.0, 0.0],
+            [0.0, 0.3, 0.1, -0.5, -0.8, 0.0, 0.2, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    logit_p = torch.tensor([0.75, 0.25], dtype=torch.float32)
+    # First two rows are logits (node indices at tail), then two visited feature rows
+    row_to_node_index = torch.tensor(
+        [total_nodes - 2, total_nodes - 1, 1, 3],
+        dtype=torch.int32,
+    )
+
+    expected_full = compute_partial_influences(
+        edge_matrix,
+        logit_p,
+        row_to_node_index,
+        device=torch.device("cpu"),
+        row_chunk_size=2,
+    )
+
+    actual_feature_only = compute_partial_feature_influences(
+        edge_matrix[:, :n_features],
+        edge_matrix.abs().sum(dim=1),
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        device=torch.device("cpu"),
+        row_chunk_size=2,
+    )
+
+    assert torch.allclose(actual_feature_only, expected_full[:n_features], atol=1e-6, rtol=1e-6)
+
+
+def test_compute_partial_feature_influences_uses_full_row_abs_sums_for_normalization():
+    n_features = 3
+    n_sinks = 2
+    n_logits = 1
+    total_nodes = n_features + n_sinks + n_logits
+
+    # Large sink mass should dilute feature influence exactly as in dense path.
+    edge_matrix = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 100.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0, 0.0, 50.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([total_nodes - 1, 0], dtype=torch.int32)
+
+    expected = compute_partial_influences(edge_matrix, logit_p, row_to_node_index)
+
+    compact = compute_partial_feature_influences(
+        edge_matrix[:, :n_features],
+        edge_matrix.abs().sum(dim=1),
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+
+    # If row_abs_sums ignored sink columns this would fail (much larger values).
+    assert torch.allclose(compact, expected[:n_features], atol=1e-6, rtol=1e-6)

@@ -34,7 +34,11 @@ from circuit_tracer.attribution.targets import (
     log_attribution_target_info,
 )
 from circuit_tracer.attribution.sparsification import SparsificationConfig
-from circuit_tracer.graph import Graph, compute_partial_influences
+from circuit_tracer.graph import (
+    Graph,
+    compute_partial_feature_influences,
+    compute_partial_influences,
+)
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.utils.telemetry import (
@@ -413,17 +417,43 @@ def _run_attribution(
             f"Will include {actual_max_feature_nodes} of {total_active_feats} feature nodes"
         )
 
-        edge_matrix = torch.zeros(actual_max_feature_nodes + n_logits, total_nodes)
+        use_compact_feature_row_store = compact_output and bool(
+            getattr(model.transcoders, "exact_chunked_decoder", False)
+        )
+        if use_compact_feature_row_store:
+            feature_edge_matrix = torch.zeros(
+                actual_max_feature_nodes + n_logits,
+                total_active_feats,
+            )
+            row_abs_sums = torch.zeros(actual_max_feature_nodes + n_logits)
+        else:
+            edge_matrix = torch.zeros(actual_max_feature_nodes + n_logits, total_nodes)
+
         # Maps row indices in edge_matrix to original feature/node indices
         # First populated with logit node IDs, then feature IDs in attribution order
         row_to_node_index = torch.zeros(actual_max_feature_nodes + n_logits, dtype=torch.int32)
+
+        phase2_extra: dict[str, object] = {
+            "row_store_mode": "compact_feature" if use_compact_feature_row_store else "dense_full"
+        }
+        if use_compact_feature_row_store:
+            phase2_extra.update(
+                feature_edge_matrix_shape=f"{tuple(feature_edge_matrix.shape)}",
+                row_abs_sums_shape=f"{tuple(row_abs_sums.shape)}",
+                feature_edge_matrix_dtype=feature_edge_matrix.dtype,
+            )
+        else:
+            phase2_extra.update(
+                edge_matrix_shape=f"{tuple(edge_matrix.shape)}",
+                edge_matrix_dtype=edge_matrix.dtype,
+            )
+
         _log_phase_metrics(
             logger,
             "Input vector build",
             phase2_start,
             model.device,
-            edge_matrix_shape=f"{tuple(edge_matrix.shape)}",
-            edge_matrix_dtype=edge_matrix.dtype,
+            **phase2_extra,
         )
 
         # Phase 3: logit attribution
@@ -446,7 +476,13 @@ def _run_attribution(
                 inject_values=batch,
                 phase_label="phase3_logits",
             )
-            edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()
+            rows_cpu = rows.cpu()
+            if use_compact_feature_row_store:
+                end = i + batch.shape[0]
+                feature_edge_matrix[i:end] = rows_cpu[:, :total_active_feats]
+                row_abs_sums[i:end] = rows_cpu[:, :logit_offset].abs().sum(dim=1)
+            else:
+                edge_matrix[i : i + batch.shape[0], :logit_offset] = rows_cpu
             row_to_node_index[i : i + batch.shape[0]] = (
                 torch.arange(i, i + batch.shape[0]) + logit_offset
             )
@@ -491,13 +527,26 @@ def _run_attribution(
             if actual_max_feature_nodes == total_active_feats:
                 pending = torch.arange(total_active_feats)
             else:
-                influences = compute_partial_influences(
-                    edge_matrix[:st],
-                    targets.logit_probabilities,
-                    row_to_node_index[:st],
-                    device=edge_matrix.device,
-                )
-                feature_rank = torch.argsort(influences[:total_active_feats], descending=True).cpu()
+                if use_compact_feature_row_store:
+                    feature_influences = compute_partial_feature_influences(
+                        feature_edge_matrix[:st],
+                        row_abs_sums[:st],
+                        targets.logit_probabilities,
+                        row_to_node_index[:st],
+                        n_feature_nodes=total_active_feats,
+                        n_logits=n_logits,
+                        device=feature_edge_matrix.device,
+                    )
+                else:
+                    influences = compute_partial_influences(
+                        edge_matrix[:st],
+                        targets.logit_probabilities,
+                        row_to_node_index[:st],
+                        device=edge_matrix.device,
+                    )
+                    feature_influences = influences[:total_active_feats]
+
+                feature_rank = torch.argsort(feature_influences, descending=True).cpu()
                 queue_size = min(
                     update_interval * effective_feature_batch_size,
                     actual_max_feature_nodes - n_visited,
@@ -524,7 +573,13 @@ def _run_attribution(
                 )
 
                 end = min(st + effective_feature_batch_size, st + rows.shape[0])
-                edge_matrix[st:end, :logit_offset] = rows.cpu()
+                rows_cpu = rows.cpu()
+                if use_compact_feature_row_store:
+                    row_count = end - st
+                    feature_edge_matrix[st:end] = rows_cpu[:row_count, :total_active_feats]
+                    row_abs_sums[st:end] = rows_cpu[:row_count, :logit_offset].abs().sum(dim=1)
+                else:
+                    edge_matrix[st:end, :logit_offset] = rows_cpu
                 row_to_node_index[st:end] = idx_batch
                 visited[idx_batch] = True
                 st = end
@@ -564,6 +619,17 @@ def _run_attribution(
         # Phase 5: packaging graph / compact output
         selected_features = torch.where(visited)[0]
         if compact_output:
+            if use_compact_feature_row_store:
+                feature_feature_edges = (
+                    feature_edge_matrix[n_logits:st, selected_features].detach().cpu()
+                )
+                logit_feature_edges = (
+                    feature_edge_matrix[:n_logits, selected_features].detach().cpu()
+                )
+            else:
+                feature_feature_edges = edge_matrix[n_logits:st, selected_features].detach().cpu()
+                logit_feature_edges = edge_matrix[:n_logits, selected_features].detach().cpu()
+
             compact_output_result = {
                 "input_string": model.tokenizer.decode(input_ids),
                 "input_tokens": input_ids.detach().cpu(),
@@ -575,12 +641,16 @@ def _run_attribution(
                 "selected_features": selected_features.detach().cpu(),
                 "feature_row_node_indices": row_to_node_index[n_logits:st].detach().cpu(),
                 "logit_row_node_indices": row_to_node_index[:n_logits].detach().cpu(),
-                "feature_feature_edges": edge_matrix[n_logits:st, selected_features].detach().cpu(),
-                "logit_feature_edges": edge_matrix[:n_logits, selected_features].detach().cpu(),
+                "feature_feature_edges": feature_feature_edges,
+                "logit_feature_edges": logit_feature_edges,
                 "cfg": model.config,
                 "scan": model.scan,
             }
-            del edge_matrix
+            if use_compact_feature_row_store:
+                del feature_edge_matrix
+                del row_abs_sums
+            else:
+                del edge_matrix
             logger.info(
                 "Attribution completed in "
                 f"{time.time() - start_time:.2f}s | "
