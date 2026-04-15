@@ -179,13 +179,44 @@ class AttributionContext:
         *,
         device: torch.device | None = None,
     ) -> torch.Tensor:
+        if self.encoder_vecs.numel() > 0:
+            if isinstance(indices, slice):
+                encoder_slice = self.encoder_vecs[indices]
+            else:
+                encoder_slice = self.encoder_vecs[
+                    indices.to(device=self.encoder_vecs.device, dtype=torch.long)
+                ]
+            return self._materialize_tensor(
+                encoder_slice, device=device, dtype=self.encoder_vecs.dtype
+            )
+
+        if self.chunked_decoder_state is None:
+            raise RuntimeError("encoder vectors are unavailable and no chunked state was provided")
+
+        materialize_rows = getattr(self.decoder_provider, "materialize_encoder_rows", None)
+        if not callable(materialize_rows):
+            raise RuntimeError(
+                "encoder vectors are unavailable and decoder_provider does not support "
+                "materialize_encoder_rows"
+            )
+
+        total_active_feats = self.activation_matrix._nnz()
         if isinstance(indices, slice):
-            encoder_slice = self.encoder_vecs[indices]
+            row_indices = torch.arange(
+                total_active_feats,
+                device=self.chunked_decoder_state["source_layers"].device,
+                dtype=torch.long,
+            )[indices]
         else:
-            encoder_slice = self.encoder_vecs[
-                indices.to(device=self.encoder_vecs.device, dtype=torch.long)
-            ]
-        return self._materialize_tensor(encoder_slice, device=device, dtype=self.encoder_vecs.dtype)
+            row_indices = indices.to(
+                device=self.chunked_decoder_state["source_layers"].device,
+                dtype=torch.long,
+            )
+
+        source_layers = self.chunked_decoder_state["source_layers"][row_indices]
+        feature_ids = self.chunked_decoder_state["feature_ids"][row_indices]
+        encoder_slice = materialize_rows(source_layers=source_layers, feature_ids=feature_ids)
+        return self._materialize_tensor(encoder_slice, device=device, dtype=encoder_slice.dtype)
 
     def _prepare_error_vector_window(
         self, layer: int, *, device: torch.device | None = None
@@ -394,7 +425,8 @@ class AttributionContext:
             device=self.activation_matrix.device,
             dtype=self.activation_matrix.dtype,
         ).coalesce()
-        self.encoder_vecs = self.encoder_vecs[selected.to(device=self.encoder_vecs.device)]
+        if self.encoder_vecs.numel() > 0:
+            self.encoder_vecs = self.encoder_vecs[selected.to(device=self.encoder_vecs.device)]
 
         if self.chunked_decoder_state is not None:
             for key in self.chunked_decoder_state:

@@ -549,11 +549,20 @@ class NNSightReplacementModel(LanguageModel):
         component_start = time.perf_counter()
         if callable(trace_event):
             trace_event("phase0.setup.components_start", backend="nnsight")
-        attribution_data = transcoders.compute_attribution_components(
-            mlp_in_cache,
-            self.zero_positions,
-            sparsification=sparsification,
-        )  # type: ignore
+        exact_chunked_decoder = getattr(transcoders, "exact_chunked_decoder", False)
+        if exact_chunked_decoder:
+            attribution_data = transcoders.compute_attribution_components(
+                mlp_in_cache,
+                self.zero_positions,
+                sparsification=sparsification,
+                materialize_encoder_vecs=False,
+            )  # type: ignore
+        else:
+            attribution_data = transcoders.compute_attribution_components(
+                mlp_in_cache,
+                self.zero_positions,
+                sparsification=sparsification,
+            )  # type: ignore
         activation_matrix = cast(torch.Tensor, attribution_data["activation_matrix"])
         reconstruction = cast(torch.Tensor, attribution_data["reconstruction"])
         decoder_vecs = cast(torch.Tensor, attribution_data["decoder_vecs"])
@@ -583,7 +592,6 @@ class NNSightReplacementModel(LanguageModel):
         token_vectors = self.embed_weight[  # type: ignore
             tokens
         ].detach()  # (n_pos, d_model)  # type: ignore
-        exact_chunked_decoder = getattr(transcoders, "exact_chunked_decoder", False)
         retained_logits = logits
         full_logits = logits if retain_full_logits else None
         if exact_chunked_decoder and not retain_full_logits:

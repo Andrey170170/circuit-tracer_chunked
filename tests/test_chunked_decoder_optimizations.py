@@ -533,6 +533,68 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
     assert torch.equal(batch, encoder_vecs[torch.tensor([2, 0])])
 
 
+def test_exact_chunked_lazy_encoder_materialization_matches_eager_rows(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    clt = load_gemma_scope_2_clt(
+        _create_gemmascope2_clt_files(tmp_path),
+        device=torch.device("cpu"),
+        lazy_encoder=True,
+        lazy_decoder=True,
+    )
+    inputs = torch.randn(clt.n_layers, 4, clt.d_model, dtype=clt.dtype)
+
+    eager_components = clt.compute_attribution_components(
+        inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=True,
+    )
+    lazy_components = clt.compute_attribution_components(
+        inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=False,
+    )
+
+    eager_activation = cast(torch.Tensor, eager_components["activation_matrix"])
+    lazy_activation = cast(torch.Tensor, lazy_components["activation_matrix"])
+    eager_encoder_vecs = cast(torch.Tensor, eager_components["encoder_vecs"])
+    lazy_encoder_vecs = cast(torch.Tensor, lazy_components["encoder_vecs"])
+
+    assert torch.equal(lazy_activation.indices(), eager_activation.indices())
+    assert torch.allclose(lazy_activation.values(), eager_activation.values())
+    assert lazy_encoder_vecs.shape == (0, clt.d_model)
+    assert eager_activation._nnz() > 0
+
+    ctx = NNSightAttributionContext(
+        activation_matrix=lazy_activation,
+        error_vectors=torch.zeros(clt.n_layers, inputs.shape[1], clt.d_model, dtype=clt.dtype),
+        token_vectors=torch.zeros(inputs.shape[1], clt.d_model, dtype=clt.dtype),
+        decoder_vecs=cast(torch.Tensor, lazy_components["decoder_vecs"]),
+        encoder_vecs=lazy_encoder_vecs,
+        encoder_to_decoder_map=cast(torch.Tensor, lazy_components["encoder_to_decoder_map"]),
+        decoder_locations=cast(torch.Tensor, lazy_components["decoder_locations"]),
+        logits=torch.zeros(1, 1, 1, dtype=clt.dtype),
+        decoder_provider=clt,
+        chunked_decoder_state=cast(
+            dict[str, torch.Tensor], lazy_components["chunked_decoder_state"]
+        ),
+    )
+
+    nnz = eager_activation._nnz()
+    row_probe = torch.randperm(nnz)[: min(5, nnz)]
+    lazy_rows = ctx.materialize_encoder_vectors(row_probe, device=torch.device("cpu"))
+    assert torch.allclose(lazy_rows, eager_encoder_vecs[row_probe])
+
+    cap = max(1, nnz // 2)
+    selected = (
+        torch.topk(eager_activation.values().abs(), k=cap, sorted=False).indices.sort().values
+    )
+    before_cap, after_cap = ctx.apply_diagnostic_feature_cap(cap)
+    assert before_cap == nnz
+    assert after_cap == cap
+    capped_rows = ctx.materialize_encoder_vectors(torch.arange(cap), device=torch.device("cpu"))
+    assert torch.allclose(capped_rows, eager_encoder_vecs[selected])
+
+
 def test_exact_chunked_error_vector_prefetch_window_stays_bounded() -> None:
     activation_matrix = torch.sparse_coo_tensor(
         indices=torch.tensor([[0, 1, 2, 3], [0, 0, 0, 0], [0, 0, 0, 0]]),

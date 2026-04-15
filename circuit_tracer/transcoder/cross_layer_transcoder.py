@@ -588,6 +588,80 @@ class CrossLayerTranscoder(torch.nn.Module):
 
         return self._gather_encoder_vectors_by_layer(feature_ids_by_layer, device=features.device)
 
+    def _get_encoder_rows_for_layer(
+        self,
+        layer_id: int,
+        feat_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        feat_ids = feat_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+        if feat_ids.numel() == 0:
+            return torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+
+        if not self.lazy_encoder:
+            assert self.W_enc is not None, "Encoder weights are not set"
+            return self.W_enc[layer_id][feat_ids.to(device=self.W_enc.device)].to(dtype=self.dtype)
+
+        start = time.perf_counter()
+        if self.layer_paths is not None:
+            path = self.layer_paths[layer_id]
+            with safe_open(path, framework="pt", device="cpu") as f:
+                encoder_rows = f.get_slice("w_enc")[:, feat_ids].transpose(0, 1).contiguous()
+                result = self._move_lazy_slice_to_device(encoder_rows)
+        else:
+            assert self.clt_path is not None, "CLT path is not set"
+            path = os.path.join(self.clt_path, f"W_enc_{layer_id}.safetensors")
+            with safe_open(path, framework="pt", device="cpu") as f:
+                result = self._move_lazy_slice_to_device(f.get_slice(f"W_enc_{layer_id}")[feat_ids])
+
+        elapsed = time.perf_counter() - start
+        self._add_diagnostic_value("encoder_load_count", 1)
+        self._add_diagnostic_value("encoder_load_seconds", elapsed)
+        self._add_diagnostic_layer_value("encoder_load_by_layer", layer_id, elapsed)
+        return result
+
+    def materialize_encoder_rows(
+        self,
+        source_layers: torch.Tensor,
+        feature_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Materialize encoder rows for specific (layer, feature) pairs.
+
+        Args:
+            source_layers: 1-D tensor of source layer indices in requested row order.
+            feature_ids: 1-D tensor of feature indices aligned with ``source_layers``.
+
+        Returns:
+            Tensor of shape ``(len(source_layers), d_model)`` with rows in exactly
+            the input order.
+        """
+
+        source_layers = source_layers.reshape(-1).to(device="cpu", dtype=torch.long)
+        feature_ids = feature_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+        if source_layers.numel() != feature_ids.numel():
+            raise ValueError("source_layers and feature_ids must have matching lengths")
+
+        if source_layers.numel() == 0:
+            return torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+
+        active_encoders = torch.empty(
+            (source_layers.numel(), self.d_model),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        for layer_id in torch.unique(source_layers, sorted=True).tolist():
+            layer_mask = source_layers == layer_id
+            layer_rows = torch.nonzero(layer_mask, as_tuple=False).squeeze(-1)
+            if layer_rows.numel() == 0:
+                continue
+
+            layer_feat_ids = feature_ids[layer_rows]
+            active_encoders[layer_rows.to(device=self.device)] = self._get_encoder_rows_for_layer(
+                layer_id,
+                layer_feat_ids,
+            )
+
+        return active_encoders
+
     def _get_decoder_vectors(self, layer_id, feat_ids=None):
         to_read = feat_ids if feat_ids is not None else np.s_[:]
 
@@ -938,6 +1012,8 @@ class CrossLayerTranscoder(torch.nn.Module):
         inputs,
         zero_positions: slice = slice(0, 1),
         sparsification: SparsificationConfig | None = None,
+        *,
+        materialize_encoder_vecs: bool = True,
     ):
         """Extract active features and their encoder/decoder vectors for attribution.
 
@@ -956,12 +1032,19 @@ class CrossLayerTranscoder(torch.nn.Module):
             "phase0.components.start",
             input_shape=tuple(inputs.shape),
             exact_chunked_decoder=self.exact_chunked_decoder,
+            materialize_encoder_vecs=materialize_encoder_vecs,
         )
         component_start = time.perf_counter()
+
+        if not materialize_encoder_vecs and not self.exact_chunked_decoder:
+            raise ValueError(
+                "materialize_encoder_vecs=False is only supported with exact_chunked_decoder"
+            )
+
         features, encoder_vectors = self.encode_sparse(
             inputs,
             zero_positions=zero_positions,
-            return_encoder_vectors=sparsification is None,
+            return_encoder_vectors=materialize_encoder_vecs and sparsification is None,
         )
         sparsification_stats = None
 
@@ -970,9 +1053,13 @@ class CrossLayerTranscoder(torch.nn.Module):
                 features, sparsification
             )
             features = filter_sparse_activations(features, selected_indices)
+            if materialize_encoder_vecs:
+                encoder_vectors = self.gather_encoder_vectors(features)
+        elif encoder_vectors is None and materialize_encoder_vecs:
             encoder_vectors = self.gather_encoder_vectors(features)
-        elif encoder_vectors is None:
-            encoder_vectors = self.gather_encoder_vectors(features)
+
+        if not materialize_encoder_vecs:
+            encoder_vectors = torch.empty((0, self.d_model), dtype=self.dtype, device=inputs.device)
 
         if self.exact_chunked_decoder:
             reconstruction = self.compute_reconstruction_chunked(features, inputs)
