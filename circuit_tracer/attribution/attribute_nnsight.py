@@ -21,10 +21,12 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
 """
 
 import logging
+import tempfile
 import time
 from collections.abc import Sequence
 from typing import Literal, cast
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -36,7 +38,7 @@ from circuit_tracer.attribution.targets import (
 from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.graph import (
     Graph,
-    compute_partial_feature_influences,
+    compute_partial_feature_influences_streaming,
     compute_partial_influences,
 )
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
@@ -101,6 +103,136 @@ def _log_sparsification_profile(logger, stats: dict[str, object]) -> None:
         f"screen_seconds={stats.get('screen_seconds', 0.0):.4f} | "
         f"per_layer_retained={retained}"
     )
+
+
+class _FileBackedFeatureRowStore:
+    """Append-only dense feature-row store backed by a temporary memmap file."""
+
+    def __init__(self, *, n_rows: int, n_feature_columns: int, dtype: torch.dtype) -> None:
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError(f"Unsupported feature row store dtype: {dtype}")
+
+        self.n_rows = n_rows
+        self.n_feature_columns = n_feature_columns
+        self.row_abs_sums = torch.zeros(n_rows, dtype=dtype)
+
+        self._dtype = dtype
+        self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="ct_feature_rows_")
+        self._path = f"{self._tmpdir.name}/feature_rows.memmap"
+        self._rows: np.memmap | None = np.memmap(
+            self._path,
+            mode="w+",
+            dtype=self._np_dtype,
+            shape=(n_rows, n_feature_columns),
+        )
+        self._closed = False
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    @property
+    def nbytes(self) -> int:
+        rows = self._require_open_rows()
+        return int(rows.size * rows.dtype.itemsize)
+
+    def _require_open_rows(self) -> np.memmap:
+        if self._closed or self._rows is None:
+            raise RuntimeError("feature row store has been cleaned up")
+        return self._rows
+
+    def append_rows(
+        self,
+        *,
+        row_start: int,
+        feature_rows: torch.Tensor,
+        full_row_abs_sums: torch.Tensor,
+    ) -> None:
+        if feature_rows.ndim != 2:
+            raise ValueError("feature_rows must be rank-2")
+        row_count, n_feature_cols = feature_rows.shape
+        if n_feature_cols != self.n_feature_columns:
+            raise ValueError(
+                "feature_rows second dimension must equal configured n_feature_columns"
+            )
+        if full_row_abs_sums.numel() != row_count:
+            raise ValueError("full_row_abs_sums length must equal number of feature_rows")
+        row_end = row_start + row_count
+        if row_start < 0 or row_end > self.n_rows:
+            raise ValueError("row range is out of bounds for file-backed store")
+
+        rows = self._require_open_rows()
+        feature_rows_cpu = feature_rows.to(
+            device=self.row_abs_sums.device,
+            dtype=self._dtype,
+        ).contiguous()
+        rows[row_start:row_end] = feature_rows_cpu.numpy()
+
+        self.row_abs_sums[row_start:row_end] = full_row_abs_sums.to(
+            device=self.row_abs_sums.device,
+            dtype=self.row_abs_sums.dtype,
+        )
+
+    def read_feature_rows(self, row_start: int, row_end: int) -> torch.Tensor:
+        if row_start < 0 or row_end < row_start or row_end > self.n_rows:
+            raise ValueError("requested row slice is out of bounds for file-backed store")
+
+        rows = self._require_open_rows()
+        return torch.from_numpy(np.asarray(rows[row_start:row_end], dtype=self._np_dtype))
+
+    def materialize_dense_feature_slice(
+        self,
+        *,
+        row_start: int,
+        row_end: int,
+        selected_feature_columns: torch.Tensor,
+        col_chunk_size: int = 2048,
+    ) -> torch.Tensor:
+        if row_start < 0 or row_end < row_start or row_end > self.n_rows:
+            raise ValueError("requested row slice is out of bounds for file-backed store")
+        if col_chunk_size <= 0:
+            raise ValueError("col_chunk_size must be > 0")
+
+        n_rows = row_end - row_start
+        n_cols = selected_feature_columns.numel()
+        dense = torch.zeros((n_rows, n_cols), dtype=self.row_abs_sums.dtype)
+        if n_rows == 0 or n_cols == 0:
+            return dense
+
+        selected_cols = selected_feature_columns.to(dtype=torch.long, device="cpu")
+        if selected_cols.min() < 0 or selected_cols.max() >= self.n_feature_columns:
+            raise ValueError("selected feature column indices must be in [0, n_feature_columns)")
+
+        rows = self._require_open_rows()
+        for col_start in range(0, n_cols, col_chunk_size):
+            col_end = min(col_start + col_chunk_size, n_cols)
+            cols_np = selected_cols[col_start:col_end].numpy()
+            chunk_np = np.asarray(rows[row_start:row_end, cols_np], dtype=self._np_dtype)
+            dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
+
+        return dense
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        rows = self._rows
+        self._rows = None
+        if rows is not None:
+            try:
+                rows.flush()
+            except Exception:
+                pass
+
+        self._tmpdir.cleanup()
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            pass
 
 
 def attribute(
@@ -268,6 +400,7 @@ def _run_attribution(
     effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
     trace_batch_size = max(batch_size, effective_feature_batch_size, effective_logit_batch_size)
     ctx = None
+    feature_row_store: _FileBackedFeatureRowStore | None = None
 
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
@@ -421,26 +554,36 @@ def _run_attribution(
             getattr(model.transcoders, "exact_chunked_decoder", False)
         )
         if use_compact_feature_row_store:
-            feature_edge_matrix = torch.zeros(
-                actual_max_feature_nodes + n_logits,
-                total_active_feats,
+            # Benchmark-critical path only: exact chunked decoder + compact output.
+            # Keep dense full-row behavior unchanged for non-compact Graph outputs.
+            assert compact_output
+            assert bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+            feature_row_store = _FileBackedFeatureRowStore(
+                n_rows=actual_max_feature_nodes + n_logits,
+                n_feature_columns=total_active_feats,
+                dtype=torch.float32,
             )
-            row_abs_sums = torch.zeros(actual_max_feature_nodes + n_logits)
         else:
             edge_matrix = torch.zeros(actual_max_feature_nodes + n_logits, total_nodes)
 
-        # Maps row indices in edge_matrix to original feature/node indices
+        # Maps stored row indices to original feature/node indices.
         # First populated with logit node IDs, then feature IDs in attribution order
         row_to_node_index = torch.zeros(actual_max_feature_nodes + n_logits, dtype=torch.int32)
 
         phase2_extra: dict[str, object] = {
-            "row_store_mode": "compact_feature" if use_compact_feature_row_store else "dense_full"
+            "row_store_mode": (
+                "compact_feature_file_backed_dense"
+                if use_compact_feature_row_store
+                else "dense_full"
+            )
         }
         if use_compact_feature_row_store:
+            assert feature_row_store is not None
             phase2_extra.update(
-                feature_edge_matrix_shape=f"{tuple(feature_edge_matrix.shape)}",
-                row_abs_sums_shape=f"{tuple(row_abs_sums.shape)}",
-                feature_edge_matrix_dtype=feature_edge_matrix.dtype,
+                feature_row_store="dense_memmap",
+                feature_row_store_path=feature_row_store.path,
+                row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_sums.shape)}",
+                feature_edge_columns=total_active_feats,
             )
         else:
             phase2_extra.update(
@@ -478,9 +621,13 @@ def _run_attribution(
             )
             rows_cpu = rows.cpu()
             if use_compact_feature_row_store:
+                assert feature_row_store is not None
                 end = i + batch.shape[0]
-                feature_edge_matrix[i:end] = rows_cpu[:, :total_active_feats]
-                row_abs_sums[i:end] = rows_cpu[:, :logit_offset].abs().sum(dim=1)
+                feature_row_store.append_rows(
+                    row_start=i,
+                    feature_rows=rows_cpu[:, :total_active_feats],
+                    full_row_abs_sums=rows_cpu[:, :logit_offset].abs().sum(dim=1),
+                )
             else:
                 edge_matrix[i : i + batch.shape[0], :logit_offset] = rows_cpu
             row_to_node_index[i : i + batch.shape[0]] = (
@@ -528,14 +675,15 @@ def _run_attribution(
                 pending = torch.arange(total_active_feats)
             else:
                 if use_compact_feature_row_store:
-                    feature_influences = compute_partial_feature_influences(
-                        feature_edge_matrix[:st],
-                        row_abs_sums[:st],
+                    assert feature_row_store is not None
+                    feature_influences = compute_partial_feature_influences_streaming(
+                        feature_row_store.read_feature_rows,
+                        feature_row_store.row_abs_sums[:st],
                         targets.logit_probabilities,
                         row_to_node_index[:st],
                         n_feature_nodes=total_active_feats,
                         n_logits=n_logits,
-                        device=feature_edge_matrix.device,
+                        device=feature_row_store.row_abs_sums.device,
                     )
                 else:
                     influences = compute_partial_influences(
@@ -575,9 +723,13 @@ def _run_attribution(
                 end = min(st + effective_feature_batch_size, st + rows.shape[0])
                 rows_cpu = rows.cpu()
                 if use_compact_feature_row_store:
+                    assert feature_row_store is not None
                     row_count = end - st
-                    feature_edge_matrix[st:end] = rows_cpu[:row_count, :total_active_feats]
-                    row_abs_sums[st:end] = rows_cpu[:row_count, :logit_offset].abs().sum(dim=1)
+                    feature_row_store.append_rows(
+                        row_start=st,
+                        feature_rows=rows_cpu[:row_count, :total_active_feats],
+                        full_row_abs_sums=rows_cpu[:row_count, :logit_offset].abs().sum(dim=1),
+                    )
                 else:
                     edge_matrix[st:end, :logit_offset] = rows_cpu
                 row_to_node_index[st:end] = idx_batch
@@ -620,11 +772,16 @@ def _run_attribution(
         selected_features = torch.where(visited)[0]
         if compact_output:
             if use_compact_feature_row_store:
-                feature_feature_edges = (
-                    feature_edge_matrix[n_logits:st, selected_features].detach().cpu()
+                assert feature_row_store is not None
+                feature_feature_edges = feature_row_store.materialize_dense_feature_slice(
+                    row_start=n_logits,
+                    row_end=st,
+                    selected_feature_columns=selected_features,
                 )
-                logit_feature_edges = (
-                    feature_edge_matrix[:n_logits, selected_features].detach().cpu()
+                logit_feature_edges = feature_row_store.materialize_dense_feature_slice(
+                    row_start=0,
+                    row_end=n_logits,
+                    selected_feature_columns=selected_features,
                 )
             else:
                 feature_feature_edges = edge_matrix[n_logits:st, selected_features].detach().cpu()
@@ -647,15 +804,21 @@ def _run_attribution(
                 "scan": model.scan,
             }
             if use_compact_feature_row_store:
-                del feature_edge_matrix
-                del row_abs_sums
+                assert feature_row_store is not None
+                file_backed_store_bytes = feature_row_store.nbytes
             else:
                 del edge_matrix
+                file_backed_store_bytes = None
             logger.info(
                 "Attribution completed in "
                 f"{time.time() - start_time:.2f}s | "
                 f"compact_feature_edge_shape={tuple(compact_output_result['feature_feature_edges'].shape)} | "
                 f"compact_logit_edge_shape={tuple(compact_output_result['logit_feature_edges'].shape)}"
+                + (
+                    f" | feature_row_store_bytes={file_backed_store_bytes}"
+                    if file_backed_store_bytes is not None
+                    else ""
+                )
             )
             return compact_output_result
 
@@ -694,6 +857,8 @@ def _run_attribution(
 
         return graph
     finally:
+        if feature_row_store is not None:
+            feature_row_store.cleanup()
         if ctx is not None:
             _log_memory_boundary(logger, "Teardown start", model.device)
             cleanup = getattr(ctx, "cleanup", None)

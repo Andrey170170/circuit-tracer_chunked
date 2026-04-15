@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import NamedTuple
 import warnings
 
@@ -524,6 +525,116 @@ def compute_partial_feature_influences(
             next_feature_prod += (chunk_row_weights / denom) @ chunk
 
         if not next_feature_prod.any():
+            break
+
+        influences += next_feature_prod
+        row_weights.zero_()
+        if feature_row_node_index.numel():
+            row_weights[n_logits:] = next_feature_prod[feature_row_node_index]
+    else:
+        raise RuntimeError("Failed to converge")
+
+    return influences
+
+
+def compute_partial_feature_influences_streaming(
+    row_reader: Callable[[int, int], torch.Tensor],
+    row_abs_sums: torch.Tensor,
+    logit_p: torch.Tensor,
+    row_to_node_index: torch.Tensor,
+    *,
+    n_feature_nodes: int,
+    n_logits: int,
+    max_iter: int = 128,
+    device=None,
+    row_chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Compute feature-only partial influences from streamed dense row chunks.
+
+    This computes the same quantity as ``compute_partial_feature_influences`` while
+    reading feature rows incrementally via ``row_reader``. It is intended for
+    file-backed row stores where materializing the full dense feature matrix in RAM
+    is undesirable.
+
+    Args:
+        row_reader: Callable receiving ``(row_start, row_end)`` and returning a dense
+            tensor of shape ``(row_end - row_start, n_feature_nodes)`` for that row range.
+        row_abs_sums: Exact absolute row sums over the original full rows.
+        logit_p: Logit probabilities / weights for the first ``n_logits`` rows.
+        row_to_node_index: Mapping from row index to original node index.
+        n_feature_nodes: Number of active feature columns in the original graph.
+        n_logits: Number of logit rows at the start of the stored rows.
+        max_iter: Maximum number of power-iteration steps.
+        device: Device to run computation on.
+        row_chunk_size: Row chunk size used for streamed reads.
+
+    Returns:
+        Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
+
+    Raises:
+        ValueError: If inputs are inconsistent.
+        RuntimeError: If computation fails to converge within ``max_iter``.
+    """
+
+    if n_feature_nodes < 0:
+        raise ValueError("n_feature_nodes must be >= 0")
+    if n_logits < 0:
+        raise ValueError("n_logits must be >= 0")
+    if row_chunk_size <= 0:
+        raise ValueError("row_chunk_size must be > 0")
+
+    n_rows = row_abs_sums.numel()
+    if row_to_node_index.numel() != n_rows:
+        raise ValueError("row_to_node_index length must equal row_abs_sums length")
+    if n_logits > n_rows:
+        raise ValueError("n_logits must be <= number of rows")
+    if logit_p.numel() != n_logits:
+        raise ValueError("logit_p length must equal n_logits")
+
+    device = device or row_abs_sums.device
+    working_row_abs_sums = (
+        row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
+    )
+    dtype = working_row_abs_sums.dtype
+    working_row_abs_sums = working_row_abs_sums.to(dtype=dtype)
+    working_row_index = (
+        row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
+    ).long()
+    working_logit_p = logit_p if logit_p.device == device else logit_p.to(device)
+
+    feature_row_node_index = working_row_index[n_logits:]
+    if feature_row_node_index.numel():
+        if feature_row_node_index.min() < 0 or feature_row_node_index.max() >= n_feature_nodes:
+            raise ValueError(
+                "feature row node indices must be in [0, n_feature_nodes) for compact influences"
+            )
+
+    influences = torch.zeros(n_feature_nodes, device=device, dtype=dtype)
+    row_weights = torch.zeros(n_rows, device=device, dtype=dtype)
+    row_weights[:n_logits] = working_logit_p.to(dtype=dtype)
+    denom = working_row_abs_sums.clamp(min=1e-8)
+
+    for _ in range(max_iter):
+        next_feature_prod = torch.zeros_like(influences)
+        for start in range(0, n_rows, row_chunk_size):
+            end = min(start + row_chunk_size, n_rows)
+            chunk_row_weights = row_weights[start:end]
+            if not bool(chunk_row_weights.any()):
+                continue
+
+            chunk = row_reader(start, end)
+            if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
+                raise ValueError(
+                    "row_reader must return shape "
+                    f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
+                )
+            if chunk.device != device:
+                chunk = chunk.to(device)
+            chunk = chunk.to(dtype=dtype).abs()
+
+            next_feature_prod += (chunk_row_weights / denom[start:end]) @ chunk
+
+        if not bool(next_feature_prod.any()):
             break
 
         influences += next_feature_prod
