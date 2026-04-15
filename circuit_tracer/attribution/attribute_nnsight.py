@@ -235,6 +235,41 @@ class _FileBackedFeatureRowStore:
             pass
 
 
+def _reorder_pending_for_phase4_locality(
+    pending: torch.Tensor,
+    *,
+    feat_layers: torch.Tensor,
+    feat_positions: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> torch.Tensor:
+    """Stable-reorder a fixed frontier for better Phase-4 locality.
+
+    Frontier membership stays unchanged; only execution order changes.
+    The current priority is:
+      1. source layer
+      2. decoder chunk id (when exact chunked + chunk size available)
+      3. position
+
+    For equal keys, Python's stable sort preserves the original influence-rank order.
+    """
+
+    if pending.numel() <= 1:
+        return pending
+
+    use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
+    pending_list = pending.detach().cpu().tolist()
+    pending_list.sort(
+        key=lambda idx: (
+            int(feat_layers[idx]),
+            (int(feat_ids[idx]) // int(decoder_chunk_size)) if use_chunk_key else -1,
+            int(feat_positions[idx]),
+        )
+    )
+    return torch.tensor(pending_list, dtype=pending.dtype, device=pending.device)
+
+
 def attribute(
     prompt: str | torch.Tensor | list[int],
     model: NNSightReplacementModel,
@@ -516,7 +551,7 @@ def _run_attribution(
         logger.info("Phase 2: Building input vectors")
         phase2_start = time.time()
         _log_memory_boundary(logger, "Phase 2 start", model.device)
-        feat_layers, feat_pos, _ = activation_matrix.indices()
+        feat_layers, feat_pos, feat_ids = activation_matrix.indices()
         n_layers, n_pos, _ = activation_matrix.shape
         total_active_feats = activation_matrix._nnz()
 
@@ -660,6 +695,14 @@ def _run_attribution(
         logger.info("Phase 4: Computing feature attributions")
         phase4_start = time.time()
         _log_memory_boundary(logger, "Phase 4 start", model.device)
+        exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+        decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
+        logger.info(
+            "Phase 4 frontier order | "
+            "mode=fixed_frontier_locality | "
+            f"exact_chunked_decoder={exact_chunked_decoder} | "
+            f"decoder_chunk_size={decoder_chunk_size}"
+        )
         st = n_logits
         visited = torch.zeros(total_active_feats, dtype=torch.bool)
         n_visited = 0
@@ -700,6 +743,14 @@ def _run_attribution(
                     actual_max_feature_nodes - n_visited,
                 )
                 pending = feature_rank[~visited[feature_rank]][:queue_size]
+                pending = _reorder_pending_for_phase4_locality(
+                    pending,
+                    feat_layers=feat_layers,
+                    feat_positions=feat_pos,
+                    feat_ids=feat_ids,
+                    exact_chunked_decoder=exact_chunked_decoder,
+                    decoder_chunk_size=decoder_chunk_size,
+                )
 
             queue = [
                 pending[i : i + effective_feature_batch_size]

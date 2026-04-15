@@ -5,6 +5,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from circuit_tracer.attribution.attribute_nnsight import _reorder_pending_for_phase4_locality
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
 )
@@ -631,6 +632,24 @@ def test_exact_chunked_error_vector_prefetch_window_stays_bounded() -> None:
         ctx.get_error_vectors_for_layer(1, device=torch.device("cpu")), error_vectors[1]
     )
     assert set(ctx._materialized_error_vector_layers) == {0, 1}
+
+
+def test_reorder_pending_for_phase4_locality_groups_layer_then_chunk_then_position() -> None:
+    pending = torch.tensor([5, 1, 4, 0, 3, 2], dtype=torch.long)
+    feat_layers = torch.tensor([1, 0, 1, 0, 1, 0], dtype=torch.long)
+    feat_positions = torch.tensor([2, 1, 0, 2, 1, 0], dtype=torch.long)
+    feat_ids = torch.tensor([9, 7, 1, 4, 6, 3], dtype=torch.long)
+
+    reordered = _reorder_pending_for_phase4_locality(
+        pending,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=4,
+    )
+
+    assert torch.equal(reordered, torch.tensor([5, 1, 3, 2, 4, 0], dtype=torch.long))
 
 
 def test_chunked_feature_replay_windows_match_full_replay() -> None:
