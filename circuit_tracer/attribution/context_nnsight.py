@@ -59,6 +59,7 @@ class AttributionContext:
         stage_error_vectors_on_cpu: bool | None = None,
         error_vector_prefetch_lookahead: int = 2,
         chunked_feature_replay_window: int = 4,
+        row_subchunk_size: int | None = None,
     ) -> None:
         n_layers, n_pos, _ = activation_matrix.shape
 
@@ -79,6 +80,9 @@ class AttributionContext:
         self._stage_error_vectors_on_cpu = bool(stage_error_vectors_on_cpu)
         self._error_vector_prefetch_lookahead = max(1, int(error_vector_prefetch_lookahead))
         self._chunked_feature_replay_window = max(1, int(chunked_feature_replay_window))
+        self._row_subchunk_size = (
+            None if row_subchunk_size is None else max(1, int(row_subchunk_size))
+        )
         self._materialized_error_vector_layers: dict[int, torch.Tensor] = {}
         self._cleanup_complete = False
 
@@ -297,6 +301,8 @@ class AttributionContext:
             len(self._materialized_error_vector_layers)
         )
         snapshot["chunked_feature_replay_window"] = float(self._chunked_feature_replay_window)
+        if self.chunked_decoder_state is not None:
+            snapshot["row_subchunk_size"] = float(self._effective_row_subchunk_size())
         snapshot["logit_retention"] = self.logit_retention
         return snapshot
 
@@ -351,6 +357,14 @@ class AttributionContext:
         if self.chunked_decoder_state is None or not callable(init_decoder_cache):
             return None
         return init_decoder_cache()
+
+    def _effective_row_subchunk_size(self) -> int:
+        if self._row_subchunk_size is not None:
+            return self._row_subchunk_size
+        if self.decoder_provider is None:
+            return 1
+        chunk_size = getattr(self.decoder_provider, "decoder_chunk_size", 256)
+        return max(1, int(chunk_size))
 
     def clear_decoder_cache(self) -> None:
         clear_decoder_cache = getattr(self.decoder_provider, "clear_decoder_block_cache", None)
@@ -420,7 +434,7 @@ class AttributionContext:
         feature_ids = self.chunked_decoder_state["feature_ids"]
         activation_values = self.chunked_decoder_state["activation_values"]
         chunk_size = getattr(self.decoder_provider, "decoder_chunk_size", 256)
-        row_subchunk_size = max(1, int(chunk_size))
+        row_subchunk_size = self._effective_row_subchunk_size()
         active_output_layers = [
             layer for layer, grads in enumerate(output_layer_grads) if grads is not None
         ]

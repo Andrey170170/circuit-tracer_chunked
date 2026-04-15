@@ -117,6 +117,11 @@ def attribute(
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
+    chunked_feature_replay_window: int = 4,
+    error_vector_prefetch_lookahead: int = 2,
+    stage_encoder_vecs_on_cpu: bool | None = None,
+    stage_error_vectors_on_cpu: bool | None = None,
+    row_subchunk_size: int | None = None,
     compact_output: bool = False,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -151,6 +156,17 @@ def attribute(
             This changes attribution semantics and should only be used for profiling.
         sparsification: Optional candidate-screening config applied before
             reconstruction and reused by later attribution phases.
+        chunked_feature_replay_window: Exact-mode knob controlling how many
+            layer grads are buffered before chunked feature replay flush.
+        error_vector_prefetch_lookahead: Exact-mode knob controlling staged
+            error-vector lookahead window size.
+        stage_encoder_vecs_on_cpu: Exact-mode knob to force/disable CPU staging
+            of encoder vectors. ``None`` preserves backend default behavior.
+        stage_error_vectors_on_cpu: Exact-mode knob to force/disable CPU
+            staging of error vectors. ``None`` preserves backend defaults.
+        row_subchunk_size: Optional exact-mode knob controlling inner replay
+            row subchunk size. ``None`` preserves current behavior (equal to
+            decoder chunk size).
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -188,6 +204,11 @@ def attribute(
             profile_log_interval=profile_log_interval,
             diagnostic_feature_cap=diagnostic_feature_cap,
             sparsification=sparsification,
+            chunked_feature_replay_window=chunked_feature_replay_window,
+            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            row_subchunk_size=row_subchunk_size,
             compact_output=compact_output,
             logger=logger,
         )
@@ -218,6 +239,11 @@ def _run_attribution(
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
+    chunked_feature_replay_window: int = 4,
+    error_vector_prefetch_lookahead: int = 2,
+    stage_encoder_vecs_on_cpu: bool | None = None,
+    stage_error_vectors_on_cpu: bool | None = None,
+    row_subchunk_size: int | None = None,
     compact_output: bool = False,
 ):
     start_time = time.time()
@@ -227,6 +253,12 @@ def _run_attribution(
         raise ValueError("feature_batch_size must be > 0 when provided")
     if logit_batch_size is not None and logit_batch_size <= 0:
         raise ValueError("logit_batch_size must be > 0 when provided")
+    if chunked_feature_replay_window <= 0:
+        raise ValueError("chunked_feature_replay_window must be > 0")
+    if error_vector_prefetch_lookahead <= 0:
+        raise ValueError("error_vector_prefetch_lookahead must be > 0")
+    if row_subchunk_size is not None and row_subchunk_size <= 0:
+        raise ValueError("row_subchunk_size must be > 0 when provided")
 
     effective_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
     effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
@@ -255,6 +287,11 @@ def _run_attribution(
             f"exact_chunked_decoder={getattr(model.transcoders, 'exact_chunked_decoder', False)} | "
             f"decoder_chunk_size={getattr(model.transcoders, 'decoder_chunk_size', 'n/a')} | "
             f"decoder_cache_bytes={getattr(model.transcoders, 'cross_batch_decoder_cache_bytes', 0)} | "
+            f"chunked_feature_replay_window={chunked_feature_replay_window} | "
+            f"error_vector_prefetch_lookahead={error_vector_prefetch_lookahead} | "
+            f"stage_encoder_vecs_on_cpu={stage_encoder_vecs_on_cpu} | "
+            f"stage_error_vectors_on_cpu={stage_error_vectors_on_cpu} | "
+            f"row_subchunk_size={row_subchunk_size} | "
             f"prompt_tokens={input_ids.shape[-1]} | feature_batch_size={effective_feature_batch_size} | "
             f"logit_batch_size={effective_logit_batch_size}"
         )
@@ -263,6 +300,11 @@ def _run_attribution(
         input_ids,
         sparsification=sparsification,
         retain_full_logits=False,
+        chunked_feature_replay_window=chunked_feature_replay_window,
+        error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+        stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+        stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+        row_subchunk_size=row_subchunk_size,
     )
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)

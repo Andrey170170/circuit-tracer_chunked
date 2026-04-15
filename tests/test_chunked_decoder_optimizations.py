@@ -339,6 +339,69 @@ def test_transformerlens_chunked_attr_subchunks_large_decoder_bucket() -> None:
     _assert_chunked_attr_subchunks_large_decoder_bucket(TransformerLensAttributionContext)
 
 
+def test_nnsight_row_subchunk_override_matches_default_replay() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 0, 0, 0], [0, 1, 2, 3, 4], [0, 1, 0, 1, 0]]),
+        values=torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]),
+        size=(2, 5, 2),
+        check_invariants=True,
+    ).coalesce()
+    blocks = {
+        0: torch.tensor(
+            [
+                [[1.0, 0.0], [10.0, 1.0]],
+                [[0.0, 1.0], [1.0, 10.0]],
+            ]
+        ),
+    }
+    grads_by_output_layer = [
+        torch.tensor(
+            [
+                [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]],
+                [[2.0, 1.0], [4.0, 3.0], [6.0, 5.0], [8.0, 7.0], [10.0, 9.0]],
+            ]
+        ),
+        torch.tensor(
+            [
+                [[11.0, 12.0], [13.0, 14.0], [15.0, 16.0], [17.0, 18.0], [19.0, 20.0]],
+                [[12.0, 11.0], [14.0, 13.0], [16.0, 15.0], [18.0, 17.0], [20.0, 19.0]],
+            ]
+        ),
+    ]
+
+    def _make_ctx(*, row_subchunk_size: int | None) -> NNSightAttributionContext:
+        provider = FakeDecoderProvider(blocks=blocks, chunk_size=2, enable_cache=True)
+        ctx = NNSightAttributionContext(
+            activation_matrix=activation_matrix,
+            error_vectors=torch.zeros(2, 5, 2),
+            token_vectors=torch.zeros(5, 2),
+            decoder_vecs=torch.empty((0, 2)),
+            encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+            encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+            decoder_locations=torch.empty((2, 0), dtype=torch.long),
+            logits=torch.zeros(1),
+            decoder_provider=provider,
+            chunked_decoder_state={
+                "source_layers": activation_matrix.indices()[0],
+                "positions": activation_matrix.indices()[1],
+                "feature_ids": activation_matrix.indices()[2],
+                "activation_values": activation_matrix.values(),
+            },
+            row_subchunk_size=row_subchunk_size,
+        )
+        ctx._batch_buffer = torch.zeros(ctx._row_size, 2)
+        return ctx
+
+    baseline_ctx = _make_ctx(row_subchunk_size=None)
+    baseline_ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+
+    custom_ctx = _make_ctx(row_subchunk_size=1)
+    custom_ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+
+    assert torch.allclose(custom_ctx._batch_buffer, baseline_ctx._batch_buffer)
+    assert custom_ctx.get_diagnostic_snapshot()["row_subchunk_size"] == 1.0
+
+
 def _create_gemmascope2_clt_files(
     tmp_path: Path,
     n_layers: int = 3,

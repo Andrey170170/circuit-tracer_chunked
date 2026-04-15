@@ -135,6 +135,11 @@ def attribute(
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
+    chunked_feature_replay_window: int = 4,
+    error_vector_prefetch_lookahead: int = 2,
+    stage_encoder_vecs_on_cpu: bool | None = None,
+    stage_error_vectors_on_cpu: bool | None = None,
+    row_subchunk_size: int | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -196,6 +201,11 @@ def attribute(
             profile_log_interval=profile_log_interval,
             diagnostic_feature_cap=diagnostic_feature_cap,
             sparsification=sparsification,
+            chunked_feature_replay_window=chunked_feature_replay_window,
+            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            row_subchunk_size=row_subchunk_size,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens

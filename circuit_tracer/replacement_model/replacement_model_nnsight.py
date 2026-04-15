@@ -486,6 +486,11 @@ class NNSightReplacementModel(LanguageModel):
         *,
         sparsification: SparsificationConfig | None = None,
         retain_full_logits: bool = False,
+        chunked_feature_replay_window: int = 4,
+        error_vector_prefetch_lookahead: int = 2,
+        stage_encoder_vecs_on_cpu: bool | None = None,
+        stage_error_vectors_on_cpu: bool | None = None,
+        row_subchunk_size: int | None = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
@@ -606,6 +611,11 @@ class NNSightReplacementModel(LanguageModel):
             decoder_locations=decoder_locations,
             decoder_provider=transcoders if exact_chunked_decoder else None,
             chunked_decoder_state=chunked_decoder_state,
+            chunked_feature_replay_window=chunked_feature_replay_window,
+            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            row_subchunk_size=row_subchunk_size,
         )
         del reconstruction
         del attribution_data["reconstruction"]
@@ -627,6 +637,11 @@ class NNSightReplacementModel(LanguageModel):
             "reconstruction_shape": reconstruction_shape,
             "active_features": active_features,
             "logit_retention": ctx.logit_retention,
+            "chunked_feature_replay_window": chunked_feature_replay_window,
+            "error_vector_prefetch_lookahead": error_vector_prefetch_lookahead,
+            "stage_encoder_vecs_on_cpu": stage_encoder_vecs_on_cpu,
+            "stage_error_vectors_on_cpu": stage_error_vectors_on_cpu,
+            "row_subchunk_size": row_subchunk_size,
         }
         ctx.sparsification_stats = cast(
             dict[str, object] | None, attribution_data.get("sparsification_stats")
