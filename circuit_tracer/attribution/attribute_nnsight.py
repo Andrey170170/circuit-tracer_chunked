@@ -21,6 +21,7 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
 """
 
 import logging
+import math
 import tempfile
 import time
 from collections.abc import Sequence
@@ -38,6 +39,7 @@ from circuit_tracer.attribution.targets import (
 from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.graph import (
     Graph,
+    compute_partial_feature_influences,
     compute_partial_feature_influences_streaming,
     compute_partial_influences,
 )
@@ -270,31 +272,57 @@ def _reorder_pending_for_phase4_locality(
     return torch.tensor(pending_list, dtype=pending.dtype, device=pending.device)
 
 
-def _autoscale_phase4_feature_batch_size(
-    current_batch_size: int,
+def _resolve_phase4_feature_batch_planner_enabled(
+    *,
+    plan_feature_batch_size: bool,
+    auto_scale_feature_batch_size: bool,
+) -> bool:
+    # Backward compatibility: keep legacy flag as an alias for fixed preflight planning.
+    return bool(plan_feature_batch_size or auto_scale_feature_batch_size)
+
+
+def _compute_phase4_planned_feature_batch_size(
+    observed_feature_batch_size: int,
     *,
     max_feature_batch_size: int,
-    reserved_bytes: int | None,
+    observed_reserved_bytes: int | None,
     total_cuda_bytes: int | None,
-    growth_reserved_fraction_threshold: float = 0.72,
+    target_reserved_fraction: float,
+    min_free_fraction: float,
 ) -> int:
-    """Conservatively grow the Phase-4 feature batch size when CUDA headroom is ample."""
+    """Compute a fixed Phase-4 feature batch size from probe telemetry."""
 
-    if current_batch_size <= 0:
-        raise ValueError("current_batch_size must be > 0")
-    if max_feature_batch_size < current_batch_size:
-        raise ValueError("max_feature_batch_size must be >= current_batch_size")
-    if reserved_bytes is None or total_cuda_bytes is None or total_cuda_bytes <= 0:
-        return current_batch_size
-    if current_batch_size >= max_feature_batch_size:
-        return current_batch_size
+    if observed_feature_batch_size <= 0:
+        raise ValueError("observed_feature_batch_size must be > 0")
+    if max_feature_batch_size <= 0:
+        raise ValueError("max_feature_batch_size must be > 0")
+    if not 0.0 < target_reserved_fraction < 1.0:
+        raise ValueError("target_reserved_fraction must be in (0, 1)")
+    if not 0.0 <= min_free_fraction < 1.0:
+        raise ValueError("min_free_fraction must be in [0, 1)")
 
-    reserved_fraction = reserved_bytes / total_cuda_bytes
-    if reserved_fraction > growth_reserved_fraction_threshold:
-        return current_batch_size
+    baseline = min(observed_feature_batch_size, max_feature_batch_size)
+    if observed_reserved_bytes is None or total_cuda_bytes is None or total_cuda_bytes <= 0:
+        return baseline
+    if observed_reserved_bytes <= 0:
+        return baseline
 
-    next_batch_size = current_batch_size + max(1, current_batch_size // 4)
-    return min(max_feature_batch_size, next_batch_size)
+    observed_reserved_fraction = observed_reserved_bytes / total_cuda_bytes
+    if observed_reserved_fraction <= 0:
+        return baseline
+
+    reserved_budget_fraction = min(target_reserved_fraction, 1.0 - min_free_fraction)
+    if reserved_budget_fraction <= 0:
+        return 1
+
+    scaled_batch_size = int(
+        math.floor(
+            observed_feature_batch_size * reserved_budget_fraction / observed_reserved_fraction
+        )
+    )
+    if scaled_batch_size < 1:
+        scaled_batch_size = 1
+    return min(max_feature_batch_size, scaled_batch_size)
 
 
 def _get_cuda_reserved_snapshot() -> tuple[int, int] | None:
@@ -305,6 +333,277 @@ def _get_cuda_reserved_snapshot() -> tuple[int, int] | None:
     peak_reserved = int(torch.cuda.memory_reserved(device_index))
     total_cuda_bytes = int(torch.cuda.get_device_properties(device_index).total_memory)
     return peak_reserved, total_cuda_bytes
+
+
+def _build_phase4_probe_pending_frontier(
+    *,
+    feature_influences: torch.Tensor | None,
+    total_active_feats: int,
+    feat_layers: torch.Tensor,
+    feat_positions: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+    initial_feature_batch_size: int,
+    feature_batch_probe_batches: int,
+    update_interval: int,
+    max_feature_nodes: int | None,
+) -> torch.Tensor:
+    """Build a representative fixed Phase-4 frontier for preflight probes."""
+
+    actual_max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
+    if actual_max_feature_nodes <= 0:
+        return torch.empty(0, dtype=torch.long)
+
+    if feature_influences is None or actual_max_feature_nodes == total_active_feats:
+        pending = torch.arange(total_active_feats)
+        max_probe_candidates = min(
+            int(pending.numel()),
+            initial_feature_batch_size * feature_batch_probe_batches,
+        )
+        return pending[:max_probe_candidates]
+
+    feature_rank = torch.argsort(feature_influences, descending=True).cpu()
+    queue_size = min(update_interval * initial_feature_batch_size, actual_max_feature_nodes)
+    pending = feature_rank[:queue_size]
+
+    pending = _reorder_pending_for_phase4_locality(
+        pending,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=exact_chunked_decoder,
+        decoder_chunk_size=decoder_chunk_size,
+    )
+
+    max_probe_candidates = min(
+        int(pending.numel()),
+        initial_feature_batch_size * feature_batch_probe_batches,
+    )
+    return pending[:max_probe_candidates]
+
+
+def _plan_phase4_feature_batch_size_preflight(
+    *,
+    model: NNSightReplacementModel,
+    prompt,
+    attribution_targets,
+    batch_size: int,
+    initial_feature_batch_size: int,
+    effective_logit_batch_size: int,
+    max_feature_batch_size: int,
+    max_feature_nodes: int | None,
+    update_interval: int,
+    max_n_logits: int,
+    desired_logit_prob: float,
+    logger,
+    sparsification: SparsificationConfig | None = None,
+    chunked_feature_replay_window: int = 4,
+    error_vector_prefetch_lookahead: int = 2,
+    stage_encoder_vecs_on_cpu: bool | None = None,
+    stage_error_vectors_on_cpu: bool | None = None,
+    row_subchunk_size: int | None = None,
+    diagnostic_feature_cap: int | None = None,
+    feature_batch_target_reserved_fraction: float = 0.9,
+    feature_batch_min_free_fraction: float = 0.05,
+    feature_batch_probe_batches: int = 1,
+) -> int:
+    if not torch.cuda.is_available():
+        logger.info(
+            "Phase 4 planner skipped (CUDA unavailable); using fixed feature batch size "
+            f"{min(initial_feature_batch_size, max_feature_batch_size)}"
+        )
+        return min(initial_feature_batch_size, max_feature_batch_size)
+
+    input_ids = model.ensure_tokenized(prompt)
+    ctx = None
+    observed_peak_reserved_bytes = 0
+    total_cuda_bytes: int | None = None
+
+    try:
+        logger.info(
+            "Phase 4 planner preflight | "
+            f"initial_feature_batch_size={initial_feature_batch_size} | "
+            f"max_feature_batch_size={max_feature_batch_size} | "
+            f"max_feature_nodes={max_feature_nodes} | "
+            f"update_interval={update_interval} | "
+            f"probe_batches={feature_batch_probe_batches} | "
+            f"target_reserved_fraction={feature_batch_target_reserved_fraction:.3f} | "
+            f"min_free_fraction={feature_batch_min_free_fraction:.3f}"
+        )
+
+        ctx = model.setup_attribution(
+            input_ids,
+            sparsification=sparsification,
+            retain_full_logits=False,
+            chunked_feature_replay_window=chunked_feature_replay_window,
+            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            row_subchunk_size=row_subchunk_size,
+        )
+        if hasattr(ctx, "set_diagnostic_mode"):
+            ctx.set_diagnostic_mode(False)
+
+        if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
+            ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
+
+        activation_matrix = ctx.activation_matrix
+        total_active_feats = int(activation_matrix._nnz())
+        if total_active_feats <= 0:
+            logger.info(
+                "Phase 4 planner preflight observed no active features; "
+                f"using feature batch size {min(initial_feature_batch_size, max_feature_batch_size)}"
+            )
+            return min(initial_feature_batch_size, max_feature_batch_size)
+
+        feat_layers, feat_pos, feat_ids = activation_matrix.indices()
+        n_layers, n_pos, _ = activation_matrix.shape
+        logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
+        trace_batch_size = max(batch_size, initial_feature_batch_size, effective_logit_batch_size)
+
+        with model.trace() as tracer:
+            with tracer.invoke(input_ids.expand(trace_batch_size, -1)):
+                pass
+
+            detach_barrier = tracer.barrier(2)
+            model.configure_gradient_flow(tracer)
+            model.configure_skip_connection(tracer, barrier=detach_barrier)
+            ctx.cache_residual(model, tracer, barrier=detach_barrier)
+
+        exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+        decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
+
+        # Build probe candidates using the same Phase-3 attribution targets and
+        # first Phase-4 frontier ranking semantics used by the real run.
+        feature_influences: torch.Tensor | None = None
+        targets = AttributionTargets(
+            attribution_targets=attribution_targets,
+            logits=ctx.get_last_token_logits()[0],
+            unembed_proj=cast(torch.Tensor, model.unembed_weight),
+            tokenizer=model.tokenizer,
+            max_n_logits=max_n_logits,
+            desired_logit_prob=desired_logit_prob,
+        )
+        n_logits = len(targets)
+        if n_logits > 0 and total_active_feats > 0:
+            logit_feature_rows = torch.zeros((n_logits, total_active_feats), dtype=torch.float32)
+            logit_row_abs_sums = torch.zeros(n_logits, dtype=torch.float32)
+            row_to_node_index = torch.arange(n_logits, dtype=torch.long) + int(logit_offset)
+            for i in range(0, n_logits, effective_logit_batch_size):
+                batch = targets.logit_vectors[i : i + effective_logit_batch_size]
+                rows = ctx.compute_batch(
+                    layers=torch.full((batch.shape[0],), n_layers),
+                    positions=torch.full((batch.shape[0],), n_pos - 1),
+                    inject_values=batch,
+                    retain_graph=True,
+                    phase_label="phase3_logits_probe",
+                )
+                rows_cpu = rows.to(device="cpu", dtype=torch.float32)
+                end = i + batch.shape[0]
+                logit_feature_rows[i:end] = rows_cpu[:, :total_active_feats]
+                logit_row_abs_sums[i:end] = rows_cpu[:, :logit_offset].abs().sum(dim=1)
+
+            feature_influences = compute_partial_feature_influences(
+                logit_feature_rows,
+                logit_row_abs_sums,
+                targets.logit_probabilities.detach().cpu().to(dtype=torch.float32),
+                row_to_node_index,
+                n_feature_nodes=total_active_feats,
+                n_logits=n_logits,
+                device=logit_feature_rows.device,
+            )
+
+        reset_decoder_cache = getattr(ctx, "reset_decoder_cache", None)
+        if callable(reset_decoder_cache):
+            reset_decoder_cache()
+
+        pending = _build_phase4_probe_pending_frontier(
+            feature_influences=feature_influences,
+            total_active_feats=total_active_feats,
+            feat_layers=feat_layers,
+            feat_positions=feat_pos,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+            initial_feature_batch_size=initial_feature_batch_size,
+            feature_batch_probe_batches=feature_batch_probe_batches,
+            update_interval=update_interval,
+            max_feature_nodes=max_feature_nodes,
+        )
+
+        pending_offset = 0
+        probe_batches_ran = 0
+        observed_feature_batch_size = 0
+        for probe_idx in range(feature_batch_probe_batches):
+            idx_batch = pending[pending_offset : pending_offset + initial_feature_batch_size]
+            if idx_batch.numel() == 0:
+                break
+            pending_offset += int(idx_batch.numel())
+            observed_feature_batch_size = max(observed_feature_batch_size, int(idx_batch.numel()))
+
+            device_index = torch.cuda.current_device()
+            torch.cuda.reset_peak_memory_stats(device_index)
+            rows = ctx.compute_batch(
+                layers=feat_layers[idx_batch],
+                positions=feat_pos[idx_batch],
+                inject_values=ctx.materialize_encoder_vectors(idx_batch),
+                retain_graph=(probe_idx + 1) < feature_batch_probe_batches,
+                phase_label="phase4_probe",
+            )
+            del rows
+            torch.cuda.synchronize(device_index)
+            observed_peak_reserved_bytes = max(
+                observed_peak_reserved_bytes,
+                int(torch.cuda.max_memory_reserved(device_index)),
+            )
+            probe_batches_ran += 1
+
+        if probe_batches_ran <= 0 or observed_feature_batch_size <= 0:
+            logger.info(
+                "Phase 4 planner preflight observed no representative probe batches; "
+                f"using feature batch size {min(initial_feature_batch_size, max_feature_batch_size)}"
+            )
+            return min(initial_feature_batch_size, max_feature_batch_size)
+
+        cuda_snapshot = _get_cuda_reserved_snapshot()
+        observed_reserved_bytes: int | None = None
+        if cuda_snapshot is not None:
+            current_reserved_bytes, total_cuda_bytes = cuda_snapshot
+            observed_reserved_bytes = max(current_reserved_bytes, observed_peak_reserved_bytes)
+
+        planned_feature_batch_size = _compute_phase4_planned_feature_batch_size(
+            observed_feature_batch_size,
+            max_feature_batch_size=max_feature_batch_size,
+            observed_reserved_bytes=observed_reserved_bytes,
+            total_cuda_bytes=total_cuda_bytes,
+            target_reserved_fraction=feature_batch_target_reserved_fraction,
+            min_free_fraction=feature_batch_min_free_fraction,
+        )
+
+        planned_reserved_fraction = (
+            None
+            if observed_reserved_bytes is None or total_cuda_bytes in (None, 0)
+            else observed_reserved_bytes / total_cuda_bytes
+        )
+        logger.info(
+            "Phase 4 planner result | "
+            f"probes_ran={probe_batches_ran} | "
+            f"observed_probe_feature_batch_size={observed_feature_batch_size} | "
+            f"probe_frontier_candidates={int(pending.numel())} | "
+            f"probe_reserved_fraction={planned_reserved_fraction if planned_reserved_fraction is not None else 'n/a'} | "
+            f"planned_feature_batch_size={planned_feature_batch_size}"
+        )
+        return planned_feature_batch_size
+    finally:
+        if ctx is not None:
+            cleanup = getattr(ctx, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+            else:
+                clear_decoder_cache = getattr(ctx, "clear_decoder_cache", None)
+                if callable(clear_decoder_cache):
+                    clear_decoder_cache()
 
 
 def attribute(
@@ -330,8 +629,12 @@ def attribute(
     stage_encoder_vecs_on_cpu: bool | None = None,
     stage_error_vectors_on_cpu: bool | None = None,
     row_subchunk_size: int | None = None,
+    plan_feature_batch_size: bool = False,
     auto_scale_feature_batch_size: bool = False,
     feature_batch_size_max: int | None = None,
+    feature_batch_target_reserved_fraction: float = 0.9,
+    feature_batch_min_free_fraction: float = 0.05,
+    feature_batch_probe_batches: int = 1,
     compact_output: bool = False,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -377,11 +680,18 @@ def attribute(
         row_subchunk_size: Optional exact-mode knob controlling inner replay
             row subchunk size. ``None`` preserves current behavior (equal to
             decoder chunk size).
-        auto_scale_feature_batch_size: Whether to conservatively grow the
-            Phase-4 feature microbatch size when CUDA headroom remains ample.
-        feature_batch_size_max: Optional upper bound for autoscaled Phase-4
-            feature microbatch size. Defaults to the effective feature batch
-            size, which disables growth.
+        plan_feature_batch_size: Whether to run a probe-based preflight and
+            choose a single fixed Phase-4 feature microbatch size for the run.
+        auto_scale_feature_batch_size: Legacy alias for
+            ``plan_feature_batch_size`` (kept for backward compatibility).
+        feature_batch_size_max: Optional upper bound for the preflight-planned
+            Phase-4 feature microbatch size.
+        feature_batch_target_reserved_fraction: Reserved-memory utilization
+            target used by the planner (0-1).
+        feature_batch_min_free_fraction: Minimum free-memory fraction to keep
+            unused (0-1), applied as a stricter cap than target utilization.
+        feature_batch_probe_batches: Number of preflight Phase-4 probe batches
+            to run before the real attribution pass.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -424,8 +734,12 @@ def attribute(
             stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
+            plan_feature_batch_size=plan_feature_batch_size,
             auto_scale_feature_batch_size=auto_scale_feature_batch_size,
             feature_batch_size_max=feature_batch_size_max,
+            feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
+            feature_batch_min_free_fraction=feature_batch_min_free_fraction,
+            feature_batch_probe_batches=feature_batch_probe_batches,
             compact_output=compact_output,
             logger=logger,
         )
@@ -461,8 +775,12 @@ def _run_attribution(
     stage_encoder_vecs_on_cpu: bool | None = None,
     stage_error_vectors_on_cpu: bool | None = None,
     row_subchunk_size: int | None = None,
+    plan_feature_batch_size: bool = False,
     auto_scale_feature_batch_size: bool = False,
     feature_batch_size_max: int | None = None,
+    feature_batch_target_reserved_fraction: float = 0.9,
+    feature_batch_min_free_fraction: float = 0.05,
+    feature_batch_probe_batches: int = 1,
     compact_output: bool = False,
 ):
     start_time = time.time()
@@ -480,14 +798,66 @@ def _run_attribution(
         raise ValueError("row_subchunk_size must be > 0 when provided")
     if feature_batch_size_max is not None and feature_batch_size_max <= 0:
         raise ValueError("feature_batch_size_max must be > 0 when provided")
+    if not 0.0 < feature_batch_target_reserved_fraction < 1.0:
+        raise ValueError("feature_batch_target_reserved_fraction must be in (0, 1)")
+    if not 0.0 <= feature_batch_min_free_fraction < 1.0:
+        raise ValueError("feature_batch_min_free_fraction must be in [0, 1)")
+    if feature_batch_probe_batches <= 0:
+        raise ValueError("feature_batch_probe_batches must be > 0")
 
     effective_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
     max_phase4_feature_batch_size = (
         effective_feature_batch_size if feature_batch_size_max is None else feature_batch_size_max
     )
-    if max_phase4_feature_batch_size < effective_feature_batch_size:
+    planner_enabled = _resolve_phase4_feature_batch_planner_enabled(
+        plan_feature_batch_size=plan_feature_batch_size,
+        auto_scale_feature_batch_size=auto_scale_feature_batch_size,
+    )
+    if auto_scale_feature_batch_size and not plan_feature_batch_size:
+        logger.info(
+            "Phase-4 feature batch planning | "
+            "legacy auto_scale_feature_batch_size flag detected; "
+            "using fixed preflight planner semantics"
+        )
+    if (not planner_enabled) and max_phase4_feature_batch_size < effective_feature_batch_size:
         raise ValueError("feature_batch_size_max must be >= the effective feature batch size")
     effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
+
+    exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+    if planner_enabled and not (compact_output and exact_chunked_decoder):
+        raise ValueError(
+            "Phase-4 feature batch planner requires compact_output=True and exact_chunked_decoder=True"
+        )
+    if planner_enabled:
+        planner_probe_feature_batch_size = min(
+            effective_feature_batch_size,
+            max_phase4_feature_batch_size,
+        )
+        effective_feature_batch_size = _plan_phase4_feature_batch_size_preflight(
+            model=model,
+            prompt=prompt,
+            attribution_targets=attribution_targets,
+            batch_size=batch_size,
+            initial_feature_batch_size=planner_probe_feature_batch_size,
+            effective_logit_batch_size=effective_logit_batch_size,
+            max_feature_batch_size=max_phase4_feature_batch_size,
+            max_feature_nodes=max_feature_nodes,
+            update_interval=update_interval,
+            max_n_logits=max_n_logits,
+            desired_logit_prob=desired_logit_prob,
+            logger=logger,
+            sparsification=sparsification,
+            chunked_feature_replay_window=chunked_feature_replay_window,
+            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            row_subchunk_size=row_subchunk_size,
+            diagnostic_feature_cap=diagnostic_feature_cap,
+            feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
+            feature_batch_min_free_fraction=feature_batch_min_free_fraction,
+            feature_batch_probe_batches=feature_batch_probe_batches,
+        )
+
     trace_batch_size = max(
         batch_size,
         effective_feature_batch_size,
@@ -523,7 +893,7 @@ def _run_attribution(
             f"stage_encoder_vecs_on_cpu={stage_encoder_vecs_on_cpu} | "
             f"stage_error_vectors_on_cpu={stage_error_vectors_on_cpu} | "
             f"row_subchunk_size={row_subchunk_size} | "
-            f"auto_scale_feature_batch_size={auto_scale_feature_batch_size} | "
+            f"planner_enabled={planner_enabled} | "
             f"feature_batch_size_max={max_phase4_feature_batch_size} | "
             f"prompt_tokens={input_ids.shape[-1]} | feature_batch_size={effective_feature_batch_size} | "
             f"logit_batch_size={effective_logit_batch_size}"
@@ -756,9 +1126,8 @@ def _run_attribution(
         logger.info("Phase 4: Computing feature attributions")
         phase4_start = time.time()
         _log_memory_boundary(logger, "Phase 4 start", model.device)
-        exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
-        current_phase4_feature_batch_size = effective_feature_batch_size
+        phase4_feature_batch_size = effective_feature_batch_size
         logger.info(
             "Phase 4 frontier order | "
             "mode=fixed_frontier_locality | "
@@ -767,8 +1136,8 @@ def _run_attribution(
         )
         logger.info(
             "Phase 4 feature batch mode | "
-            f"auto_scale_feature_batch_size={auto_scale_feature_batch_size} | "
-            f"initial_feature_batch_size={effective_feature_batch_size} | "
+            f"planner_enabled={planner_enabled} | "
+            f"fixed_feature_batch_size={phase4_feature_batch_size} | "
             f"max_feature_batch_size={max_phase4_feature_batch_size}"
         )
         st = n_logits
@@ -808,7 +1177,7 @@ def _run_attribution(
 
                 feature_rank = torch.argsort(feature_influences, descending=True).cpu()
                 queue_size = min(
-                    update_interval * current_phase4_feature_batch_size,
+                    update_interval * phase4_feature_batch_size,
                     actual_max_feature_nodes - n_visited,
                 )
                 pending = feature_rank[~visited[feature_rank]][:queue_size]
@@ -823,9 +1192,7 @@ def _run_attribution(
 
             pending_offset = 0
             while pending_offset < len(pending):
-                idx_batch = pending[
-                    pending_offset : pending_offset + current_phase4_feature_batch_size
-                ]
+                idx_batch = pending[pending_offset : pending_offset + phase4_feature_batch_size]
                 pending_offset += len(idx_batch)
                 n_visited += len(idx_batch)
                 phase4_batch_count += 1
@@ -858,29 +1225,6 @@ def _run_attribution(
                 st = end
                 pbar.update(len(idx_batch))
 
-                if (
-                    auto_scale_feature_batch_size
-                    and len(idx_batch) == current_phase4_feature_batch_size
-                ):
-                    cuda_snapshot = _get_cuda_reserved_snapshot()
-                    if cuda_snapshot is not None:
-                        reserved_bytes, total_cuda_bytes = cuda_snapshot
-                        next_feature_batch_size = _autoscale_phase4_feature_batch_size(
-                            current_phase4_feature_batch_size,
-                            max_feature_batch_size=max_phase4_feature_batch_size,
-                            reserved_bytes=reserved_bytes,
-                            total_cuda_bytes=total_cuda_bytes,
-                        )
-                        if next_feature_batch_size != current_phase4_feature_batch_size:
-                            logger.info(
-                                "Phase 4 autoscale | "
-                                f"batch={phase4_batch_count} | "
-                                f"feature_batch_size={current_phase4_feature_batch_size}->{next_feature_batch_size} | "
-                                f"cuda_reserved_gib={reserved_bytes / (1024**3):.2f} | "
-                                f"reserved_fraction={reserved_bytes / total_cuda_bytes:.3f}"
-                            )
-                            current_phase4_feature_batch_size = next_feature_batch_size
-
                 if profile:
                     batch_number = phase4_batch_count
                     if batch_number % profile_log_interval == 0:
@@ -889,8 +1233,8 @@ def _run_attribution(
                             "Phase 4",
                             batch_number,
                             max(
-                                (actual_max_feature_nodes + current_phase4_feature_batch_size - 1)
-                                // current_phase4_feature_batch_size,
+                                (actual_max_feature_nodes + phase4_feature_batch_size - 1)
+                                // phase4_feature_batch_size,
                                 1,
                             ),
                             time.perf_counter() - batch_start,
@@ -907,7 +1251,7 @@ def _run_attribution(
             phase4_start,
             model.device,
             selected_features=int(visited.sum().item()),
-            final_feature_batch_size=current_phase4_feature_batch_size,
+            final_feature_batch_size=phase4_feature_batch_size,
             phase4_batches=phase4_batch_count,
         )
 
@@ -943,6 +1287,12 @@ def _run_attribution(
                 "logit_row_node_indices": row_to_node_index[:n_logits].detach().cpu(),
                 "feature_feature_edges": feature_feature_edges,
                 "logit_feature_edges": logit_feature_edges,
+                "phase4_feature_batch_size": int(phase4_feature_batch_size),
+                "phase4_feature_batch_size_initial": int(
+                    batch_size if feature_batch_size is None else feature_batch_size
+                ),
+                "phase4_feature_batch_size_max": int(max_phase4_feature_batch_size),
+                "phase4_feature_batch_planner_enabled": bool(planner_enabled),
                 "cfg": model.config,
                 "scan": model.scan,
             }

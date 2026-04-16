@@ -140,6 +140,12 @@ def attribute(
     stage_encoder_vecs_on_cpu: bool | None = None,
     stage_error_vectors_on_cpu: bool | None = None,
     row_subchunk_size: int | None = None,
+    plan_feature_batch_size: bool = False,
+    auto_scale_feature_batch_size: bool = False,
+    feature_batch_size_max: int | None = None,
+    feature_batch_target_reserved_fraction: float = 0.9,
+    feature_batch_min_free_fraction: float = 0.05,
+    feature_batch_probe_batches: int = 1,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -181,6 +187,13 @@ def attribute(
         Graph: Fully dense adjacency (unpruned).
     """
 
+    planner_enabled = bool(plan_feature_batch_size or auto_scale_feature_batch_size)
+    if planner_enabled:
+        raise ValueError(
+            "Phase-4 feature batch planner is unsupported via circuit_tracer.attribution.attribute(). "
+            "Use the NNSight entrypoint with compact_output=True on exact_chunked_decoder paths."
+        )
+
     if model.backend == "nnsight":
         from .attribute_nnsight import attribute as attribute_nnsight
 
@@ -206,6 +219,12 @@ def attribute(
             stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
+            plan_feature_batch_size=plan_feature_batch_size,
+            auto_scale_feature_batch_size=auto_scale_feature_batch_size,
+            feature_batch_size_max=feature_batch_size_max,
+            feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
+            feature_batch_min_free_fraction=feature_batch_min_free_fraction,
+            feature_batch_probe_batches=feature_batch_probe_batches,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens

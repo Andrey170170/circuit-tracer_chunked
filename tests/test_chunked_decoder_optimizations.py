@@ -5,8 +5,10 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from circuit_tracer.attribution.attribute import attribute as attribute_top_level
 from circuit_tracer.attribution.attribute_nnsight import (
-    _autoscale_phase4_feature_batch_size,
+    _build_phase4_probe_pending_frontier,
+    _compute_phase4_planned_feature_batch_size,
     _reorder_pending_for_phase4_locality,
 )
 from circuit_tracer.attribution.context_nnsight import (
@@ -655,28 +657,106 @@ def test_reorder_pending_for_phase4_locality_groups_layer_then_chunk_then_positi
     assert torch.equal(reordered, torch.tensor([5, 1, 3, 2, 4, 0], dtype=torch.long))
 
 
-def test_autoscale_phase4_feature_batch_size_grows_when_reserved_fraction_is_low() -> None:
+def test_phase4_planner_batch_size_grows_and_respects_max_cap() -> None:
     assert (
-        _autoscale_phase4_feature_batch_size(
+        _compute_phase4_planned_feature_batch_size(
             128,
             max_feature_batch_size=256,
-            reserved_bytes=8 * 1024**3,
+            observed_reserved_bytes=8 * 1024**3,
             total_cuda_bytes=40 * 1024**3,
+            target_reserved_fraction=0.9,
+            min_free_fraction=0.05,
         )
-        == 160
+        == 256
     )
 
 
-def test_autoscale_phase4_feature_batch_size_holds_when_reserved_fraction_is_high() -> None:
+def test_phase4_planner_batch_size_shrinks_when_probe_is_over_budget() -> None:
     assert (
-        _autoscale_phase4_feature_batch_size(
+        _compute_phase4_planned_feature_batch_size(
             128,
             max_feature_batch_size=256,
-            reserved_bytes=32 * 1024**3,
+            observed_reserved_bytes=32 * 1024**3,
             total_cuda_bytes=40 * 1024**3,
+            target_reserved_fraction=0.7,
+            min_free_fraction=0.05,
         )
-        == 128
+        == 111
     )
+
+
+def test_phase4_planner_batch_size_uses_min_free_fraction_guardrail() -> None:
+    assert (
+        _compute_phase4_planned_feature_batch_size(
+            128,
+            max_feature_batch_size=512,
+            observed_reserved_bytes=16 * 1024**3,
+            total_cuda_bytes=40 * 1024**3,
+            target_reserved_fraction=0.95,
+            min_free_fraction=0.2,
+        )
+        == 256
+    )
+
+
+def test_phase4_probe_frontier_uses_ranked_first_frontier_then_locality() -> None:
+    feature_influences = torch.tensor([0.1, 0.7, 0.2, 0.9, 0.3, 0.8], dtype=torch.float32)
+    feat_layers = torch.tensor([1, 0, 1, 0, 1, 0], dtype=torch.long)
+    feat_positions = torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.long)
+    feat_ids = torch.tensor([5, 8, 2, 1, 6, 4], dtype=torch.long)
+
+    pending = _build_phase4_probe_pending_frontier(
+        feature_influences=feature_influences,
+        total_active_feats=6,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=4,
+        initial_feature_batch_size=2,
+        feature_batch_probe_batches=1,
+        update_interval=2,
+        max_feature_nodes=3,
+    )
+
+    assert torch.equal(pending, torch.tensor([3, 5], dtype=torch.long))
+
+
+def test_phase4_probe_frontier_preserves_full_frontier_order_when_all_features_included() -> None:
+    feat_layers = torch.tensor([1, 0, 1, 0], dtype=torch.long)
+    feat_positions = torch.tensor([2, 0, 1, 3], dtype=torch.long)
+    feat_ids = torch.tensor([8, 1, 6, 3], dtype=torch.long)
+
+    pending = _build_phase4_probe_pending_frontier(
+        feature_influences=torch.tensor([0.4, 0.9, 0.2, 0.7], dtype=torch.float32),
+        total_active_feats=4,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=4,
+        initial_feature_batch_size=2,
+        feature_batch_probe_batches=2,
+        update_interval=4,
+        max_feature_nodes=4,
+    )
+
+    assert torch.equal(pending, torch.tensor([0, 1, 2, 3], dtype=torch.long))
+
+
+def test_top_level_attribute_rejects_phase4_planner_flags() -> None:
+    class _DummyModel:
+        backend = "nnsight"
+
+    with pytest.raises(
+        ValueError,
+        match=r"unsupported via circuit_tracer\.attribution\.attribute",
+    ):
+        attribute_top_level(
+            prompt="hello",
+            model=cast(object, _DummyModel()),
+            plan_feature_batch_size=True,
+        )
 
 
 def test_chunked_feature_replay_windows_match_full_replay() -> None:
