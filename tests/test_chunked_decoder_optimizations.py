@@ -5,7 +5,10 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from circuit_tracer.attribution.attribute_nnsight import _reorder_pending_for_phase4_locality
+from circuit_tracer.attribution.attribute_nnsight import (
+    _autoscale_phase4_feature_batch_size,
+    _reorder_pending_for_phase4_locality,
+)
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
 )
@@ -650,6 +653,30 @@ def test_reorder_pending_for_phase4_locality_groups_layer_then_chunk_then_positi
     )
 
     assert torch.equal(reordered, torch.tensor([5, 1, 3, 2, 4, 0], dtype=torch.long))
+
+
+def test_autoscale_phase4_feature_batch_size_grows_when_reserved_fraction_is_low() -> None:
+    assert (
+        _autoscale_phase4_feature_batch_size(
+            128,
+            max_feature_batch_size=256,
+            reserved_bytes=8 * 1024**3,
+            total_cuda_bytes=40 * 1024**3,
+        )
+        == 160
+    )
+
+
+def test_autoscale_phase4_feature_batch_size_holds_when_reserved_fraction_is_high() -> None:
+    assert (
+        _autoscale_phase4_feature_batch_size(
+            128,
+            max_feature_batch_size=256,
+            reserved_bytes=32 * 1024**3,
+            total_cuda_bytes=40 * 1024**3,
+        )
+        == 128
+    )
 
 
 def test_chunked_feature_replay_windows_match_full_replay() -> None:

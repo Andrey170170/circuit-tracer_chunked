@@ -270,6 +270,44 @@ def _reorder_pending_for_phase4_locality(
     return torch.tensor(pending_list, dtype=pending.dtype, device=pending.device)
 
 
+def _autoscale_phase4_feature_batch_size(
+    current_batch_size: int,
+    *,
+    max_feature_batch_size: int,
+    reserved_bytes: int | None,
+    total_cuda_bytes: int | None,
+    growth_reserved_fraction_threshold: float = 0.72,
+) -> int:
+    """Conservatively grow the Phase-4 feature batch size when CUDA headroom is ample."""
+
+    if current_batch_size <= 0:
+        raise ValueError("current_batch_size must be > 0")
+    if max_feature_batch_size < current_batch_size:
+        raise ValueError("max_feature_batch_size must be >= current_batch_size")
+    if reserved_bytes is None or total_cuda_bytes is None or total_cuda_bytes <= 0:
+        return current_batch_size
+    if current_batch_size >= max_feature_batch_size:
+        return current_batch_size
+
+    reserved_fraction = reserved_bytes / total_cuda_bytes
+    if reserved_fraction > growth_reserved_fraction_threshold:
+        return current_batch_size
+
+    next_batch_size = current_batch_size + max(1, current_batch_size // 4)
+    return min(max_feature_batch_size, next_batch_size)
+
+
+def _get_cuda_reserved_snapshot(device) -> tuple[int, int] | None:
+    device_obj = torch.device(device)
+    if device_obj.type != "cuda" or not torch.cuda.is_available():
+        return None
+
+    device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+    peak_reserved = int(torch.cuda.memory_reserved(device_index))
+    total_cuda_bytes = int(torch.cuda.get_device_properties(device_index).total_memory)
+    return peak_reserved, total_cuda_bytes
+
+
 def attribute(
     prompt: str | torch.Tensor | list[int],
     model: NNSightReplacementModel,
@@ -293,6 +331,8 @@ def attribute(
     stage_encoder_vecs_on_cpu: bool | None = None,
     stage_error_vectors_on_cpu: bool | None = None,
     row_subchunk_size: int | None = None,
+    auto_scale_feature_batch_size: bool = False,
+    feature_batch_size_max: int | None = None,
     compact_output: bool = False,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -338,6 +378,11 @@ def attribute(
         row_subchunk_size: Optional exact-mode knob controlling inner replay
             row subchunk size. ``None`` preserves current behavior (equal to
             decoder chunk size).
+        auto_scale_feature_batch_size: Whether to conservatively grow the
+            Phase-4 feature microbatch size when CUDA headroom remains ample.
+        feature_batch_size_max: Optional upper bound for autoscaled Phase-4
+            feature microbatch size. Defaults to the effective feature batch
+            size, which disables growth.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -380,6 +425,8 @@ def attribute(
             stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
+            auto_scale_feature_batch_size=auto_scale_feature_batch_size,
+            feature_batch_size_max=feature_batch_size_max,
             compact_output=compact_output,
             logger=logger,
         )
@@ -415,6 +462,8 @@ def _run_attribution(
     stage_encoder_vecs_on_cpu: bool | None = None,
     stage_error_vectors_on_cpu: bool | None = None,
     row_subchunk_size: int | None = None,
+    auto_scale_feature_batch_size: bool = False,
+    feature_batch_size_max: int | None = None,
     compact_output: bool = False,
 ):
     start_time = time.time()
@@ -430,10 +479,23 @@ def _run_attribution(
         raise ValueError("error_vector_prefetch_lookahead must be > 0")
     if row_subchunk_size is not None and row_subchunk_size <= 0:
         raise ValueError("row_subchunk_size must be > 0 when provided")
+    if feature_batch_size_max is not None and feature_batch_size_max <= 0:
+        raise ValueError("feature_batch_size_max must be > 0 when provided")
 
     effective_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
+    max_phase4_feature_batch_size = (
+        effective_feature_batch_size if feature_batch_size_max is None else feature_batch_size_max
+    )
+    if max_phase4_feature_batch_size < effective_feature_batch_size:
+        raise ValueError("feature_batch_size_max must be >= the effective feature batch size")
     effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
-    trace_batch_size = max(batch_size, effective_feature_batch_size, effective_logit_batch_size)
+    trace_batch_size = max(
+        batch_size,
+        max_phase4_feature_batch_size
+        if auto_scale_feature_batch_size
+        else effective_feature_batch_size,
+        effective_logit_batch_size,
+    )
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
 
@@ -464,6 +526,8 @@ def _run_attribution(
             f"stage_encoder_vecs_on_cpu={stage_encoder_vecs_on_cpu} | "
             f"stage_error_vectors_on_cpu={stage_error_vectors_on_cpu} | "
             f"row_subchunk_size={row_subchunk_size} | "
+            f"auto_scale_feature_batch_size={auto_scale_feature_batch_size} | "
+            f"feature_batch_size_max={max_phase4_feature_batch_size} | "
             f"prompt_tokens={input_ids.shape[-1]} | feature_batch_size={effective_feature_batch_size} | "
             f"logit_batch_size={effective_logit_batch_size}"
         )
@@ -697,15 +761,23 @@ def _run_attribution(
         _log_memory_boundary(logger, "Phase 4 start", model.device)
         exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
+        current_phase4_feature_batch_size = effective_feature_batch_size
         logger.info(
             "Phase 4 frontier order | "
             "mode=fixed_frontier_locality | "
             f"exact_chunked_decoder={exact_chunked_decoder} | "
             f"decoder_chunk_size={decoder_chunk_size}"
         )
+        logger.info(
+            "Phase 4 feature batch mode | "
+            f"auto_scale_feature_batch_size={auto_scale_feature_batch_size} | "
+            f"initial_feature_batch_size={effective_feature_batch_size} | "
+            f"max_feature_batch_size={max_phase4_feature_batch_size}"
+        )
         st = n_logits
         visited = torch.zeros(total_active_feats, dtype=torch.bool)
         n_visited = 0
+        phase4_batch_count = 0
 
         pbar = tqdm(
             total=actual_max_feature_nodes,
@@ -739,7 +811,7 @@ def _run_attribution(
 
                 feature_rank = torch.argsort(feature_influences, descending=True).cpu()
                 queue_size = min(
-                    update_interval * effective_feature_batch_size,
+                    update_interval * current_phase4_feature_batch_size,
                     actual_max_feature_nodes - n_visited,
                 )
                 pending = feature_rank[~visited[feature_rank]][:queue_size]
@@ -752,13 +824,14 @@ def _run_attribution(
                     decoder_chunk_size=decoder_chunk_size,
                 )
 
-            queue = [
-                pending[i : i + effective_feature_batch_size]
-                for i in range(0, len(pending), effective_feature_batch_size)
-            ]
-
-            for idx_batch in queue:
+            pending_offset = 0
+            while pending_offset < len(pending):
+                idx_batch = pending[
+                    pending_offset : pending_offset + current_phase4_feature_batch_size
+                ]
+                pending_offset += len(idx_batch)
                 n_visited += len(idx_batch)
+                phase4_batch_count += 1
 
                 ctx_before = _snapshot_diagnostics(ctx) if profile else None
                 transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
@@ -787,20 +860,40 @@ def _run_attribution(
                 visited[idx_batch] = True
                 st = end
                 pbar.update(len(idx_batch))
+
+                if (
+                    auto_scale_feature_batch_size
+                    and len(idx_batch) == current_phase4_feature_batch_size
+                ):
+                    cuda_snapshot = _get_cuda_reserved_snapshot(model.device)
+                    if cuda_snapshot is not None:
+                        reserved_bytes, total_cuda_bytes = cuda_snapshot
+                        next_feature_batch_size = _autoscale_phase4_feature_batch_size(
+                            current_phase4_feature_batch_size,
+                            max_feature_batch_size=max_phase4_feature_batch_size,
+                            reserved_bytes=reserved_bytes,
+                            total_cuda_bytes=total_cuda_bytes,
+                        )
+                        if next_feature_batch_size != current_phase4_feature_batch_size:
+                            logger.info(
+                                "Phase 4 autoscale | "
+                                f"batch={phase4_batch_count} | "
+                                f"feature_batch_size={current_phase4_feature_batch_size}->{next_feature_batch_size} | "
+                                f"cuda_reserved_gib={reserved_bytes / (1024**3):.2f} | "
+                                f"reserved_fraction={reserved_bytes / total_cuda_bytes:.3f}"
+                            )
+                            current_phase4_feature_batch_size = next_feature_batch_size
+
                 if profile:
-                    batch_number = max(
-                        1,
-                        (n_visited + effective_feature_batch_size - 1)
-                        // effective_feature_batch_size,
-                    )
+                    batch_number = phase4_batch_count
                     if batch_number % profile_log_interval == 0:
                         _log_batch_profile(
                             logger,
                             "Phase 4",
                             batch_number,
                             max(
-                                (actual_max_feature_nodes + effective_feature_batch_size - 1)
-                                // effective_feature_batch_size,
+                                (actual_max_feature_nodes + current_phase4_feature_batch_size - 1)
+                                // current_phase4_feature_batch_size,
                                 1,
                             ),
                             time.perf_counter() - batch_start,
@@ -817,6 +910,8 @@ def _run_attribution(
             phase4_start,
             model.device,
             selected_features=int(visited.sum().item()),
+            final_feature_batch_size=current_phase4_feature_batch_size,
+            phase4_batches=phase4_batch_count,
         )
 
         # Phase 5: packaging graph / compact output
