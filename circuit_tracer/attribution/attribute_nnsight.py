@@ -297,12 +297,11 @@ def _autoscale_phase4_feature_batch_size(
     return min(max_feature_batch_size, next_batch_size)
 
 
-def _get_cuda_reserved_snapshot(device) -> tuple[int, int] | None:
-    device_obj = torch.device(device)
-    if device_obj.type != "cuda" or not torch.cuda.is_available():
+def _get_cuda_reserved_snapshot() -> tuple[int, int] | None:
+    if not torch.cuda.is_available():
         return None
 
-    device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+    device_index = torch.cuda.current_device()
     peak_reserved = int(torch.cuda.memory_reserved(device_index))
     total_cuda_bytes = int(torch.cuda.get_device_properties(device_index).total_memory)
     return peak_reserved, total_cuda_bytes
@@ -863,7 +862,7 @@ def _run_attribution(
                     auto_scale_feature_batch_size
                     and len(idx_batch) == current_phase4_feature_batch_size
                 ):
-                    cuda_snapshot = _get_cuda_reserved_snapshot(model.device)
+                    cuda_snapshot = _get_cuda_reserved_snapshot()
                     if cuda_snapshot is not None:
                         reserved_bytes, total_cuda_bytes = cuda_snapshot
                         next_feature_batch_size = _autoscale_phase4_feature_batch_size(
