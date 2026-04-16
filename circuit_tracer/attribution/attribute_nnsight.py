@@ -491,9 +491,7 @@ def _run_attribution(
     effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
     trace_batch_size = max(
         batch_size,
-        max_phase4_feature_batch_size
-        if auto_scale_feature_batch_size
-        else effective_feature_batch_size,
+        effective_feature_batch_size,
         effective_logit_batch_size,
     )
     ctx = None
@@ -844,11 +842,11 @@ def _run_attribution(
                     phase_label="phase4_features",
                 )
 
-                end = min(st + effective_feature_batch_size, st + rows.shape[0])
+                row_count = rows.shape[0]
+                end = st + row_count
                 rows_cpu = rows.cpu()
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
-                    row_count = end - st
                     feature_row_store.append_rows(
                         row_start=st,
                         feature_rows=rows_cpu[:row_count, :total_active_feats],
