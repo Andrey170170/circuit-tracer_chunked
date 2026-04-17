@@ -281,6 +281,22 @@ def _resolve_phase4_feature_batch_planner_enabled(
     return bool(plan_feature_batch_size or auto_scale_feature_batch_size)
 
 
+def _resolve_phase4_feature_batch_planner_status(
+    *,
+    planner_enabled: bool,
+    effective_feature_batch_size: int,
+    max_feature_batch_size: int,
+) -> tuple[str, str | None]:
+    if not planner_enabled:
+        return "disabled", None
+    if max_feature_batch_size <= effective_feature_batch_size:
+        return (
+            "skipped_no_headroom",
+            "feature_batch_size_max does not exceed initial feature_batch_size",
+        )
+    return "pending", None
+
+
 def _compute_phase4_planned_feature_batch_size(
     observed_feature_batch_size: int,
     *,
@@ -824,39 +840,54 @@ def _run_attribution(
     effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
 
     exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+    planner_status, planner_skip_reason = _resolve_phase4_feature_batch_planner_status(
+        planner_enabled=planner_enabled,
+        effective_feature_batch_size=effective_feature_batch_size,
+        max_feature_batch_size=max_phase4_feature_batch_size,
+    )
     if planner_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "Phase-4 feature batch planner requires compact_output=True and exact_chunked_decoder=True"
         )
     if planner_enabled:
-        planner_probe_feature_batch_size = min(
-            effective_feature_batch_size,
-            max_phase4_feature_batch_size,
-        )
-        effective_feature_batch_size = _plan_phase4_feature_batch_size_preflight(
-            model=model,
-            prompt=prompt,
-            attribution_targets=attribution_targets,
-            batch_size=batch_size,
-            initial_feature_batch_size=planner_probe_feature_batch_size,
-            effective_logit_batch_size=effective_logit_batch_size,
-            max_feature_batch_size=max_phase4_feature_batch_size,
-            max_feature_nodes=max_feature_nodes,
-            update_interval=update_interval,
-            max_n_logits=max_n_logits,
-            desired_logit_prob=desired_logit_prob,
-            logger=logger,
-            sparsification=sparsification,
-            chunked_feature_replay_window=chunked_feature_replay_window,
-            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
-            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
-            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
-            row_subchunk_size=row_subchunk_size,
-            diagnostic_feature_cap=diagnostic_feature_cap,
-            feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
-            feature_batch_min_free_fraction=feature_batch_min_free_fraction,
-            feature_batch_probe_batches=feature_batch_probe_batches,
-        )
+        if planner_status == "skipped_no_headroom":
+            logger.info(
+                "Phase-4 feature batch planner skipped | "
+                f"status={planner_status} | "
+                f"initial_feature_batch_size={effective_feature_batch_size} | "
+                f"feature_batch_size_max={max_phase4_feature_batch_size} | "
+                f"reason={planner_skip_reason}"
+            )
+        else:
+            planner_probe_feature_batch_size = min(
+                effective_feature_batch_size,
+                max_phase4_feature_batch_size,
+            )
+            effective_feature_batch_size = _plan_phase4_feature_batch_size_preflight(
+                model=model,
+                prompt=prompt,
+                attribution_targets=attribution_targets,
+                batch_size=batch_size,
+                initial_feature_batch_size=planner_probe_feature_batch_size,
+                effective_logit_batch_size=effective_logit_batch_size,
+                max_feature_batch_size=max_phase4_feature_batch_size,
+                max_feature_nodes=max_feature_nodes,
+                update_interval=update_interval,
+                max_n_logits=max_n_logits,
+                desired_logit_prob=desired_logit_prob,
+                logger=logger,
+                sparsification=sparsification,
+                chunked_feature_replay_window=chunked_feature_replay_window,
+                error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+                stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+                stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+                row_subchunk_size=row_subchunk_size,
+                diagnostic_feature_cap=diagnostic_feature_cap,
+                feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
+                feature_batch_min_free_fraction=feature_batch_min_free_fraction,
+                feature_batch_probe_batches=feature_batch_probe_batches,
+            )
+            planner_status = "executed"
 
     trace_batch_size = max(
         batch_size,
@@ -1137,8 +1168,14 @@ def _run_attribution(
         logger.info(
             "Phase 4 feature batch mode | "
             f"planner_enabled={planner_enabled} | "
+            f"planner_status={planner_status} | "
             f"fixed_feature_batch_size={phase4_feature_batch_size} | "
             f"max_feature_batch_size={max_phase4_feature_batch_size}"
+            + (
+                f" | planner_skip_reason={planner_skip_reason}"
+                if planner_skip_reason is not None
+                else ""
+            )
         )
         st = n_logits
         visited = torch.zeros(total_active_feats, dtype=torch.bool)
@@ -1293,6 +1330,8 @@ def _run_attribution(
                 ),
                 "phase4_feature_batch_size_max": int(max_phase4_feature_batch_size),
                 "phase4_feature_batch_planner_enabled": bool(planner_enabled),
+                "phase4_feature_batch_planner_status": planner_status,
+                "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
                 "cfg": model.config,
                 "scan": model.scan,
             }

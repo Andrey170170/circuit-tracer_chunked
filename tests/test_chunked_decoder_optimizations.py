@@ -10,6 +10,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_probe_pending_frontier,
     _compute_phase4_planned_feature_batch_size,
     _reorder_pending_for_phase4_locality,
+    _resolve_phase4_feature_batch_planner_status,
 )
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
@@ -697,6 +698,25 @@ def test_phase4_planner_batch_size_uses_min_free_fraction_guardrail() -> None:
         )
         == 256
     )
+
+
+def test_phase4_planner_status_skips_when_no_headroom() -> None:
+    assert _resolve_phase4_feature_batch_planner_status(
+        planner_enabled=True,
+        effective_feature_batch_size=128,
+        max_feature_batch_size=128,
+    ) == (
+        "skipped_no_headroom",
+        "feature_batch_size_max does not exceed initial feature_batch_size",
+    )
+
+
+def test_phase4_planner_status_is_pending_when_growth_is_possible() -> None:
+    assert _resolve_phase4_feature_batch_planner_status(
+        planner_enabled=True,
+        effective_feature_batch_size=128,
+        max_feature_batch_size=256,
+    ) == ("pending", None)
 
 
 def test_phase4_probe_frontier_uses_ranked_first_frontier_then_locality() -> None:
