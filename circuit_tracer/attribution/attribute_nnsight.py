@@ -22,9 +22,11 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
 
 import logging
 import math
+import sys
 import tempfile
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import Literal, cast
 
 import numpy as np
@@ -46,6 +48,7 @@ from circuit_tracer.graph import (
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.utils.telemetry import (
+    TelemetryRecorder,
     diff_numeric_metrics,
     format_memory_snapshot,
     format_numeric_metrics,
@@ -54,7 +57,7 @@ from circuit_tracer.utils.telemetry import (
 
 def _log_phase_metrics(logger, label: str, phase_start: float, device, **extra):
     logger.info(
-        f"{label} completed in {time.time() - phase_start:.2f}s | "
+        f"{label} completed in {time.perf_counter() - phase_start:.2f}s | "
         f"{format_memory_snapshot(device=device, extra=extra)}"
     )
 
@@ -110,7 +113,14 @@ def _log_sparsification_profile(logger, stats: dict[str, object]) -> None:
 class _FileBackedFeatureRowStore:
     """Append-only dense feature-row store backed by a temporary memmap file."""
 
-    def __init__(self, *, n_rows: int, n_feature_columns: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        *,
+        n_rows: int,
+        n_feature_columns: int,
+        dtype: torch.dtype,
+        telemetry_recorder: TelemetryRecorder | None = None,
+    ) -> None:
         if dtype not in (torch.float32, torch.float64):
             raise ValueError(f"Unsupported feature row store dtype: {dtype}")
 
@@ -128,7 +138,24 @@ class _FileBackedFeatureRowStore:
             dtype=self._np_dtype,
             shape=(n_rows, n_feature_columns),
         )
+        self._telemetry_recorder = telemetry_recorder
         self._closed = False
+
+    def _telemetry_timer(
+        self,
+        *,
+        name: str,
+        phase: str | None,
+        attrs: dict[str, object],
+    ):
+        if self._telemetry_recorder is None:
+            return nullcontext()
+        return self._telemetry_recorder.timer(
+            scope="op",
+            name=name,
+            phase=phase,
+            attrs=attrs,
+        )
 
     @property
     def path(self) -> str:
@@ -150,6 +177,7 @@ class _FileBackedFeatureRowStore:
         row_start: int,
         feature_rows: torch.Tensor,
         full_row_abs_sums: torch.Tensor,
+        phase: str | None = None,
     ) -> None:
         if feature_rows.ndim != 2:
             raise ValueError("feature_rows must be rank-2")
@@ -164,24 +192,49 @@ class _FileBackedFeatureRowStore:
         if row_start < 0 or row_end > self.n_rows:
             raise ValueError("row range is out of bounds for file-backed store")
 
-        rows = self._require_open_rows()
-        feature_rows_cpu = feature_rows.to(
-            device=self.row_abs_sums.device,
-            dtype=self._dtype,
-        ).contiguous()
-        rows[row_start:row_end] = feature_rows_cpu.numpy()
+        with self._telemetry_timer(
+            name="feature_row_store.append_rows",
+            phase=phase,
+            attrs={
+                "row_start": row_start,
+                "row_end": row_end,
+                "row_count": row_count,
+                "feature_columns": n_feature_cols,
+            },
+        ):
+            rows = self._require_open_rows()
+            feature_rows_cpu = feature_rows.to(
+                device=self.row_abs_sums.device,
+                dtype=self._dtype,
+            ).contiguous()
+            rows[row_start:row_end] = feature_rows_cpu.numpy()
 
-        self.row_abs_sums[row_start:row_end] = full_row_abs_sums.to(
-            device=self.row_abs_sums.device,
-            dtype=self.row_abs_sums.dtype,
-        )
+            self.row_abs_sums[row_start:row_end] = full_row_abs_sums.to(
+                device=self.row_abs_sums.device,
+                dtype=self.row_abs_sums.dtype,
+            )
 
-    def read_feature_rows(self, row_start: int, row_end: int) -> torch.Tensor:
+    def read_feature_rows(
+        self,
+        row_start: int,
+        row_end: int,
+        *,
+        phase: str | None = None,
+    ) -> torch.Tensor:
         if row_start < 0 or row_end < row_start or row_end > self.n_rows:
             raise ValueError("requested row slice is out of bounds for file-backed store")
 
-        rows = self._require_open_rows()
-        return torch.from_numpy(np.asarray(rows[row_start:row_end], dtype=self._np_dtype))
+        with self._telemetry_timer(
+            name="feature_row_store.read_rows",
+            phase=phase,
+            attrs={
+                "row_start": row_start,
+                "row_end": row_end,
+                "row_count": row_end - row_start,
+            },
+        ):
+            rows = self._require_open_rows()
+            return torch.from_numpy(np.asarray(rows[row_start:row_end], dtype=self._np_dtype))
 
     def materialize_dense_feature_slice(
         self,
@@ -190,6 +243,7 @@ class _FileBackedFeatureRowStore:
         row_end: int,
         selected_feature_columns: torch.Tensor,
         col_chunk_size: int = 2048,
+        phase: str | None = None,
     ) -> torch.Tensor:
         if row_start < 0 or row_end < row_start or row_end > self.n_rows:
             raise ValueError("requested row slice is out of bounds for file-backed store")
@@ -206,12 +260,23 @@ class _FileBackedFeatureRowStore:
         if selected_cols.min() < 0 or selected_cols.max() >= self.n_feature_columns:
             raise ValueError("selected feature column indices must be in [0, n_feature_columns)")
 
-        rows = self._require_open_rows()
-        for col_start in range(0, n_cols, col_chunk_size):
-            col_end = min(col_start + col_chunk_size, n_cols)
-            cols_np = selected_cols[col_start:col_end].numpy()
-            chunk_np = np.asarray(rows[row_start:row_end, cols_np], dtype=self._np_dtype)
-            dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
+        with self._telemetry_timer(
+            name="feature_row_store.materialize_dense_slice",
+            phase=phase,
+            attrs={
+                "row_start": row_start,
+                "row_end": row_end,
+                "row_count": n_rows,
+                "selected_columns": n_cols,
+                "col_chunk_size": col_chunk_size,
+            },
+        ):
+            rows = self._require_open_rows()
+            for col_start in range(0, n_cols, col_chunk_size):
+                col_end = min(col_start + col_chunk_size, n_cols)
+                cols_np = selected_cols[col_start:col_end].numpy()
+                chunk_np = np.asarray(rows[row_start:row_end, cols_np], dtype=self._np_dtype)
+                dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
 
         return dense
 
@@ -423,18 +488,50 @@ def _plan_phase4_feature_batch_size_preflight(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
+    telemetry_recorder: TelemetryRecorder | None = None,
 ) -> int:
+    planner_start = time.perf_counter()
+
+    def _finalize_planner(
+        *,
+        planned_feature_batch_size: int,
+        planner_status: str,
+        attrs: dict[str, object] | None = None,
+    ) -> int:
+        if telemetry_recorder is not None:
+            payload = {
+                "planner_status": planner_status,
+                "planned_feature_batch_size": planned_feature_batch_size,
+            }
+            if attrs:
+                payload.update(attrs)
+            telemetry_recorder.record_event(
+                scope="phase",
+                name="phase4.planner.preflight",
+                phase="phase4",
+                elapsed_ms=(time.perf_counter() - planner_start) * 1000.0,
+                attrs=payload,
+            )
+        return planned_feature_batch_size
+
     if not torch.cuda.is_available():
         logger.info(
             "Phase 4 planner skipped (CUDA unavailable); using fixed feature batch size "
             f"{min(initial_feature_batch_size, max_feature_batch_size)}"
         )
-        return min(initial_feature_batch_size, max_feature_batch_size)
+        return _finalize_planner(
+            planned_feature_batch_size=min(initial_feature_batch_size, max_feature_batch_size),
+            planner_status="skipped_cuda_unavailable",
+        )
 
     input_ids = model.ensure_tokenized(prompt)
     ctx = None
     observed_peak_reserved_bytes = 0
     total_cuda_bytes: int | None = None
+
+    configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
+    if callable(configure_trace_logging):
+        configure_trace_logging(None, telemetry_recorder=telemetry_recorder)
 
     try:
         logger.info(
@@ -460,6 +557,9 @@ def _plan_phase4_feature_batch_size_preflight(
         )
         if hasattr(ctx, "set_diagnostic_mode"):
             ctx.set_diagnostic_mode(False)
+        configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
+        if callable(configure_ctx_trace_logging):
+            configure_ctx_trace_logging(None, telemetry_recorder=telemetry_recorder)
 
         if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
             ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
@@ -471,7 +571,10 @@ def _plan_phase4_feature_batch_size_preflight(
                 "Phase 4 planner preflight observed no active features; "
                 f"using feature batch size {min(initial_feature_batch_size, max_feature_batch_size)}"
             )
-            return min(initial_feature_batch_size, max_feature_batch_size)
+            return _finalize_planner(
+                planned_feature_batch_size=min(initial_feature_batch_size, max_feature_batch_size),
+                planner_status="skipped_no_active_features",
+            )
 
         feat_layers, feat_pos, feat_ids = activation_matrix.indices()
         n_layers, n_pos, _ = activation_matrix.shape
@@ -560,6 +663,7 @@ def _plan_phase4_feature_batch_size_preflight(
 
             device_index = torch.cuda.current_device()
             torch.cuda.reset_peak_memory_stats(device_index)
+            probe_batch_start = time.perf_counter()
             rows = ctx.compute_batch(
                 layers=feat_layers[idx_batch],
                 positions=feat_pos[idx_batch],
@@ -574,13 +678,30 @@ def _plan_phase4_feature_batch_size_preflight(
                 int(torch.cuda.max_memory_reserved(device_index)),
             )
             probe_batches_ran += 1
+            if telemetry_recorder is not None:
+                telemetry_recorder.record_event(
+                    scope="batch",
+                    name="phase4.planner.probe_batch",
+                    phase="phase4",
+                    batch_index=probe_batches_ran,
+                    elapsed_ms=(time.perf_counter() - probe_batch_start) * 1000.0,
+                    attrs={
+                        "batch_nodes": int(idx_batch.numel()),
+                        "observed_peak_reserved_bytes": int(
+                            torch.cuda.max_memory_reserved(device_index)
+                        ),
+                    },
+                )
 
         if probe_batches_ran <= 0 or observed_feature_batch_size <= 0:
             logger.info(
                 "Phase 4 planner preflight observed no representative probe batches; "
                 f"using feature batch size {min(initial_feature_batch_size, max_feature_batch_size)}"
             )
-            return min(initial_feature_batch_size, max_feature_batch_size)
+            return _finalize_planner(
+                planned_feature_batch_size=min(initial_feature_batch_size, max_feature_batch_size),
+                planner_status="skipped_no_probe_batches",
+            )
 
         cuda_snapshot = _get_cuda_reserved_snapshot()
         observed_reserved_bytes: int | None = None
@@ -610,7 +731,16 @@ def _plan_phase4_feature_batch_size_preflight(
             f"probe_reserved_fraction={planned_reserved_fraction if planned_reserved_fraction is not None else 'n/a'} | "
             f"planned_feature_batch_size={planned_feature_batch_size}"
         )
-        return planned_feature_batch_size
+        return _finalize_planner(
+            planned_feature_batch_size=planned_feature_batch_size,
+            planner_status="executed",
+            attrs={
+                "probes_ran": probe_batches_ran,
+                "observed_probe_feature_batch_size": observed_feature_batch_size,
+                "probe_frontier_candidates": int(pending.numel()),
+                "probe_reserved_fraction": planned_reserved_fraction,
+            },
+        )
     finally:
         if ctx is not None:
             cleanup = getattr(ctx, "cleanup", None)
@@ -800,6 +930,7 @@ def _run_attribution(
     compact_output: bool = False,
 ):
     start_time = time.time()
+    run_start = time.perf_counter()
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
     if feature_batch_size is not None and feature_batch_size <= 0:
@@ -820,6 +951,19 @@ def _run_attribution(
         raise ValueError("feature_batch_min_free_fraction must be in [0, 1)")
     if feature_batch_probe_batches <= 0:
         raise ValueError("feature_batch_probe_batches must be > 0")
+
+    telemetry_recorder = TelemetryRecorder(enabled=(profile or compact_output), max_events=20000)
+    telemetry_recorder.record_event(
+        scope="run",
+        name="attribute.start",
+        attrs={
+            "profile": profile,
+            "compact_output": compact_output,
+            "batch_size": batch_size,
+            "feature_batch_size": feature_batch_size,
+            "logit_batch_size": logit_batch_size,
+        },
+    )
 
     effective_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
     max_phase4_feature_batch_size = (
@@ -858,6 +1002,16 @@ def _run_attribution(
                 f"feature_batch_size_max={max_phase4_feature_batch_size} | "
                 f"reason={planner_skip_reason}"
             )
+            telemetry_recorder.record_event(
+                scope="phase",
+                name="phase4.planner.preflight",
+                phase="phase4",
+                attrs={
+                    "planner_status": planner_status,
+                    "planned_feature_batch_size": effective_feature_batch_size,
+                    "planner_skip_reason": planner_skip_reason,
+                },
+            )
         else:
             planner_probe_feature_batch_size = min(
                 effective_feature_batch_size,
@@ -886,6 +1040,7 @@ def _run_attribution(
                 feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
                 feature_batch_min_free_fraction=feature_batch_min_free_fraction,
                 feature_batch_probe_batches=feature_batch_probe_batches,
+                telemetry_recorder=telemetry_recorder,
             )
             planner_status = "executed"
 
@@ -896,16 +1051,20 @@ def _run_attribution(
     )
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
+    compact_output_result: dict[str, object] | None = None
 
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
-    phase_start = time.time()
+    phase_start = time.perf_counter()
     input_ids = model.ensure_tokenized(prompt)
     _log_memory_boundary(logger, "Phase 0 start", model.device)
 
     configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
     if callable(configure_trace_logging):
-        configure_trace_logging(logger.info if profile else None)
+        configure_trace_logging(
+            logger.info if profile else None,
+            telemetry_recorder=telemetry_recorder,
+        )
 
     reset_diagnostics = getattr(model.transcoders, "reset_diagnostic_stats", None)
     if callable(reset_diagnostics):
@@ -944,7 +1103,10 @@ def _run_attribution(
         ctx.set_diagnostic_mode(profile)
     configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
     if callable(configure_ctx_trace_logging):
-        configure_ctx_trace_logging(logger.info if profile else None)
+        configure_ctx_trace_logging(
+            logger.info if profile else None,
+            telemetry_recorder=telemetry_recorder,
+        )
 
     if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
         before_cap, after_cap = ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
@@ -964,6 +1126,16 @@ def _run_attribution(
             model.device,
             active_features=ctx.activation_matrix._nnz(),
             logit_retention=getattr(ctx, "logit_retention", "full"),
+        )
+        telemetry_recorder.record_event(
+            scope="phase",
+            name="phase0.precompute",
+            phase="phase0",
+            elapsed_ms=(time.perf_counter() - phase_start) * 1000.0,
+            attrs={
+                "active_features": int(ctx.activation_matrix._nnz()),
+                "logit_retention": getattr(ctx, "logit_retention", "full"),
+            },
         )
         if profile:
             if getattr(ctx, "setup_diagnostic_stats", None):
@@ -986,7 +1158,7 @@ def _run_attribution(
 
         # Phase 1: forward pass
         logger.info("Phase 1: Running forward pass")
-        phase_start = time.time()
+        phase_start = time.perf_counter()
         _log_memory_boundary(logger, "Phase 1 start", model.device)
         with model.trace() as tracer:
             with tracer.invoke(input_ids.expand(trace_batch_size, -1)):
@@ -999,6 +1171,12 @@ def _run_attribution(
             ctx.cache_residual(model, tracer, barrier=detach_barrier)
 
         _log_phase_metrics(logger, "Forward pass", phase_start, model.device)
+        telemetry_recorder.record_event(
+            scope="phase",
+            name="phase1.forward_pass",
+            phase="phase1",
+            elapsed_ms=(time.perf_counter() - phase_start) * 1000.0,
+        )
 
         if offload:
             offload_handles += offload_modules(
@@ -1011,7 +1189,7 @@ def _run_attribution(
 
         # Phase 2: build input vector list
         logger.info("Phase 2: Building input vectors")
-        phase2_start = time.time()
+        phase2_start = time.perf_counter()
         _log_memory_boundary(logger, "Phase 2 start", model.device)
         feat_layers, feat_pos, feat_ids = activation_matrix.indices()
         n_layers, n_pos, _ = activation_matrix.shape
@@ -1059,6 +1237,7 @@ def _run_attribution(
                 n_rows=actual_max_feature_nodes + n_logits,
                 n_feature_columns=total_active_feats,
                 dtype=torch.float32,
+                telemetry_recorder=telemetry_recorder,
             )
         else:
             edge_matrix = torch.zeros(actual_max_feature_nodes + n_logits, total_nodes)
@@ -1095,10 +1274,17 @@ def _run_attribution(
             model.device,
             **phase2_extra,
         )
+        telemetry_recorder.record_event(
+            scope="phase",
+            name="phase2.input_vector_build",
+            phase="phase2",
+            elapsed_ms=(time.perf_counter() - phase2_start) * 1000.0,
+            attrs=phase2_extra,
+        )
 
         # Phase 3: logit attribution
         logger.info("Phase 3: Computing logit attributions")
-        phase3_start = time.time()
+        phase3_start = time.perf_counter()
         _log_memory_boundary(logger, "Phase 3 start", model.device)
         i = -1
         total_logit_batches = max(
@@ -1124,11 +1310,25 @@ def _run_attribution(
                     row_start=i,
                     feature_rows=rows_cpu[:, :total_active_feats],
                     full_row_abs_sums=rows_cpu[:, :logit_offset].abs().sum(dim=1),
+                    phase="phase3",
                 )
             else:
                 edge_matrix[i : i + batch.shape[0], :logit_offset] = rows_cpu
             row_to_node_index[i : i + batch.shape[0]] = (
                 torch.arange(i, i + batch.shape[0]) + logit_offset
+            )
+            batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+            telemetry_recorder.record_event(
+                scope="batch",
+                name="phase3.logit_batch",
+                phase="phase3",
+                batch_index=(i // effective_logit_batch_size) + 1,
+                elapsed_ms=batch_elapsed_ms,
+                attrs={
+                    "batch_rows": int(batch.shape[0]),
+                    "batch_start_index": int(i),
+                    "total_logit_batches": int(total_logit_batches),
+                },
             )
             if profile and ((i // effective_logit_batch_size) + 1) % profile_log_interval == 0:
                 _log_batch_profile(
@@ -1136,7 +1336,7 @@ def _run_attribution(
                     "Phase 3",
                     (i // effective_logit_batch_size) + 1,
                     total_logit_batches,
-                    time.perf_counter() - batch_start,
+                    batch_elapsed_ms / 1000.0,
                     ctx_before,
                     _snapshot_diagnostics(ctx),
                     transcoder_before,
@@ -1149,13 +1349,20 @@ def _run_attribution(
             phase3_start,
             model.device,
         )
+        telemetry_recorder.record_event(
+            scope="phase",
+            name="phase3.logit_attribution",
+            phase="phase3",
+            elapsed_ms=(time.perf_counter() - phase3_start) * 1000.0,
+            attrs={"logit_count": int(len(targets)), "batches": int(total_logit_batches)},
+        )
         reset_decoder_cache = getattr(ctx, "reset_decoder_cache", None)
         if callable(reset_decoder_cache):
             reset_decoder_cache()
 
         # Phase 4: feature attribution
         logger.info("Phase 4: Computing feature attributions")
-        phase4_start = time.time()
+        phase4_start = time.perf_counter()
         _log_memory_boundary(logger, "Phase 4 start", model.device)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
         phase4_feature_batch_size = effective_feature_batch_size
@@ -1195,7 +1402,11 @@ def _run_attribution(
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     feature_influences = compute_partial_feature_influences_streaming(
-                        feature_row_store.read_feature_rows,
+                        lambda row_start, row_end: feature_row_store.read_feature_rows(
+                            row_start,
+                            row_end,
+                            phase="phase4",
+                        ),
                         feature_row_store.row_abs_sums[:st],
                         targets.logit_probabilities,
                         row_to_node_index[:st],
@@ -1254,6 +1465,7 @@ def _run_attribution(
                         row_start=st,
                         feature_rows=rows_cpu[:row_count, :total_active_feats],
                         full_row_abs_sums=rows_cpu[:row_count, :logit_offset].abs().sum(dim=1),
+                        phase="phase4",
                     )
                 else:
                     edge_matrix[st:end, :logit_offset] = rows_cpu
@@ -1265,6 +1477,7 @@ def _run_attribution(
                 if profile:
                     batch_number = phase4_batch_count
                     if batch_number % profile_log_interval == 0:
+                        batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
                         _log_batch_profile(
                             logger,
                             "Phase 4",
@@ -1274,12 +1487,26 @@ def _run_attribution(
                                 // phase4_feature_batch_size,
                                 1,
                             ),
-                            time.perf_counter() - batch_start,
+                            batch_elapsed_ms / 1000.0,
                             ctx_before,
                             _snapshot_diagnostics(ctx),
                             transcoder_before,
                             _snapshot_diagnostics(model.transcoders),
                         )
+                batch_number = phase4_batch_count
+                batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                telemetry_recorder.record_event(
+                    scope="batch",
+                    name="phase4.feature_batch",
+                    phase="phase4",
+                    batch_index=batch_number,
+                    elapsed_ms=batch_elapsed_ms,
+                    attrs={
+                        "batch_rows": int(row_count),
+                        "visited_features": int(n_visited),
+                        "target_feature_count": int(actual_max_feature_nodes),
+                    },
+                )
 
         pbar.close()
         _log_phase_metrics(
@@ -1291,8 +1518,20 @@ def _run_attribution(
             final_feature_batch_size=phase4_feature_batch_size,
             phase4_batches=phase4_batch_count,
         )
+        telemetry_recorder.record_event(
+            scope="phase",
+            name="phase4.feature_attribution",
+            phase="phase4",
+            elapsed_ms=(time.perf_counter() - phase4_start) * 1000.0,
+            attrs={
+                "selected_features": int(visited.sum().item()),
+                "feature_batch_size": int(phase4_feature_batch_size),
+                "phase4_batches": int(phase4_batch_count),
+            },
+        )
 
         # Phase 5: packaging graph / compact output
+        phase5_start = time.perf_counter()
         selected_features = torch.where(visited)[0]
         if compact_output:
             if use_compact_feature_row_store:
@@ -1301,11 +1540,13 @@ def _run_attribution(
                     row_start=n_logits,
                     row_end=st,
                     selected_feature_columns=selected_features,
+                    phase="phase5",
                 )
                 logit_feature_edges = feature_row_store.materialize_dense_feature_slice(
                     row_start=0,
                     row_end=n_logits,
                     selected_feature_columns=selected_features,
+                    phase="phase5",
                 )
             else:
                 feature_feature_edges = edge_matrix[n_logits:st, selected_features].detach().cpu()
@@ -1352,6 +1593,22 @@ def _run_attribution(
                     else ""
                 )
             )
+            telemetry_recorder.record_event(
+                scope="phase",
+                name="phase5.packaging",
+                phase="phase5",
+                elapsed_ms=(time.perf_counter() - phase5_start) * 1000.0,
+                attrs={
+                    "compact_output": True,
+                    "selected_features": int(selected_features.numel()),
+                    "feature_edge_rows": int(
+                        compact_output_result["feature_feature_edges"].shape[0]
+                    ),
+                    "feature_edge_cols": int(
+                        compact_output_result["feature_feature_edges"].shape[1]
+                    ),
+                },
+            )
             return compact_output_result
 
         non_feature_nodes = torch.arange(total_active_feats, total_nodes)
@@ -1386,9 +1643,21 @@ def _run_attribution(
             f"Attribution completed in {time.time() - start_time:.2f}s | "
             f"{format_memory_snapshot(device=model.device, extra={'adjacency_shape': tuple(full_edge_matrix.shape)})}"
         )
+        telemetry_recorder.record_event(
+            scope="phase",
+            name="phase5.packaging",
+            phase="phase5",
+            elapsed_ms=(time.perf_counter() - phase5_start) * 1000.0,
+            attrs={
+                "compact_output": False,
+                "adjacency_rows": int(full_edge_matrix.shape[0]),
+                "adjacency_cols": int(full_edge_matrix.shape[1]),
+            },
+        )
 
         return graph
     finally:
+        teardown_start = time.perf_counter()
         if feature_row_store is not None:
             feature_row_store.cleanup()
         if ctx is not None:
@@ -1401,3 +1670,46 @@ def _run_attribution(
                 if callable(clear_decoder_cache):
                     clear_decoder_cache()
             _log_memory_boundary(logger, "Teardown done", model.device)
+        telemetry_recorder.record_event(
+            scope="phase",
+            name="teardown.cleanup",
+            phase="teardown",
+            elapsed_ms=(time.perf_counter() - teardown_start) * 1000.0,
+            attrs={
+                "ctx_present": ctx is not None,
+                "feature_row_store": feature_row_store is not None,
+            },
+        )
+
+        exc_type, exc, _ = sys.exc_info()
+        if exc_type is None:
+            telemetry_recorder.record_event(
+                scope="run",
+                name="attribute.done",
+                elapsed_ms=(time.perf_counter() - run_start) * 1000.0,
+                attrs={"compact_output": compact_output},
+            )
+        else:
+            telemetry_recorder.record_event(
+                scope="run",
+                name="attribute.failed",
+                elapsed_ms=(time.perf_counter() - run_start) * 1000.0,
+                attrs={
+                    "compact_output": compact_output,
+                    "error_type": exc_type.__name__,
+                    "error_message": str(exc) if exc is not None else None,
+                },
+            )
+
+        if compact_output_result is not None:
+            telemetry_export = telemetry_recorder.export(include_events=True)
+            compact_output_result["telemetry_summary"] = telemetry_export["summary"]
+            compact_output_result["telemetry_events"] = telemetry_export.get("events", [])
+        elif profile:
+            telemetry_summary = telemetry_recorder.build_summary()
+            logger.info(
+                "Telemetry summary | "
+                f"event_count={telemetry_summary.get('event_count')} | "
+                f"stored_event_count={telemetry_summary.get('stored_event_count')} | "
+                f"dropped_event_count={telemetry_summary.get('dropped_event_count')}"
+            )

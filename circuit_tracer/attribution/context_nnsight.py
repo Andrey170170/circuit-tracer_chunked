@@ -10,6 +10,8 @@ import numpy as np
 import torch
 from einops import einsum
 
+from circuit_tracer.utils.telemetry import TelemetryRecorder
+
 
 if TYPE_CHECKING:
     from circuit_tracer.replacement_model.replacement_model_nnsight import (
@@ -116,7 +118,9 @@ class AttributionContext:
         self.sparsification_stats: dict[str, object] | None = None
         self.diagnostic_mode = False
         self._trace_logger = None
+        self._telemetry_recorder: TelemetryRecorder | None = None
         self._trace_chunk_interval = 16
+        self._compute_batch_call_index = 0
         self._diagnostic_stats: dict[str, object] = {
             "compute_batch_calls": 0.0,
             "compute_batch_seconds": 0.0,
@@ -258,14 +262,31 @@ class AttributionContext:
         self,
         grad_window: dict[int, torch.Tensor],
         window_layers: list[int],
+        *,
+        phase_label: str | None = None,
+        batch_index: int | None = None,
     ) -> None:
         if not window_layers:
             return
+        flush_start = time.perf_counter()
+        flushed_layers = len(window_layers)
         grads_to_replay: list[torch.Tensor | None] = [None] * self.n_layers
         for layer in window_layers:
             grads_to_replay[layer] = grad_window.pop(layer)
-        self._compute_chunked_feature_attributions_from_grads(grads_to_replay)
+        self._compute_chunked_feature_attributions_from_grads(
+            grads_to_replay,
+            phase_label=phase_label,
+            batch_index=batch_index,
+        )
         window_layers.clear()
+        self._record_telemetry_event(
+            scope="op",
+            name="context.chunked_grad_window_flush",
+            phase=phase_label,
+            batch_index=batch_index,
+            elapsed_ms=(time.perf_counter() - flush_start) * 1000.0,
+            attrs={"flushed_layers": flushed_layers},
+        )
 
     @staticmethod
     def _empty_like_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -308,18 +329,64 @@ class AttributionContext:
     def set_diagnostic_mode(self, enabled: bool) -> None:
         self.diagnostic_mode = enabled
 
-    def configure_trace_logging(self, logger=None, *, chunk_interval: int = 16) -> None:
+    def configure_trace_logging(
+        self,
+        logger=None,
+        *,
+        chunk_interval: int = 16,
+        telemetry_recorder: TelemetryRecorder | None = None,
+    ) -> None:
         self._trace_logger = logger
+        self._telemetry_recorder = telemetry_recorder
         self._trace_chunk_interval = max(1, chunk_interval)
 
     def _emit_trace(self, event: str, **fields: object) -> None:
-        if self._trace_logger is None:
+        if self._trace_logger is not None:
+            payload = ", ".join(f"{key}={value}" for key, value in fields.items())
+            message = f"TRACE {event}"
+            if payload:
+                message = f"{message} | {payload}"
+            self._trace_logger(message)
+
+        if self._telemetry_recorder is not None:
+            phase_value = fields.get("phase")
+            phase = str(phase_value) if isinstance(phase_value, str) else None
+            if phase is None:
+                phase_name = event.split(".", 1)[0]
+                if phase_name.startswith("phase") and phase_name[len("phase") :].isdigit():
+                    phase = phase_name
+            elapsed_ms = fields.get("elapsed_ms")
+            elapsed_ms_value = float(elapsed_ms) if isinstance(elapsed_ms, (int, float)) else None
+            self._telemetry_recorder.record_event(
+                scope="op",
+                name=f"context.{event}",
+                phase=phase,
+                elapsed_ms=elapsed_ms_value,
+                attrs=fields,
+            )
+
+    def _record_telemetry_event(
+        self,
+        *,
+        scope: str,
+        name: str,
+        phase: str | None = None,
+        step_index: int | None = None,
+        batch_index: int | None = None,
+        elapsed_ms: float | None = None,
+        attrs: dict[str, object] | None = None,
+    ) -> None:
+        if self._telemetry_recorder is None:
             return
-        payload = ", ".join(f"{key}={value}" for key, value in fields.items())
-        message = f"TRACE {event}"
-        if payload:
-            message = f"{message} | {payload}"
-        self._trace_logger(message)
+        self._telemetry_recorder.record_event(
+            scope=scope,
+            name=name,
+            phase=phase,
+            step_index=step_index,
+            batch_index=batch_index,
+            elapsed_ms=elapsed_ms,
+            attrs=attrs,
+        )
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:
         snapshot: dict[str, object] = {}
@@ -455,7 +522,11 @@ class AttributionContext:
         return total_active_feats, self.activation_matrix._nnz()
 
     def _compute_chunked_feature_attributions_from_grads(
-        self, output_layer_grads: list[torch.Tensor | None]
+        self,
+        output_layer_grads: list[torch.Tensor | None],
+        *,
+        phase_label: str | None = None,
+        batch_index: int | None = None,
     ) -> None:
         assert self.chunked_decoder_state is not None
         assert self.decoder_provider is not None
@@ -586,6 +657,18 @@ class AttributionContext:
                     source_layer,
                     time.perf_counter() - source_layer_start,
                 )
+            self._record_telemetry_event(
+                scope="op",
+                name="context.chunked_replay.source_layer",
+                phase=phase_label,
+                batch_index=batch_index,
+                elapsed_ms=(time.perf_counter() - source_layer_start) * 1000.0,
+                attrs={
+                    "source_layer": source_layer,
+                    "active_decoder_chunks": int(len(unique_chunk_ids)),
+                    "relevant_output_layers": int(len(relevant_output_layers)),
+                },
+            )
 
         for output_layer in active_output_layers:
             elapsed = output_layer_seconds[output_layer]
@@ -602,13 +685,31 @@ class AttributionContext:
                 output_layer=output_layer,
                 chunks=chunk_counts[output_layer],
                 elapsed_s=f"{elapsed:.2f}",
+                elapsed_ms=elapsed * 1000.0,
             )
         if self.diagnostic_mode:
             self._add_stat("chunked_attr_replay_seconds", time.perf_counter() - replay_start)
+        self._record_telemetry_event(
+            scope="op",
+            name="context.chunked_replay",
+            phase=phase_label,
+            batch_index=batch_index,
+            elapsed_ms=(time.perf_counter() - replay_start) * 1000.0,
+            attrs={"active_output_layers": int(len(active_output_layers))},
+        )
 
-    def _compute_chunked_feature_attributions(self, layer: int, grads: torch.Tensor):
+    def _compute_chunked_feature_attributions(
+        self,
+        layer: int,
+        grads: torch.Tensor,
+        *,
+        phase_label: str | None = None,
+        batch_index: int | None = None,
+    ):
         self._compute_chunked_feature_attributions_from_grads(
-            [grads if output_layer == layer else None for output_layer in range(self.n_layers)]
+            [grads if output_layer == layer else None for output_layer in range(self.n_layers)],
+            phase_label=phase_label,
+            batch_index=batch_index,
         )
 
     def cache_residual(self, model: "NNSightReplacementModel", tracer, barrier=None):
@@ -647,9 +748,21 @@ class AttributionContext:
             "batch position d_model, position d_model -> position batch",
         )
 
-    def compute_feature_attributions(self, layer, grads):
+    def compute_feature_attributions(
+        self,
+        layer,
+        grads,
+        *,
+        phase_label: str | None = None,
+        batch_index: int | None = None,
+    ):
         if self.chunked_decoder_state is not None:
-            self._compute_chunked_feature_attributions(layer, grads)
+            self._compute_chunked_feature_attributions(
+                layer,
+                grads,
+                phase_label=phase_label,
+                batch_index=batch_index,
+            )
             return
 
         nnz_layers, nnz_positions = self.decoder_locations
@@ -716,6 +829,8 @@ class AttributionContext:
 
         batch_size = self._resid_activations[0].shape[0]
         batch_start = time.perf_counter()
+        self._compute_batch_call_index += 1
+        batch_call_index = self._compute_batch_call_index
         self._emit_trace(
             "compute_batch.start",
             phase=phase_label,
@@ -789,7 +904,12 @@ class AttributionContext:
                         grad = self._feature_output_activations[layer + 1].grad.detach()  # type:ignore
                         feature_start = time.perf_counter()
                         if chunked_feature_grads is None:
-                            self.compute_feature_attributions(layer, grad)
+                            self.compute_feature_attributions(
+                                layer,
+                                grad,
+                                phase_label=phase_label,
+                                batch_index=batch_call_index,
+                            )
                             if self.diagnostic_mode:
                                 self._add_layer_stat(
                                     "feature_attr_seconds_by_layer",
@@ -814,6 +934,8 @@ class AttributionContext:
                                 self._flush_chunked_feature_grad_window(
                                     chunked_feature_grads,
                                     chunked_feature_grad_layers,
+                                    phase_label=phase_label,
+                                    batch_index=batch_call_index,
                                 )
                         error_start = time.perf_counter()
                         self.compute_error_attributions(layer, grad)
@@ -842,24 +964,41 @@ class AttributionContext:
                     self._flush_chunked_feature_grad_window(
                         chunked_feature_grads,
                         chunked_feature_grad_layers,
+                        phase_label=phase_label,
+                        batch_index=batch_call_index,
                     )
         finally:
             self._clear_saved_grads()
 
         buf, self._batch_buffer = self._batch_buffer, None
+        elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
         if self.diagnostic_mode:
             self._add_stat("compute_batch_calls", 1)
-            elapsed = time.perf_counter() - batch_start
+            elapsed = elapsed_ms / 1000.0
             self._add_stat("compute_batch_seconds", elapsed)
             phase_bucket = cast(
                 dict[str, float],
                 self._diagnostic_stats.setdefault("compute_batch_seconds_by_phase", {}),
             )
             phase_bucket[phase_label] = phase_bucket.get(phase_label, 0.0) + elapsed
+        self._record_telemetry_event(
+            scope="batch",
+            name="context.compute_batch",
+            phase=phase_label,
+            batch_index=batch_call_index,
+            elapsed_ms=elapsed_ms,
+            attrs={
+                "batch_nodes": len(layers),
+                "unique_layers": len(layers_in_batch),
+                "retain_graph": retain_graph,
+                "chunked_decoder": self.chunked_decoder_state is not None,
+            },
+        )
         self._emit_trace(
             "compute_batch.done",
             phase=phase_label,
             batch_nodes=len(layers),
-            elapsed_s=f"{time.perf_counter() - batch_start:.2f}",
+            elapsed_s=f"{elapsed_ms / 1000.0:.2f}",
+            elapsed_ms=elapsed_ms,
         )
         return buf.T[: len(layers)]
