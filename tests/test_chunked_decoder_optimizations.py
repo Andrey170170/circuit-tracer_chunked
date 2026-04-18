@@ -10,6 +10,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_probe_pending_frontier,
     _compute_phase4_planned_feature_batch_size,
     _reorder_pending_for_phase4_locality,
+    _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
 )
 from circuit_tracer.attribution.context_nnsight import (
@@ -717,6 +718,15 @@ def test_phase4_planner_status_is_pending_when_growth_is_possible() -> None:
         effective_feature_batch_size=128,
         max_feature_batch_size=256,
     ) == ("pending", None)
+
+
+def test_phase4_anomaly_debug_enabled_from_flag() -> None:
+    assert _resolve_phase4_anomaly_debug_enabled(True) is True
+
+
+def test_phase4_anomaly_debug_enabled_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PHASE4_ANOMALY_DEBUG", "1")
+    assert _resolve_phase4_anomaly_debug_enabled(False) is True
 
 
 def test_phase4_probe_frontier_uses_ranked_first_frontier_then_locality() -> None:

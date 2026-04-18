@@ -22,6 +22,7 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
 
 import logging
 import math
+import os
 import sys
 import tempfile
 import time
@@ -344,6 +345,17 @@ def _resolve_phase4_feature_batch_planner_enabled(
 ) -> bool:
     # Backward compatibility: keep legacy flag as an alias for fixed preflight planning.
     return bool(plan_feature_batch_size or auto_scale_feature_batch_size)
+
+
+def _parse_env_bool(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug: bool) -> bool:
+    return bool(phase4_anomaly_debug or _parse_env_bool("PHASE4_ANOMALY_DEBUG"))
 
 
 def _resolve_phase4_feature_batch_planner_status(
@@ -781,6 +793,7 @@ def attribute(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
+    phase4_anomaly_debug: bool = False,
     compact_output: bool = False,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -838,6 +851,8 @@ def attribute(
             unused (0-1), applied as a stricter cap than target utilization.
         feature_batch_probe_batches: Number of preflight Phase-4 probe batches
             to run before the real attribution pass.
+        phase4_anomaly_debug: Enable opt-in Phase-4 anomaly debug scaffolding.
+            Can also be activated via ``PHASE4_ANOMALY_DEBUG=1``.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -886,6 +901,7 @@ def attribute(
             feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
             feature_batch_min_free_fraction=feature_batch_min_free_fraction,
             feature_batch_probe_batches=feature_batch_probe_batches,
+            phase4_anomaly_debug=phase4_anomaly_debug,
             compact_output=compact_output,
             logger=logger,
         )
@@ -927,6 +943,7 @@ def _run_attribution(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
+    phase4_anomaly_debug: bool = False,
     compact_output: bool = False,
 ):
     start_time = time.time()
@@ -952,7 +969,11 @@ def _run_attribution(
     if feature_batch_probe_batches <= 0:
         raise ValueError("feature_batch_probe_batches must be > 0")
 
-    telemetry_recorder = TelemetryRecorder(enabled=(profile or compact_output), max_events=20000)
+    phase4_anomaly_debug_enabled = _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug)
+    telemetry_recorder = TelemetryRecorder(
+        enabled=(profile or compact_output or phase4_anomaly_debug_enabled),
+        max_events=20000,
+    )
     telemetry_recorder.record_event(
         scope="run",
         name="attribute.start",
@@ -989,6 +1010,22 @@ def _run_attribution(
         effective_feature_batch_size=effective_feature_batch_size,
         max_feature_batch_size=max_phase4_feature_batch_size,
     )
+    anomaly_debug_result: dict[str, object] | None = None
+    if phase4_anomaly_debug_enabled and not (compact_output and exact_chunked_decoder):
+        raise ValueError(
+            "Phase-4 anomaly debug requires compact_output=True and exact_chunked_decoder=True"
+        )
+    if phase4_anomaly_debug_enabled:
+        anomaly_debug_result = {
+            "schema_version": 1,
+            "enabled": True,
+            "mode": "phase4_shadow_debug",
+            "status": "scaffold",
+            "shadow_execution": False,
+            "refresh_count": 0,
+            "summary": {},
+            "records": [],
+        }
     if planner_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "Phase-4 feature batch planner requires compact_output=True and exact_chunked_decoder=True"
@@ -1573,6 +1610,7 @@ def _run_attribution(
                 "phase4_feature_batch_planner_enabled": bool(planner_enabled),
                 "phase4_feature_batch_planner_status": planner_status,
                 "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
+                "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
                 "cfg": model.config,
                 "scan": model.scan,
             }
@@ -1705,6 +1743,8 @@ def _run_attribution(
             telemetry_export = telemetry_recorder.export(include_events=True)
             compact_output_result["telemetry_summary"] = telemetry_export["summary"]
             compact_output_result["telemetry_events"] = telemetry_export.get("events", [])
+            if anomaly_debug_result is not None:
+                compact_output_result["phase4_anomaly_debug"] = anomaly_debug_result
         elif profile:
             telemetry_summary = telemetry_recorder.build_summary()
             logger.info(
