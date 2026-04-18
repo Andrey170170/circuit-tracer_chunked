@@ -20,6 +20,7 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
    needed for interpretation.
 """
 
+import hashlib
 import logging
 import math
 import os
@@ -356,6 +357,112 @@ def _parse_env_bool(name: str) -> bool:
 
 def _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug: bool) -> bool:
     return bool(phase4_anomaly_debug or _parse_env_bool("PHASE4_ANOMALY_DEBUG"))
+
+
+def _hash_index_tensor(indices: torch.Tensor) -> str:
+    indices_cpu = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    return hashlib.blake2s(indices_cpu.numpy().tobytes(), digest_size=8).hexdigest()
+
+
+def _safe_float(value: torch.Tensor | float | int | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return float(value.item())
+    return float(value)
+
+
+def _build_phase4_cutoff_debug(
+    candidate_scores: torch.Tensor,
+    *,
+    queue_size: int,
+    window_radius: int = 8,
+) -> dict[str, object]:
+    if queue_size <= 0 or candidate_scores.numel() == 0:
+        return {
+            "queue_size": int(queue_size),
+            "candidate_count": int(candidate_scores.numel()),
+            "cutoff_rank": None,
+            "cutoff_score": None,
+            "next_score": None,
+            "cutoff_margin": None,
+            "near_cutoff_epsilon": None,
+            "near_cutoff_count": 0,
+            "exact_cutoff_count": 0,
+            "window_scores": [],
+        }
+
+    cutoff_rank = min(queue_size - 1, candidate_scores.numel() - 1)
+    cutoff_score = float(candidate_scores[cutoff_rank].item())
+    next_score = (
+        float(candidate_scores[cutoff_rank + 1].item())
+        if cutoff_rank + 1 < candidate_scores.numel()
+        else None
+    )
+    cutoff_margin = None if next_score is None else float(cutoff_score - next_score)
+    epsilon = max(abs(cutoff_score) * 1e-6, 1e-8)
+    near_cutoff_count = int(((candidate_scores - cutoff_score).abs() <= epsilon).sum().item())
+    exact_cutoff_count = int((candidate_scores == cutoff_score).sum().item())
+    window_start = max(0, cutoff_rank - window_radius)
+    window_end = min(candidate_scores.numel(), cutoff_rank + window_radius + 1)
+    window_scores = [float(value) for value in candidate_scores[window_start:window_end].tolist()]
+    return {
+        "queue_size": int(queue_size),
+        "candidate_count": int(candidate_scores.numel()),
+        "cutoff_rank": int(cutoff_rank),
+        "cutoff_score": cutoff_score,
+        "next_score": next_score,
+        "cutoff_margin": cutoff_margin,
+        "near_cutoff_epsilon": float(epsilon),
+        "near_cutoff_count": near_cutoff_count,
+        "exact_cutoff_count": exact_cutoff_count,
+        "window_scores": window_scores,
+    }
+
+
+def _record_phase4_refresh_debug(
+    anomaly_debug_result: dict[str, object] | None,
+    *,
+    refresh_index: int,
+    n_visited: int,
+    queue_size: int,
+    pending: torch.Tensor,
+    previous_pending: torch.Tensor | None,
+    first_pending: torch.Tensor | None,
+    candidate_scores: torch.Tensor,
+) -> None:
+    if anomaly_debug_result is None:
+        return
+
+    pending_cpu = pending.detach().to(device="cpu", dtype=torch.int64)
+    pending_set = set(int(value) for value in pending_cpu.tolist())
+    previous_overlap = None
+    if previous_pending is not None:
+        previous_set = set(int(value) for value in previous_pending.tolist())
+        if previous_set:
+            previous_overlap = len(pending_set & previous_set) / len(previous_set)
+    first_overlap = None
+    if first_pending is not None:
+        first_set = set(int(value) for value in first_pending.tolist())
+        if first_set:
+            first_overlap = len(pending_set & first_set) / len(first_set)
+
+    record = {
+        "refresh_index": int(refresh_index),
+        "n_visited": int(n_visited),
+        "pending_size": int(pending_cpu.numel()),
+        "queue_size": int(queue_size),
+        "pending_hash": _hash_index_tensor(pending_cpu),
+        "pending_sample": [int(value) for value in pending_cpu[:16].tolist()],
+        "overlap_with_previous": previous_overlap,
+        "overlap_with_first": first_overlap,
+        "cutoff": _build_phase4_cutoff_debug(candidate_scores, queue_size=queue_size),
+    }
+    records = anomaly_debug_result.setdefault("records", [])
+    assert isinstance(records, list)
+    records.append(record)
 
 
 def _resolve_phase4_feature_batch_planner_status(
@@ -1425,6 +1532,9 @@ def _run_attribution(
         visited = torch.zeros(total_active_feats, dtype=torch.bool)
         n_visited = 0
         phase4_batch_count = 0
+        phase4_refresh_count = 0
+        previous_phase4_pending: torch.Tensor | None = None
+        first_phase4_pending: torch.Tensor | None = None
 
         pbar = tqdm(
             total=actual_max_feature_nodes,
@@ -1461,11 +1571,12 @@ def _run_attribution(
                     feature_influences = influences[:total_active_feats]
 
                 feature_rank = torch.argsort(feature_influences, descending=True).cpu()
+                unvisited_feature_rank = feature_rank[~visited[feature_rank]]
                 queue_size = min(
                     update_interval * phase4_feature_batch_size,
                     actual_max_feature_nodes - n_visited,
                 )
-                pending = feature_rank[~visited[feature_rank]][:queue_size]
+                pending = unvisited_feature_rank[:queue_size]
                 pending = _reorder_pending_for_phase4_locality(
                     pending,
                     feat_layers=feat_layers,
@@ -1474,6 +1585,23 @@ def _run_attribution(
                     exact_chunked_decoder=exact_chunked_decoder,
                     decoder_chunk_size=decoder_chunk_size,
                 )
+                if anomaly_debug_result is not None:
+                    candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
+                    _record_phase4_refresh_debug(
+                        anomaly_debug_result,
+                        refresh_index=phase4_refresh_count,
+                        n_visited=n_visited,
+                        queue_size=queue_size,
+                        pending=pending,
+                        previous_pending=previous_phase4_pending,
+                        first_pending=first_phase4_pending,
+                        candidate_scores=candidate_scores,
+                    )
+                    current_pending_cpu = pending.detach().to(device="cpu", dtype=torch.int64)
+                    if first_phase4_pending is None:
+                        first_phase4_pending = current_pending_cpu.clone()
+                    previous_phase4_pending = current_pending_cpu
+                phase4_refresh_count += 1
 
             pending_offset = 0
             while pending_offset < len(pending):
@@ -1566,6 +1694,45 @@ def _run_attribution(
                 "phase4_batches": int(phase4_batch_count),
             },
         )
+        if anomaly_debug_result is not None:
+            records = anomaly_debug_result.get("records", [])
+            cutoff_margins = [
+                float(record["cutoff"]["cutoff_margin"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("cutoff"), dict)
+                and record["cutoff"].get("cutoff_margin") is not None
+            ]
+            previous_overlaps = [
+                float(record["overlap_with_previous"])
+                for record in records
+                if isinstance(record, dict) and record.get("overlap_with_previous") is not None
+            ]
+            first_overlaps = [
+                float(record["overlap_with_first"])
+                for record in records
+                if isinstance(record, dict) and record.get("overlap_with_first") is not None
+            ]
+            anomaly_debug_result["refresh_count"] = int(len(records))
+            anomaly_debug_result["status"] = "captured_refresh_debug"
+            anomaly_debug_result["summary"] = {
+                "refresh_count": int(len(records)),
+                "pending_size_first": (
+                    int(records[0]["pending_size"])
+                    if records and isinstance(records[0], dict)
+                    else 0
+                ),
+                "cutoff_margin_min": min(cutoff_margins) if cutoff_margins else None,
+                "cutoff_margin_mean": (
+                    sum(cutoff_margins) / len(cutoff_margins) if cutoff_margins else None
+                ),
+                "overlap_with_previous_mean": (
+                    sum(previous_overlaps) / len(previous_overlaps) if previous_overlaps else None
+                ),
+                "overlap_with_first_mean": (
+                    sum(first_overlaps) / len(first_overlaps) if first_overlaps else None
+                ),
+            }
 
         # Phase 5: packaging graph / compact output
         phase5_start = time.perf_counter()
@@ -1611,6 +1778,7 @@ def _run_attribution(
                 "phase4_feature_batch_planner_status": planner_status,
                 "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
+                "phase4_refresh_count": int(phase4_refresh_count),
                 "cfg": model.config,
                 "scan": model.scan,
             }

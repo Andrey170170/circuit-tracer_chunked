@@ -7,6 +7,7 @@ from safetensors.torch import save_file
 
 from circuit_tracer.attribution.attribute import attribute as attribute_top_level
 from circuit_tracer.attribution.attribute_nnsight import (
+    _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
     _compute_phase4_planned_feature_batch_size,
     _reorder_pending_for_phase4_locality,
@@ -727,6 +728,18 @@ def test_phase4_anomaly_debug_enabled_from_flag() -> None:
 def test_phase4_anomaly_debug_enabled_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PHASE4_ANOMALY_DEBUG", "1")
     assert _resolve_phase4_anomaly_debug_enabled(False) is True
+
+
+def test_build_phase4_cutoff_debug_reports_margin_and_ties() -> None:
+    scores = torch.tensor([1.0, 0.9, 0.9, 0.5], dtype=torch.float32)
+    result = _build_phase4_cutoff_debug(scores, queue_size=2)
+
+    assert result["cutoff_rank"] == 1
+    assert result["cutoff_score"] == pytest.approx(0.9)
+    assert result["next_score"] == pytest.approx(0.9)
+    assert result["cutoff_margin"] == pytest.approx(0.0)
+    assert result["exact_cutoff_count"] == 2
+    assert result["near_cutoff_count"] >= 2
 
 
 def test_phase4_probe_frontier_uses_ranked_first_frontier_then_locality() -> None:
