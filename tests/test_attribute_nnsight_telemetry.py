@@ -36,6 +36,11 @@ def test_file_backed_feature_row_store_emits_structured_events() -> None:
     finally:
         store.cleanup()
 
+    stats = store.get_diagnostic_snapshot()
+    assert stats["append_call_count"] == 1
+    assert stats["read_call_count"] >= 1
+    assert stats["materialize_call_count"] == 1
+
     summary = recorder.build_summary()
     assert summary["counts_by_scope"]["op"] >= 3
     events = recorder.export(include_events=True)["events"]

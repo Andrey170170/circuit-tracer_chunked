@@ -148,6 +148,11 @@ class TelemetryRecorder:
         self._elapsed_ms_by_scope: dict[str, float] = defaultdict(float)
         self._elapsed_ms_by_phase: dict[str, float] = defaultdict(float)
         self._elapsed_ms_by_name: dict[str, float] = defaultdict(float)
+        self._wall_clock_elapsed_ms_total = 0.0
+        self._wall_clock_elapsed_ms_by_scope: dict[str, float] = defaultdict(float)
+        self._wall_clock_elapsed_ms_by_phase: dict[str, float] = defaultdict(float)
+        self._wall_clock_elapsed_ms_by_name: dict[str, float] = defaultdict(float)
+        self._wall_clock_count = 0
 
     def _normalize_scope(self, scope: str) -> str:
         if scope in _ALLOWED_TELEMETRY_SCOPES:
@@ -220,6 +225,34 @@ class TelemetryRecorder:
 
         self._events.append(event)
 
+    def record_wall_clock_duration(
+        self,
+        *,
+        scope: str,
+        name: str,
+        elapsed_ms: float | int | None,
+        phase: str | None = None,
+    ) -> None:
+        """Record explicit wall-clock timing independent from event aggregates."""
+
+        if not self.enabled:
+            return
+
+        safe_elapsed_ms = self._normalize_elapsed_ms(elapsed_ms)
+        if safe_elapsed_ms is None:
+            return
+
+        safe_scope = self._normalize_scope(scope)
+        safe_name = str(name)
+        safe_phase = None if phase is None else str(phase)
+
+        self._wall_clock_count += 1
+        self._wall_clock_elapsed_ms_total += safe_elapsed_ms
+        self._wall_clock_elapsed_ms_by_scope[safe_scope] += safe_elapsed_ms
+        self._wall_clock_elapsed_ms_by_name[safe_name] += safe_elapsed_ms
+        if safe_phase is not None:
+            self._wall_clock_elapsed_ms_by_phase[safe_phase] += safe_elapsed_ms
+
     def timer(
         self,
         *,
@@ -252,16 +285,30 @@ class TelemetryRecorder:
     def build_summary(self) -> dict[str, object]:
         return {
             "enabled": self.enabled,
+            "max_events": int(self.max_events),
             "event_count": int(self._event_count),
             "stored_event_count": int(len(self._events)),
             "dropped_event_count": int(self._dropped_event_count),
             "total_elapsed_ms": float(self._elapsed_ms_total),
+            "wall_clock_elapsed_ms_total": float(self._wall_clock_elapsed_ms_total),
+            "wall_clock_interval_count": int(self._wall_clock_count),
             "counts_by_scope": dict(sorted(self._counts_by_scope.items())),
             "counts_by_phase": dict(sorted(self._counts_by_phase.items())),
             "elapsed_ms_by_scope": dict(sorted(self._elapsed_ms_by_scope.items())),
             "elapsed_ms_by_phase": dict(sorted(self._elapsed_ms_by_phase.items())),
+            "elapsed_ms_by_scope_aggregate": dict(sorted(self._elapsed_ms_by_scope.items())),
+            "elapsed_ms_by_phase_aggregate": dict(sorted(self._elapsed_ms_by_phase.items())),
+            "wall_clock_elapsed_ms_by_scope": dict(
+                sorted(self._wall_clock_elapsed_ms_by_scope.items())
+            ),
+            "wall_clock_elapsed_ms_by_phase": dict(
+                sorted(self._wall_clock_elapsed_ms_by_phase.items())
+            ),
             "counts_by_name_top": self._top_items_by_value(self._counts_by_name),
             "elapsed_ms_by_name_top": self._top_items_by_value(self._elapsed_ms_by_name),
+            "wall_clock_elapsed_ms_by_name_top": self._top_items_by_value(
+                self._wall_clock_elapsed_ms_by_name
+            ),
         }
 
     def export(

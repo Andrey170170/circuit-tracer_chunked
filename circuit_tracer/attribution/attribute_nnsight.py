@@ -142,6 +142,19 @@ class _FileBackedFeatureRowStore:
         )
         self._telemetry_recorder = telemetry_recorder
         self._closed = False
+        self._diagnostic_stats: dict[str, float | int | None] = {
+            "append_call_count": 0,
+            "append_row_count": 0,
+            "read_call_count": 0,
+            "read_row_count": 0,
+            "read_last_row_start": None,
+            "read_last_row_end": None,
+            "materialize_call_count": 0,
+            "materialize_row_count": 0,
+            "materialize_column_count": 0,
+            "materialize_last_row_start": None,
+            "materialize_last_row_end": None,
+        }
 
     def _telemetry_timer(
         self,
@@ -216,6 +229,13 @@ class _FileBackedFeatureRowStore:
                 dtype=self.row_abs_sums.dtype,
             )
 
+        self._diagnostic_stats["append_call_count"] = (
+            int(self._diagnostic_stats["append_call_count"] or 0) + 1
+        )
+        self._diagnostic_stats["append_row_count"] = int(
+            self._diagnostic_stats["append_row_count"] or 0
+        ) + int(row_count)
+
     def read_feature_rows(
         self,
         row_start: int,
@@ -236,7 +256,17 @@ class _FileBackedFeatureRowStore:
             },
         ):
             rows = self._require_open_rows()
-            return torch.from_numpy(np.asarray(rows[row_start:row_end], dtype=self._np_dtype))
+            result = torch.from_numpy(np.asarray(rows[row_start:row_end], dtype=self._np_dtype))
+
+        self._diagnostic_stats["read_call_count"] = (
+            int(self._diagnostic_stats["read_call_count"] or 0) + 1
+        )
+        self._diagnostic_stats["read_row_count"] = int(
+            self._diagnostic_stats["read_row_count"] or 0
+        ) + int(row_end - row_start)
+        self._diagnostic_stats["read_last_row_start"] = int(row_start)
+        self._diagnostic_stats["read_last_row_end"] = int(row_end)
+        return result
 
     def materialize_dense_feature_slice(
         self,
@@ -280,7 +310,22 @@ class _FileBackedFeatureRowStore:
                 chunk_np = np.asarray(rows[row_start:row_end, cols_np], dtype=self._np_dtype)
                 dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
 
+        self._diagnostic_stats["materialize_call_count"] = (
+            int(self._diagnostic_stats["materialize_call_count"] or 0) + 1
+        )
+        self._diagnostic_stats["materialize_row_count"] = int(
+            self._diagnostic_stats["materialize_row_count"] or 0
+        ) + int(n_rows)
+        self._diagnostic_stats["materialize_column_count"] = int(
+            self._diagnostic_stats["materialize_column_count"] or 0
+        ) + int(n_cols)
+        self._diagnostic_stats["materialize_last_row_start"] = int(row_start)
+        self._diagnostic_stats["materialize_last_row_end"] = int(row_end)
+
         return dense
+
+    def get_diagnostic_snapshot(self) -> dict[str, float | int | None]:
+        return dict(self._diagnostic_stats)
 
     def cleanup(self) -> None:
         if self._closed:
@@ -355,6 +400,39 @@ def _parse_env_bool(name: str) -> bool:
     return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
+def _parse_env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value.strip())
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _resolve_telemetry_max_events(
+    *,
+    telemetry_max_events: int | None,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
+    profile: bool,
+    phase4_anomaly_debug_enabled: bool,
+) -> int:
+    if telemetry_max_events is not None and telemetry_max_events > 0:
+        return int(telemetry_max_events)
+
+    env_override = _parse_env_int("CIRCUIT_TRACER_TELEMETRY_MAX_EVENTS")
+    if env_override is not None:
+        return env_override
+
+    if compact_output and exact_chunked_decoder:
+        return 120_000
+    if profile or phase4_anomaly_debug_enabled:
+        return 60_000
+    return 20_000
+
+
 def _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug: bool) -> bool:
     return bool(phase4_anomaly_debug or _parse_env_bool("PHASE4_ANOMALY_DEBUG"))
 
@@ -362,6 +440,90 @@ def _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug: bool) -> bool:
 def _hash_index_tensor(indices: torch.Tensor) -> str:
     indices_cpu = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
     return hashlib.blake2s(indices_cpu.numpy().tobytes(), digest_size=8).hexdigest()
+
+
+def _build_vector_stats(
+    vector: torch.Tensor,
+    *,
+    epsilon: float = 1e-12,
+    top_k: int = 8,
+) -> dict[str, object]:
+    values = vector.detach().to(device="cpu", dtype=torch.float64).flatten()
+    count = int(values.numel())
+    if count == 0:
+        return {
+            "count": 0,
+            "nonzero_count": 0,
+            "effective_nonzero_count": 0,
+            "zero_count": 0,
+            "effective_zero_count": 0,
+            "min": None,
+            "max": None,
+            "sum": 0.0,
+            "abs_sum": 0.0,
+            "mean": None,
+            "abs_mean": None,
+            "epsilon": float(epsilon),
+            "all_zero": True,
+            "effectively_all_zero": True,
+            "top_abs_values": [],
+        }
+
+    abs_values = values.abs()
+    nonzero_count = int((values != 0).sum().item())
+    effective_nonzero_count = int((abs_values > epsilon).sum().item())
+    top_k_actual = min(max(0, int(top_k)), count)
+    top_abs_values = []
+    if top_k_actual > 0:
+        top_abs, top_indices = torch.topk(abs_values, k=top_k_actual)
+        for rank, (abs_value, idx_tensor) in enumerate(
+            zip(top_abs.tolist(), top_indices.tolist(), strict=False),
+            start=1,
+        ):
+            idx = int(idx_tensor)
+            top_abs_values.append(
+                {
+                    "rank": rank,
+                    "index": idx,
+                    "value": float(values[idx].item()),
+                    "abs_value": float(abs_value),
+                }
+            )
+
+    sum_value = float(values.sum().item())
+    abs_sum_value = float(abs_values.sum().item())
+    return {
+        "count": count,
+        "nonzero_count": nonzero_count,
+        "effective_nonzero_count": effective_nonzero_count,
+        "zero_count": count - nonzero_count,
+        "effective_zero_count": count - effective_nonzero_count,
+        "min": float(values.min().item()),
+        "max": float(values.max().item()),
+        "sum": sum_value,
+        "abs_sum": abs_sum_value,
+        "mean": float(sum_value / count),
+        "abs_mean": float(abs_sum_value / count),
+        "epsilon": float(epsilon),
+        "all_zero": nonzero_count == 0,
+        "effectively_all_zero": effective_nonzero_count == 0,
+        "top_abs_values": top_abs_values,
+    }
+
+
+def _build_phase4_normalization_stats(
+    row_abs_sums: torch.Tensor,
+    *,
+    clamp_epsilon: float = 1e-8,
+) -> dict[str, object]:
+    stats = _build_vector_stats(row_abs_sums, epsilon=clamp_epsilon)
+    count = int(stats.get("count", 0) or 0)
+    effective_zero_count = int(stats.get("effective_zero_count", 0) or 0)
+    clamped_fraction = (effective_zero_count / count) if count else 0.0
+    stats["clamp_epsilon"] = float(clamp_epsilon)
+    stats["clamped_row_count"] = effective_zero_count
+    stats["clamped_row_fraction"] = float(clamped_fraction)
+    return stats
 
 
 def _safe_float(value: torch.Tensor | float | int | None) -> float | None:
@@ -432,6 +594,11 @@ def _record_phase4_refresh_debug(
     previous_pending: torch.Tensor | None,
     first_pending: torch.Tensor | None,
     candidate_scores: torch.Tensor,
+    refresh_elapsed_ms: float,
+    rank_signal_stats: dict[str, object] | None,
+    logit_probability_stats: dict[str, object] | None,
+    normalization_input_stats: dict[str, object] | None,
+    feature_row_store_read_stats: dict[str, object] | None,
 ) -> None:
     if anomaly_debug_result is None:
         return
@@ -451,6 +618,7 @@ def _record_phase4_refresh_debug(
 
     record = {
         "refresh_index": int(refresh_index),
+        "refresh_elapsed_ms": float(refresh_elapsed_ms),
         "n_visited": int(n_visited),
         "pending_size": int(pending_cpu.numel()),
         "queue_size": int(queue_size),
@@ -460,6 +628,18 @@ def _record_phase4_refresh_debug(
         "overlap_with_first": first_overlap,
         "cutoff": _build_phase4_cutoff_debug(candidate_scores, queue_size=queue_size),
     }
+    if rank_signal_stats is not None:
+        record["rank_signal_stats"] = rank_signal_stats
+        record["rank_signal_all_zero"] = bool(rank_signal_stats.get("all_zero", False))
+        record["rank_signal_effectively_all_zero"] = bool(
+            rank_signal_stats.get("effectively_all_zero", False)
+        )
+    if logit_probability_stats is not None:
+        record["logit_probability_stats"] = logit_probability_stats
+    if normalization_input_stats is not None:
+        record["normalization_input_stats"] = normalization_input_stats
+    if feature_row_store_read_stats is not None:
+        record["feature_row_store_read_stats"] = feature_row_store_read_stats
     records = anomaly_debug_result.setdefault("records", [])
     assert isinstance(records, list)
     records.append(record)
@@ -977,6 +1157,7 @@ def attribute(
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
     phase4_anomaly_debug: bool = False,
+    telemetry_max_events: int | None = None,
     compact_output: bool = False,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -1036,6 +1217,8 @@ def attribute(
             to run before the real attribution pass.
         phase4_anomaly_debug: Enable opt-in Phase-4 anomaly debug scaffolding.
             Can also be activated via ``PHASE4_ANOMALY_DEBUG=1``.
+        telemetry_max_events: Optional cap for in-memory telemetry event storage.
+            If omitted, an environment/default policy is used.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -1085,6 +1268,7 @@ def attribute(
             feature_batch_min_free_fraction=feature_batch_min_free_fraction,
             feature_batch_probe_batches=feature_batch_probe_batches,
             phase4_anomaly_debug=phase4_anomaly_debug,
+            telemetry_max_events=telemetry_max_events,
             compact_output=compact_output,
             logger=logger,
         )
@@ -1127,6 +1311,7 @@ def _run_attribution(
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
     phase4_anomaly_debug: bool = False,
+    telemetry_max_events: int | None = None,
     compact_output: bool = False,
 ):
     start_time = time.time()
@@ -1153,9 +1338,16 @@ def _run_attribution(
         raise ValueError("feature_batch_probe_batches must be > 0")
 
     phase4_anomaly_debug_enabled = _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug)
+    telemetry_max_events_resolved = _resolve_telemetry_max_events(
+        telemetry_max_events=telemetry_max_events,
+        compact_output=compact_output,
+        exact_chunked_decoder=bool(getattr(model.transcoders, "exact_chunked_decoder", False)),
+        profile=profile,
+        phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,
+    )
     telemetry_recorder = TelemetryRecorder(
         enabled=(profile or compact_output or phase4_anomaly_debug_enabled),
-        max_events=20000,
+        max_events=telemetry_max_events_resolved,
     )
     telemetry_recorder.record_event(
         scope="run",
@@ -1166,6 +1358,7 @@ def _run_attribution(
             "batch_size": batch_size,
             "feature_batch_size": feature_batch_size,
             "logit_batch_size": logit_batch_size,
+            "telemetry_max_events": telemetry_max_events_resolved,
         },
     )
 
@@ -1200,7 +1393,7 @@ def _run_attribution(
         )
     if phase4_anomaly_debug_enabled:
         anomaly_debug_result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "enabled": True,
             "mode": "phase4_shadow_debug",
             "status": "scaffold",
@@ -1348,15 +1541,22 @@ def _run_attribution(
             active_features=ctx.activation_matrix._nnz(),
             logit_retention=getattr(ctx, "logit_retention", "full"),
         )
+        phase0_elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
         telemetry_recorder.record_event(
             scope="phase",
             name="phase0.precompute",
             phase="phase0",
-            elapsed_ms=(time.perf_counter() - phase_start) * 1000.0,
+            elapsed_ms=phase0_elapsed_ms,
             attrs={
                 "active_features": int(ctx.activation_matrix._nnz()),
                 "logit_retention": getattr(ctx, "logit_retention", "full"),
             },
+        )
+        telemetry_recorder.record_wall_clock_duration(
+            scope="phase",
+            name="phase0.precompute",
+            phase="phase0",
+            elapsed_ms=phase0_elapsed_ms,
         )
         if profile:
             if getattr(ctx, "setup_diagnostic_stats", None):
@@ -1392,11 +1592,18 @@ def _run_attribution(
             ctx.cache_residual(model, tracer, barrier=detach_barrier)
 
         _log_phase_metrics(logger, "Forward pass", phase_start, model.device)
+        phase1_elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
         telemetry_recorder.record_event(
             scope="phase",
             name="phase1.forward_pass",
             phase="phase1",
-            elapsed_ms=(time.perf_counter() - phase_start) * 1000.0,
+            elapsed_ms=phase1_elapsed_ms,
+        )
+        telemetry_recorder.record_wall_clock_duration(
+            scope="phase",
+            name="phase1.forward_pass",
+            phase="phase1",
+            elapsed_ms=phase1_elapsed_ms,
         )
 
         if offload:
@@ -1495,12 +1702,19 @@ def _run_attribution(
             model.device,
             **phase2_extra,
         )
+        phase2_elapsed_ms = (time.perf_counter() - phase2_start) * 1000.0
         telemetry_recorder.record_event(
             scope="phase",
             name="phase2.input_vector_build",
             phase="phase2",
-            elapsed_ms=(time.perf_counter() - phase2_start) * 1000.0,
+            elapsed_ms=phase2_elapsed_ms,
             attrs=phase2_extra,
+        )
+        telemetry_recorder.record_wall_clock_duration(
+            scope="phase",
+            name="phase2.input_vector_build",
+            phase="phase2",
+            elapsed_ms=phase2_elapsed_ms,
         )
 
         # Phase 3: logit attribution
@@ -1551,6 +1765,11 @@ def _run_attribution(
                     "total_logit_batches": int(total_logit_batches),
                 },
             )
+            telemetry_recorder.record_wall_clock_duration(
+                scope="batch",
+                name="phase3.logit_batch",
+                elapsed_ms=batch_elapsed_ms,
+            )
             if profile and ((i // effective_logit_batch_size) + 1) % profile_log_interval == 0:
                 _log_batch_profile(
                     logger,
@@ -1570,12 +1789,19 @@ def _run_attribution(
             phase3_start,
             model.device,
         )
+        phase3_elapsed_ms = (time.perf_counter() - phase3_start) * 1000.0
         telemetry_recorder.record_event(
             scope="phase",
             name="phase3.logit_attribution",
             phase="phase3",
-            elapsed_ms=(time.perf_counter() - phase3_start) * 1000.0,
+            elapsed_ms=phase3_elapsed_ms,
             attrs={"logit_count": int(len(targets)), "batches": int(total_logit_batches)},
+        )
+        telemetry_recorder.record_wall_clock_duration(
+            scope="phase",
+            name="phase3.logit_attribution",
+            phase="phase3",
+            elapsed_ms=phase3_elapsed_ms,
         )
         reset_decoder_cache = getattr(ctx, "reset_decoder_cache", None)
         if callable(reset_decoder_cache):
@@ -1610,8 +1836,16 @@ def _run_attribution(
         n_visited = 0
         phase4_batch_count = 0
         phase4_refresh_count = 0
+        phase4_refresh_elapsed_ms_total = 0.0
         previous_phase4_pending: torch.Tensor | None = None
         first_phase4_pending: torch.Tensor | None = None
+        phase4_logit_probability_stats = _build_vector_stats(
+            targets.logit_probabilities.detach().cpu(),
+            epsilon=1e-12,
+            top_k=8,
+        )
+        if anomaly_debug_result is not None:
+            anomaly_debug_result["logit_probability_stats"] = phase4_logit_probability_stats
 
         pbar = tqdm(
             total=actual_max_feature_nodes,
@@ -1623,6 +1857,12 @@ def _run_attribution(
             if actual_max_feature_nodes == total_active_feats:
                 pending = torch.arange(total_active_feats)
             else:
+                refresh_start = time.perf_counter()
+                feature_row_store_snapshot_before = (
+                    feature_row_store.get_diagnostic_snapshot()
+                    if use_compact_feature_row_store and feature_row_store is not None
+                    else None
+                )
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     feature_influences = compute_partial_feature_influences_streaming(
@@ -1649,6 +1889,34 @@ def _run_attribution(
 
                 feature_rank = torch.argsort(feature_influences, descending=True).cpu()
                 unvisited_feature_rank = feature_rank[~visited[feature_rank]]
+                candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
+                rank_signal_stats = _build_vector_stats(
+                    candidate_scores,
+                    epsilon=1e-12,
+                    top_k=8,
+                )
+                if use_compact_feature_row_store:
+                    assert feature_row_store is not None
+                    normalization_input_stats = _build_phase4_normalization_stats(
+                        feature_row_store.row_abs_sums[:st].detach().cpu(),
+                    )
+                else:
+                    normalization_input_stats = _build_phase4_normalization_stats(
+                        edge_matrix[:st, :logit_offset].abs().sum(dim=1).detach().cpu(),
+                    )
+                feature_row_store_snapshot_after = (
+                    feature_row_store.get_diagnostic_snapshot()
+                    if use_compact_feature_row_store and feature_row_store is not None
+                    else None
+                )
+                feature_row_store_read_stats = (
+                    diff_numeric_metrics(
+                        feature_row_store_snapshot_before,
+                        feature_row_store_snapshot_after,
+                    )
+                    if feature_row_store_snapshot_after is not None
+                    else None
+                )
                 queue_size = min(
                     update_interval * phase4_feature_batch_size,
                     actual_max_feature_nodes - n_visited,
@@ -1662,8 +1930,50 @@ def _run_attribution(
                     exact_chunked_decoder=exact_chunked_decoder,
                     decoder_chunk_size=decoder_chunk_size,
                 )
+                refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
+                phase4_refresh_elapsed_ms_total += refresh_elapsed_ms
+                telemetry_recorder.record_event(
+                    scope="batch",
+                    name="phase4.refresh",
+                    phase="phase4",
+                    batch_index=phase4_refresh_count + 1,
+                    elapsed_ms=refresh_elapsed_ms,
+                    attrs={
+                        "refresh_index": int(phase4_refresh_count),
+                        "stored_rows": int(st),
+                        "visited_features": int(n_visited),
+                        "frontier_candidate_count": int(candidate_scores.numel()),
+                        "queue_size": int(queue_size),
+                        "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
+                        "rank_effective_nonzero_count": int(
+                            rank_signal_stats["effective_nonzero_count"]
+                        ),
+                        "rank_max": _safe_float(rank_signal_stats.get("max")),
+                        "rank_abs_sum": _safe_float(rank_signal_stats.get("abs_sum")),
+                        "rank_all_zero": bool(rank_signal_stats["all_zero"]),
+                        "rank_effectively_all_zero": bool(
+                            rank_signal_stats["effectively_all_zero"]
+                        ),
+                        "normalization_clamped_row_count": int(
+                            normalization_input_stats["clamped_row_count"]
+                        ),
+                        "normalization_clamped_row_fraction": _safe_float(
+                            normalization_input_stats.get("clamped_row_fraction")
+                        ),
+                        "feature_row_store_read_calls": _safe_float(
+                            (feature_row_store_read_stats or {}).get("read_call_count")
+                        ),
+                        "feature_row_store_read_rows": _safe_float(
+                            (feature_row_store_read_stats or {}).get("read_row_count")
+                        ),
+                    },
+                )
+                telemetry_recorder.record_wall_clock_duration(
+                    scope="batch",
+                    name="phase4.refresh",
+                    elapsed_ms=refresh_elapsed_ms,
+                )
                 if anomaly_debug_result is not None:
-                    candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
                     _record_phase4_refresh_debug(
                         anomaly_debug_result,
                         refresh_index=phase4_refresh_count,
@@ -1673,6 +1983,11 @@ def _run_attribution(
                         previous_pending=previous_phase4_pending,
                         first_pending=first_phase4_pending,
                         candidate_scores=candidate_scores,
+                        refresh_elapsed_ms=refresh_elapsed_ms,
+                        rank_signal_stats=rank_signal_stats,
+                        logit_probability_stats=phase4_logit_probability_stats,
+                        normalization_input_stats=normalization_input_stats,
+                        feature_row_store_read_stats=feature_row_store_read_stats,
                     )
                     debug_records = anomaly_debug_result.get("records", [])
                     assert isinstance(debug_records, list) and debug_records
@@ -1718,6 +2033,16 @@ def _run_attribution(
                                 device=torch.device("cpu"),
                             )
                             float64_feature_influences = float64_influences[:total_active_feats]
+                        float32_signal_stats = _build_vector_stats(
+                            feature_influences.detach().cpu(),
+                            epsilon=1e-12,
+                            top_k=8,
+                        )
+                        float64_signal_stats = _build_vector_stats(
+                            float64_feature_influences.detach().cpu(),
+                            epsilon=1e-12,
+                            top_k=8,
+                        )
                         float64_feature_rank = torch.argsort(
                             float64_feature_influences,
                             descending=True,
@@ -1737,6 +2062,18 @@ def _run_attribution(
                             pending,
                             float64_pending,
                         )
+                        current_debug_record["float_precision_signal_compare"] = {
+                            "float32": float32_signal_stats,
+                            "float64": float64_signal_stats,
+                            "float32_all_zero": bool(float32_signal_stats["all_zero"]),
+                            "float64_all_zero": bool(float64_signal_stats["all_zero"]),
+                            "float32_effectively_all_zero": bool(
+                                float32_signal_stats["effectively_all_zero"]
+                            ),
+                            "float64_effectively_all_zero": bool(
+                                float64_signal_stats["effectively_all_zero"]
+                            ),
+                        }
                     current_pending_cpu = pending.detach().to(device="cpu", dtype=torch.int64)
                     if first_phase4_pending is None:
                         first_phase4_pending = current_pending_cpu.clone()
@@ -1812,6 +2149,11 @@ def _run_attribution(
                         "target_feature_count": int(actual_max_feature_nodes),
                     },
                 )
+                telemetry_recorder.record_wall_clock_duration(
+                    scope="batch",
+                    name="phase4.feature_batch",
+                    elapsed_ms=batch_elapsed_ms,
+                )
 
         pbar.close()
         _log_phase_metrics(
@@ -1823,16 +2165,25 @@ def _run_attribution(
             final_feature_batch_size=phase4_feature_batch_size,
             phase4_batches=phase4_batch_count,
         )
+        phase4_elapsed_ms = (time.perf_counter() - phase4_start) * 1000.0
         telemetry_recorder.record_event(
             scope="phase",
             name="phase4.feature_attribution",
             phase="phase4",
-            elapsed_ms=(time.perf_counter() - phase4_start) * 1000.0,
+            elapsed_ms=phase4_elapsed_ms,
             attrs={
                 "selected_features": int(visited.sum().item()),
                 "feature_batch_size": int(phase4_feature_batch_size),
                 "phase4_batches": int(phase4_batch_count),
+                "phase4_refreshes": int(phase4_refresh_count),
+                "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
             },
+        )
+        telemetry_recorder.record_wall_clock_duration(
+            scope="phase",
+            name="phase4.feature_attribution",
+            phase="phase4",
+            elapsed_ms=phase4_elapsed_ms,
         )
         if anomaly_debug_result is not None:
             records = anomaly_debug_result.get("records", [])
@@ -1867,6 +2218,82 @@ def _run_attribution(
                 and isinstance(record.get("float64_shadow"), dict)
                 and record["float64_shadow"].get("overlap_fraction") is not None
             ]
+            refresh_elapsed_values = [
+                float(record["refresh_elapsed_ms"])
+                for record in records
+                if isinstance(record, dict) and record.get("refresh_elapsed_ms") is not None
+            ]
+            rank_nonzero_counts = [
+                int(record["rank_signal_stats"]["nonzero_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("rank_signal_stats"), dict)
+                and record["rank_signal_stats"].get("nonzero_count") is not None
+            ]
+            rank_effective_nonzero_counts = [
+                int(record["rank_signal_stats"]["effective_nonzero_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("rank_signal_stats"), dict)
+                and record["rank_signal_stats"].get("effective_nonzero_count") is not None
+            ]
+            rank_abs_sums = [
+                float(record["rank_signal_stats"]["abs_sum"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("rank_signal_stats"), dict)
+                and record["rank_signal_stats"].get("abs_sum") is not None
+            ]
+            rank_max_values = [
+                float(record["rank_signal_stats"]["max"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("rank_signal_stats"), dict)
+                and record["rank_signal_stats"].get("max") is not None
+            ]
+            rank_all_zero_count = sum(
+                1
+                for record in records
+                if isinstance(record, dict) and bool(record.get("rank_signal_all_zero"))
+            )
+            rank_effectively_all_zero_count = sum(
+                1
+                for record in records
+                if isinstance(record, dict) and bool(record.get("rank_signal_effectively_all_zero"))
+            )
+            normalization_clamped_counts = [
+                int(record["normalization_input_stats"]["clamped_row_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("normalization_input_stats"), dict)
+                and record["normalization_input_stats"].get("clamped_row_count") is not None
+            ]
+            normalization_clamped_fractions = [
+                float(record["normalization_input_stats"]["clamped_row_fraction"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("normalization_input_stats"), dict)
+                and record["normalization_input_stats"].get("clamped_row_fraction") is not None
+            ]
+            feature_row_store_read_calls = [
+                float(record["feature_row_store_read_stats"]["read_call_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("feature_row_store_read_stats"), dict)
+                and record["feature_row_store_read_stats"].get("read_call_count") is not None
+            ]
+            feature_row_store_read_rows = [
+                float(record["feature_row_store_read_stats"]["read_row_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("feature_row_store_read_stats"), dict)
+                and record["feature_row_store_read_stats"].get("read_row_count") is not None
+            ]
+            first_float_precision = None
+            if records and isinstance(records[0], dict):
+                precision_compare = records[0].get("float_precision_signal_compare")
+                if isinstance(precision_compare, dict):
+                    first_float_precision = precision_compare
             anomaly_debug_result["refresh_count"] = int(len(records))
             anomaly_debug_result["status"] = "captured_refresh_debug"
             anomaly_debug_result["summary"] = {
@@ -1893,6 +2320,66 @@ def _run_attribution(
                 ),
                 "float64_shadow_overlap_mean": (
                     sum(float64_overlaps) / len(float64_overlaps) if float64_overlaps else None
+                ),
+                "refresh_elapsed_ms_total": (
+                    sum(refresh_elapsed_values) if refresh_elapsed_values else None
+                ),
+                "refresh_elapsed_ms_mean": (
+                    (sum(refresh_elapsed_values) / len(refresh_elapsed_values))
+                    if refresh_elapsed_values
+                    else None
+                ),
+                "rank_signal_all_zero_refresh_count": int(rank_all_zero_count),
+                "rank_signal_effectively_all_zero_refresh_count": int(
+                    rank_effectively_all_zero_count
+                ),
+                "rank_signal_nonzero_count_min": (
+                    min(rank_nonzero_counts) if rank_nonzero_counts else None
+                ),
+                "rank_signal_nonzero_count_mean": (
+                    (sum(rank_nonzero_counts) / len(rank_nonzero_counts))
+                    if rank_nonzero_counts
+                    else None
+                ),
+                "rank_signal_effective_nonzero_count_min": (
+                    min(rank_effective_nonzero_counts) if rank_effective_nonzero_counts else None
+                ),
+                "rank_signal_effective_nonzero_count_mean": (
+                    (sum(rank_effective_nonzero_counts) / len(rank_effective_nonzero_counts))
+                    if rank_effective_nonzero_counts
+                    else None
+                ),
+                "rank_signal_abs_sum_mean": (
+                    (sum(rank_abs_sums) / len(rank_abs_sums)) if rank_abs_sums else None
+                ),
+                "rank_signal_max_max": max(rank_max_values) if rank_max_values else None,
+                "normalization_clamped_row_count_max": (
+                    max(normalization_clamped_counts) if normalization_clamped_counts else None
+                ),
+                "normalization_clamped_row_fraction_mean": (
+                    (sum(normalization_clamped_fractions) / len(normalization_clamped_fractions))
+                    if normalization_clamped_fractions
+                    else None
+                ),
+                "feature_row_store_read_calls_per_refresh_mean": (
+                    (sum(feature_row_store_read_calls) / len(feature_row_store_read_calls))
+                    if feature_row_store_read_calls
+                    else None
+                ),
+                "feature_row_store_read_rows_per_refresh_mean": (
+                    (sum(feature_row_store_read_rows) / len(feature_row_store_read_rows))
+                    if feature_row_store_read_rows
+                    else None
+                ),
+                "first_refresh_float32_effectively_all_zero": (
+                    bool(first_float_precision.get("float32_effectively_all_zero"))
+                    if isinstance(first_float_precision, dict)
+                    else None
+                ),
+                "first_refresh_float64_effectively_all_zero": (
+                    bool(first_float_precision.get("float64_effectively_all_zero"))
+                    if isinstance(first_float_precision, dict)
+                    else None
                 ),
             }
 
@@ -1941,6 +2428,12 @@ def _run_attribution(
                 "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
                 "phase4_refresh_count": int(phase4_refresh_count),
+                "phase4_batch_count": int(phase4_batch_count),
+                "phase4_refresh_elapsed_seconds_total": round(
+                    phase4_refresh_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "telemetry_max_events": int(telemetry_max_events_resolved),
                 "cfg": model.config,
                 "scan": model.scan,
             }
@@ -1961,11 +2454,12 @@ def _run_attribution(
                     else ""
                 )
             )
+            phase5_elapsed_ms = (time.perf_counter() - phase5_start) * 1000.0
             telemetry_recorder.record_event(
                 scope="phase",
                 name="phase5.packaging",
                 phase="phase5",
-                elapsed_ms=(time.perf_counter() - phase5_start) * 1000.0,
+                elapsed_ms=phase5_elapsed_ms,
                 attrs={
                     "compact_output": True,
                     "selected_features": int(selected_features.numel()),
@@ -1976,6 +2470,12 @@ def _run_attribution(
                         compact_output_result["feature_feature_edges"].shape[1]
                     ),
                 },
+            )
+            telemetry_recorder.record_wall_clock_duration(
+                scope="phase",
+                name="phase5.packaging",
+                phase="phase5",
+                elapsed_ms=phase5_elapsed_ms,
             )
             return compact_output_result
 
@@ -2011,16 +2511,23 @@ def _run_attribution(
             f"Attribution completed in {time.time() - start_time:.2f}s | "
             f"{format_memory_snapshot(device=model.device, extra={'adjacency_shape': tuple(full_edge_matrix.shape)})}"
         )
+        phase5_elapsed_ms = (time.perf_counter() - phase5_start) * 1000.0
         telemetry_recorder.record_event(
             scope="phase",
             name="phase5.packaging",
             phase="phase5",
-            elapsed_ms=(time.perf_counter() - phase5_start) * 1000.0,
+            elapsed_ms=phase5_elapsed_ms,
             attrs={
                 "compact_output": False,
                 "adjacency_rows": int(full_edge_matrix.shape[0]),
                 "adjacency_cols": int(full_edge_matrix.shape[1]),
             },
+        )
+        telemetry_recorder.record_wall_clock_duration(
+            scope="phase",
+            name="phase5.packaging",
+            phase="phase5",
+            elapsed_ms=phase5_elapsed_ms,
         )
 
         return graph
@@ -2038,35 +2545,54 @@ def _run_attribution(
                 if callable(clear_decoder_cache):
                     clear_decoder_cache()
             _log_memory_boundary(logger, "Teardown done", model.device)
+        teardown_elapsed_ms = (time.perf_counter() - teardown_start) * 1000.0
         telemetry_recorder.record_event(
             scope="phase",
             name="teardown.cleanup",
             phase="teardown",
-            elapsed_ms=(time.perf_counter() - teardown_start) * 1000.0,
+            elapsed_ms=teardown_elapsed_ms,
             attrs={
                 "ctx_present": ctx is not None,
                 "feature_row_store": feature_row_store is not None,
             },
         )
+        telemetry_recorder.record_wall_clock_duration(
+            scope="phase",
+            name="teardown.cleanup",
+            phase="teardown",
+            elapsed_ms=teardown_elapsed_ms,
+        )
 
         exc_type, exc, _ = sys.exc_info()
         if exc_type is None:
+            run_elapsed_ms = (time.perf_counter() - run_start) * 1000.0
             telemetry_recorder.record_event(
                 scope="run",
                 name="attribute.done",
-                elapsed_ms=(time.perf_counter() - run_start) * 1000.0,
+                elapsed_ms=run_elapsed_ms,
                 attrs={"compact_output": compact_output},
             )
+            telemetry_recorder.record_wall_clock_duration(
+                scope="run",
+                name="attribute.done",
+                elapsed_ms=run_elapsed_ms,
+            )
         else:
+            run_elapsed_ms = (time.perf_counter() - run_start) * 1000.0
             telemetry_recorder.record_event(
                 scope="run",
                 name="attribute.failed",
-                elapsed_ms=(time.perf_counter() - run_start) * 1000.0,
+                elapsed_ms=run_elapsed_ms,
                 attrs={
                     "compact_output": compact_output,
                     "error_type": exc_type.__name__,
                     "error_message": str(exc) if exc is not None else None,
                 },
+            )
+            telemetry_recorder.record_wall_clock_duration(
+                scope="run",
+                name="attribute.failed",
+                elapsed_ms=run_elapsed_ms,
             )
 
         if compact_output_result is not None:

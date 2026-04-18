@@ -7,9 +7,11 @@ from safetensors.torch import save_file
 
 from circuit_tracer.attribution.attribute import attribute as attribute_top_level
 from circuit_tracer.attribution.attribute_nnsight import (
+    _build_phase4_normalization_stats,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
+    _build_vector_stats,
     _compare_phase4_frontiers,
     _compute_phase4_planned_feature_batch_size,
     _reorder_pending_for_phase4_locality,
@@ -742,6 +744,26 @@ def test_build_phase4_cutoff_debug_reports_margin_and_ties() -> None:
     assert result["cutoff_margin"] == pytest.approx(0.0)
     assert result["exact_cutoff_count"] == 2
     assert result["near_cutoff_count"] >= 2
+
+
+def test_build_vector_stats_reports_effective_zero_signal() -> None:
+    stats = _build_vector_stats(torch.tensor([0.0, 0.0, 1e-13], dtype=torch.float32), epsilon=1e-12)
+
+    assert stats["count"] == 3
+    assert stats["nonzero_count"] == 1
+    assert stats["effective_nonzero_count"] == 0
+    assert stats["all_zero"] is False
+    assert stats["effectively_all_zero"] is True
+
+
+def test_phase4_normalization_stats_reports_clamped_rows() -> None:
+    stats = _build_phase4_normalization_stats(
+        torch.tensor([0.0, 1e-9, 2.0], dtype=torch.float32),
+        clamp_epsilon=1e-8,
+    )
+
+    assert stats["clamped_row_count"] == 2
+    assert stats["clamped_row_fraction"] == pytest.approx(2 / 3)
 
 
 def test_compare_phase4_frontiers_reports_overlap_and_first_difference() -> None:

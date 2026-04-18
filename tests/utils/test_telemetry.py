@@ -42,6 +42,7 @@ def test_telemetry_recorder_tracks_summary_and_dropped_events() -> None:
     assert summary["event_count"] == 3
     assert summary["stored_event_count"] == 2
     assert summary["dropped_event_count"] == 1
+    assert summary["max_events"] == 2
     assert summary["counts_by_scope"]["op"] == 2
     assert summary["counts_by_scope"]["phase"] == 1
 
@@ -49,6 +50,23 @@ def test_telemetry_recorder_tracks_summary_and_dropped_events() -> None:
     events = exported["events"]
     assert isinstance(events, list)
     assert len(events) == 2
+
+
+def test_telemetry_recorder_tracks_wall_clock_durations_separately() -> None:
+    recorder = TelemetryRecorder(enabled=True, max_events=1)
+    recorder.record_event(scope="phase", name="phase4.refresh", phase="phase4", elapsed_ms=5.0)
+    recorder.record_wall_clock_duration(
+        scope="phase",
+        name="phase4.refresh",
+        phase="phase4",
+        elapsed_ms=2.0,
+    )
+
+    summary = recorder.build_summary()
+    assert summary["elapsed_ms_by_phase"]["phase4"] == 5.0
+    assert summary["elapsed_ms_by_phase_aggregate"]["phase4"] == 5.0
+    assert summary["wall_clock_elapsed_ms_by_phase"]["phase4"] == 2.0
+    assert summary["wall_clock_elapsed_ms_total"] == 2.0
 
 
 def test_telemetry_timer_records_elapsed_and_error_type() -> None:
