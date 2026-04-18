@@ -7,8 +7,10 @@ from safetensors.torch import save_file
 
 from circuit_tracer.attribution.attribute import attribute as attribute_top_level
 from circuit_tracer.attribution.attribute_nnsight import (
+    _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
+    _compare_phase4_frontiers,
     _compute_phase4_planned_feature_batch_size,
     _reorder_pending_for_phase4_locality,
     _resolve_phase4_anomaly_debug_enabled,
@@ -740,6 +742,38 @@ def test_build_phase4_cutoff_debug_reports_margin_and_ties() -> None:
     assert result["cutoff_margin"] == pytest.approx(0.0)
     assert result["exact_cutoff_count"] == 2
     assert result["near_cutoff_count"] >= 2
+
+
+def test_compare_phase4_frontiers_reports_overlap_and_first_difference() -> None:
+    result = _compare_phase4_frontiers(
+        torch.tensor([1, 3, 5], dtype=torch.long),
+        torch.tensor([1, 4, 5], dtype=torch.long),
+    )
+
+    assert result["overlap_count"] == 2
+    assert result["changed_selected_nodes"] == 2
+    assert result["first_differing_rank"] == 1
+
+
+def test_build_phase4_deterministic_shadow_pending_breaks_ties_stably() -> None:
+    candidate_indices = torch.tensor([4, 2, 1, 3], dtype=torch.long)
+    feature_influences = torch.tensor([0.0, 0.7, 0.7, 0.6, 0.7], dtype=torch.float32)
+    feat_layers = torch.tensor([0, 0, 0, 0, 0], dtype=torch.long)
+    feat_positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
+
+    pending = _build_phase4_deterministic_shadow_pending(
+        candidate_indices,
+        feature_influences,
+        queue_size=3,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert torch.equal(pending, torch.tensor([1, 2, 4], dtype=torch.long))
 
 
 def test_phase4_probe_frontier_uses_ranked_first_frontier_then_locality() -> None:

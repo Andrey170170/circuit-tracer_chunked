@@ -465,6 +465,82 @@ def _record_phase4_refresh_debug(
     records.append(record)
 
 
+def _compare_phase4_frontiers(
+    actual_pending: torch.Tensor,
+    shadow_pending: torch.Tensor,
+) -> dict[str, object]:
+    actual_cpu = actual_pending.detach().to(device="cpu", dtype=torch.int64)
+    shadow_cpu = shadow_pending.detach().to(device="cpu", dtype=torch.int64)
+    actual_set = set(int(value) for value in actual_cpu.tolist())
+    shadow_set = set(int(value) for value in shadow_cpu.tolist())
+    overlap_count = len(actual_set & shadow_set)
+    overlap_fraction = overlap_count / len(actual_set) if actual_set else None
+    first_differing_rank = None
+    for idx, (actual_value, shadow_value) in enumerate(
+        zip(actual_cpu.tolist(), shadow_cpu.tolist())
+    ):
+        if actual_value != shadow_value:
+            first_differing_rank = int(idx)
+            break
+    return {
+        "actual_hash": _hash_index_tensor(actual_cpu),
+        "shadow_hash": _hash_index_tensor(shadow_cpu),
+        "overlap_count": int(overlap_count),
+        "overlap_fraction": overlap_fraction,
+        "changed_selected_nodes": int(len(actual_set ^ shadow_set)),
+        "first_differing_rank": first_differing_rank,
+        "actual_sample": [int(value) for value in actual_cpu[:16].tolist()],
+        "shadow_sample": [int(value) for value in shadow_cpu[:16].tolist()],
+    }
+
+
+def _build_phase4_deterministic_shadow_pending(
+    candidate_indices: torch.Tensor,
+    feature_influences: torch.Tensor,
+    *,
+    queue_size: int,
+    feat_layers: torch.Tensor,
+    feat_positions: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> torch.Tensor:
+    use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
+    ranked = sorted(
+        candidate_indices.detach().to(device="cpu", dtype=torch.int64).tolist(),
+        key=lambda idx: (
+            -float(feature_influences[idx].item()),
+            int(feat_layers[idx]),
+            (int(feat_ids[idx]) // int(decoder_chunk_size)) if use_chunk_key else -1,
+            int(feat_positions[idx]),
+            int(feat_ids[idx]),
+            int(idx),
+        ),
+    )
+    pending = torch.tensor(ranked[:queue_size], dtype=torch.long)
+    return _reorder_pending_for_phase4_locality(
+        pending,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=exact_chunked_decoder,
+        decoder_chunk_size=decoder_chunk_size,
+    )
+
+
+def _build_phase4_environment_fingerprint() -> dict[str, object]:
+    return {
+        "omp_num_threads": os.getenv("OMP_NUM_THREADS"),
+        "mkl_num_threads": os.getenv("MKL_NUM_THREADS"),
+        "openblas_num_threads": os.getenv("OPENBLAS_NUM_THREADS"),
+        "workspace_root": os.getenv("WORKSPACE_ROOT"),
+        "lib_workspace_root": os.getenv("LIB_WORKSPACE_ROOT"),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "attribute_nnsight_file": __file__,
+    }
+
+
 def _resolve_phase4_feature_batch_planner_status(
     *,
     planner_enabled: bool,
@@ -1130,6 +1206,7 @@ def _run_attribution(
             "status": "scaffold",
             "shadow_execution": False,
             "refresh_count": 0,
+            "environment": _build_phase4_environment_fingerprint(),
             "summary": {},
             "records": [],
         }
@@ -1597,6 +1674,69 @@ def _run_attribution(
                         first_pending=first_phase4_pending,
                         candidate_scores=candidate_scores,
                     )
+                    debug_records = anomaly_debug_result.get("records", [])
+                    assert isinstance(debug_records, list) and debug_records
+                    current_debug_record = debug_records[-1]
+                    assert isinstance(current_debug_record, dict)
+                    deterministic_pending = _build_phase4_deterministic_shadow_pending(
+                        unvisited_feature_rank,
+                        feature_influences.detach().cpu(),
+                        queue_size=queue_size,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                    current_debug_record["deterministic_shadow"] = _compare_phase4_frontiers(
+                        pending,
+                        deterministic_pending,
+                    )
+                    if phase4_refresh_count == 0:
+                        if use_compact_feature_row_store:
+                            assert feature_row_store is not None
+                            float64_feature_influences = (
+                                compute_partial_feature_influences_streaming(
+                                    lambda row_start, row_end: feature_row_store.read_feature_rows(
+                                        row_start,
+                                        row_end,
+                                        phase="phase4_anomaly_debug",
+                                    ),
+                                    feature_row_store.row_abs_sums[:st].to(dtype=torch.float64),
+                                    targets.logit_probabilities.to(dtype=torch.float64),
+                                    row_to_node_index[:st],
+                                    n_feature_nodes=total_active_feats,
+                                    n_logits=n_logits,
+                                    device=torch.device("cpu"),
+                                )
+                            )
+                        else:
+                            float64_influences = compute_partial_influences(
+                                edge_matrix[:st].to(dtype=torch.float64),
+                                targets.logit_probabilities.to(dtype=torch.float64),
+                                row_to_node_index[:st],
+                                device=torch.device("cpu"),
+                            )
+                            float64_feature_influences = float64_influences[:total_active_feats]
+                        float64_feature_rank = torch.argsort(
+                            float64_feature_influences,
+                            descending=True,
+                        ).cpu()
+                        float64_pending = float64_feature_rank[~visited[float64_feature_rank]][
+                            :queue_size
+                        ]
+                        float64_pending = _reorder_pending_for_phase4_locality(
+                            float64_pending,
+                            feat_layers=feat_layers,
+                            feat_positions=feat_pos,
+                            feat_ids=feat_ids,
+                            exact_chunked_decoder=exact_chunked_decoder,
+                            decoder_chunk_size=decoder_chunk_size,
+                        )
+                        current_debug_record["float64_shadow"] = _compare_phase4_frontiers(
+                            pending,
+                            float64_pending,
+                        )
                     current_pending_cpu = pending.detach().to(device="cpu", dtype=torch.int64)
                     if first_phase4_pending is None:
                         first_phase4_pending = current_pending_cpu.clone()
@@ -1713,6 +1853,20 @@ def _run_attribution(
                 for record in records
                 if isinstance(record, dict) and record.get("overlap_with_first") is not None
             ]
+            deterministic_overlaps = [
+                float(record["deterministic_shadow"]["overlap_fraction"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("deterministic_shadow"), dict)
+                and record["deterministic_shadow"].get("overlap_fraction") is not None
+            ]
+            float64_overlaps = [
+                float(record["float64_shadow"]["overlap_fraction"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("float64_shadow"), dict)
+                and record["float64_shadow"].get("overlap_fraction") is not None
+            ]
             anomaly_debug_result["refresh_count"] = int(len(records))
             anomaly_debug_result["status"] = "captured_refresh_debug"
             anomaly_debug_result["summary"] = {
@@ -1731,6 +1885,14 @@ def _run_attribution(
                 ),
                 "overlap_with_first_mean": (
                     sum(first_overlaps) / len(first_overlaps) if first_overlaps else None
+                ),
+                "deterministic_shadow_overlap_mean": (
+                    sum(deterministic_overlaps) / len(deterministic_overlaps)
+                    if deterministic_overlaps
+                    else None
+                ),
+                "float64_shadow_overlap_mean": (
+                    sum(float64_overlaps) / len(float64_overlaps) if float64_overlaps else None
                 ),
             }
 
