@@ -1758,9 +1758,7 @@ def _run_attribution(
                 n_rows=actual_max_feature_nodes + n_logits,
                 n_feature_columns=total_active_feats,
                 dtype=torch.float32,
-                row_abs_sum_dtype=(
-                    torch.float64 if phase4_anomaly_debug_enabled else torch.float32
-                ),
+                row_abs_sum_dtype=torch.float64,
                 telemetry_recorder=telemetry_recorder,
             )
         else:
