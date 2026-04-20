@@ -121,14 +121,17 @@ class _FileBackedFeatureRowStore:
         n_rows: int,
         n_feature_columns: int,
         dtype: torch.dtype,
+        row_abs_sum_dtype: torch.dtype = torch.float32,
         telemetry_recorder: TelemetryRecorder | None = None,
     ) -> None:
         if dtype not in (torch.float32, torch.float64):
             raise ValueError(f"Unsupported feature row store dtype: {dtype}")
+        if row_abs_sum_dtype not in (torch.float32, torch.float64):
+            raise ValueError(f"Unsupported row_abs_sum_dtype: {row_abs_sum_dtype}")
 
         self.n_rows = n_rows
         self.n_feature_columns = n_feature_columns
-        self.row_abs_sums = torch.zeros(n_rows, dtype=dtype)
+        self.row_abs_sums = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
 
         self._dtype = dtype
         self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
@@ -453,6 +456,11 @@ def _build_vector_stats(
     if count == 0:
         return {
             "count": 0,
+            "finite_count": 0,
+            "nan_count": 0,
+            "posinf_count": 0,
+            "neginf_count": 0,
+            "nonfinite_count": 0,
             "nonzero_count": 0,
             "effective_nonzero_count": 0,
             "zero_count": 0,
@@ -470,6 +478,11 @@ def _build_vector_stats(
         }
 
     abs_values = values.abs()
+    finite_mask = torch.isfinite(values)
+    nan_count = int(torch.isnan(values).sum().item())
+    posinf_count = int(torch.isposinf(values).sum().item())
+    neginf_count = int(torch.isneginf(values).sum().item())
+    finite_count = int(finite_mask.sum().item())
     nonzero_count = int((values != 0).sum().item())
     effective_nonzero_count = int((abs_values > epsilon).sum().item())
     top_k_actual = min(max(0, int(top_k)), count)
@@ -494,6 +507,11 @@ def _build_vector_stats(
     abs_sum_value = float(abs_values.sum().item())
     return {
         "count": count,
+        "finite_count": finite_count,
+        "nan_count": nan_count,
+        "posinf_count": posinf_count,
+        "neginf_count": neginf_count,
+        "nonfinite_count": count - finite_count,
         "nonzero_count": nonzero_count,
         "effective_nonzero_count": effective_nonzero_count,
         "zero_count": count - nonzero_count,
@@ -508,6 +526,81 @@ def _build_vector_stats(
         "all_zero": nonzero_count == 0,
         "effectively_all_zero": effective_nonzero_count == 0,
         "top_abs_values": top_abs_values,
+    }
+
+
+def _compute_row_abs_sums(row_values: torch.Tensor) -> torch.Tensor:
+    return row_values.detach().to(device="cpu", dtype=torch.float64).abs().sum(dim=1)
+
+
+def _build_matrix_abs_stats(
+    matrix: torch.Tensor,
+    *,
+    epsilon: float = 1e-12,
+    top_k: int = 8,
+) -> dict[str, object]:
+    values = matrix.detach().to(device="cpu", dtype=torch.float64)
+    flat = values.flatten()
+    abs_values = flat.abs()
+    finite_mask = torch.isfinite(flat)
+    nan_count = int(torch.isnan(flat).sum().item())
+    posinf_count = int(torch.isposinf(flat).sum().item())
+    neginf_count = int(torch.isneginf(flat).sum().item())
+    finite_count = int(finite_mask.sum().item())
+
+    row_l1 = values.abs().sum(dim=1)
+    row_max_abs = (
+        values.abs().amax(dim=1)
+        if values.ndim == 2 and values.shape[0] > 0
+        else torch.empty(0, dtype=torch.float64)
+    )
+
+    top_entries: list[dict[str, object]] = []
+    if flat.numel() > 0:
+        top_k_actual = min(max(int(top_k), 0), int(flat.numel()))
+        if top_k_actual > 0:
+            top_abs, top_indices = torch.topk(abs_values, k=top_k_actual)
+            n_cols = values.shape[1] if values.ndim == 2 and values.shape else 1
+            for rank, (abs_value, flat_idx) in enumerate(
+                zip(top_abs.tolist(), top_indices.tolist(), strict=False),
+                start=1,
+            ):
+                flat_idx_int = int(flat_idx)
+                row_idx = flat_idx_int // n_cols
+                col_idx = flat_idx_int % n_cols
+                top_entries.append(
+                    {
+                        "rank": rank,
+                        "flat_index": flat_idx_int,
+                        "row_index": int(row_idx),
+                        "col_index": int(col_idx),
+                        "value": float(flat[flat_idx_int].item()),
+                        "abs_value": float(abs_value),
+                    }
+                )
+
+    finite_abs_values = abs_values[finite_mask]
+    return {
+        "shape": list(values.shape),
+        "count": int(flat.numel()),
+        "finite_count": finite_count,
+        "nan_count": nan_count,
+        "posinf_count": posinf_count,
+        "neginf_count": neginf_count,
+        "nonfinite_count": int(flat.numel()) - finite_count,
+        "finite_max_abs": (
+            float(finite_abs_values.max().item()) if finite_abs_values.numel() else None
+        ),
+        "finite_mean_abs": (
+            float(finite_abs_values.mean().item()) if finite_abs_values.numel() else None
+        ),
+        "row_l1_stats": _build_vector_stats(row_l1, epsilon=max(epsilon, 1e-8), top_k=top_k),
+        "row_max_abs_stats": _build_vector_stats(
+            row_max_abs,
+            epsilon=max(epsilon, 1e-8),
+            top_k=top_k,
+        ),
+        "top_abs_entries": top_entries,
     }
 
 
@@ -982,7 +1075,7 @@ def _plan_phase4_feature_batch_size_preflight(
         n_logits = len(targets)
         if n_logits > 0 and total_active_feats > 0:
             logit_feature_rows = torch.zeros((n_logits, total_active_feats), dtype=torch.float32)
-            logit_row_abs_sums = torch.zeros(n_logits, dtype=torch.float32)
+            logit_row_abs_sums = torch.zeros(n_logits, dtype=torch.float64)
             row_to_node_index = torch.arange(n_logits, dtype=torch.long) + int(logit_offset)
             for i in range(0, n_logits, effective_logit_batch_size):
                 batch = targets.logit_vectors[i : i + effective_logit_batch_size]
@@ -996,12 +1089,12 @@ def _plan_phase4_feature_batch_size_preflight(
                 rows_cpu = rows.to(device="cpu", dtype=torch.float32)
                 end = i + batch.shape[0]
                 logit_feature_rows[i:end] = rows_cpu[:, :total_active_feats]
-                logit_row_abs_sums[i:end] = rows_cpu[:, :logit_offset].abs().sum(dim=1)
+                logit_row_abs_sums[i:end] = _compute_row_abs_sums(rows_cpu[:, :logit_offset])
 
             feature_influences = compute_partial_feature_influences(
                 logit_feature_rows,
                 logit_row_abs_sums,
-                targets.logit_probabilities.detach().cpu().to(dtype=torch.float32),
+                targets.logit_probabilities.detach().cpu().to(dtype=torch.float64),
                 row_to_node_index,
                 n_feature_nodes=total_active_feats,
                 n_logits=n_logits,
@@ -1665,6 +1758,9 @@ def _run_attribution(
                 n_rows=actual_max_feature_nodes + n_logits,
                 n_feature_columns=total_active_feats,
                 dtype=torch.float32,
+                row_abs_sum_dtype=(
+                    torch.float64 if phase4_anomaly_debug_enabled else torch.float32
+                ),
                 telemetry_recorder=telemetry_recorder,
             )
         else:
@@ -1738,13 +1834,37 @@ def _run_attribution(
                 phase_label="phase3_logits",
             )
             rows_cpu = rows.cpu()
+            row_input_slice = rows_cpu[:, :logit_offset]
+            row_abs_sums_cpu = _compute_row_abs_sums(row_input_slice)
+            if anomaly_debug_result is not None:
+                logit_row_batches = anomaly_debug_result.setdefault(
+                    "phase3_logit_row_batches",
+                    [],
+                )
+                assert isinstance(logit_row_batches, list)
+                logit_row_batches.append(
+                    {
+                        "batch_index": int((i // effective_logit_batch_size) + 1),
+                        "batch_row_count": int(batch.shape[0]),
+                        "row_input_stats": _build_matrix_abs_stats(
+                            row_input_slice,
+                            epsilon=1e-12,
+                            top_k=8,
+                        ),
+                        "row_abs_sum_stats": _build_vector_stats(
+                            row_abs_sums_cpu,
+                            epsilon=1e-8,
+                            top_k=8,
+                        ),
+                    }
+                )
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
                 end = i + batch.shape[0]
                 feature_row_store.append_rows(
                     row_start=i,
                     feature_rows=rows_cpu[:, :total_active_feats],
-                    full_row_abs_sums=rows_cpu[:, :logit_offset].abs().sum(dim=1),
+                    full_row_abs_sums=row_abs_sums_cpu,
                     phase="phase3",
                 )
             else:
@@ -2101,12 +2221,36 @@ def _run_attribution(
                 row_count = rows.shape[0]
                 end = st + row_count
                 rows_cpu = rows.cpu()
+                row_input_slice = rows_cpu[:row_count, :logit_offset]
+                row_abs_sums_cpu = _compute_row_abs_sums(row_input_slice)
+                if anomaly_debug_result is not None and phase4_batch_count <= 2:
+                    feature_row_batches = anomaly_debug_result.setdefault(
+                        "phase4_feature_row_batches",
+                        [],
+                    )
+                    assert isinstance(feature_row_batches, list)
+                    feature_row_batches.append(
+                        {
+                            "batch_index": int(phase4_batch_count),
+                            "batch_row_count": int(row_count),
+                            "row_input_stats": _build_matrix_abs_stats(
+                                row_input_slice,
+                                epsilon=1e-12,
+                                top_k=8,
+                            ),
+                            "row_abs_sum_stats": _build_vector_stats(
+                                row_abs_sums_cpu,
+                                epsilon=1e-8,
+                                top_k=8,
+                            ),
+                        }
+                    )
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     feature_row_store.append_rows(
                         row_start=st,
                         feature_rows=rows_cpu[:row_count, :total_active_feats],
-                        full_row_abs_sums=rows_cpu[:row_count, :logit_offset].abs().sum(dim=1),
+                        full_row_abs_sums=row_abs_sums_cpu,
                         phase="phase4",
                     )
                 else:
@@ -2294,6 +2438,13 @@ def _run_attribution(
                 precision_compare = records[0].get("float_precision_signal_compare")
                 if isinstance(precision_compare, dict):
                     first_float_precision = precision_compare
+            phase3_logit_row_batches = anomaly_debug_result.get("phase3_logit_row_batches", [])
+            first_phase3_logit_batch = (
+                phase3_logit_row_batches[0]
+                if isinstance(phase3_logit_row_batches, list) and phase3_logit_row_batches
+                else None
+            )
+            phase4_feature_row_batches = anomaly_debug_result.get("phase4_feature_row_batches", [])
             anomaly_debug_result["refresh_count"] = int(len(records))
             anomaly_debug_result["status"] = "captured_refresh_debug"
             anomaly_debug_result["summary"] = {
@@ -2371,6 +2522,16 @@ def _run_attribution(
                     if feature_row_store_read_rows
                     else None
                 ),
+                "phase3_logit_row_batch_count": int(
+                    len(phase3_logit_row_batches)
+                    if isinstance(phase3_logit_row_batches, list)
+                    else 0
+                ),
+                "phase4_feature_row_batch_count": int(
+                    len(phase4_feature_row_batches)
+                    if isinstance(phase4_feature_row_batches, list)
+                    else 0
+                ),
                 "first_refresh_float32_effectively_all_zero": (
                     bool(first_float_precision.get("float32_effectively_all_zero"))
                     if isinstance(first_float_precision, dict)
@@ -2379,6 +2540,38 @@ def _run_attribution(
                 "first_refresh_float64_effectively_all_zero": (
                     bool(first_float_precision.get("float64_effectively_all_zero"))
                     if isinstance(first_float_precision, dict)
+                    else None
+                ),
+                "phase3_logit_row_batch_0_abs_sum": (
+                    first_phase3_logit_batch.get("row_abs_sum_stats", {}).get("abs_sum")
+                    if isinstance(first_phase3_logit_batch, dict)
+                    else None
+                ),
+                "phase3_logit_row_batch_0_max_abs": (
+                    first_phase3_logit_batch.get("row_input_stats", {}).get("finite_max_abs")
+                    if isinstance(first_phase3_logit_batch, dict)
+                    else None
+                ),
+                "phase3_logit_row_batch_0_nonfinite_count": (
+                    first_phase3_logit_batch.get("row_input_stats", {}).get("nonfinite_count")
+                    if isinstance(first_phase3_logit_batch, dict)
+                    else None
+                ),
+                "phase3_logit_row_batch_0_row_l1_max": (
+                    first_phase3_logit_batch.get("row_abs_sum_stats", {}).get("max")
+                    if isinstance(first_phase3_logit_batch, dict)
+                    else None
+                ),
+                "phase3_logit_row_batch_0_row_l1_effectively_all_zero": (
+                    first_phase3_logit_batch.get("row_abs_sum_stats", {}).get(
+                        "effectively_all_zero"
+                    )
+                    if isinstance(first_phase3_logit_batch, dict)
+                    else None
+                ),
+                "phase3_logit_row_batch_0_row_l1_nonfinite_count": (
+                    first_phase3_logit_batch.get("row_abs_sum_stats", {}).get("nonfinite_count")
+                    if isinstance(first_phase3_logit_batch, dict)
                     else None
                 ),
             }

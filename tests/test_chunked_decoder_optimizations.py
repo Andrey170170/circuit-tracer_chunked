@@ -7,10 +7,12 @@ from safetensors.torch import save_file
 
 from circuit_tracer.attribution.attribute import attribute as attribute_top_level
 from circuit_tracer.attribution.attribute_nnsight import (
+    _build_matrix_abs_stats,
     _build_phase4_normalization_stats,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
+    _compute_row_abs_sums,
     _build_vector_stats,
     _compare_phase4_frontiers,
     _compute_phase4_planned_feature_batch_size,
@@ -754,6 +756,36 @@ def test_build_vector_stats_reports_effective_zero_signal() -> None:
     assert stats["effective_nonzero_count"] == 0
     assert stats["all_zero"] is False
     assert stats["effectively_all_zero"] is True
+
+
+def test_build_vector_stats_reports_nonfinite_counts() -> None:
+    stats = _build_vector_stats(
+        torch.tensor([0.0, float("inf"), float("nan")], dtype=torch.float32)
+    )
+
+    assert stats["count"] == 3
+    assert stats["finite_count"] == 1
+    assert stats["posinf_count"] == 1
+    assert stats["nan_count"] == 1
+    assert stats["nonfinite_count"] == 2
+
+
+def test_compute_row_abs_sums_uses_float64_accumulation() -> None:
+    rows = torch.tensor([[1e38, 1e38, 1e38]], dtype=torch.float32)
+    result = _compute_row_abs_sums(rows)
+
+    assert result.dtype == torch.float64
+    assert torch.isfinite(result).all()
+    assert result[0].item() == pytest.approx(3e38)
+
+
+def test_build_matrix_abs_stats_reports_row_l1_nonfinite_counts() -> None:
+    stats = _build_matrix_abs_stats(
+        torch.tensor([[1.0, float("inf")], [0.0, 0.0]], dtype=torch.float32)
+    )
+
+    assert stats["nonfinite_count"] == 1
+    assert stats["row_l1_stats"]["posinf_count"] == 1
 
 
 def test_phase4_normalization_stats_reports_clamped_rows() -> None:
