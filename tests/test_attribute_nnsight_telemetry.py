@@ -298,3 +298,42 @@ def test_file_backed_row_store_materialize_dtype_tracks_denominator_dtype() -> N
         store.cleanup()
 
     assert dense.dtype == torch.float64
+
+
+def test_file_backed_row_store_materialize_same_dtype_preserves_order_after_cleanup() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=3,
+        n_feature_columns=5,
+        dtype=torch.float32,
+        row_abs_sum_dtype=torch.float32,
+    )
+
+    rows = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0],
+            [6.0, 7.0, 8.0, 9.0, 10.0],
+            [11.0, 12.0, 13.0, 14.0, 15.0],
+        ],
+        dtype=torch.float32,
+    )
+    selected = torch.tensor([4, 1, 3], dtype=torch.long)
+
+    try:
+        store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            full_row_abs_sums=torch.tensor([15.0, 40.0, 65.0], dtype=torch.float32),
+        )
+        dense = store.materialize_dense_feature_slice(
+            row_start=0,
+            row_end=3,
+            selected_feature_columns=selected,
+            col_chunk_size=2,
+        )
+    finally:
+        store.cleanup()
+
+    expected = rows[:, selected]
+    assert torch.allclose(dense, expected)
+    dense[0, 0] = -123.0
+    assert dense[0, 0].item() == pytest.approx(-123.0)

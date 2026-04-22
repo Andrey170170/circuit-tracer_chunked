@@ -467,13 +467,15 @@ class _FileBackedFeatureRowStore:
 
         n_rows = row_end - row_start
         n_cols = selected_feature_columns.numel()
-        dense = torch.zeros((n_rows, n_cols), dtype=self.row_abs_max.dtype)
+        dense = torch.empty((n_rows, n_cols), dtype=self.row_abs_max.dtype)
         if n_rows == 0 or n_cols == 0:
             return dense
 
         selected_cols = selected_feature_columns.to(dtype=torch.long, device="cpu")
         if selected_cols.min() < 0 or selected_cols.max() >= self.n_feature_columns:
             raise ValueError("selected feature column indices must be in [0, n_feature_columns)")
+        selected_cols_np = selected_cols.numpy()
+        same_dtype_fast_path = dense.dtype == self._dtype
 
         with self._telemetry_timer(
             name="feature_row_store.materialize_dense_slice",
@@ -487,11 +489,22 @@ class _FileBackedFeatureRowStore:
             },
         ):
             rows = self._require_open_rows()
+            row_slice = rows[row_start:row_end]
+            dense_np = dense.numpy() if same_dtype_fast_path else None
             for col_start in range(0, n_cols, col_chunk_size):
                 col_end = min(col_start + col_chunk_size, n_cols)
-                cols_np = selected_cols[col_start:col_end].numpy()
-                chunk_np = np.asarray(rows[row_start:row_end, cols_np], dtype=self._np_dtype)
-                dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
+                cols_np = selected_cols_np[col_start:col_end]
+                if same_dtype_fast_path:
+                    assert dense_np is not None
+                    np.take(
+                        row_slice,
+                        cols_np,
+                        axis=1,
+                        out=dense_np[:, col_start:col_end],
+                    )
+                else:
+                    chunk_np = np.asarray(row_slice[:, cols_np], dtype=self._np_dtype)
+                    dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
 
         self._diagnostic_stats["materialize_call_count"] = (
             int(self._diagnostic_stats["materialize_call_count"] or 0) + 1
@@ -3936,25 +3949,32 @@ def _run_attribution(
         # Phase 5: packaging graph / compact output
         phase5_start = time.perf_counter()
         selected_features = torch.where(visited)[0]
+        selected_features_cpu = (
+            selected_features.detach().to(device="cpu", dtype=torch.long)
+            if compact_output
+            else None
+        )
         if compact_output:
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
+                assert selected_features_cpu is not None
                 feature_feature_edges = feature_row_store.materialize_dense_feature_slice(
                     row_start=n_logits,
                     row_end=st,
-                    selected_feature_columns=selected_features,
+                    selected_feature_columns=selected_features_cpu,
                     phase="phase5",
                 )
                 logit_feature_edges = feature_row_store.materialize_dense_feature_slice(
                     row_start=0,
                     row_end=n_logits,
-                    selected_feature_columns=selected_features,
+                    selected_feature_columns=selected_features_cpu,
                     phase="phase5",
                 )
             else:
                 feature_feature_edges = edge_matrix[n_logits:st, selected_features].detach().cpu()
                 logit_feature_edges = edge_matrix[:n_logits, selected_features].detach().cpu()
 
+            assert selected_features_cpu is not None
             compact_output_result = {
                 "input_string": model.tokenizer.decode(input_ids),
                 "input_tokens": input_ids.detach().cpu(),
@@ -3963,7 +3983,7 @@ def _run_attribution(
                 "vocab_size": targets.vocab_size,
                 "active_features": activation_matrix.indices().T.detach().cpu(),
                 "activation_values": activation_matrix.values().detach().cpu(),
-                "selected_features": selected_features.detach().cpu(),
+                "selected_features": selected_features_cpu,
                 "feature_row_node_indices": row_to_node_index[n_logits:st].detach().cpu(),
                 "logit_row_node_indices": row_to_node_index[:n_logits].detach().cpu(),
                 "feature_feature_edges": feature_feature_edges,
