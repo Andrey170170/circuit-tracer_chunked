@@ -357,20 +357,32 @@ class _FileBackedFeatureRowStore:
             },
         ):
             rows = self._require_open_rows()
-            feature_rows_cpu = feature_rows.to(
-                device=self.row_abs_max.device,
-                dtype=self._dtype,
-            ).contiguous()
+            feature_rows_cpu = feature_rows.detach()
+            if feature_rows_cpu.device.type != "cpu" or feature_rows_cpu.dtype != self._dtype:
+                feature_rows_cpu = feature_rows_cpu.to(device="cpu", dtype=self._dtype)
             rows[row_start:row_end] = feature_rows_cpu.numpy()
 
-            self.row_abs_max[row_start:row_end] = row_abs_max.to(
-                device=self.row_abs_max.device,
-                dtype=self.row_abs_max.dtype,
-            )
-            self.row_l1_scaled[row_start:row_end] = row_l1_scaled.to(
-                device=self.row_l1_scaled.device,
-                dtype=self.row_l1_scaled.dtype,
-            )
+            row_abs_max_cpu = row_abs_max.detach()
+            if (
+                row_abs_max_cpu.device.type != "cpu"
+                or row_abs_max_cpu.dtype != self.row_abs_max.dtype
+            ):
+                row_abs_max_cpu = row_abs_max_cpu.to(
+                    device=self.row_abs_max.device,
+                    dtype=self.row_abs_max.dtype,
+                )
+            row_l1_scaled_cpu = row_l1_scaled.detach()
+            if (
+                row_l1_scaled_cpu.device.type != "cpu"
+                or row_l1_scaled_cpu.dtype != self.row_l1_scaled.dtype
+            ):
+                row_l1_scaled_cpu = row_l1_scaled_cpu.to(
+                    device=self.row_l1_scaled.device,
+                    dtype=self.row_l1_scaled.dtype,
+                )
+
+            self.row_abs_max[row_start:row_end] = row_abs_max_cpu
+            self.row_l1_scaled[row_start:row_end] = row_l1_scaled_cpu
 
         self._diagnostic_stats["append_call_count"] = (
             int(self._diagnostic_stats["append_call_count"] or 0) + 1
@@ -789,22 +801,38 @@ def _compute_row_denominator_scaled_l1(
     """
 
     resolved_dtype = _resolve_exact_trace_internal_dtype(dtype)
-    abs_values = row_values.detach().to(device="cpu", dtype=resolved_dtype).abs()
-    if abs_values.ndim != 2:
+    row_values_cpu = row_values.detach()
+    if row_values_cpu.ndim != 2:
         raise ValueError("row_values must be rank-2")
+    if row_values_cpu.device.type != "cpu" or row_values_cpu.dtype != resolved_dtype:
+        row_values_cpu = row_values_cpu.to(device="cpu", dtype=resolved_dtype)
 
-    n_rows = int(abs_values.shape[0])
-    if abs_values.shape[1] == 0:
+    n_rows = int(row_values_cpu.shape[0])
+    n_cols = int(row_values_cpu.shape[1])
+    if n_cols == 0:
         row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
         row_l1_scaled = torch.zeros(n_rows, dtype=resolved_dtype)
         return row_abs_max, row_l1_scaled
 
-    row_abs_max = abs_values.amax(dim=1)
+    # Two-pass chunked reduction to avoid materializing a full abs() matrix copy.
+    col_chunk_size = min(max(n_cols, 1), 4096)
+    row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
+    for col_start in range(0, n_cols, col_chunk_size):
+        col_end = min(col_start + col_chunk_size, n_cols)
+        chunk_abs_max = row_values_cpu[:, col_start:col_end].abs().amax(dim=1)
+        row_abs_max = torch.maximum(row_abs_max, chunk_abs_max)
+
     row_l1_scaled = torch.zeros_like(row_abs_max)
     nonzero_rows = (row_abs_max > 0) & torch.isfinite(row_abs_max)
     if bool(nonzero_rows.any()):
-        scaled_rows = abs_values[nonzero_rows] / row_abs_max[nonzero_rows].unsqueeze(1)
-        row_l1_scaled[nonzero_rows] = scaled_rows.sum(dim=1)
+        nonzero_denom = row_abs_max[nonzero_rows].unsqueeze(1)
+        nonzero_scaled_sum = torch.zeros(nonzero_denom.shape[0], dtype=resolved_dtype)
+        for col_start in range(0, n_cols, col_chunk_size):
+            col_end = min(col_start + col_chunk_size, n_cols)
+            chunk = row_values_cpu[nonzero_rows, col_start:col_end].abs()
+            nonzero_scaled_sum += (chunk / nonzero_denom).sum(dim=1)
+        row_l1_scaled[nonzero_rows] = nonzero_scaled_sum
+
     infinite_rows = torch.isinf(row_abs_max)
     if bool(infinite_rows.any()):
         row_l1_scaled[infinite_rows] = 1
@@ -2528,6 +2556,7 @@ def _run_attribution(
             )
             rows_cpu = rows.cpu()
             row_input_slice = rows_cpu[:, :logit_offset]
+            feature_row_slice = rows_cpu[:, :total_active_feats]
             row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                 row_input_slice,
                 dtype=exact_trace_internal_dtype_resolved,
@@ -2558,7 +2587,7 @@ def _run_attribution(
                 end = i + batch.shape[0]
                 feature_row_store.append_rows(
                     row_start=i,
-                    feature_rows=rows_cpu[:, :total_active_feats],
+                    feature_rows=feature_row_slice,
                     row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                     phase="phase3",
                 )
@@ -3374,7 +3403,8 @@ def _run_attribution(
                 row_count = rows.shape[0]
                 end = st + row_count
                 rows_cpu = rows.cpu()
-                row_input_slice = rows_cpu[:row_count, :logit_offset]
+                row_input_slice = rows_cpu[:, :logit_offset]
+                feature_row_slice = rows_cpu[:, :total_active_feats]
                 row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                     row_input_slice,
                     dtype=exact_trace_internal_dtype_resolved,
@@ -3404,7 +3434,7 @@ def _run_attribution(
                     assert feature_row_store is not None
                     feature_row_store.append_rows(
                         row_start=st,
-                        feature_rows=rows_cpu[:row_count, :total_active_feats],
+                        feature_rows=feature_row_slice,
                         row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                         phase="phase4",
                     )

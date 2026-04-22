@@ -186,6 +186,94 @@ def test_compute_row_denominator_scaled_l1_handles_infinite_rows_without_nan() -
     assert torch.equal(row_l1_scaled, torch.ones_like(row_l1_scaled))
 
 
+def test_compute_row_denominator_scaled_l1_chunked_matches_reference_on_strided_input() -> None:
+    padded = torch.zeros((3, 5003), dtype=torch.float32)
+    padded[0, 1:] = 2.0
+    padded[2, 1] = float("inf")
+    rows = padded[:, 1:]
+    assert not rows.is_contiguous()
+
+    row_abs_max, row_l1_scaled = _compute_row_denominator_scaled_l1(rows, dtype=torch.float32)
+
+    reference_abs = rows.to(device="cpu", dtype=torch.float32).abs()
+    reference_row_abs_max = reference_abs.amax(dim=1)
+    reference_row_l1_scaled = torch.zeros_like(reference_row_abs_max)
+    nonzero_rows = (reference_row_abs_max > 0) & torch.isfinite(reference_row_abs_max)
+    if bool(nonzero_rows.any()):
+        reference_row_l1_scaled[nonzero_rows] = (
+            reference_abs[nonzero_rows] / reference_row_abs_max[nonzero_rows].unsqueeze(1)
+        ).sum(dim=1)
+    infinite_rows = torch.isinf(reference_row_abs_max)
+    if bool(infinite_rows.any()):
+        reference_row_l1_scaled[infinite_rows] = 1
+
+    assert torch.allclose(row_abs_max, reference_row_abs_max)
+    assert torch.allclose(row_l1_scaled, reference_row_l1_scaled)
+    assert row_l1_scaled[1].item() == pytest.approx(0.0)
+    assert row_l1_scaled[2].item() == pytest.approx(1.0)
+
+
+def test_file_backed_feature_row_store_append_rows_supports_strided_cpu_slices() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        row_abs_sum_dtype=torch.float64,
+    )
+
+    try:
+        padded_rows = torch.tensor(
+            [[1.0, 2.0, 3.0, 99.0], [0.0, 0.0, 0.0, 77.0]],
+            dtype=torch.float32,
+        )
+        rows = padded_rows[:, :3]
+        assert not rows.is_contiguous()
+
+        store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            full_row_abs_sums=torch.tensor([6.0, 0.0], dtype=torch.float64),
+        )
+        restored = store.read_feature_rows(0, 2)
+    finally:
+        store.cleanup()
+
+    assert torch.allclose(restored, rows)
+    assert torch.allclose(store.row_abs_max[:2], torch.tensor([6.0, 0.0], dtype=torch.float64))
+    assert torch.allclose(store.row_l1_scaled[:2], torch.tensor([1.0, 0.0], dtype=torch.float64))
+
+
+def test_file_backed_feature_row_store_append_rows_accepts_strided_scaled_l1_tuple() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        row_abs_sum_dtype=torch.float64,
+    )
+
+    try:
+        padded_rows = torch.tensor(
+            [[1.0, -2.0, 3.0, 5.0], [0.0, 0.0, 0.0, 7.0]],
+            dtype=torch.float32,
+        )
+        rows = padded_rows[:, :3]
+        assert not rows.is_contiguous()
+        row_denominator = _compute_row_denominator_scaled_l1(rows, dtype=torch.float64)
+
+        store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=row_denominator,
+        )
+        restored = store.read_feature_rows(0, 2)
+    finally:
+        store.cleanup()
+
+    assert torch.allclose(restored, rows)
+    assert torch.allclose(store.row_abs_max[:2], row_denominator[0])
+    assert torch.allclose(store.row_l1_scaled[:2], row_denominator[1])
+
+
 def test_file_backed_row_store_materialize_dtype_tracks_denominator_dtype() -> None:
     store = _FileBackedFeatureRowStore(
         n_rows=2,
