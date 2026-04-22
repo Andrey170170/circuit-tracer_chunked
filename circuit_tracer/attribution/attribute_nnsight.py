@@ -166,7 +166,8 @@ class _FileBackedFeatureRowStore:
 
         self.n_rows = n_rows
         self.n_feature_columns = n_feature_columns
-        self.row_abs_sums = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
+        self.row_abs_max = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
+        self.row_l1_scaled = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
 
         self._dtype = dtype
         self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
@@ -307,7 +308,8 @@ class _FileBackedFeatureRowStore:
         *,
         row_start: int,
         feature_rows: torch.Tensor,
-        full_row_abs_sums: torch.Tensor,
+        row_denominator_scaled_l1: tuple[torch.Tensor, torch.Tensor] | None = None,
+        full_row_abs_sums: torch.Tensor | None = None,
         phase: str | None = None,
     ) -> None:
         if feature_rows.ndim != 2:
@@ -317,8 +319,29 @@ class _FileBackedFeatureRowStore:
             raise ValueError(
                 "feature_rows second dimension must equal configured n_feature_columns"
             )
-        if full_row_abs_sums.numel() != row_count:
-            raise ValueError("full_row_abs_sums length must equal number of feature_rows")
+        if row_denominator_scaled_l1 is not None and full_row_abs_sums is not None:
+            raise ValueError(
+                "Provide either row_denominator_scaled_l1 or full_row_abs_sums, not both"
+            )
+
+        if row_denominator_scaled_l1 is not None:
+            row_abs_max, row_l1_scaled = row_denominator_scaled_l1
+            if row_abs_max.numel() != row_count:
+                raise ValueError("row_abs_max length must equal number of feature_rows")
+            if row_l1_scaled.numel() != row_count:
+                raise ValueError("row_l1_scaled length must equal number of feature_rows")
+        elif full_row_abs_sums is not None:
+            if full_row_abs_sums.numel() != row_count:
+                raise ValueError("full_row_abs_sums length must equal number of feature_rows")
+            row_abs_max = full_row_abs_sums
+            row_l1_scaled = torch.where(
+                full_row_abs_sums > 0,
+                torch.ones_like(full_row_abs_sums),
+                torch.zeros_like(full_row_abs_sums),
+            )
+        else:
+            raise ValueError("row denominator data must be provided")
+
         row_end = row_start + row_count
         if row_start < 0 or row_end > self.n_rows:
             raise ValueError("row range is out of bounds for file-backed store")
@@ -335,14 +358,18 @@ class _FileBackedFeatureRowStore:
         ):
             rows = self._require_open_rows()
             feature_rows_cpu = feature_rows.to(
-                device=self.row_abs_sums.device,
+                device=self.row_abs_max.device,
                 dtype=self._dtype,
             ).contiguous()
             rows[row_start:row_end] = feature_rows_cpu.numpy()
 
-            self.row_abs_sums[row_start:row_end] = full_row_abs_sums.to(
-                device=self.row_abs_sums.device,
-                dtype=self.row_abs_sums.dtype,
+            self.row_abs_max[row_start:row_end] = row_abs_max.to(
+                device=self.row_abs_max.device,
+                dtype=self.row_abs_max.dtype,
+            )
+            self.row_l1_scaled[row_start:row_end] = row_l1_scaled.to(
+                device=self.row_l1_scaled.device,
+                dtype=self.row_l1_scaled.dtype,
             )
 
         self._diagnostic_stats["append_call_count"] = (
@@ -428,7 +455,7 @@ class _FileBackedFeatureRowStore:
 
         n_rows = row_end - row_start
         n_cols = selected_feature_columns.numel()
-        dense = torch.zeros((n_rows, n_cols), dtype=self.row_abs_sums.dtype)
+        dense = torch.zeros((n_rows, n_cols), dtype=self.row_abs_max.dtype)
         if n_rows == 0 or n_cols == 0:
             return dense
 
@@ -470,6 +497,15 @@ class _FileBackedFeatureRowStore:
 
     def get_diagnostic_snapshot(self) -> dict[str, float | int | None]:
         return dict(self._diagnostic_stats)
+
+    @property
+    def row_denominator_scaled_l1(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (self.row_abs_max, self.row_l1_scaled)
+
+    @property
+    def row_abs_sums(self) -> torch.Tensor:
+        """Backward-compatible legacy accessor (non-hot-path only)."""
+        return self.row_abs_max * self.row_l1_scaled
 
     def cleanup(self) -> None:
         if self._closed:
@@ -741,13 +777,59 @@ def _build_vector_stats(
     }
 
 
+def _compute_row_denominator_scaled_l1(
+    row_values: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build stable row-L1 denominator representation.
+
+    Returns ``(row_abs_max, row_l1_scaled)`` where
+    ``row_l1 = row_abs_max * row_l1_scaled`` for each row.
+    """
+
+    resolved_dtype = _resolve_exact_trace_internal_dtype(dtype)
+    abs_values = row_values.detach().to(device="cpu", dtype=resolved_dtype).abs()
+    if abs_values.ndim != 2:
+        raise ValueError("row_values must be rank-2")
+
+    n_rows = int(abs_values.shape[0])
+    if abs_values.shape[1] == 0:
+        row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
+        row_l1_scaled = torch.zeros(n_rows, dtype=resolved_dtype)
+        return row_abs_max, row_l1_scaled
+
+    row_abs_max = abs_values.amax(dim=1)
+    row_l1_scaled = torch.zeros_like(row_abs_max)
+    nonzero_rows = (row_abs_max > 0) & torch.isfinite(row_abs_max)
+    if bool(nonzero_rows.any()):
+        scaled_rows = abs_values[nonzero_rows] / row_abs_max[nonzero_rows].unsqueeze(1)
+        row_l1_scaled[nonzero_rows] = scaled_rows.sum(dim=1)
+    infinite_rows = torch.isinf(row_abs_max)
+    if bool(infinite_rows.any()):
+        row_l1_scaled[infinite_rows] = 1
+    return row_abs_max, row_l1_scaled
+
+
 def _compute_row_abs_sums(
     row_values: torch.Tensor,
     *,
     dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
-    resolved_dtype = _resolve_exact_trace_internal_dtype(dtype)
-    return row_values.detach().to(device="cpu", dtype=resolved_dtype).abs().sum(dim=1)
+    """Backward-compatible helper for non-hot-path diagnostics/tests."""
+
+    row_abs_max, row_l1_scaled = _compute_row_denominator_scaled_l1(row_values, dtype=dtype)
+    return row_abs_max * row_l1_scaled
+
+
+def _row_denominator_to_row_abs_sums(
+    row_denominator: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    if isinstance(row_denominator, torch.Tensor):
+        return row_denominator
+
+    row_abs_max, row_l1_scaled = row_denominator
+    return row_abs_max * row_l1_scaled
 
 
 def _build_matrix_abs_stats(
@@ -822,10 +904,42 @@ def _build_matrix_abs_stats(
 
 
 def _build_phase4_normalization_stats(
-    row_abs_sums: torch.Tensor,
+    row_abs_sums: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     *,
     clamp_epsilon: float = 1e-8,
 ) -> dict[str, object]:
+    if isinstance(row_abs_sums, tuple):
+        row_abs_max, row_l1_scaled = row_abs_sums
+        row_abs_max_cpu = row_abs_max.detach().to(device="cpu", dtype=torch.float64).flatten()
+        row_l1_scaled_cpu = row_l1_scaled.detach().to(device="cpu", dtype=torch.float64).flatten()
+        materialized_row_l1 = row_abs_max_cpu * row_l1_scaled_cpu
+        stats = _build_vector_stats(materialized_row_l1, epsilon=clamp_epsilon)
+        count = int(row_abs_max_cpu.numel())
+        scaled_threshold = torch.where(
+            row_abs_max_cpu > 0,
+            torch.full_like(row_abs_max_cpu, clamp_epsilon) / row_abs_max_cpu,
+            torch.full_like(row_abs_max_cpu, float("inf")),
+        )
+        clamped_mask = (
+            ~torch.isfinite(row_abs_max_cpu)
+            | ~torch.isfinite(row_l1_scaled_cpu)
+            | (row_abs_max_cpu <= 0)
+            | (row_l1_scaled_cpu <= 0)
+            | (row_l1_scaled_cpu < scaled_threshold)
+        )
+        clamped_row_count = int(clamped_mask.sum().item())
+        clamped_fraction = (clamped_row_count / count) if count else 0.0
+        stats["representation"] = "scaled_row_l1"
+        stats["effective_zero_count"] = clamped_row_count
+        stats["effective_nonzero_count"] = int(count - clamped_row_count)
+        stats["effectively_all_zero"] = bool(count == 0 or clamped_row_count == count)
+        stats["clamp_epsilon"] = float(clamp_epsilon)
+        stats["clamped_row_count"] = clamped_row_count
+        stats["clamped_row_fraction"] = float(clamped_fraction)
+        stats["row_abs_max_stats"] = _build_vector_stats(row_abs_max_cpu, epsilon=clamp_epsilon)
+        stats["row_l1_scaled_stats"] = _build_vector_stats(row_l1_scaled_cpu, epsilon=clamp_epsilon)
+        return stats
+
     stats = _build_vector_stats(row_abs_sums, epsilon=clamp_epsilon)
     count = int(stats.get("count", 0) or 0)
     effective_zero_count = int(stats.get("effective_zero_count", 0) or 0)
@@ -833,6 +947,7 @@ def _build_phase4_normalization_stats(
     stats["clamp_epsilon"] = float(clamp_epsilon)
     stats["clamped_row_count"] = effective_zero_count
     stats["clamped_row_fraction"] = float(clamped_fraction)
+    stats["representation"] = "raw_l1"
     return stats
 
 
@@ -1394,7 +1509,8 @@ def _plan_phase4_feature_batch_size_preflight(
                 (n_logits, total_active_feats),
                 dtype=exact_trace_internal_dtype,
             )
-            logit_row_abs_sums = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
+            logit_row_abs_max = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
+            logit_row_l1_scaled = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
             row_to_node_index = torch.arange(n_logits, dtype=torch.long) + int(logit_offset)
             for i in range(0, n_logits, effective_logit_batch_size):
                 batch = targets.logit_vectors[i : i + effective_logit_batch_size]
@@ -1408,14 +1524,16 @@ def _plan_phase4_feature_batch_size_preflight(
                 rows_cpu = rows.to(device="cpu", dtype=exact_trace_internal_dtype)
                 end = i + batch.shape[0]
                 logit_feature_rows[i:end] = rows_cpu[:, :total_active_feats]
-                logit_row_abs_sums[i:end] = _compute_row_abs_sums(
+                row_abs_max_chunk, row_l1_scaled_chunk = _compute_row_denominator_scaled_l1(
                     rows_cpu[:, :logit_offset],
                     dtype=exact_trace_internal_dtype,
                 )
+                logit_row_abs_max[i:end] = row_abs_max_chunk
+                logit_row_l1_scaled[i:end] = row_l1_scaled_chunk
 
             feature_influences = compute_partial_feature_influences(
                 logit_feature_rows,
-                logit_row_abs_sums,
+                (logit_row_abs_max, logit_row_l1_scaled),
                 targets.logit_probabilities.detach().cpu().to(dtype=exact_trace_internal_dtype),
                 row_to_node_index,
                 n_feature_nodes=total_active_feats,
@@ -2284,7 +2402,8 @@ def _run_attribution(
             phase2_extra.update(
                 feature_row_store="dense_memmap",
                 feature_row_store_path=feature_row_store.path,
-                row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_sums.shape)}",
+                row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
+                row_l1_scaled_shape=f"{tuple(feature_row_store.row_l1_scaled.shape)}",
                 feature_edge_columns=total_active_feats,
             )
         else:
@@ -2337,7 +2456,7 @@ def _run_attribution(
                 * torch.empty((), dtype=row_store_dtype_for_metrics).element_size()
             )
             row_abs_sums_expected_bytes = (
-                row_count * torch.empty((), dtype=row_abs_sum_dtype_for_metrics).element_size()
+                2 * row_count * torch.empty((), dtype=row_abs_sum_dtype_for_metrics).element_size()
             )
             phase2_summary_checkpoint = {
                 "feat_layers_hash": _hash_index_tensor(feat_layers),
@@ -2398,7 +2517,7 @@ def _run_attribution(
             )
             rows_cpu = rows.cpu()
             row_input_slice = rows_cpu[:, :logit_offset]
-            row_abs_sums_cpu = _compute_row_abs_sums(
+            row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                 row_input_slice,
                 dtype=exact_trace_internal_dtype_resolved,
             )
@@ -2417,10 +2536,9 @@ def _run_attribution(
                             epsilon=1e-12,
                             top_k=8,
                         ),
-                        "row_abs_sum_stats": _build_vector_stats(
-                            row_abs_sums_cpu,
-                            epsilon=1e-8,
-                            top_k=8,
+                        "row_abs_sum_stats": _build_phase4_normalization_stats(
+                            (row_abs_max_cpu, row_l1_scaled_cpu),
+                            clamp_epsilon=1e-8,
                         ),
                     }
                 )
@@ -2430,7 +2548,7 @@ def _run_attribution(
                 feature_row_store.append_rows(
                     row_start=i,
                     feature_rows=rows_cpu[:, :total_active_feats],
-                    full_row_abs_sums=row_abs_sums_cpu,
+                    row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                     phase="phase3",
                 )
             else:
@@ -2462,10 +2580,9 @@ def _run_attribution(
                     epsilon=1e-12,
                     top_k=0,
                 )
-                row_abs_sum_stats = _build_vector_stats(
-                    row_abs_sums_cpu,
-                    epsilon=1e-8,
-                    top_k=0,
+                row_abs_sum_stats = _build_phase4_normalization_stats(
+                    (row_abs_max_cpu, row_l1_scaled_cpu),
+                    clamp_epsilon=1e-8,
                 )
                 _record_cross_cluster_batch_event(
                     cross_cluster_debug_batches=cross_cluster_debug_batches,
@@ -2546,22 +2663,29 @@ def _run_attribution(
             if actual_max_feature_nodes < total_active_feats:
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
+                    row_denominator_prefix = (
+                        feature_row_store.row_abs_max[:pre_phase4_st],
+                        feature_row_store.row_l1_scaled[:pre_phase4_st],
+                    )
                     seed_feature_influences = compute_partial_feature_influences_streaming(
                         lambda row_start, row_end: feature_row_store.read_feature_rows(
                             row_start,
                             row_end,
                             phase="phase3_seed_ranking",
                         ),
-                        feature_row_store.row_abs_sums[:pre_phase4_st],
+                        row_denominator_prefix,
                         targets.logit_probabilities,
                         row_to_node_index[:pre_phase4_st],
                         n_feature_nodes=total_active_feats,
                         n_logits=n_logits,
-                        device=feature_row_store.row_abs_sums.device,
+                        device=feature_row_store.row_abs_max.device,
                         compute_dtype=planner_compute_dtype,
                     )
                     normalization_input_stats = _build_phase4_normalization_stats(
-                        feature_row_store.row_abs_sums[:pre_phase4_st].detach().cpu(),
+                        (
+                            row_denominator_prefix[0].detach().cpu(),
+                            row_denominator_prefix[1].detach().cpu(),
+                        ),
                     )
                     row_store_snapshot = feature_row_store.get_diagnostic_snapshot()
                 else:
@@ -2638,13 +2762,17 @@ def _run_attribution(
                 if shadow_debug_compute_dtype != planner_compute_dtype:
                     if use_compact_feature_row_store:
                         assert feature_row_store is not None
+                        row_denominator_prefix = (
+                            feature_row_store.row_abs_max[:pre_phase4_st],
+                            feature_row_store.row_l1_scaled[:pre_phase4_st],
+                        )
                         shadow_feature_influences = compute_partial_feature_influences_streaming(
                             lambda row_start, row_end: feature_row_store.read_feature_rows(
                                 row_start,
                                 row_end,
                                 phase="phase3_seed_ranking_shadow",
                             ),
-                            feature_row_store.row_abs_sums[:pre_phase4_st],
+                            row_denominator_prefix,
                             targets.logit_probabilities,
                             row_to_node_index[:pre_phase4_st],
                             n_feature_nodes=total_active_feats,
@@ -2826,18 +2954,22 @@ def _run_attribution(
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     streaming_chunk_reuse_stats = {}
+                    row_denominator_prefix = (
+                        feature_row_store.row_abs_max[:st],
+                        feature_row_store.row_l1_scaled[:st],
+                    )
                     feature_influences = compute_partial_feature_influences_streaming(
                         lambda row_start, row_end: feature_row_store.read_feature_rows(
                             row_start,
                             row_end,
                             phase="phase4",
                         ),
-                        feature_row_store.row_abs_sums[:st],
+                        row_denominator_prefix,
                         phase4_logit_probabilities,
                         row_to_node_index[:st],
                         n_feature_nodes=total_active_feats,
                         n_logits=n_logits,
-                        device=feature_row_store.row_abs_sums.device,
+                        device=feature_row_store.row_abs_max.device,
                         chunk_reuse_stats=streaming_chunk_reuse_stats,
                         compute_dtype=influence_compute_dtype,
                     )
@@ -2861,7 +2993,10 @@ def _run_attribution(
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     normalization_input_stats = _build_phase4_normalization_stats(
-                        feature_row_store.row_abs_sums[:st].detach().cpu(),
+                        (
+                            feature_row_store.row_abs_max[:st].detach().cpu(),
+                            feature_row_store.row_l1_scaled[:st].detach().cpu(),
+                        ),
                     )
                 else:
                     normalization_input_stats = _build_phase4_normalization_stats(
@@ -3067,6 +3202,14 @@ def _run_attribution(
                     if phase4_refresh_count == 0:
                         if use_compact_feature_row_store:
                             assert feature_row_store is not None
+                            shadow_row_denominator = (
+                                feature_row_store.row_abs_max[:st].to(
+                                    dtype=shadow_debug_compute_dtype
+                                ),
+                                feature_row_store.row_l1_scaled[:st].to(
+                                    dtype=shadow_debug_compute_dtype
+                                ),
+                            )
                             float64_feature_influences = (
                                 compute_partial_feature_influences_streaming(
                                     lambda row_start, row_end: feature_row_store.read_feature_rows(
@@ -3074,9 +3217,7 @@ def _run_attribution(
                                         row_end,
                                         phase="phase4_anomaly_debug",
                                     ),
-                                    feature_row_store.row_abs_sums[:st].to(
-                                        dtype=shadow_debug_compute_dtype
-                                    ),
+                                    shadow_row_denominator,
                                     phase4_logit_probabilities.to(dtype=shadow_debug_compute_dtype),
                                     row_to_node_index[:st],
                                     n_feature_nodes=total_active_feats,
@@ -3097,6 +3238,10 @@ def _run_attribution(
                             float32_feature_influences = feature_influences
                         elif use_compact_feature_row_store:
                             assert feature_row_store is not None
+                            float32_row_denominator = (
+                                feature_row_store.row_abs_max[:st].to(dtype=torch.float32),
+                                feature_row_store.row_l1_scaled[:st].to(dtype=torch.float32),
+                            )
                             float32_feature_influences = (
                                 compute_partial_feature_influences_streaming(
                                     lambda row_start, row_end: feature_row_store.read_feature_rows(
@@ -3104,7 +3249,7 @@ def _run_attribution(
                                         row_end,
                                         phase="phase4_anomaly_debug",
                                     ),
-                                    feature_row_store.row_abs_sums[:st].to(dtype=torch.float32),
+                                    float32_row_denominator,
                                     phase4_logit_probabilities.to(dtype=torch.float32),
                                     row_to_node_index[:st],
                                     n_feature_nodes=total_active_feats,
@@ -3189,7 +3334,7 @@ def _run_attribution(
                 end = st + row_count
                 rows_cpu = rows.cpu()
                 row_input_slice = rows_cpu[:row_count, :logit_offset]
-                row_abs_sums_cpu = _compute_row_abs_sums(
+                row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                     row_input_slice,
                     dtype=exact_trace_internal_dtype_resolved,
                 )
@@ -3208,10 +3353,9 @@ def _run_attribution(
                                 epsilon=1e-12,
                                 top_k=8,
                             ),
-                            "row_abs_sum_stats": _build_vector_stats(
-                                row_abs_sums_cpu,
-                                epsilon=1e-8,
-                                top_k=8,
+                            "row_abs_sum_stats": _build_phase4_normalization_stats(
+                                (row_abs_max_cpu, row_l1_scaled_cpu),
+                                clamp_epsilon=1e-8,
                             ),
                         }
                     )
@@ -3220,7 +3364,7 @@ def _run_attribution(
                     feature_row_store.append_rows(
                         row_start=st,
                         feature_rows=rows_cpu[:row_count, :total_active_feats],
-                        full_row_abs_sums=row_abs_sums_cpu,
+                        row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                         phase="phase4",
                     )
                 else:
@@ -3274,10 +3418,9 @@ def _run_attribution(
                         epsilon=1e-12,
                         top_k=0,
                     )
-                    row_abs_sum_stats = _build_vector_stats(
-                        row_abs_sums_cpu,
-                        epsilon=1e-8,
-                        top_k=0,
+                    row_abs_sum_stats = _build_phase4_normalization_stats(
+                        (row_abs_max_cpu, row_l1_scaled_cpu),
+                        clamp_epsilon=1e-8,
                     )
                     _record_cross_cluster_batch_event(
                         cross_cluster_debug_batches=cross_cluster_debug_batches,

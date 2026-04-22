@@ -232,6 +232,104 @@ class PruneResult(NamedTuple):
     cumulative_scores: torch.Tensor  # Tensor of cumulative influence scores for each node
 
 
+class RowL1ScaledDenominator(NamedTuple):
+    """Stable row-denominator representation.
+
+    ``row_l1 = row_abs_max * row_l1_scaled`` where:
+      - ``row_abs_max = max(abs(row))``
+      - ``row_l1_scaled = sum(abs(row) / row_abs_max)`` for non-zero rows,
+        and ``0`` for all-zero rows.
+    """
+
+    row_abs_max: torch.Tensor
+    row_l1_scaled: torch.Tensor
+
+
+def _normalize_row_weights_from_denominator(
+    row_weights: torch.Tensor,
+    *,
+    denom_mode: str,
+    denom_primary: torch.Tensor,
+    denom_secondary: torch.Tensor | None,
+    clamp_epsilon: float = 1e-8,
+) -> torch.Tensor:
+    if denom_mode == "raw_l1":
+        return row_weights / denom_primary.clamp(min=clamp_epsilon)
+
+    if denom_secondary is None:
+        raise ValueError("scaled_row_l1 denominator requires secondary component")
+
+    row_abs_max = denom_primary
+    row_l1_scaled = denom_secondary
+    scaled_threshold = torch.where(
+        row_abs_max > 0,
+        torch.full_like(row_abs_max, clamp_epsilon) / row_abs_max,
+        torch.full_like(row_abs_max, float("inf")),
+    )
+    nan_denominator = torch.isnan(row_abs_max) | torch.isnan(row_l1_scaled)
+    infinite_denominator = ~nan_denominator & (
+        torch.isinf(row_abs_max) | torch.isinf(row_l1_scaled)
+    )
+    finite_denominator = ~(nan_denominator | infinite_denominator)
+    use_scaled_denominator = (
+        finite_denominator
+        & (row_abs_max > 0)
+        & (row_l1_scaled > 0)
+        & (row_l1_scaled >= scaled_threshold)
+    )
+    use_clamped_epsilon = finite_denominator & (
+        (row_abs_max <= 0) | (row_l1_scaled <= 0) | (row_l1_scaled < scaled_threshold)
+    )
+
+    normalized = torch.empty_like(row_weights)
+    if bool(use_scaled_denominator.any()):
+        normalized[use_scaled_denominator] = (
+            row_weights[use_scaled_denominator] / row_abs_max[use_scaled_denominator]
+        ) / row_l1_scaled[use_scaled_denominator]
+    if bool(use_clamped_epsilon.any()):
+        normalized[use_clamped_epsilon] = row_weights[use_clamped_epsilon] / clamp_epsilon
+    if bool(infinite_denominator.any()):
+        normalized[infinite_denominator] = 0
+    if bool(nan_denominator.any()):
+        normalized[nan_denominator] = torch.full_like(row_weights[nan_denominator], float("nan"))
+    return normalized
+
+
+def _resolve_row_denominator(
+    row_denominator: torch.Tensor | RowL1ScaledDenominator | tuple[torch.Tensor, torch.Tensor],
+    *,
+    expected_rows: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[str, torch.Tensor, torch.Tensor | None]:
+    if isinstance(row_denominator, torch.Tensor):
+        if row_denominator.numel() != expected_rows:
+            raise ValueError("row_abs_sums length must equal number of rows")
+        return (
+            "raw_l1",
+            row_denominator.to(device=device, dtype=dtype),
+            None,
+        )
+
+    if isinstance(row_denominator, tuple) and len(row_denominator) == 2:
+        row_abs_max, row_l1_scaled = row_denominator
+        if not isinstance(row_abs_max, torch.Tensor) or not isinstance(row_l1_scaled, torch.Tensor):
+            raise TypeError(
+                "row_abs_sums tuple form must be (row_abs_max: Tensor, row_l1_scaled: Tensor)"
+            )
+        if row_abs_max.numel() != expected_rows:
+            raise ValueError("row_abs_max length must equal number of rows")
+        if row_l1_scaled.numel() != expected_rows:
+            raise ValueError("row_l1_scaled length must equal number of rows")
+        return (
+            "scaled_row_l1",
+            row_abs_max.to(device=device, dtype=dtype),
+            row_l1_scaled.to(device=device, dtype=dtype),
+        )
+
+    raise TypeError("row_abs_sums must be a Tensor or a (row_abs_max, row_l1_scaled) tuple")
+
+
 def prune_graph(
     graph: Graph, node_threshold: float = 0.8, edge_threshold: float = 0.98
 ) -> PruneResult:
@@ -423,7 +521,7 @@ def compute_partial_influences(
 
 def compute_partial_feature_influences(
     feature_edge_matrix: torch.Tensor,
-    row_abs_sums: torch.Tensor,
+    row_abs_sums: torch.Tensor | RowL1ScaledDenominator | tuple[torch.Tensor, torch.Tensor],
     logit_p: torch.Tensor,
     row_to_node_index: torch.Tensor,
     *,
@@ -439,14 +537,17 @@ def compute_partial_feature_influences(
     when:
       - rows correspond to logit + feature source nodes,
       - only feature-column edges are materialized, and
-      - ``row_abs_sums`` stores exact L1 row sums over *all* original columns.
+      - ``row_abs_sums`` stores exact L1 row denominators over *all* original columns.
 
     Args:
         feature_edge_matrix: Dense matrix of shape ``(n_rows, n_feature_nodes)`` containing
             feature-column edge values for each stored row.
-        row_abs_sums: Exact absolute row sums over the original full edge rows
-            (shape ``(n_rows,)``). These preserve normalization semantics even when
-            non-feature columns are not materialized.
+        row_abs_sums: Either
+            (1) exact absolute row sums over original full rows (shape ``(n_rows,)``), or
+            (2) stable scaled-row-L1 pair ``(row_abs_max, row_l1_scaled)`` where
+                ``row_l1 = row_abs_max * row_l1_scaled``.
+            Both preserve normalization semantics even when non-feature columns are
+            not materialized.
         logit_p: Logit probabilities / weights for the first ``n_logits`` rows.
         row_to_node_index: Mapping from row index to original node index.
         n_feature_nodes: Number of active feature columns in the original graph.
@@ -476,8 +577,6 @@ def compute_partial_feature_influences(
             "feature_edge_matrix second dimension must equal n_feature_nodes "
             f"({feature_cols} != {n_feature_nodes})"
         )
-    if row_abs_sums.numel() != n_rows:
-        raise ValueError("row_abs_sums length must equal number of rows")
     if row_to_node_index.numel() != n_rows:
         raise ValueError("row_to_node_index length must equal number of rows")
     if n_logits > n_rows:
@@ -491,9 +590,12 @@ def compute_partial_feature_influences(
         if feature_edge_matrix.device == device
         else feature_edge_matrix.to(device)
     )
-    working_row_abs_sums = (
-        row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
-    ).to(dtype=working_feature_matrix.dtype)
+    denom_mode, denom_primary, denom_secondary = _resolve_row_denominator(
+        row_abs_sums,
+        expected_rows=n_rows,
+        device=device,
+        dtype=working_feature_matrix.dtype,
+    )
     working_row_index = (
         row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
     ).long()
@@ -522,8 +624,15 @@ def compute_partial_feature_influences(
             if not chunk_row_weights.any():
                 continue
 
-            denom = working_row_abs_sums[start:end].clamp(min=1e-8)
-            next_feature_prod += (chunk_row_weights / denom) @ chunk
+            normalized_row_weights = _normalize_row_weights_from_denominator(
+                chunk_row_weights,
+                denom_mode=denom_mode,
+                denom_primary=denom_primary[start:end],
+                denom_secondary=(
+                    denom_secondary[start:end] if denom_secondary is not None else None
+                ),
+            )
+            next_feature_prod += normalized_row_weights @ chunk
 
         if not next_feature_prod.any():
             break
@@ -540,7 +649,7 @@ def compute_partial_feature_influences(
 
 def compute_partial_feature_influences_streaming(
     row_reader: Callable[[int, int], torch.Tensor],
-    row_abs_sums: torch.Tensor,
+    row_abs_sums: torch.Tensor | RowL1ScaledDenominator | tuple[torch.Tensor, torch.Tensor],
     logit_p: torch.Tensor,
     row_to_node_index: torch.Tensor,
     *,
@@ -563,7 +672,8 @@ def compute_partial_feature_influences_streaming(
     Args:
         row_reader: Callable receiving ``(row_start, row_end)`` and returning a dense
             tensor of shape ``(row_end - row_start, n_feature_nodes)`` for that row range.
-        row_abs_sums: Exact absolute row sums over the original full rows.
+        row_abs_sums: Either exact absolute row sums over original full rows or
+            a stable scaled-row-L1 pair ``(row_abs_max, row_l1_scaled)``.
         logit_p: Logit probabilities / weights for the first ``n_logits`` rows.
         row_to_node_index: Mapping from row index to original node index.
         n_feature_nodes: Number of active feature columns in the original graph.
@@ -576,7 +686,8 @@ def compute_partial_feature_influences_streaming(
         chunk_reuse_stats: Optional output dictionary populated with lightweight
             chunk reuse counters for diagnostics.
         compute_dtype: Optional explicit compute dtype for influence math. When
-            omitted, defaults to ``row_abs_sums.dtype`` for backward compatibility.
+            omitted, defaults to the primary denominator dtype for backward
+            compatibility.
 
     Returns:
         Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
@@ -595,7 +706,14 @@ def compute_partial_feature_influences_streaming(
     if chunk_cache_max_bytes < 0:
         raise ValueError("chunk_cache_max_bytes must be >= 0")
 
-    n_rows = row_abs_sums.numel()
+    if isinstance(row_abs_sums, torch.Tensor):
+        n_rows = row_abs_sums.numel()
+        denominator_dtype = row_abs_sums.dtype
+    elif isinstance(row_abs_sums, tuple) and len(row_abs_sums) == 2:
+        n_rows = row_abs_sums[0].numel()
+        denominator_dtype = row_abs_sums[0].dtype
+    else:
+        raise TypeError("row_abs_sums must be a Tensor or a (row_abs_max, row_l1_scaled) tuple")
     if row_to_node_index.numel() != n_rows:
         raise ValueError("row_to_node_index length must equal row_abs_sums length")
     if n_logits > n_rows:
@@ -606,12 +724,19 @@ def compute_partial_feature_influences_streaming(
     if compute_dtype is not None and compute_dtype not in (torch.float32, torch.float64):
         raise ValueError("compute_dtype must be float32 or float64 when provided")
 
-    device = device or row_abs_sums.device
-    dtype = row_abs_sums.dtype if compute_dtype is None else compute_dtype
-    working_row_abs_sums = (
-        row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
+    if isinstance(row_abs_sums, torch.Tensor):
+        row_denominator_device = row_abs_sums.device
+    else:
+        row_denominator_device = row_abs_sums[0].device
+
+    device = device or row_denominator_device
+    dtype = denominator_dtype if compute_dtype is None else compute_dtype
+    denom_mode, denom_primary, denom_secondary = _resolve_row_denominator(
+        row_abs_sums,
+        expected_rows=n_rows,
+        device=device,
+        dtype=dtype,
     )
-    working_row_abs_sums = working_row_abs_sums.to(dtype=dtype)
     working_row_index = (
         row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
     ).long()
@@ -627,7 +752,6 @@ def compute_partial_feature_influences_streaming(
     influences = torch.zeros(n_feature_nodes, device=device, dtype=dtype)
     row_weights = torch.zeros(n_rows, device=device, dtype=dtype)
     row_weights[:n_logits] = working_logit_p.to(dtype=dtype)
-    denom = working_row_abs_sums.clamp(min=1e-8)
     chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
     cache_enabled = bool(chunk_cache_max_bytes > 0)
     chunk_cache_nbytes = 0
@@ -692,7 +816,16 @@ def compute_partial_feature_influences_streaming(
                 chunk_cache.move_to_end(cache_key)
                 chunk_cache_hit_count += 1
 
-            next_feature_prod += (chunk_row_weights / denom[start:end]) @ chunk
+            normalized_row_weights = _normalize_row_weights_from_denominator(
+                chunk_row_weights,
+                denom_mode=denom_mode,
+                denom_primary=denom_primary[start:end],
+                denom_secondary=(
+                    denom_secondary[start:end] if denom_secondary is not None else None
+                ),
+            )
+
+            next_feature_prod += normalized_row_weights @ chunk
 
         if not bool(next_feature_prod.any()):
             break

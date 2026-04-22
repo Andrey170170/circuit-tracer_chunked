@@ -3,6 +3,7 @@ import torch
 
 from circuit_tracer.attribution.attribute_nnsight import (
     _compute_row_abs_sums,
+    _compute_row_denominator_scaled_l1,
     _FileBackedFeatureRowStore,
     _resolve_exact_trace_internal_dtype,
 )
@@ -21,11 +22,11 @@ def test_file_backed_feature_row_store_emits_structured_events() -> None:
 
     try:
         rows = torch.tensor([[1.0, 2.0, 3.0], [0.5, 0.25, 0.75]], dtype=torch.float32)
-        full_row_abs_sums = torch.tensor([6.0, 1.5], dtype=torch.float32)
+        row_denominator_scaled_l1 = _compute_row_denominator_scaled_l1(rows, dtype=torch.float32)
         store.append_rows(
             row_start=0,
             feature_rows=rows,
-            full_row_abs_sums=full_row_abs_sums,
+            row_denominator_scaled_l1=row_denominator_scaled_l1,
             phase="phase3",
         )
 
@@ -140,3 +141,57 @@ def test_compute_row_abs_sums_uses_requested_dtype() -> None:
     assert row_abs_fp32.dtype == torch.float32
     assert row_abs_fp64.dtype == torch.float64
     assert torch.allclose(row_abs_fp32.to(dtype=torch.float64), row_abs_fp64)
+
+
+def test_compute_row_denominator_scaled_l1_builds_stable_components() -> None:
+    rows = torch.tensor(
+        [
+            [1e38, -1e38, 1e38, -1e38],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    row_abs_max, row_l1_scaled = _compute_row_denominator_scaled_l1(rows, dtype=torch.float32)
+
+    assert row_abs_max.dtype == torch.float32
+    assert row_l1_scaled.dtype == torch.float32
+    assert row_abs_max[0].item() == pytest.approx(1e38)
+    assert row_l1_scaled[0].item() == pytest.approx(4.0)
+    assert row_abs_max[1].item() == pytest.approx(0.0)
+    assert row_l1_scaled[1].item() == pytest.approx(0.0)
+
+
+def test_compute_row_denominator_scaled_l1_handles_infinite_rows_without_nan() -> None:
+    rows = torch.tensor([[float("inf"), 1.0, 0.0]], dtype=torch.float32)
+
+    row_abs_max, row_l1_scaled = _compute_row_denominator_scaled_l1(rows, dtype=torch.float32)
+
+    assert torch.isinf(row_abs_max).all()
+    assert torch.equal(row_l1_scaled, torch.ones_like(row_l1_scaled))
+
+
+def test_file_backed_row_store_materialize_dtype_tracks_denominator_dtype() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=2,
+        dtype=torch.float32,
+        row_abs_sum_dtype=torch.float64,
+    )
+
+    try:
+        rows = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+        store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=_compute_row_denominator_scaled_l1(rows, dtype=torch.float64),
+        )
+        dense = store.materialize_dense_feature_slice(
+            row_start=0,
+            row_end=2,
+            selected_feature_columns=torch.tensor([0, 1]),
+        )
+    finally:
+        store.cleanup()
+
+    assert dense.dtype == torch.float64

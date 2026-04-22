@@ -149,6 +149,18 @@ def _dense_row_reader(dense_feature_rows: torch.Tensor):
     return _read_rows
 
 
+def _scaled_row_l1_from_dense_rows(dense_rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    abs_rows = dense_rows.abs()
+    row_abs_max = abs_rows.amax(dim=1)
+    row_l1_scaled = torch.zeros_like(row_abs_max)
+    nonzero_rows = row_abs_max > 0
+    if bool(nonzero_rows.any()):
+        row_l1_scaled[nonzero_rows] = (
+            abs_rows[nonzero_rows] / row_abs_max[nonzero_rows].unsqueeze(1)
+        ).sum(dim=1)
+    return row_abs_max, row_l1_scaled
+
+
 def test_compute_partial_feature_influences_streaming_matches_dense_companion():
     n_features = 4
     n_sinks = 3
@@ -182,6 +194,51 @@ def test_compute_partial_feature_influences_streaming_matches_dense_companion():
     streaming_actual = compute_partial_feature_influences_streaming(
         _dense_row_reader(edge_matrix[:, :n_features]),
         edge_matrix.abs().sum(dim=1),
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=2,
+    )
+
+    assert torch.allclose(streaming_actual, dense_expected, atol=1e-6, rtol=1e-6)
+
+
+def test_compute_partial_feature_influences_dense_and_streaming_match_with_scaled_row_l1():
+    n_features = 4
+    n_sinks = 3
+    n_logits = 2
+    total_nodes = n_features + n_sinks + n_logits
+
+    edge_matrix = torch.tensor(
+        [
+            [0.2, -0.1, 0.0, 0.3, 0.7, 0.0, -0.2, 0.0, 0.0],
+            [0.1, 0.0, -0.2, 0.0, 0.2, -0.4, 0.3, 0.0, 0.0],
+            [0.4, -0.1, 0.2, 0.0, 0.6, -0.2, 0.0, 0.0, 0.0],
+            [0.0, 0.3, 0.1, -0.5, -0.8, 0.0, 0.2, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    logit_p = torch.tensor([0.75, 0.25], dtype=torch.float32)
+    row_to_node_index = torch.tensor(
+        [total_nodes - 2, total_nodes - 1, 1, 3],
+        dtype=torch.int32,
+    )
+
+    stable_denominator = _scaled_row_l1_from_dense_rows(edge_matrix[:, : n_features + n_sinks])
+
+    dense_expected = compute_partial_feature_influences(
+        edge_matrix[:, :n_features],
+        stable_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+
+    streaming_actual = compute_partial_feature_influences_streaming(
+        _dense_row_reader(edge_matrix[:, :n_features]),
+        stable_denominator,
         logit_p,
         row_to_node_index,
         n_feature_nodes=n_features,
@@ -272,6 +329,201 @@ def test_compute_partial_feature_influences_streaming_handles_zero_feature_rows(
     )
 
     assert torch.allclose(streaming_actual, dense_expected, atol=1e-6, rtol=1e-6)
+
+
+def test_compute_partial_feature_influences_scaled_row_l1_handles_zero_rows():
+    n_features = 2
+    n_sinks = 2
+    n_logits = 1
+    total_nodes = n_features + n_sinks + n_logits
+
+    edge_matrix = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 1.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([total_nodes - 1, 0], dtype=torch.int32)
+    stable_denominator = _scaled_row_l1_from_dense_rows(edge_matrix[:, : n_features + n_sinks])
+
+    dense_actual = compute_partial_feature_influences(
+        edge_matrix[:, :n_features],
+        stable_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+    streaming_actual = compute_partial_feature_influences_streaming(
+        _dense_row_reader(edge_matrix[:, :n_features]),
+        stable_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=2,
+    )
+
+    expected = compute_partial_influences(
+        edge_matrix,
+        logit_p,
+        row_to_node_index,
+    )[:n_features]
+
+    assert torch.allclose(dense_actual, expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(streaming_actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_compute_partial_feature_influences_scaled_row_l1_avoids_float32_overflow_regression():
+    n_features = 2
+    n_sinks = 2
+    n_logits = 1
+    total_nodes = n_features + n_sinks + n_logits
+
+    edge_matrix = torch.tensor(
+        [[1e38, 1e38, 1e38, 1e38, 0.0]],
+        dtype=torch.float32,
+    )
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([total_nodes - 1], dtype=torch.int32)
+
+    # Legacy raw-L1 float32 overflows here (sum=4e38 -> inf), causing zeroed weights.
+    raw_overflow = edge_matrix[:, : n_features + n_sinks].abs().sum(dim=1)
+    stable_denominator = (
+        torch.tensor([1e38], dtype=torch.float32),
+        torch.tensor([4.0], dtype=torch.float32),
+    )
+
+    stable_result = compute_partial_feature_influences(
+        edge_matrix[:, :n_features],
+        stable_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+    raw_result = compute_partial_feature_influences(
+        edge_matrix[:, :n_features],
+        raw_overflow,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+    streaming_stable_result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(edge_matrix[:, :n_features]),
+        stable_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=1,
+    )
+    dense_expected = compute_partial_influences(
+        edge_matrix.to(dtype=torch.float64),
+        logit_p.to(dtype=torch.float64),
+        row_to_node_index,
+    )[:n_features].to(dtype=torch.float32)
+
+    assert torch.isinf(raw_overflow).all()
+    assert torch.allclose(stable_result, dense_expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(streaming_stable_result, dense_expected, atol=1e-6, rtol=1e-6)
+    assert torch.all(raw_result < stable_result)
+
+
+def test_compute_partial_feature_influences_scaled_row_l1_preserves_clamp_equivalence():
+    n_features = 2
+    n_sinks = 2
+    n_logits = 1
+    total_nodes = n_features + n_sinks + n_logits
+
+    edge_matrix = torch.tensor(
+        [
+            [4e-9, 4e-9, 4e-9, 4e-9, 0.0],
+            [1e-12, 1e-12, 1e-12, 1e-12, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([total_nodes - 1, 0], dtype=torch.int32)
+    raw_row_abs_sums = edge_matrix[:, : n_features + n_sinks].abs().sum(dim=1)
+    stable_denominator = _scaled_row_l1_from_dense_rows(edge_matrix[:, : n_features + n_sinks])
+
+    dense_stable = compute_partial_feature_influences(
+        edge_matrix[:, :n_features],
+        stable_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+    dense_raw = compute_partial_feature_influences(
+        edge_matrix[:, :n_features],
+        raw_row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+    streaming_stable = compute_partial_feature_influences_streaming(
+        _dense_row_reader(edge_matrix[:, :n_features]),
+        stable_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=1,
+    )
+
+    assert raw_row_abs_sums[0].item() > 1e-8
+    assert raw_row_abs_sums[1].item() < 1e-8
+    assert torch.allclose(dense_stable, dense_raw, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(streaming_stable, dense_raw, atol=1e-6, rtol=1e-6)
+
+
+def test_compute_partial_feature_influences_scaled_row_l1_preserves_infinite_denominator_behavior():
+    n_features = 2
+    n_logits = 1
+    row_to_node_index = torch.tensor([2], dtype=torch.int32)
+    feature_rows = torch.tensor([[1.0, 1.0]], dtype=torch.float32)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    raw_infinite_denominator = torch.tensor([float("inf")], dtype=torch.float32)
+    stable_infinite_denominator = (
+        torch.tensor([float("inf")], dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+    )
+
+    dense_raw = compute_partial_feature_influences(
+        feature_rows,
+        raw_infinite_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+    dense_stable = compute_partial_feature_influences(
+        feature_rows,
+        stable_infinite_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+    )
+    streaming_stable = compute_partial_feature_influences_streaming(
+        _dense_row_reader(feature_rows),
+        stable_infinite_denominator,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=1,
+    )
+
+    assert torch.equal(dense_raw, torch.zeros_like(dense_raw))
+    assert torch.equal(dense_stable, dense_raw)
+    assert torch.equal(streaming_stable, dense_raw)
 
 
 def test_compute_partial_feature_influences_streaming_reuses_row_chunks_within_call():
