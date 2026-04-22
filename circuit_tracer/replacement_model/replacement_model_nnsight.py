@@ -491,6 +491,8 @@ class NNSightReplacementModel(LanguageModel):
         stage_encoder_vecs_on_cpu: bool | None = None,
         stage_error_vectors_on_cpu: bool | None = None,
         row_subchunk_size: int | None = None,
+        internal_precision_requested: str | None = None,
+        resolved_dtype_map: dict[str, str] | None = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
@@ -624,6 +626,8 @@ class NNSightReplacementModel(LanguageModel):
             stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
+            internal_precision_requested=internal_precision_requested,
+            resolved_dtype_map=resolved_dtype_map,
         )
         del reconstruction
         del attribution_data["reconstruction"]
@@ -650,6 +654,8 @@ class NNSightReplacementModel(LanguageModel):
             "stage_encoder_vecs_on_cpu": stage_encoder_vecs_on_cpu,
             "stage_error_vectors_on_cpu": stage_error_vectors_on_cpu,
             "row_subchunk_size": row_subchunk_size,
+            "internal_precision_requested": internal_precision_requested,
+            "resolved_dtype_map": resolved_dtype_map,
         }
         ctx.sparsification_stats = cast(
             dict[str, object] | None, attribution_data.get("sparsification_stats")

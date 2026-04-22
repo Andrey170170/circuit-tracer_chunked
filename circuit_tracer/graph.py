@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import NamedTuple
 import warnings
@@ -548,6 +549,9 @@ def compute_partial_feature_influences_streaming(
     max_iter: int = 128,
     device=None,
     row_chunk_size: int = 4096,
+    chunk_cache_max_bytes: int = 0,
+    chunk_reuse_stats: dict[str, int] | None = None,
+    compute_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Compute feature-only partial influences from streamed dense row chunks.
 
@@ -567,6 +571,12 @@ def compute_partial_feature_influences_streaming(
         max_iter: Maximum number of power-iteration steps.
         device: Device to run computation on.
         row_chunk_size: Row chunk size used for streamed reads.
+        chunk_cache_max_bytes: Strict byte budget for optional solver-local
+            row-chunk reuse cache. ``0`` disables solver-local caching.
+        chunk_reuse_stats: Optional output dictionary populated with lightweight
+            chunk reuse counters for diagnostics.
+        compute_dtype: Optional explicit compute dtype for influence math. When
+            omitted, defaults to ``row_abs_sums.dtype`` for backward compatibility.
 
     Returns:
         Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
@@ -582,6 +592,8 @@ def compute_partial_feature_influences_streaming(
         raise ValueError("n_logits must be >= 0")
     if row_chunk_size <= 0:
         raise ValueError("row_chunk_size must be > 0")
+    if chunk_cache_max_bytes < 0:
+        raise ValueError("chunk_cache_max_bytes must be >= 0")
 
     n_rows = row_abs_sums.numel()
     if row_to_node_index.numel() != n_rows:
@@ -591,11 +603,14 @@ def compute_partial_feature_influences_streaming(
     if logit_p.numel() != n_logits:
         raise ValueError("logit_p length must equal n_logits")
 
+    if compute_dtype is not None and compute_dtype not in (torch.float32, torch.float64):
+        raise ValueError("compute_dtype must be float32 or float64 when provided")
+
     device = device or row_abs_sums.device
+    dtype = row_abs_sums.dtype if compute_dtype is None else compute_dtype
     working_row_abs_sums = (
         row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
     )
-    dtype = working_row_abs_sums.dtype
     working_row_abs_sums = working_row_abs_sums.to(dtype=dtype)
     working_row_index = (
         row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
@@ -613,6 +628,26 @@ def compute_partial_feature_influences_streaming(
     row_weights = torch.zeros(n_rows, device=device, dtype=dtype)
     row_weights[:n_logits] = working_logit_p.to(dtype=dtype)
     denom = working_row_abs_sums.clamp(min=1e-8)
+    chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+    cache_enabled = bool(chunk_cache_max_bytes > 0)
+    chunk_cache_nbytes = 0
+    chunk_request_count = 0
+    chunk_cache_hit_count = 0
+    chunk_cache_miss_count = 0
+    chunk_cache_eviction_count = 0
+    chunk_cache_store_success_count = 0
+    chunk_cache_store_skip_disabled_count = 0
+    chunk_cache_store_skip_too_large_count = 0
+
+    def _tensor_nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    def _drop_oldest_chunk() -> None:
+        nonlocal chunk_cache_nbytes, chunk_cache_eviction_count
+        oldest_key = next(iter(chunk_cache))
+        dropped = chunk_cache.pop(oldest_key)
+        chunk_cache_nbytes = max(0, chunk_cache_nbytes - _tensor_nbytes(dropped))
+        chunk_cache_eviction_count += 1
 
     for _ in range(max_iter):
         next_feature_prod = torch.zeros_like(influences)
@@ -622,15 +657,40 @@ def compute_partial_feature_influences_streaming(
             if not bool(chunk_row_weights.any()):
                 continue
 
-            chunk = row_reader(start, end)
-            if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
-                raise ValueError(
-                    "row_reader must return shape "
-                    f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
-                )
-            if chunk.device != device:
-                chunk = chunk.to(device)
-            chunk = chunk.to(dtype=dtype).abs()
+            chunk_request_count += 1
+            cache_key = (start, end)
+            cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
+            if cached_chunk is None:
+                chunk = row_reader(start, end)
+                if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
+                    raise ValueError(
+                        "row_reader must return shape "
+                        f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
+                    )
+                if chunk.device != device:
+                    chunk = chunk.to(device)
+                chunk = chunk.to(dtype=dtype).abs()
+                if not cache_enabled:
+                    chunk_cache_store_skip_disabled_count += 1
+                else:
+                    chunk_nbytes = _tensor_nbytes(chunk)
+                    if chunk_nbytes > chunk_cache_max_bytes:
+                        chunk_cache_store_skip_too_large_count += 1
+                    else:
+                        while (
+                            chunk_cache
+                            and chunk_cache_nbytes + chunk_nbytes > chunk_cache_max_bytes
+                        ):
+                            _drop_oldest_chunk()
+                        chunk_cache[cache_key] = chunk
+                        chunk_cache.move_to_end(cache_key)
+                        chunk_cache_nbytes += chunk_nbytes
+                        chunk_cache_store_success_count += 1
+                chunk_cache_miss_count += 1
+            else:
+                chunk = cached_chunk
+                chunk_cache.move_to_end(cache_key)
+                chunk_cache_hit_count += 1
 
             next_feature_prod += (chunk_row_weights / denom[start:end]) @ chunk
 
@@ -643,5 +703,26 @@ def compute_partial_feature_influences_streaming(
             row_weights[n_logits:] = next_feature_prod[feature_row_node_index]
     else:
         raise RuntimeError("Failed to converge")
+
+    if chunk_reuse_stats is not None:
+        chunk_reuse_stats.clear()
+        chunk_reuse_stats.update(
+            {
+                "chunk_request_count": int(chunk_request_count),
+                "chunk_cache_enabled": int(cache_enabled),
+                "chunk_cache_max_bytes": int(chunk_cache_max_bytes),
+                "chunk_cache_hit_count": int(chunk_cache_hit_count),
+                "chunk_cache_miss_count": int(chunk_cache_miss_count),
+                "row_reader_call_count": int(chunk_cache_miss_count),
+                "chunk_cache_eviction_count": int(chunk_cache_eviction_count),
+                "chunk_cache_store_success_count": int(chunk_cache_store_success_count),
+                "chunk_cache_store_skip_disabled_count": int(chunk_cache_store_skip_disabled_count),
+                "chunk_cache_store_skip_too_large_count": int(
+                    chunk_cache_store_skip_too_large_count
+                ),
+                "chunk_cache_unique_entries": int(len(chunk_cache)),
+                "chunk_cache_nbytes": int(chunk_cache_nbytes),
+            }
+        )
 
     return influences

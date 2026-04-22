@@ -146,6 +146,7 @@ def attribute(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -182,6 +183,8 @@ def attribute(
         sparsification: Optional candidate-screening config. When provided, phase 0
             keeps only retained feature candidates before reconstruction, and later
             attribution phases reuse the same candidate set.
+        exact_trace_internal_dtype: Internal dtype used by compact exact-trace
+            normalization/ranking internals ("fp32" or "fp64").
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -225,6 +228,7 @@ def attribute(
             feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
             feature_batch_min_free_fraction=feature_batch_min_free_fraction,
             feature_batch_probe_batches=feature_batch_probe_batches,
+            exact_trace_internal_dtype=exact_trace_internal_dtype,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens

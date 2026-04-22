@@ -7,16 +7,21 @@ from safetensors.torch import save_file
 
 from circuit_tracer.attribution.attribute import attribute as attribute_top_level
 from circuit_tracer.attribution.attribute_nnsight import (
+    _build_cross_cluster_runtime_snapshot,
     _build_matrix_abs_stats,
     _build_phase4_normalization_stats,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
+    _record_cross_cluster_batch_event,
+    _record_cross_cluster_checkpoint,
     _compute_row_abs_sums,
     _build_vector_stats,
     _compare_phase4_frontiers,
     _compute_phase4_planned_feature_batch_size,
     _reorder_pending_for_phase4_locality,
+    _resolve_internal_dtype_map,
+    _resolve_internal_precision_requested,
     _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
 )
@@ -736,6 +741,35 @@ def test_phase4_anomaly_debug_enabled_from_env(monkeypatch: pytest.MonkeyPatch) 
     assert _resolve_phase4_anomaly_debug_enabled(False) is True
 
 
+def test_internal_precision_contract_resolves_float64_defaults() -> None:
+    precision = _resolve_internal_precision_requested("float64")
+    dtype_map = _resolve_internal_dtype_map(
+        internal_precision_requested=precision,
+        phase4_anomaly_debug_enabled=False,
+    )
+
+    assert dtype_map["internal_precision_requested"] == "float64"
+    assert dtype_map["feature_row_storage_dtype"] == "float32"
+    assert dtype_map["row_abs_sum_dtype"] == "float64"
+    assert dtype_map["influence_compute_dtype"] == "float64"
+    assert dtype_map["planner_compute_dtype"] == "float64"
+    assert dtype_map["shadow_debug_compute_dtype"] == "float64"
+
+
+def test_internal_precision_contract_resolves_float32_math() -> None:
+    precision = _resolve_internal_precision_requested("float32")
+    dtype_map = _resolve_internal_dtype_map(
+        internal_precision_requested=precision,
+        phase4_anomaly_debug_enabled=False,
+    )
+
+    assert dtype_map["internal_precision_requested"] == "float32"
+    assert dtype_map["feature_row_storage_dtype"] == "float32"
+    assert dtype_map["row_abs_sum_dtype"] == "float32"
+    assert dtype_map["influence_compute_dtype"] == "float32"
+    assert dtype_map["planner_compute_dtype"] == "float32"
+
+
 def test_build_phase4_cutoff_debug_reports_margin_and_ties() -> None:
     scores = torch.tensor([1.0, 0.9, 0.9, 0.5], dtype=torch.float32)
     result = _build_phase4_cutoff_debug(scores, queue_size=2)
@@ -796,6 +830,58 @@ def test_phase4_normalization_stats_reports_clamped_rows() -> None:
 
     assert stats["clamped_row_count"] == 2
     assert stats["clamped_row_fraction"] == pytest.approx(2 / 3)
+
+
+def test_record_cross_cluster_checkpoint_updates_summary_and_stream() -> None:
+    summary: dict[str, object] = {"checkpoints": {}}
+    stream: list[dict[str, object]] = []
+
+    _record_cross_cluster_checkpoint(
+        cross_cluster_debug_summary=summary,
+        cross_cluster_debug_checkpoints=stream,
+        checkpoint_name="phase1_target_logits",
+        phase="phase1",
+        summary_payload={"target_count": 2, "target_token_ids_hash": "abc123"},
+        stream_payload={"target_count": 2, "target_probability_abs_sum": 0.95},
+    )
+
+    checkpoints = summary.get("checkpoints")
+    assert isinstance(checkpoints, dict)
+    assert checkpoints["phase1_target_logits"]["target_count"] == 2
+    assert len(stream) == 1
+    assert stream[0]["checkpoint_name"] == "phase1_target_logits"
+    assert stream[0]["phase"] == "phase1"
+    assert stream[0]["target_probability_abs_sum"] == pytest.approx(0.95)
+
+
+def test_record_cross_cluster_batch_event_emits_scalar_event_record() -> None:
+    events: list[dict[str, object]] = []
+
+    _record_cross_cluster_batch_event(
+        cross_cluster_debug_batches=events,
+        event_name="phase4.refresh",
+        phase="phase4",
+        event_index=3,
+        payload={"queue_size": 64, "rank_abs_sum": 12.5, "rank_effectively_all_zero": False},
+    )
+
+    assert len(events) == 1
+    assert events[0]["event_name"] == "phase4.refresh"
+    assert events[0]["phase"] == "phase4"
+    assert events[0]["event_index"] == 3
+    assert events[0]["queue_size"] == 64
+    assert events[0]["rank_abs_sum"] == pytest.approx(12.5)
+
+
+def test_build_cross_cluster_runtime_snapshot_emits_memory_and_hashes() -> None:
+    summary_payload, stream_payload = _build_cross_cluster_runtime_snapshot(
+        device=torch.device("cpu")
+    )
+
+    assert "memory_snapshot" in summary_payload
+    assert "rss_gib" in stream_payload
+    assert "ctx_diagnostic_snapshot_hash" in stream_payload
+    assert "transcoder_diagnostic_snapshot_hash" in stream_payload
 
 
 def test_compare_phase4_frontiers_reports_overlap_and_first_difference() -> None:

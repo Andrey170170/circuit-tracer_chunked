@@ -272,3 +272,175 @@ def test_compute_partial_feature_influences_streaming_handles_zero_feature_rows(
     )
 
     assert torch.allclose(streaming_actual, dense_expected, atol=1e-6, rtol=1e-6)
+
+
+def test_compute_partial_feature_influences_streaming_reuses_row_chunks_within_call():
+    n_features = 3
+    n_logits = 1
+
+    # row_chunk_size=2 => chunks are [0:2) and [2:4)
+    # This setup forces multiple iterations that revisit both chunks.
+    feature_rows = torch.tensor(
+        [
+            [0.0, 1.0, 1.0],  # logit row
+            [0.0, 0.0, 0.0],  # feature 0 row
+            [1.0, 0.0, 0.0],  # feature 1 row
+            [0.0, 1.0, 0.0],  # feature 2 row
+        ],
+        dtype=torch.float32,
+    )
+    row_abs_sums = torch.ones(4, dtype=torch.float32)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([3, 0, 1, 2], dtype=torch.int32)
+
+    row_reader_calls = 0
+
+    def counting_reader(row_start: int, row_end: int) -> torch.Tensor:
+        nonlocal row_reader_calls
+        row_reader_calls += 1
+        return feature_rows[row_start:row_end]
+
+    chunk_reuse_stats: dict[str, int] = {}
+    result = compute_partial_feature_influences_streaming(
+        counting_reader,
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=2,
+        chunk_cache_max_bytes=1024,
+        chunk_reuse_stats=chunk_reuse_stats,
+    )
+
+    assert result.shape == (n_features,)
+    assert row_reader_calls == 2  # one miss per unique row chunk
+    assert chunk_reuse_stats["chunk_cache_miss_count"] == 2
+    assert chunk_reuse_stats["row_reader_call_count"] == 2
+    assert chunk_reuse_stats["chunk_cache_store_success_count"] == 2
+    assert chunk_reuse_stats["chunk_cache_hit_count"] >= 1
+    assert (
+        chunk_reuse_stats["chunk_cache_hit_count"] + chunk_reuse_stats["chunk_cache_miss_count"]
+        == chunk_reuse_stats["chunk_request_count"]
+    )
+
+
+def test_compute_partial_feature_influences_streaming_solver_cache_disabled_is_explicit():
+    n_features = 3
+    n_logits = 1
+    feature_rows = torch.tensor(
+        [
+            [0.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    row_abs_sums = torch.ones(4, dtype=torch.float32)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([3, 0, 1, 2], dtype=torch.int32)
+
+    row_reader_calls = 0
+
+    def counting_reader(row_start: int, row_end: int) -> torch.Tensor:
+        nonlocal row_reader_calls
+        row_reader_calls += 1
+        return feature_rows[row_start:row_end]
+
+    chunk_reuse_stats: dict[str, int] = {}
+    result = compute_partial_feature_influences_streaming(
+        counting_reader,
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=2,
+        chunk_reuse_stats=chunk_reuse_stats,
+    )
+
+    assert result.shape == (n_features,)
+    assert chunk_reuse_stats["chunk_cache_enabled"] == 0
+    assert chunk_reuse_stats["chunk_cache_store_success_count"] == 0
+    assert (
+        chunk_reuse_stats["chunk_cache_store_skip_disabled_count"]
+        == chunk_reuse_stats["chunk_cache_miss_count"]
+    )
+    assert chunk_reuse_stats["chunk_cache_hit_count"] == 0
+    assert row_reader_calls == chunk_reuse_stats["chunk_request_count"]
+
+
+def test_compute_partial_feature_influences_streaming_solver_cache_reports_too_large_skips():
+    n_features = 3
+    n_logits = 1
+    feature_rows = torch.tensor(
+        [
+            [0.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    row_abs_sums = torch.ones(4, dtype=torch.float32)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([3, 0, 1, 2], dtype=torch.int32)
+
+    chunk_reuse_stats: dict[str, int] = {}
+    uncached_result = compute_partial_feature_influences_streaming(
+        lambda row_start, row_end: feature_rows[row_start:row_end],
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=2,
+    )
+    tiny_budget_result = compute_partial_feature_influences_streaming(
+        lambda row_start, row_end: feature_rows[row_start:row_end],
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=2,
+        chunk_cache_max_bytes=8,
+        chunk_reuse_stats=chunk_reuse_stats,
+    )
+
+    assert torch.allclose(tiny_budget_result, uncached_result, atol=1e-6, rtol=1e-6)
+    assert chunk_reuse_stats["chunk_cache_enabled"] == 1
+    assert chunk_reuse_stats["chunk_cache_store_success_count"] == 0
+    assert (
+        chunk_reuse_stats["chunk_cache_store_skip_too_large_count"]
+        == chunk_reuse_stats["chunk_cache_miss_count"]
+    )
+    assert chunk_reuse_stats["chunk_cache_hit_count"] == 0
+
+
+def test_compute_partial_feature_influences_streaming_honors_explicit_compute_dtype():
+    edge_matrix = torch.tensor(
+        [
+            [0.2, 0.8, 4.0, 0.0],
+            [0.6, 0.4, 0.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    # Intentionally keep row_abs_sums in float64 to ensure compute_dtype controls
+    # influence runtime precision explicitly.
+    row_abs_sums = edge_matrix.abs().sum(dim=1).to(dtype=torch.float64)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([3, 0], dtype=torch.int32)
+
+    streaming_actual = compute_partial_feature_influences_streaming(
+        _dense_row_reader(edge_matrix[:, :2]),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=2,
+        n_logits=1,
+        compute_dtype=torch.float32,
+    )
+
+    assert streaming_actual.dtype == torch.float32

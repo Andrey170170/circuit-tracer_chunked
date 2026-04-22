@@ -21,12 +21,14 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
 """
 
 import hashlib
+import json
 import logging
 import math
 import os
 import sys
 import tempfile
 import time
+from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Literal, cast
@@ -52,6 +54,7 @@ from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.utils.telemetry import (
     TelemetryRecorder,
     diff_numeric_metrics,
+    get_memory_snapshot,
     format_memory_snapshot,
     format_numeric_metrics,
 )
@@ -112,6 +115,37 @@ def _log_sparsification_profile(logger, stats: dict[str, object]) -> None:
     )
 
 
+_EXACT_TRACE_INTERNAL_DTYPE_BY_NAME: dict[str, torch.dtype] = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "torch.float32": torch.float32,
+    "fp64": torch.float64,
+    "float64": torch.float64,
+    "torch.float64": torch.float64,
+}
+
+
+def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        if value in (torch.float32, torch.float64):
+            return value
+        raise ValueError(
+            f"exact_trace_internal_dtype must be one of: fp32, fp64 (got dtype={value})"
+        )
+
+    normalized = str(value).strip().lower()
+    resolved = _EXACT_TRACE_INTERNAL_DTYPE_BY_NAME.get(normalized)
+    if resolved is None:
+        allowed = ", ".join(sorted(_EXACT_TRACE_INTERNAL_DTYPE_BY_NAME))
+        raise ValueError(f"exact_trace_internal_dtype must be one of: {allowed} (got {value!r})")
+    return resolved
+
+
+def _exact_trace_internal_dtype_name(dtype: torch.dtype) -> str:
+    resolved = _resolve_exact_trace_internal_dtype(dtype)
+    return "fp32" if resolved == torch.float32 else "fp64"
+
+
 class _FileBackedFeatureRowStore:
     """Append-only dense feature-row store backed by a temporary memmap file."""
 
@@ -122,6 +156,7 @@ class _FileBackedFeatureRowStore:
         n_feature_columns: int,
         dtype: torch.dtype,
         row_abs_sum_dtype: torch.dtype = torch.float32,
+        read_chunk_cache_bytes: int = 0,
         telemetry_recorder: TelemetryRecorder | None = None,
     ) -> None:
         if dtype not in (torch.float32, torch.float64):
@@ -143,6 +178,9 @@ class _FileBackedFeatureRowStore:
             dtype=self._np_dtype,
             shape=(n_rows, n_feature_columns),
         )
+        self._read_chunk_cache_max_bytes = max(0, int(read_chunk_cache_bytes))
+        self._read_chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+        self._read_chunk_cache_nbytes = 0
         self._telemetry_recorder = telemetry_recorder
         self._closed = False
         self._diagnostic_stats: dict[str, float | int | None] = {
@@ -152,6 +190,19 @@ class _FileBackedFeatureRowStore:
             "read_row_count": 0,
             "read_last_row_start": None,
             "read_last_row_end": None,
+            "read_cache_enabled": int(self._read_chunk_cache_max_bytes > 0),
+            "read_cache_hit_count": 0,
+            "read_cache_miss_count": 0,
+            "read_cache_hit_row_count": 0,
+            "read_cache_miss_row_count": 0,
+            "read_cache_eviction_count": 0,
+            "read_cache_store_attempt_count": 0,
+            "read_cache_store_success_count": 0,
+            "read_cache_store_skip_disabled_count": 0,
+            "read_cache_store_skip_too_large_count": 0,
+            "read_cache_entry_count": 0,
+            "read_cache_nbytes": 0,
+            "read_cache_max_bytes": int(self._read_chunk_cache_max_bytes),
             "materialize_call_count": 0,
             "materialize_row_count": 0,
             "materialize_column_count": 0,
@@ -188,6 +239,68 @@ class _FileBackedFeatureRowStore:
         if self._closed or self._rows is None:
             raise RuntimeError("feature row store has been cleaned up")
         return self._rows
+
+    @staticmethod
+    def _tensor_nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    def _sync_read_cache_snapshot(self) -> None:
+        self._diagnostic_stats["read_cache_entry_count"] = int(len(self._read_chunk_cache))
+        self._diagnostic_stats["read_cache_nbytes"] = int(self._read_chunk_cache_nbytes)
+
+    def _drop_read_chunk(self, key: tuple[int, int], *, count_eviction: bool = True) -> None:
+        chunk = self._read_chunk_cache.pop(key, None)
+        if chunk is None:
+            return
+        self._read_chunk_cache_nbytes = max(
+            0,
+            self._read_chunk_cache_nbytes - self._tensor_nbytes(chunk),
+        )
+        if count_eviction:
+            self._diagnostic_stats["read_cache_eviction_count"] = (
+                int(self._diagnostic_stats["read_cache_eviction_count"] or 0) + 1
+            )
+
+    def _insert_read_chunk(self, key: tuple[int, int], chunk: torch.Tensor) -> str:
+        self._diagnostic_stats["read_cache_store_attempt_count"] = (
+            int(self._diagnostic_stats["read_cache_store_attempt_count"] or 0) + 1
+        )
+        if self._read_chunk_cache_max_bytes <= 0:
+            self._diagnostic_stats["read_cache_store_skip_disabled_count"] = (
+                int(self._diagnostic_stats["read_cache_store_skip_disabled_count"] or 0) + 1
+            )
+            return "disabled"
+
+        chunk_nbytes = self._tensor_nbytes(chunk)
+        if chunk_nbytes > self._read_chunk_cache_max_bytes:
+            self._diagnostic_stats["read_cache_store_skip_too_large_count"] = (
+                int(self._diagnostic_stats["read_cache_store_skip_too_large_count"] or 0) + 1
+            )
+            return "too_large"
+
+        while (
+            self._read_chunk_cache
+            and self._read_chunk_cache_nbytes + chunk_nbytes > self._read_chunk_cache_max_bytes
+        ):
+            oldest_key = next(iter(self._read_chunk_cache))
+            self._drop_read_chunk(oldest_key, count_eviction=True)
+
+        self._read_chunk_cache[key] = chunk
+        self._read_chunk_cache.move_to_end(key)
+        self._read_chunk_cache_nbytes += chunk_nbytes
+        self._diagnostic_stats["read_cache_store_success_count"] = (
+            int(self._diagnostic_stats["read_cache_store_success_count"] or 0) + 1
+        )
+        return "stored"
+
+    def _evict_overlapping_read_chunks(self, row_start: int, row_end: int) -> None:
+        if not self._read_chunk_cache:
+            return
+        overlapping = [
+            key for key in self._read_chunk_cache if key[0] < row_end and key[1] > row_start
+        ]
+        for key in overlapping:
+            self._drop_read_chunk(key, count_eviction=True)
 
     def append_rows(
         self,
@@ -238,6 +351,8 @@ class _FileBackedFeatureRowStore:
         self._diagnostic_stats["append_row_count"] = int(
             self._diagnostic_stats["append_row_count"] or 0
         ) + int(row_count)
+        self._evict_overlapping_read_chunks(row_start, row_end)
+        self._sync_read_cache_snapshot()
 
     def read_feature_rows(
         self,
@@ -249,6 +364,10 @@ class _FileBackedFeatureRowStore:
         if row_start < 0 or row_end < row_start or row_end > self.n_rows:
             raise ValueError("requested row slice is out of bounds for file-backed store")
 
+        cache_key = (int(row_start), int(row_end))
+        cached = self._read_chunk_cache.get(cache_key)
+        cache_hit = cached is not None
+
         with self._telemetry_timer(
             name="feature_row_store.read_rows",
             phase=phase,
@@ -256,19 +375,41 @@ class _FileBackedFeatureRowStore:
                 "row_start": row_start,
                 "row_end": row_end,
                 "row_count": row_end - row_start,
+                "cache_hit": cache_hit,
             },
         ):
-            rows = self._require_open_rows()
-            result = torch.from_numpy(np.asarray(rows[row_start:row_end], dtype=self._np_dtype))
+            if cached is not None:
+                self._read_chunk_cache.move_to_end(cache_key)
+                result = cached
+            else:
+                rows = self._require_open_rows()
+                result = torch.from_numpy(np.asarray(rows[row_start:row_end], dtype=self._np_dtype))
+                self._insert_read_chunk(cache_key, result)
 
         self._diagnostic_stats["read_call_count"] = (
             int(self._diagnostic_stats["read_call_count"] or 0) + 1
         )
-        self._diagnostic_stats["read_row_count"] = int(
-            self._diagnostic_stats["read_row_count"] or 0
-        ) + int(row_end - row_start)
+        row_count = int(row_end - row_start)
+        self._diagnostic_stats["read_row_count"] = (
+            int(self._diagnostic_stats["read_row_count"] or 0) + row_count
+        )
         self._diagnostic_stats["read_last_row_start"] = int(row_start)
         self._diagnostic_stats["read_last_row_end"] = int(row_end)
+        if cache_hit:
+            self._diagnostic_stats["read_cache_hit_count"] = (
+                int(self._diagnostic_stats["read_cache_hit_count"] or 0) + 1
+            )
+            self._diagnostic_stats["read_cache_hit_row_count"] = (
+                int(self._diagnostic_stats["read_cache_hit_row_count"] or 0) + row_count
+            )
+        else:
+            self._diagnostic_stats["read_cache_miss_count"] = (
+                int(self._diagnostic_stats["read_cache_miss_count"] or 0) + 1
+            )
+            self._diagnostic_stats["read_cache_miss_row_count"] = (
+                int(self._diagnostic_stats["read_cache_miss_row_count"] or 0) + row_count
+            )
+        self._sync_read_cache_snapshot()
         return result
 
     def materialize_dense_feature_slice(
@@ -342,6 +483,10 @@ class _FileBackedFeatureRowStore:
                 rows.flush()
             except Exception:
                 pass
+
+        self._read_chunk_cache.clear()
+        self._read_chunk_cache_nbytes = 0
+        self._sync_read_cache_snapshot()
 
         self._tmpdir.cleanup()
 
@@ -440,9 +585,76 @@ def _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug: bool) -> bool:
     return bool(phase4_anomaly_debug or _parse_env_bool("PHASE4_ANOMALY_DEBUG"))
 
 
+def _resolve_internal_precision_requested(internal_precision: str) -> str:
+    normalized = str(internal_precision).strip().lower()
+    if normalized not in {"float32", "float64"}:
+        raise ValueError("internal_precision must be one of {'float32', 'float64'}")
+    return normalized
+
+
+def _dtype_to_name(dtype: torch.dtype) -> str:
+    if dtype == torch.float32:
+        return "float32"
+    if dtype == torch.float64:
+        return "float64"
+    raise ValueError(f"Unsupported dtype for precision contract: {dtype}")
+
+
+def _resolve_internal_dtype_map(
+    *,
+    internal_precision_requested: str,
+    phase4_anomaly_debug_enabled: bool,
+) -> dict[str, str]:
+    """Resolve auditable dtype choices from the public precision contract.
+
+    Notes:
+        - ``float64`` mode preserves prior default behavior as closely as possible:
+          row storage remains float32, while normalization/influence math is float64.
+        - ``float32`` mode keeps both storage and runtime compute in float32.
+        - shadow debug precision remains explicit and independently auditable.
+    """
+
+    if internal_precision_requested == "float64":
+        feature_row_storage_dtype = torch.float32
+        row_abs_sum_dtype = torch.float64
+        influence_compute_dtype = torch.float64
+        planner_compute_dtype = torch.float64
+    else:
+        feature_row_storage_dtype = torch.float32
+        row_abs_sum_dtype = torch.float32
+        influence_compute_dtype = torch.float32
+        planner_compute_dtype = torch.float32
+
+    shadow_debug_compute_dtype = (
+        torch.float64 if phase4_anomaly_debug_enabled else influence_compute_dtype
+    )
+
+    return {
+        "internal_precision_requested": internal_precision_requested,
+        "feature_row_storage_dtype": _dtype_to_name(feature_row_storage_dtype),
+        "row_abs_sum_dtype": _dtype_to_name(row_abs_sum_dtype),
+        "influence_compute_dtype": _dtype_to_name(influence_compute_dtype),
+        "planner_compute_dtype": _dtype_to_name(planner_compute_dtype),
+        "shadow_debug_compute_dtype": _dtype_to_name(shadow_debug_compute_dtype),
+    }
+
+
+def _dtype_from_name(dtype_name: str) -> torch.dtype:
+    if dtype_name == "float32":
+        return torch.float32
+    if dtype_name == "float64":
+        return torch.float64
+    raise ValueError(f"Unsupported dtype name: {dtype_name}")
+
+
 def _hash_index_tensor(indices: torch.Tensor) -> str:
     indices_cpu = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
     return hashlib.blake2s(indices_cpu.numpy().tobytes(), digest_size=8).hexdigest()
+
+
+def _hash_float_tensor(values: torch.Tensor, *, dtype: torch.dtype = torch.float64) -> str:
+    values_cpu = values.detach().to(device="cpu", dtype=dtype).contiguous()
+    return hashlib.blake2s(values_cpu.numpy().tobytes(), digest_size=8).hexdigest()
 
 
 def _build_vector_stats(
@@ -529,8 +741,13 @@ def _build_vector_stats(
     }
 
 
-def _compute_row_abs_sums(row_values: torch.Tensor) -> torch.Tensor:
-    return row_values.detach().to(device="cpu", dtype=torch.float64).abs().sum(dim=1)
+def _compute_row_abs_sums(
+    row_values: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    resolved_dtype = _resolve_exact_trace_internal_dtype(dtype)
+    return row_values.detach().to(device="cpu", dtype=resolved_dtype).abs().sum(dim=1)
 
 
 def _build_matrix_abs_stats(
@@ -629,6 +846,93 @@ def _safe_float(value: torch.Tensor | float | int | None) -> float | None:
     return float(value)
 
 
+def _record_cross_cluster_checkpoint(
+    *,
+    cross_cluster_debug_summary: dict[str, object] | None,
+    cross_cluster_debug_checkpoints: list[dict[str, object]] | None,
+    checkpoint_name: str,
+    phase: str,
+    summary_payload: dict[str, object] | None,
+    stream_payload: dict[str, object] | None = None,
+) -> None:
+    if cross_cluster_debug_summary is not None and summary_payload is not None:
+        checkpoints = cross_cluster_debug_summary.setdefault("checkpoints", {})
+        assert isinstance(checkpoints, dict)
+        checkpoints[checkpoint_name] = summary_payload
+
+    if cross_cluster_debug_checkpoints is None:
+        return
+
+    payload = stream_payload if stream_payload is not None else summary_payload
+    if payload is None:
+        payload = {}
+    record: dict[str, object] = {
+        "checkpoint_name": checkpoint_name,
+        "phase": phase,
+    }
+    record.update(payload)
+    cross_cluster_debug_checkpoints.append(record)
+
+
+def _record_cross_cluster_batch_event(
+    *,
+    cross_cluster_debug_batches: list[dict[str, object]] | None,
+    event_name: str,
+    phase: str,
+    event_index: int,
+    payload: dict[str, object],
+) -> None:
+    if cross_cluster_debug_batches is None:
+        return
+
+    record: dict[str, object] = {
+        "event_name": event_name,
+        "phase": phase,
+        "event_index": int(event_index),
+    }
+    record.update(payload)
+    cross_cluster_debug_batches.append(record)
+
+
+def _hash_json_payload(payload: object) -> str:
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:16]
+
+
+def _build_cross_cluster_runtime_snapshot(
+    *,
+    device: torch.device | None,
+    ctx=None,
+    transcoder=None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    memory_snapshot = get_memory_snapshot(device)
+    ctx_snapshot = _snapshot_diagnostics(ctx)
+    transcoder_snapshot = _snapshot_diagnostics(transcoder)
+    summary_payload: dict[str, object] = {
+        "memory_snapshot": memory_snapshot,
+        "ctx_diagnostic_snapshot": ctx_snapshot,
+        "transcoder_diagnostic_snapshot": transcoder_snapshot,
+        "ctx_diagnostic_snapshot_hash": (
+            _hash_json_payload(ctx_snapshot) if ctx_snapshot is not None else None
+        ),
+        "transcoder_diagnostic_snapshot_hash": (
+            _hash_json_payload(transcoder_snapshot) if transcoder_snapshot is not None else None
+        ),
+    }
+    stream_payload: dict[str, object] = {
+        "rss_gib": memory_snapshot.get("rss_gib"),
+        "cuda_allocated_gib": memory_snapshot.get("cuda_allocated_gib"),
+        "cuda_reserved_gib": memory_snapshot.get("cuda_reserved_gib"),
+        "cuda_max_allocated_gib": memory_snapshot.get("cuda_max_allocated_gib"),
+        "cuda_max_reserved_gib": memory_snapshot.get("cuda_max_reserved_gib"),
+        "ctx_diagnostic_snapshot_hash": summary_payload.get("ctx_diagnostic_snapshot_hash"),
+        "transcoder_diagnostic_snapshot_hash": summary_payload.get(
+            "transcoder_diagnostic_snapshot_hash"
+        ),
+    }
+    return summary_payload, stream_payload
+
+
 def _build_phase4_cutoff_debug(
     candidate_scores: torch.Tensor,
     *,
@@ -692,6 +996,7 @@ def _record_phase4_refresh_debug(
     logit_probability_stats: dict[str, object] | None,
     normalization_input_stats: dict[str, object] | None,
     feature_row_store_read_stats: dict[str, object] | None,
+    streaming_chunk_reuse_stats: dict[str, object] | None,
 ) -> None:
     if anomaly_debug_result is None:
         return
@@ -733,6 +1038,8 @@ def _record_phase4_refresh_debug(
         record["normalization_input_stats"] = normalization_input_stats
     if feature_row_store_read_stats is not None:
         record["feature_row_store_read_stats"] = feature_row_store_read_stats
+    if streaming_chunk_reuse_stats is not None:
+        record["streaming_chunk_reuse_stats"] = streaming_chunk_reuse_stats
     records = anomaly_debug_result.setdefault("records", [])
     assert isinstance(records, list)
     records.append(record)
@@ -945,6 +1252,7 @@ def _plan_phase4_feature_batch_size_preflight(
     update_interval: int,
     max_n_logits: int,
     desired_logit_prob: float,
+    exact_trace_internal_dtype: torch.dtype,
     logger,
     sparsification: SparsificationConfig | None = None,
     chunked_feature_replay_window: int = 4,
@@ -956,9 +1264,14 @@ def _plan_phase4_feature_batch_size_preflight(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
+    internal_precision_requested: str = "float64",
+    resolved_dtype_map: dict[str, str] | None = None,
+    row_abs_sum_dtype: torch.dtype = torch.float64,
+    planner_compute_dtype: torch.dtype = torch.float64,
     telemetry_recorder: TelemetryRecorder | None = None,
 ) -> int:
     planner_start = time.perf_counter()
+    exact_trace_internal_dtype_name = _exact_trace_internal_dtype_name(exact_trace_internal_dtype)
 
     def _finalize_planner(
         *,
@@ -1009,6 +1322,7 @@ def _plan_phase4_feature_batch_size_preflight(
             f"max_feature_nodes={max_feature_nodes} | "
             f"update_interval={update_interval} | "
             f"probe_batches={feature_batch_probe_batches} | "
+            f"exact_trace_internal_dtype={exact_trace_internal_dtype_name} | "
             f"target_reserved_fraction={feature_batch_target_reserved_fraction:.3f} | "
             f"min_free_fraction={feature_batch_min_free_fraction:.3f}"
         )
@@ -1022,6 +1336,8 @@ def _plan_phase4_feature_batch_size_preflight(
             stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
+            internal_precision_requested=internal_precision_requested,
+            resolved_dtype_map=resolved_dtype_map,
         )
         if hasattr(ctx, "set_diagnostic_mode"):
             ctx.set_diagnostic_mode(False)
@@ -1074,8 +1390,11 @@ def _plan_phase4_feature_batch_size_preflight(
         )
         n_logits = len(targets)
         if n_logits > 0 and total_active_feats > 0:
-            logit_feature_rows = torch.zeros((n_logits, total_active_feats), dtype=torch.float32)
-            logit_row_abs_sums = torch.zeros(n_logits, dtype=torch.float64)
+            logit_feature_rows = torch.zeros(
+                (n_logits, total_active_feats),
+                dtype=exact_trace_internal_dtype,
+            )
+            logit_row_abs_sums = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
             row_to_node_index = torch.arange(n_logits, dtype=torch.long) + int(logit_offset)
             for i in range(0, n_logits, effective_logit_batch_size):
                 batch = targets.logit_vectors[i : i + effective_logit_batch_size]
@@ -1086,15 +1405,18 @@ def _plan_phase4_feature_batch_size_preflight(
                     retain_graph=True,
                     phase_label="phase3_logits_probe",
                 )
-                rows_cpu = rows.to(device="cpu", dtype=torch.float32)
+                rows_cpu = rows.to(device="cpu", dtype=exact_trace_internal_dtype)
                 end = i + batch.shape[0]
                 logit_feature_rows[i:end] = rows_cpu[:, :total_active_feats]
-                logit_row_abs_sums[i:end] = _compute_row_abs_sums(rows_cpu[:, :logit_offset])
+                logit_row_abs_sums[i:end] = _compute_row_abs_sums(
+                    rows_cpu[:, :logit_offset],
+                    dtype=exact_trace_internal_dtype,
+                )
 
             feature_influences = compute_partial_feature_influences(
                 logit_feature_rows,
                 logit_row_abs_sums,
-                targets.logit_probabilities.detach().cpu().to(dtype=torch.float64),
+                targets.logit_probabilities.detach().cpu().to(dtype=exact_trace_internal_dtype),
                 row_to_node_index,
                 n_feature_nodes=total_active_feats,
                 n_logits=n_logits,
@@ -1249,9 +1571,12 @@ def attribute(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
+    internal_precision: Literal["float32", "float64"] = "float64",
     phase4_anomaly_debug: bool = False,
+    cross_cluster_debug: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -1308,10 +1633,17 @@ def attribute(
             unused (0-1), applied as a stricter cap than target utilization.
         feature_batch_probe_batches: Number of preflight Phase-4 probe batches
             to run before the real attribution pass.
+        internal_precision: Public precision contract for exact chunked internals.
+            ``float64`` preserves prior default behavior as closely as practical.
         phase4_anomaly_debug: Enable opt-in Phase-4 anomaly debug scaffolding.
             Can also be activated via ``PHASE4_ANOMALY_DEBUG=1``.
+        cross_cluster_debug: Enable broad scalar-only cross-cluster debug summary
+            scaffolding (Phase 0 through pre-Phase-4 checkpoints).
         telemetry_max_events: Optional cap for in-memory telemetry event storage.
             If omitted, an environment/default policy is used.
+        exact_trace_internal_dtype: Internal dtype for compact exact-trace
+            normalization/influence ranking path. ``"fp64"`` uses float64
+            internals; ``"fp32"`` uses float32 internals.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -1360,9 +1692,12 @@ def attribute(
             feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
             feature_batch_min_free_fraction=feature_batch_min_free_fraction,
             feature_batch_probe_batches=feature_batch_probe_batches,
+            internal_precision=internal_precision,
             phase4_anomaly_debug=phase4_anomaly_debug,
+            cross_cluster_debug=cross_cluster_debug,
             telemetry_max_events=telemetry_max_events,
             compact_output=compact_output,
+            exact_trace_internal_dtype=exact_trace_internal_dtype,
             logger=logger,
         )
     finally:
@@ -1403,12 +1738,21 @@ def _run_attribution(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
+    internal_precision: Literal["float32", "float64"] = "float64",
     phase4_anomaly_debug: bool = False,
+    cross_cluster_debug: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
 ):
     start_time = time.time()
     run_start = time.perf_counter()
+    exact_trace_internal_dtype_resolved = _resolve_exact_trace_internal_dtype(
+        exact_trace_internal_dtype
+    )
+    exact_trace_internal_dtype_name = _exact_trace_internal_dtype_name(
+        exact_trace_internal_dtype_resolved
+    )
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
     if feature_batch_size is not None and feature_batch_size <= 0:
@@ -1431,6 +1775,17 @@ def _run_attribution(
         raise ValueError("feature_batch_probe_batches must be > 0")
 
     phase4_anomaly_debug_enabled = _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug)
+    internal_precision_requested = _resolve_internal_precision_requested(internal_precision)
+    resolved_dtype_map = _resolve_internal_dtype_map(
+        internal_precision_requested=internal_precision_requested,
+        phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,
+    )
+    feature_row_storage_dtype = _dtype_from_name(resolved_dtype_map["feature_row_storage_dtype"])
+    row_abs_sum_dtype = _dtype_from_name(resolved_dtype_map["row_abs_sum_dtype"])
+    influence_compute_dtype = _dtype_from_name(resolved_dtype_map["influence_compute_dtype"])
+    planner_compute_dtype = _dtype_from_name(resolved_dtype_map["planner_compute_dtype"])
+    shadow_debug_compute_dtype = _dtype_from_name(resolved_dtype_map["shadow_debug_compute_dtype"])
+    cross_cluster_debug_enabled = bool(cross_cluster_debug)
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
         compact_output=compact_output,
@@ -1452,6 +1807,10 @@ def _run_attribution(
             "feature_batch_size": feature_batch_size,
             "logit_batch_size": logit_batch_size,
             "telemetry_max_events": telemetry_max_events_resolved,
+            "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
+            "internal_precision_requested": internal_precision_requested,
+            "resolved_dtype_map": resolved_dtype_map,
+            "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
         },
     )
 
@@ -1480,9 +1839,16 @@ def _run_attribution(
         max_feature_batch_size=max_phase4_feature_batch_size,
     )
     anomaly_debug_result: dict[str, object] | None = None
+    cross_cluster_debug_summary: dict[str, object] | None = None
+    cross_cluster_debug_checkpoints: list[dict[str, object]] | None = None
+    cross_cluster_debug_batches: list[dict[str, object]] | None = None
     if phase4_anomaly_debug_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "Phase-4 anomaly debug requires compact_output=True and exact_chunked_decoder=True"
+        )
+    if cross_cluster_debug_enabled and not (compact_output and exact_chunked_decoder):
+        raise ValueError(
+            "cross_cluster_debug requires compact_output=True and exact_chunked_decoder=True"
         )
     if phase4_anomaly_debug_enabled:
         anomaly_debug_result = {
@@ -1496,6 +1862,19 @@ def _run_attribution(
             "summary": {},
             "records": [],
         }
+    if cross_cluster_debug_enabled:
+        cross_cluster_debug_summary = {
+            "schema_version": 1,
+            "enabled": True,
+            "status": "collecting",
+            "mode": "early_phase_scalar_summary",
+            "internal_precision_requested": internal_precision_requested,
+            "resolved_dtype_map": resolved_dtype_map,
+            "environment": _build_phase4_environment_fingerprint(),
+            "checkpoints": {},
+        }
+        cross_cluster_debug_checkpoints = []
+        cross_cluster_debug_batches = []
     if planner_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "Phase-4 feature batch planner requires compact_output=True and exact_chunked_decoder=True"
@@ -1547,6 +1926,11 @@ def _run_attribution(
                 feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
                 feature_batch_min_free_fraction=feature_batch_min_free_fraction,
                 feature_batch_probe_batches=feature_batch_probe_batches,
+                exact_trace_internal_dtype=exact_trace_internal_dtype_resolved,
+                internal_precision_requested=internal_precision_requested,
+                resolved_dtype_map=resolved_dtype_map,
+                row_abs_sum_dtype=row_abs_sum_dtype,
+                planner_compute_dtype=planner_compute_dtype,
                 telemetry_recorder=telemetry_recorder,
             )
             planner_status = "executed"
@@ -1592,6 +1976,7 @@ def _run_attribution(
             f"row_subchunk_size={row_subchunk_size} | "
             f"planner_enabled={planner_enabled} | "
             f"feature_batch_size_max={max_phase4_feature_batch_size} | "
+            f"exact_trace_internal_dtype={exact_trace_internal_dtype_name} | "
             f"prompt_tokens={input_ids.shape[-1]} | feature_batch_size={effective_feature_batch_size} | "
             f"logit_batch_size={effective_logit_batch_size}"
         )
@@ -1605,6 +1990,8 @@ def _run_attribution(
         stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
         stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
         row_subchunk_size=row_subchunk_size,
+        internal_precision_requested=internal_precision_requested,
+        resolved_dtype_map=resolved_dtype_map,
     )
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
@@ -1662,6 +2049,71 @@ def _run_attribution(
                     f"Precompute diagnostics | {format_numeric_metrics(transcoder_snapshot, limit=20)}"
                 )
         logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
+        if cross_cluster_debug_summary is not None:
+            phase0_runtime_summary, phase0_runtime_stream = _build_cross_cluster_runtime_snapshot(
+                device=model.device,
+                ctx=ctx,
+                transcoder=model.transcoders,
+            )
+            activation_matrix = activation_matrix.coalesce()
+            activation_indices = activation_matrix.indices().detach().cpu()
+            activation_values = activation_matrix.values().detach().cpu()
+            phase0_n_layers = int(activation_matrix.shape[0])
+            layer_counts = (
+                torch.bincount(activation_indices[0], minlength=phase0_n_layers).tolist()
+                if activation_indices.numel() > 0
+                else [0] * phase0_n_layers
+            )
+            activation_value_stats = _build_vector_stats(
+                activation_values,
+                epsilon=1e-12,
+                top_k=8,
+            )
+            phase0_summary_checkpoint = {
+                "active_feature_count": int(activation_matrix._nnz()),
+                "per_layer_retained_counts": [int(v) for v in layer_counts],
+                "active_feature_indices_hash": _hash_index_tensor(activation_indices.flatten()),
+                "activation_value_stats": activation_value_stats,
+                "logit_retention": getattr(ctx, "logit_retention", None),
+                "staging_flags": {
+                    "stage_encoder_vecs_on_cpu": bool(stage_encoder_vecs_on_cpu),
+                    "stage_error_vectors_on_cpu": bool(stage_error_vectors_on_cpu),
+                },
+                "setup_diagnostic_stats": getattr(ctx, "setup_diagnostic_stats", None),
+                **phase0_runtime_summary,
+            }
+            phase0_stream_checkpoint = {
+                "active_feature_count": int(activation_matrix._nnz()),
+                "retained_layer_count": int(phase0_n_layers),
+                "retained_nonzero_layer_count": int(
+                    sum(1 for value in layer_counts if int(value) > 0)
+                ),
+                "active_feature_indices_hash": phase0_summary_checkpoint[
+                    "active_feature_indices_hash"
+                ],
+                "activation_value_count": int(activation_value_stats["count"]),
+                "activation_value_nonfinite_count": int(activation_value_stats["nonfinite_count"]),
+                "activation_value_abs_sum": _safe_float(activation_value_stats.get("abs_sum")),
+                "activation_value_max": _safe_float(activation_value_stats.get("max")),
+                "activation_value_effectively_all_zero": bool(
+                    activation_value_stats["effectively_all_zero"]
+                ),
+                "logit_retention": getattr(ctx, "logit_retention", None),
+                "stage_encoder_vecs_on_cpu": bool(stage_encoder_vecs_on_cpu),
+                "stage_error_vectors_on_cpu": bool(stage_error_vectors_on_cpu),
+                "setup_diagnostic_stats_present": bool(
+                    getattr(ctx, "setup_diagnostic_stats", None)
+                ),
+                **phase0_runtime_stream,
+            }
+            _record_cross_cluster_checkpoint(
+                cross_cluster_debug_summary=cross_cluster_debug_summary,
+                cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                checkpoint_name="phase0_sparse_setup",
+                phase="phase0",
+                summary_payload=phase0_summary_checkpoint,
+                stream_payload=phase0_stream_checkpoint,
+            )
 
         if (
             offload
@@ -1727,6 +2179,57 @@ def _run_attribution(
         )
 
         log_attribution_target_info(targets, attribution_targets, logger)
+        if cross_cluster_debug_summary is not None:
+            phase1_runtime_summary, phase1_runtime_stream = _build_cross_cluster_runtime_snapshot(
+                device=model.device,
+                ctx=ctx,
+                transcoder=model.transcoders,
+            )
+            target_token_ids = [int(target.vocab_idx) for target in targets.logit_targets]
+            target_probabilities = targets.logit_probabilities.detach().cpu()
+            target_probability_stats = _build_vector_stats(
+                target_probabilities,
+                epsilon=1e-12,
+                top_k=8,
+            )
+            phase1_summary_checkpoint = {
+                "target_count": int(len(targets)),
+                "target_token_ids": target_token_ids,
+                "target_token_ids_hash": _hash_index_tensor(
+                    torch.tensor(target_token_ids, dtype=torch.int64)
+                )
+                if target_token_ids
+                else None,
+                "target_probability_stats": target_probability_stats,
+                "target_logit_state_hash": _hash_float_tensor(
+                    target_probabilities,
+                    dtype=torch.float64,
+                ),
+                **phase1_runtime_summary,
+            }
+            phase1_stream_checkpoint = {
+                "target_count": int(len(targets)),
+                "target_token_ids_hash": phase1_summary_checkpoint["target_token_ids_hash"],
+                "target_probability_count": int(target_probability_stats["count"]),
+                "target_probability_nonfinite_count": int(
+                    target_probability_stats["nonfinite_count"]
+                ),
+                "target_probability_abs_sum": _safe_float(target_probability_stats.get("abs_sum")),
+                "target_probability_max": _safe_float(target_probability_stats.get("max")),
+                "target_probability_effectively_all_zero": bool(
+                    target_probability_stats["effectively_all_zero"]
+                ),
+                "target_logit_state_hash": phase1_summary_checkpoint["target_logit_state_hash"],
+                **phase1_runtime_stream,
+            }
+            _record_cross_cluster_checkpoint(
+                cross_cluster_debug_summary=cross_cluster_debug_summary,
+                cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                checkpoint_name="phase1_target_logits",
+                phase="phase1",
+                summary_payload=phase1_summary_checkpoint,
+                stream_payload=phase1_stream_checkpoint,
+            )
 
         if offload:
             offload_handles += offload_modules([model.embed_location], offload)
@@ -1757,8 +2260,9 @@ def _run_attribution(
             feature_row_store = _FileBackedFeatureRowStore(
                 n_rows=actual_max_feature_nodes + n_logits,
                 n_feature_columns=total_active_feats,
-                dtype=torch.float32,
-                row_abs_sum_dtype=torch.float64,
+                dtype=exact_trace_internal_dtype_resolved,
+                row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
+                read_chunk_cache_bytes=256 * 1024 * 1024,
                 telemetry_recorder=telemetry_recorder,
             )
         else:
@@ -1810,6 +2314,67 @@ def _run_attribution(
             phase="phase2",
             elapsed_ms=phase2_elapsed_ms,
         )
+        if cross_cluster_debug_summary is not None:
+            phase2_runtime_summary, phase2_runtime_stream = _build_cross_cluster_runtime_snapshot(
+                device=model.device,
+                ctx=ctx,
+                transcoder=model.transcoders,
+            )
+            row_store_dtype_for_metrics = (
+                exact_trace_internal_dtype_resolved
+                if use_compact_feature_row_store
+                else feature_row_storage_dtype
+            )
+            row_abs_sum_dtype_for_metrics = (
+                exact_trace_internal_dtype_resolved
+                if use_compact_feature_row_store
+                else row_abs_sum_dtype
+            )
+            row_count = int(actual_max_feature_nodes + n_logits)
+            row_store_expected_bytes = (
+                row_count
+                * int(total_active_feats)
+                * torch.empty((), dtype=row_store_dtype_for_metrics).element_size()
+            )
+            row_abs_sums_expected_bytes = (
+                row_count * torch.empty((), dtype=row_abs_sum_dtype_for_metrics).element_size()
+            )
+            phase2_summary_checkpoint = {
+                "feat_layers_hash": _hash_index_tensor(feat_layers),
+                "feat_pos_hash": _hash_index_tensor(feat_pos),
+                "feat_ids_hash": _hash_index_tensor(feat_ids),
+                "feature_count": int(total_active_feats),
+                "decoder_chunk_size": (
+                    int(getattr(model.transcoders, "decoder_chunk_size", 0))
+                    if getattr(model.transcoders, "decoder_chunk_size", None) is not None
+                    else None
+                ),
+                "row_store_mode": phase2_extra.get("row_store_mode"),
+                "row_store_expected_bytes": int(row_store_expected_bytes),
+                "row_abs_sums_expected_bytes": int(row_abs_sums_expected_bytes),
+                "phase4_feature_batch_size_initial": int(effective_feature_batch_size),
+                **phase2_runtime_summary,
+            }
+            phase2_stream_checkpoint = {
+                "feat_layers_hash": phase2_summary_checkpoint["feat_layers_hash"],
+                "feat_pos_hash": phase2_summary_checkpoint["feat_pos_hash"],
+                "feat_ids_hash": phase2_summary_checkpoint["feat_ids_hash"],
+                "feature_count": int(total_active_feats),
+                "decoder_chunk_size": phase2_summary_checkpoint["decoder_chunk_size"],
+                "row_store_mode": phase2_summary_checkpoint["row_store_mode"],
+                "row_store_expected_bytes": int(row_store_expected_bytes),
+                "row_abs_sums_expected_bytes": int(row_abs_sums_expected_bytes),
+                "phase4_feature_batch_size_initial": int(effective_feature_batch_size),
+                **phase2_runtime_stream,
+            }
+            _record_cross_cluster_checkpoint(
+                cross_cluster_debug_summary=cross_cluster_debug_summary,
+                cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                checkpoint_name="phase2_feature_ordering",
+                phase="phase2",
+                summary_payload=phase2_summary_checkpoint,
+                stream_payload=phase2_stream_checkpoint,
+            )
 
         # Phase 3: logit attribution
         logger.info("Phase 3: Computing logit attributions")
@@ -1833,7 +2398,10 @@ def _run_attribution(
             )
             rows_cpu = rows.cpu()
             row_input_slice = rows_cpu[:, :logit_offset]
-            row_abs_sums_cpu = _compute_row_abs_sums(row_input_slice)
+            row_abs_sums_cpu = _compute_row_abs_sums(
+                row_input_slice,
+                dtype=exact_trace_internal_dtype_resolved,
+            )
             if anomaly_debug_result is not None:
                 logit_row_batches = anomaly_debug_result.setdefault(
                     "phase3_logit_row_batches",
@@ -1888,6 +2456,39 @@ def _run_attribution(
                 name="phase3.logit_batch",
                 elapsed_ms=batch_elapsed_ms,
             )
+            if cross_cluster_debug_batches is not None:
+                row_input_stats = _build_matrix_abs_stats(
+                    row_input_slice,
+                    epsilon=1e-12,
+                    top_k=0,
+                )
+                row_abs_sum_stats = _build_vector_stats(
+                    row_abs_sums_cpu,
+                    epsilon=1e-8,
+                    top_k=0,
+                )
+                _record_cross_cluster_batch_event(
+                    cross_cluster_debug_batches=cross_cluster_debug_batches,
+                    event_name="phase3.logit_batch",
+                    phase="phase3",
+                    event_index=(i // effective_logit_batch_size) + 1,
+                    payload={
+                        "batch_rows": int(batch.shape[0]),
+                        "batch_start_index": int(i),
+                        "total_logit_batches": int(total_logit_batches),
+                        "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
+                        "row_input_finite_max_abs": _safe_float(
+                            row_input_stats.get("finite_max_abs")
+                        ),
+                        "row_l1_abs_sum": _safe_float(row_abs_sum_stats.get("abs_sum")),
+                        "row_l1_max": _safe_float(row_abs_sum_stats.get("max")),
+                        "row_l1_nonfinite_count": int(row_abs_sum_stats["nonfinite_count"]),
+                        "row_l1_effectively_all_zero": bool(
+                            row_abs_sum_stats["effectively_all_zero"]
+                        ),
+                        **get_memory_snapshot(model.device),
+                    },
+                )
             if profile and ((i // effective_logit_batch_size) + 1) % profile_log_interval == 0:
                 _log_batch_profile(
                     logger,
@@ -1925,6 +2526,221 @@ def _run_attribution(
         if callable(reset_decoder_cache):
             reset_decoder_cache()
 
+        if cross_cluster_debug_summary is not None:
+            phase3_runtime_summary, phase3_runtime_stream = _build_cross_cluster_runtime_snapshot(
+                device=model.device,
+                ctx=ctx,
+                transcoder=model.transcoders,
+            )
+            pre_phase4_st = int(n_logits)
+            phase3_seed_summary: dict[str, object] = {
+                "stored_row_count_before_phase4": pre_phase4_st,
+                "actual_max_feature_nodes": int(actual_max_feature_nodes),
+                "total_active_features": int(total_active_feats),
+                "update_interval": int(update_interval),
+                "feature_batch_size": int(effective_feature_batch_size),
+                "planner_compute_dtype": _dtype_to_name(planner_compute_dtype),
+                "influence_compute_dtype": _dtype_to_name(influence_compute_dtype),
+                **phase3_runtime_summary,
+            }
+            if actual_max_feature_nodes < total_active_feats:
+                if use_compact_feature_row_store:
+                    assert feature_row_store is not None
+                    seed_feature_influences = compute_partial_feature_influences_streaming(
+                        lambda row_start, row_end: feature_row_store.read_feature_rows(
+                            row_start,
+                            row_end,
+                            phase="phase3_seed_ranking",
+                        ),
+                        feature_row_store.row_abs_sums[:pre_phase4_st],
+                        targets.logit_probabilities,
+                        row_to_node_index[:pre_phase4_st],
+                        n_feature_nodes=total_active_feats,
+                        n_logits=n_logits,
+                        device=feature_row_store.row_abs_sums.device,
+                        compute_dtype=planner_compute_dtype,
+                    )
+                    normalization_input_stats = _build_phase4_normalization_stats(
+                        feature_row_store.row_abs_sums[:pre_phase4_st].detach().cpu(),
+                    )
+                    row_store_snapshot = feature_row_store.get_diagnostic_snapshot()
+                else:
+                    planner_influences = compute_partial_influences(
+                        edge_matrix[:pre_phase4_st].to(dtype=planner_compute_dtype),
+                        targets.logit_probabilities.to(dtype=planner_compute_dtype),
+                        row_to_node_index[:pre_phase4_st],
+                        device=torch.device("cpu"),
+                    )
+                    seed_feature_influences = planner_influences[:total_active_feats]
+                    normalization_input_stats = _build_phase4_normalization_stats(
+                        edge_matrix[:pre_phase4_st, :logit_offset].abs().sum(dim=1).detach().cpu(),
+                    )
+                    row_store_snapshot = None
+
+                unvisited_feature_rank = torch.argsort(
+                    seed_feature_influences,
+                    descending=True,
+                ).cpu()
+                queue_size = min(
+                    update_interval * effective_feature_batch_size,
+                    actual_max_feature_nodes,
+                )
+                pre_locality_pending = unvisited_feature_rank[:queue_size]
+                post_locality_pending = _reorder_pending_for_phase4_locality(
+                    pre_locality_pending,
+                    feat_layers=feat_layers,
+                    feat_positions=feat_pos,
+                    feat_ids=feat_ids,
+                    exact_chunked_decoder=exact_chunked_decoder,
+                    decoder_chunk_size=getattr(model.transcoders, "decoder_chunk_size", None),
+                )
+                deterministic_pending = _build_phase4_deterministic_shadow_pending(
+                    unvisited_feature_rank,
+                    seed_feature_influences.detach().cpu(),
+                    queue_size=queue_size,
+                    feat_layers=feat_layers,
+                    feat_positions=feat_pos,
+                    feat_ids=feat_ids,
+                    exact_chunked_decoder=exact_chunked_decoder,
+                    decoder_chunk_size=getattr(model.transcoders, "decoder_chunk_size", None),
+                )
+
+                phase3_seed_summary.update(
+                    {
+                        "status": "captured",
+                        "queue_size": int(queue_size),
+                        "feature_influence_stats": _build_vector_stats(
+                            seed_feature_influences.detach().cpu(),
+                            epsilon=1e-12,
+                            top_k=8,
+                        ),
+                        "feature_influence_hash": _hash_float_tensor(
+                            seed_feature_influences.detach().cpu(),
+                            dtype=torch.float64,
+                        ),
+                        "frontier_pre_locality_hash": _hash_index_tensor(pre_locality_pending),
+                        "frontier_post_locality_hash": _hash_index_tensor(post_locality_pending),
+                        "frontier_pre_locality_sample": [
+                            int(v) for v in pre_locality_pending[:16].tolist()
+                        ],
+                        "frontier_post_locality_sample": [
+                            int(v) for v in post_locality_pending[:16].tolist()
+                        ],
+                        "deterministic_shadow": _compare_phase4_frontiers(
+                            post_locality_pending,
+                            deterministic_pending,
+                        ),
+                        "normalization_input_stats": normalization_input_stats,
+                        "feature_row_store_summary": row_store_snapshot,
+                    }
+                )
+
+                if shadow_debug_compute_dtype != planner_compute_dtype:
+                    if use_compact_feature_row_store:
+                        assert feature_row_store is not None
+                        shadow_feature_influences = compute_partial_feature_influences_streaming(
+                            lambda row_start, row_end: feature_row_store.read_feature_rows(
+                                row_start,
+                                row_end,
+                                phase="phase3_seed_ranking_shadow",
+                            ),
+                            feature_row_store.row_abs_sums[:pre_phase4_st],
+                            targets.logit_probabilities,
+                            row_to_node_index[:pre_phase4_st],
+                            n_feature_nodes=total_active_feats,
+                            n_logits=n_logits,
+                            device=torch.device("cpu"),
+                            compute_dtype=shadow_debug_compute_dtype,
+                        )
+                    else:
+                        shadow_influences = compute_partial_influences(
+                            edge_matrix[:pre_phase4_st].to(dtype=shadow_debug_compute_dtype),
+                            targets.logit_probabilities.to(dtype=shadow_debug_compute_dtype),
+                            row_to_node_index[:pre_phase4_st],
+                            device=torch.device("cpu"),
+                        )
+                        shadow_feature_influences = shadow_influences[:total_active_feats]
+                    shadow_rank = torch.argsort(
+                        shadow_feature_influences,
+                        descending=True,
+                    ).cpu()
+                    shadow_pending = _reorder_pending_for_phase4_locality(
+                        shadow_rank[:queue_size],
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=getattr(model.transcoders, "decoder_chunk_size", None),
+                    )
+                    phase3_seed_summary["shadow_debug"] = _compare_phase4_frontiers(
+                        post_locality_pending,
+                        shadow_pending,
+                    )
+            else:
+                phase3_seed_summary.update(
+                    {
+                        "status": "skipped_all_features_included",
+                        "queue_size": int(actual_max_feature_nodes),
+                    }
+                )
+            deterministic_shadow = phase3_seed_summary.get("deterministic_shadow")
+            shadow_debug = phase3_seed_summary.get("shadow_debug")
+            normalization_input_stats = phase3_seed_summary.get("normalization_input_stats")
+            feature_influence_stats = phase3_seed_summary.get("feature_influence_stats")
+            phase3_stream_checkpoint = {
+                "status": phase3_seed_summary.get("status"),
+                "stored_row_count_before_phase4": int(pre_phase4_st),
+                "actual_max_feature_nodes": int(actual_max_feature_nodes),
+                "total_active_features": int(total_active_feats),
+                "update_interval": int(update_interval),
+                "feature_batch_size": int(effective_feature_batch_size),
+                "queue_size": phase3_seed_summary.get("queue_size"),
+                "feature_influence_hash": phase3_seed_summary.get("feature_influence_hash"),
+                "frontier_pre_locality_hash": phase3_seed_summary.get("frontier_pre_locality_hash"),
+                "frontier_post_locality_hash": phase3_seed_summary.get(
+                    "frontier_post_locality_hash"
+                ),
+                "deterministic_shadow_overlap_fraction": (
+                    _safe_float(deterministic_shadow.get("overlap_fraction"))
+                    if isinstance(deterministic_shadow, dict)
+                    else None
+                ),
+                "shadow_debug_overlap_fraction": (
+                    _safe_float(shadow_debug.get("overlap_fraction"))
+                    if isinstance(shadow_debug, dict)
+                    else None
+                ),
+                "feature_influence_nonfinite_count": (
+                    int(feature_influence_stats.get("nonfinite_count", 0))
+                    if isinstance(feature_influence_stats, dict)
+                    else None
+                ),
+                "feature_influence_abs_sum": (
+                    _safe_float(feature_influence_stats.get("abs_sum"))
+                    if isinstance(feature_influence_stats, dict)
+                    else None
+                ),
+                "normalization_clamped_row_count": (
+                    int(normalization_input_stats.get("clamped_row_count", 0))
+                    if isinstance(normalization_input_stats, dict)
+                    else None
+                ),
+                "normalization_clamped_row_fraction": (
+                    _safe_float(normalization_input_stats.get("clamped_row_fraction"))
+                    if isinstance(normalization_input_stats, dict)
+                    else None
+                ),
+                **phase3_runtime_stream,
+            }
+            _record_cross_cluster_checkpoint(
+                cross_cluster_debug_summary=cross_cluster_debug_summary,
+                cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                checkpoint_name="phase3_seed_ranking_pre_phase4",
+                phase="phase3",
+                summary_payload=phase3_seed_summary,
+                stream_payload=phase3_stream_checkpoint,
+            )
+
         # Phase 4: feature attribution
         logger.info("Phase 4: Computing feature attributions")
         phase4_start = time.perf_counter()
@@ -1949,6 +2765,24 @@ def _run_attribution(
                 else ""
             )
         )
+        if cross_cluster_debug_summary is not None:
+            _record_cross_cluster_checkpoint(
+                cross_cluster_debug_summary=cross_cluster_debug_summary,
+                cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                checkpoint_name="phase4_entry",
+                phase="phase4",
+                summary_payload=None,
+                stream_payload={
+                    "checkpoint_stage": "entry",
+                    "phase4_feature_batch_size": int(phase4_feature_batch_size),
+                    "planner_enabled": bool(planner_enabled),
+                    "planner_status": planner_status,
+                    "planner_skip_reason": planner_skip_reason,
+                    "actual_max_feature_nodes": int(actual_max_feature_nodes),
+                    "total_active_features": int(total_active_feats),
+                    "update_interval": int(update_interval),
+                },
+            )
         st = n_logits
         visited = torch.zeros(total_active_feats, dtype=torch.bool)
         n_visited = 0
@@ -1958,9 +2792,16 @@ def _run_attribution(
         previous_phase4_pending: torch.Tensor | None = None
         first_phase4_pending: torch.Tensor | None = None
         phase4_logit_probability_stats = _build_vector_stats(
-            targets.logit_probabilities.detach().cpu(),
+            targets.logit_probabilities.detach().to(
+                device="cpu",
+                dtype=exact_trace_internal_dtype_resolved,
+            ),
             epsilon=1e-12,
             top_k=8,
+        )
+        phase4_logit_probabilities = targets.logit_probabilities.detach().to(
+            device="cpu",
+            dtype=exact_trace_internal_dtype_resolved,
         )
         if anomaly_debug_result is not None:
             anomaly_debug_result["logit_probability_stats"] = phase4_logit_probability_stats
@@ -1981,8 +2822,10 @@ def _run_attribution(
                     if use_compact_feature_row_store and feature_row_store is not None
                     else None
                 )
+                streaming_chunk_reuse_stats: dict[str, int] | None = None
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
+                    streaming_chunk_reuse_stats = {}
                     feature_influences = compute_partial_feature_influences_streaming(
                         lambda row_start, row_end: feature_row_store.read_feature_rows(
                             row_start,
@@ -1990,16 +2833,18 @@ def _run_attribution(
                             phase="phase4",
                         ),
                         feature_row_store.row_abs_sums[:st],
-                        targets.logit_probabilities,
+                        phase4_logit_probabilities,
                         row_to_node_index[:st],
                         n_feature_nodes=total_active_feats,
                         n_logits=n_logits,
                         device=feature_row_store.row_abs_sums.device,
+                        chunk_reuse_stats=streaming_chunk_reuse_stats,
+                        compute_dtype=influence_compute_dtype,
                     )
                 else:
                     influences = compute_partial_influences(
                         edge_matrix[:st],
-                        targets.logit_probabilities,
+                        phase4_logit_probabilities,
                         row_to_node_index[:st],
                         device=edge_matrix.device,
                     )
@@ -2084,6 +2929,57 @@ def _run_attribution(
                         "feature_row_store_read_rows": _safe_float(
                             (feature_row_store_read_stats or {}).get("read_row_count")
                         ),
+                        "feature_row_store_read_cache_hits": _safe_float(
+                            (feature_row_store_read_stats or {}).get("read_cache_hit_count")
+                        ),
+                        "feature_row_store_read_cache_misses": _safe_float(
+                            (feature_row_store_read_stats or {}).get("read_cache_miss_count")
+                        ),
+                        "feature_row_store_read_cache_store_success": _safe_float(
+                            (feature_row_store_read_stats or {}).get(
+                                "read_cache_store_success_count"
+                            )
+                        ),
+                        "feature_row_store_read_cache_store_skip_disabled": _safe_float(
+                            (feature_row_store_read_stats or {}).get(
+                                "read_cache_store_skip_disabled_count"
+                            )
+                        ),
+                        "feature_row_store_read_cache_store_skip_too_large": _safe_float(
+                            (feature_row_store_read_stats or {}).get(
+                                "read_cache_store_skip_too_large_count"
+                            )
+                        ),
+                        "streaming_chunk_cache_requests": _safe_float(
+                            (streaming_chunk_reuse_stats or {}).get("chunk_request_count")
+                        ),
+                        "streaming_chunk_cache_enabled": _safe_float(
+                            (streaming_chunk_reuse_stats or {}).get("chunk_cache_enabled")
+                        ),
+                        "streaming_chunk_cache_max_bytes": _safe_float(
+                            (streaming_chunk_reuse_stats or {}).get("chunk_cache_max_bytes")
+                        ),
+                        "streaming_chunk_cache_hits": _safe_float(
+                            (streaming_chunk_reuse_stats or {}).get("chunk_cache_hit_count")
+                        ),
+                        "streaming_chunk_cache_misses": _safe_float(
+                            (streaming_chunk_reuse_stats or {}).get("chunk_cache_miss_count")
+                        ),
+                        "streaming_chunk_cache_store_success": _safe_float(
+                            (streaming_chunk_reuse_stats or {}).get(
+                                "chunk_cache_store_success_count"
+                            )
+                        ),
+                        "streaming_chunk_cache_store_skip_disabled": _safe_float(
+                            (streaming_chunk_reuse_stats or {}).get(
+                                "chunk_cache_store_skip_disabled_count"
+                            )
+                        ),
+                        "streaming_chunk_cache_store_skip_too_large": _safe_float(
+                            (streaming_chunk_reuse_stats or {}).get(
+                                "chunk_cache_store_skip_too_large_count"
+                            )
+                        ),
                     },
                 )
                 telemetry_recorder.record_wall_clock_duration(
@@ -2091,6 +2987,48 @@ def _run_attribution(
                     name="phase4.refresh",
                     elapsed_ms=refresh_elapsed_ms,
                 )
+                if cross_cluster_debug_batches is not None:
+                    _record_cross_cluster_batch_event(
+                        cross_cluster_debug_batches=cross_cluster_debug_batches,
+                        event_name="phase4.refresh",
+                        phase="phase4",
+                        event_index=phase4_refresh_count + 1,
+                        payload={
+                            "refresh_index": int(phase4_refresh_count),
+                            "stored_rows": int(st),
+                            "visited_features": int(n_visited),
+                            "frontier_candidate_count": int(candidate_scores.numel()),
+                            "queue_size": int(queue_size),
+                            "pending_count": int(pending.numel()),
+                            "pending_hash": (
+                                _hash_index_tensor(pending) if pending.numel() > 0 else None
+                            ),
+                            "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
+                            "rank_effective_nonzero_count": int(
+                                rank_signal_stats["effective_nonzero_count"]
+                            ),
+                            "rank_nonfinite_count": int(rank_signal_stats["nonfinite_count"]),
+                            "rank_max": _safe_float(rank_signal_stats.get("max")),
+                            "rank_abs_sum": _safe_float(rank_signal_stats.get("abs_sum")),
+                            "rank_effectively_all_zero": bool(
+                                rank_signal_stats["effectively_all_zero"]
+                            ),
+                            "normalization_clamped_row_count": int(
+                                normalization_input_stats["clamped_row_count"]
+                            ),
+                            "normalization_clamped_row_fraction": _safe_float(
+                                normalization_input_stats.get("clamped_row_fraction")
+                            ),
+                            "feature_row_store_read_calls": _safe_float(
+                                (feature_row_store_read_stats or {}).get("read_call_count")
+                            ),
+                            "feature_row_store_read_rows": _safe_float(
+                                (feature_row_store_read_stats or {}).get("read_row_count")
+                            ),
+                            "refresh_elapsed_ms": float(refresh_elapsed_ms),
+                            **get_memory_snapshot(model.device),
+                        },
+                    )
                 if anomaly_debug_result is not None:
                     _record_phase4_refresh_debug(
                         anomaly_debug_result,
@@ -2106,6 +3044,7 @@ def _run_attribution(
                         logit_probability_stats=phase4_logit_probability_stats,
                         normalization_input_stats=normalization_input_stats,
                         feature_row_store_read_stats=feature_row_store_read_stats,
+                        streaming_chunk_reuse_stats=streaming_chunk_reuse_stats,
                     )
                     debug_records = anomaly_debug_result.get("records", [])
                     assert isinstance(debug_records, list) and debug_records
@@ -2135,8 +3074,38 @@ def _run_attribution(
                                         row_end,
                                         phase="phase4_anomaly_debug",
                                     ),
-                                    feature_row_store.row_abs_sums[:st].to(dtype=torch.float64),
-                                    targets.logit_probabilities.to(dtype=torch.float64),
+                                    feature_row_store.row_abs_sums[:st].to(
+                                        dtype=shadow_debug_compute_dtype
+                                    ),
+                                    phase4_logit_probabilities.to(dtype=shadow_debug_compute_dtype),
+                                    row_to_node_index[:st],
+                                    n_feature_nodes=total_active_feats,
+                                    n_logits=n_logits,
+                                    device=torch.device("cpu"),
+                                    compute_dtype=shadow_debug_compute_dtype,
+                                )
+                            )
+                        else:
+                            float64_influences = compute_partial_influences(
+                                edge_matrix[:st].to(dtype=shadow_debug_compute_dtype),
+                                phase4_logit_probabilities.to(dtype=shadow_debug_compute_dtype),
+                                row_to_node_index[:st],
+                                device=torch.device("cpu"),
+                            )
+                            float64_feature_influences = float64_influences[:total_active_feats]
+                        if exact_trace_internal_dtype_resolved == torch.float32:
+                            float32_feature_influences = feature_influences
+                        elif use_compact_feature_row_store:
+                            assert feature_row_store is not None
+                            float32_feature_influences = (
+                                compute_partial_feature_influences_streaming(
+                                    lambda row_start, row_end: feature_row_store.read_feature_rows(
+                                        row_start,
+                                        row_end,
+                                        phase="phase4_anomaly_debug",
+                                    ),
+                                    feature_row_store.row_abs_sums[:st].to(dtype=torch.float32),
+                                    phase4_logit_probabilities.to(dtype=torch.float32),
                                     row_to_node_index[:st],
                                     n_feature_nodes=total_active_feats,
                                     n_logits=n_logits,
@@ -2144,15 +3113,15 @@ def _run_attribution(
                                 )
                             )
                         else:
-                            float64_influences = compute_partial_influences(
-                                edge_matrix[:st].to(dtype=torch.float64),
-                                targets.logit_probabilities.to(dtype=torch.float64),
+                            float32_influences = compute_partial_influences(
+                                edge_matrix[:st].to(dtype=torch.float32),
+                                phase4_logit_probabilities.to(dtype=torch.float32),
                                 row_to_node_index[:st],
                                 device=torch.device("cpu"),
                             )
-                            float64_feature_influences = float64_influences[:total_active_feats]
+                            float32_feature_influences = float32_influences[:total_active_feats]
                         float32_signal_stats = _build_vector_stats(
-                            feature_influences.detach().cpu(),
+                            float32_feature_influences.detach().cpu(),
                             epsilon=1e-12,
                             top_k=8,
                         )
@@ -2220,7 +3189,10 @@ def _run_attribution(
                 end = st + row_count
                 rows_cpu = rows.cpu()
                 row_input_slice = rows_cpu[:row_count, :logit_offset]
-                row_abs_sums_cpu = _compute_row_abs_sums(row_input_slice)
+                row_abs_sums_cpu = _compute_row_abs_sums(
+                    row_input_slice,
+                    dtype=exact_trace_internal_dtype_resolved,
+                )
                 if anomaly_debug_result is not None and phase4_batch_count <= 2:
                     feature_row_batches = anomaly_debug_result.setdefault(
                         "phase4_feature_row_batches",
@@ -2296,6 +3268,43 @@ def _run_attribution(
                     name="phase4.feature_batch",
                     elapsed_ms=batch_elapsed_ms,
                 )
+                if cross_cluster_debug_batches is not None:
+                    row_input_stats = _build_matrix_abs_stats(
+                        row_input_slice,
+                        epsilon=1e-12,
+                        top_k=0,
+                    )
+                    row_abs_sum_stats = _build_vector_stats(
+                        row_abs_sums_cpu,
+                        epsilon=1e-8,
+                        top_k=0,
+                    )
+                    _record_cross_cluster_batch_event(
+                        cross_cluster_debug_batches=cross_cluster_debug_batches,
+                        event_name="phase4.feature_batch",
+                        phase="phase4",
+                        event_index=batch_number,
+                        payload={
+                            "batch_rows": int(row_count),
+                            "visited_features": int(n_visited),
+                            "target_feature_count": int(actual_max_feature_nodes),
+                            "idx_batch_hash": (
+                                _hash_index_tensor(idx_batch) if idx_batch.numel() > 0 else None
+                            ),
+                            "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
+                            "row_input_finite_max_abs": _safe_float(
+                                row_input_stats.get("finite_max_abs")
+                            ),
+                            "row_l1_abs_sum": _safe_float(row_abs_sum_stats.get("abs_sum")),
+                            "row_l1_max": _safe_float(row_abs_sum_stats.get("max")),
+                            "row_l1_nonfinite_count": int(row_abs_sum_stats["nonfinite_count"]),
+                            "row_l1_effectively_all_zero": bool(
+                                row_abs_sum_stats["effectively_all_zero"]
+                            ),
+                            "batch_elapsed_ms": float(batch_elapsed_ms),
+                            **get_memory_snapshot(model.device),
+                        },
+                    )
 
         pbar.close()
         _log_phase_metrics(
@@ -2431,6 +3440,84 @@ def _run_attribution(
                 and isinstance(record.get("feature_row_store_read_stats"), dict)
                 and record["feature_row_store_read_stats"].get("read_row_count") is not None
             ]
+            feature_row_store_cache_store_success = [
+                float(record["feature_row_store_read_stats"]["read_cache_store_success_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("feature_row_store_read_stats"), dict)
+                and record["feature_row_store_read_stats"].get("read_cache_store_success_count")
+                is not None
+            ]
+            feature_row_store_cache_skip_disabled = [
+                float(
+                    record["feature_row_store_read_stats"]["read_cache_store_skip_disabled_count"]
+                )
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("feature_row_store_read_stats"), dict)
+                and record["feature_row_store_read_stats"].get(
+                    "read_cache_store_skip_disabled_count"
+                )
+                is not None
+            ]
+            feature_row_store_cache_skip_too_large = [
+                float(
+                    record["feature_row_store_read_stats"]["read_cache_store_skip_too_large_count"]
+                )
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("feature_row_store_read_stats"), dict)
+                and record["feature_row_store_read_stats"].get(
+                    "read_cache_store_skip_too_large_count"
+                )
+                is not None
+            ]
+            streaming_chunk_cache_hits = [
+                float(record["streaming_chunk_reuse_stats"]["chunk_cache_hit_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("streaming_chunk_reuse_stats"), dict)
+                and record["streaming_chunk_reuse_stats"].get("chunk_cache_hit_count") is not None
+            ]
+            streaming_chunk_cache_misses = [
+                float(record["streaming_chunk_reuse_stats"]["chunk_cache_miss_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("streaming_chunk_reuse_stats"), dict)
+                and record["streaming_chunk_reuse_stats"].get("chunk_cache_miss_count") is not None
+            ]
+            streaming_chunk_cache_store_success = [
+                float(record["streaming_chunk_reuse_stats"]["chunk_cache_store_success_count"])
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("streaming_chunk_reuse_stats"), dict)
+                and record["streaming_chunk_reuse_stats"].get("chunk_cache_store_success_count")
+                is not None
+            ]
+            streaming_chunk_cache_skip_disabled = [
+                float(
+                    record["streaming_chunk_reuse_stats"]["chunk_cache_store_skip_disabled_count"]
+                )
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("streaming_chunk_reuse_stats"), dict)
+                and record["streaming_chunk_reuse_stats"].get(
+                    "chunk_cache_store_skip_disabled_count"
+                )
+                is not None
+            ]
+            streaming_chunk_cache_skip_too_large = [
+                float(
+                    record["streaming_chunk_reuse_stats"]["chunk_cache_store_skip_too_large_count"]
+                )
+                for record in records
+                if isinstance(record, dict)
+                and isinstance(record.get("streaming_chunk_reuse_stats"), dict)
+                and record["streaming_chunk_reuse_stats"].get(
+                    "chunk_cache_store_skip_too_large_count"
+                )
+                is not None
+            ]
             first_float_precision = None
             if records and isinstance(records[0], dict):
                 precision_compare = records[0].get("float_precision_signal_compare")
@@ -2518,6 +3605,64 @@ def _run_attribution(
                 "feature_row_store_read_rows_per_refresh_mean": (
                     (sum(feature_row_store_read_rows) / len(feature_row_store_read_rows))
                     if feature_row_store_read_rows
+                    else None
+                ),
+                "feature_row_store_cache_store_success_per_refresh_mean": (
+                    (
+                        sum(feature_row_store_cache_store_success)
+                        / len(feature_row_store_cache_store_success)
+                    )
+                    if feature_row_store_cache_store_success
+                    else None
+                ),
+                "feature_row_store_cache_skip_disabled_per_refresh_mean": (
+                    (
+                        sum(feature_row_store_cache_skip_disabled)
+                        / len(feature_row_store_cache_skip_disabled)
+                    )
+                    if feature_row_store_cache_skip_disabled
+                    else None
+                ),
+                "feature_row_store_cache_skip_too_large_per_refresh_mean": (
+                    (
+                        sum(feature_row_store_cache_skip_too_large)
+                        / len(feature_row_store_cache_skip_too_large)
+                    )
+                    if feature_row_store_cache_skip_too_large
+                    else None
+                ),
+                "streaming_chunk_cache_hits_per_refresh_mean": (
+                    (sum(streaming_chunk_cache_hits) / len(streaming_chunk_cache_hits))
+                    if streaming_chunk_cache_hits
+                    else None
+                ),
+                "streaming_chunk_cache_misses_per_refresh_mean": (
+                    (sum(streaming_chunk_cache_misses) / len(streaming_chunk_cache_misses))
+                    if streaming_chunk_cache_misses
+                    else None
+                ),
+                "streaming_chunk_cache_store_success_per_refresh_mean": (
+                    (
+                        sum(streaming_chunk_cache_store_success)
+                        / len(streaming_chunk_cache_store_success)
+                    )
+                    if streaming_chunk_cache_store_success
+                    else None
+                ),
+                "streaming_chunk_cache_skip_disabled_per_refresh_mean": (
+                    (
+                        sum(streaming_chunk_cache_skip_disabled)
+                        / len(streaming_chunk_cache_skip_disabled)
+                    )
+                    if streaming_chunk_cache_skip_disabled
+                    else None
+                ),
+                "streaming_chunk_cache_skip_too_large_per_refresh_mean": (
+                    (
+                        sum(streaming_chunk_cache_skip_too_large)
+                        / len(streaming_chunk_cache_skip_too_large)
+                    )
+                    if streaming_chunk_cache_skip_too_large
                     else None
                 ),
                 "phase3_logit_row_batch_count": int(
@@ -2617,17 +3762,77 @@ def _run_attribution(
                 "phase4_feature_batch_planner_enabled": bool(planner_enabled),
                 "phase4_feature_batch_planner_status": planner_status,
                 "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
+                "internal_precision_requested": internal_precision_requested,
+                "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
+                "cross_cluster_debug_enabled": bool(cross_cluster_debug_enabled),
                 "phase4_refresh_count": int(phase4_refresh_count),
                 "phase4_batch_count": int(phase4_batch_count),
                 "phase4_refresh_elapsed_seconds_total": round(
                     phase4_refresh_elapsed_ms_total / 1000.0,
                     6,
                 ),
+                "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
                 "telemetry_max_events": int(telemetry_max_events_resolved),
                 "cfg": model.config,
                 "scan": model.scan,
             }
+            if cross_cluster_debug_summary is not None:
+                cross_cluster_debug_summary["status"] = "captured"
+                phase4_runtime_summary, phase4_runtime_stream = (
+                    _build_cross_cluster_runtime_snapshot(
+                        device=model.device,
+                        ctx=ctx,
+                        transcoder=model.transcoders,
+                    )
+                )
+                phase4_entry_summary_checkpoint = {
+                    "phase4_refresh_count": int(phase4_refresh_count),
+                    "phase4_batch_count": int(phase4_batch_count),
+                    **phase4_runtime_summary,
+                }
+                _record_cross_cluster_checkpoint(
+                    cross_cluster_debug_summary=cross_cluster_debug_summary,
+                    cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                    checkpoint_name="phase4_entry",
+                    phase="phase4",
+                    summary_payload=phase4_entry_summary_checkpoint,
+                    stream_payload={
+                        "checkpoint_stage": "post_phase4",
+                        "phase4_refresh_count": int(phase4_refresh_count),
+                        "phase4_batch_count": int(phase4_batch_count),
+                        **phase4_runtime_stream,
+                    },
+                )
+                _record_cross_cluster_checkpoint(
+                    cross_cluster_debug_summary=cross_cluster_debug_summary,
+                    cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                    checkpoint_name="phase4_run_summary",
+                    phase="phase4",
+                    summary_payload=None,
+                    stream_payload={
+                        "selected_feature_count": int(visited.sum().item()),
+                        "phase4_feature_batch_size": int(phase4_feature_batch_size),
+                        "phase4_refresh_count": int(phase4_refresh_count),
+                        "phase4_batch_count": int(phase4_batch_count),
+                        "phase4_elapsed_ms": float(phase4_elapsed_ms),
+                        "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
+                        **phase4_runtime_stream,
+                    },
+                )
+                cross_cluster_debug_summary["checkpoint_stream_count"] = int(
+                    len(cross_cluster_debug_checkpoints or [])
+                )
+                cross_cluster_debug_summary["batch_event_stream_count"] = int(
+                    len(cross_cluster_debug_batches or [])
+                )
+                compact_output_result["cross_cluster_debug_summary"] = cross_cluster_debug_summary
+            if cross_cluster_debug_checkpoints is not None:
+                compact_output_result["cross_cluster_debug_checkpoints"] = (
+                    cross_cluster_debug_checkpoints
+                )
+            if cross_cluster_debug_batches is not None:
+                compact_output_result["cross_cluster_debug_batches"] = cross_cluster_debug_batches
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
                 file_backed_store_bytes = feature_row_store.nbytes
@@ -2792,6 +3997,23 @@ def _run_attribution(
             compact_output_result["telemetry_events"] = telemetry_export.get("events", [])
             if anomaly_debug_result is not None:
                 compact_output_result["phase4_anomaly_debug"] = anomaly_debug_result
+            if (
+                cross_cluster_debug_summary is not None
+                and "cross_cluster_debug_summary" not in compact_output_result
+            ):
+                compact_output_result["cross_cluster_debug_summary"] = cross_cluster_debug_summary
+            if (
+                cross_cluster_debug_checkpoints is not None
+                and "cross_cluster_debug_checkpoints" not in compact_output_result
+            ):
+                compact_output_result["cross_cluster_debug_checkpoints"] = (
+                    cross_cluster_debug_checkpoints
+                )
+            if (
+                cross_cluster_debug_batches is not None
+                and "cross_cluster_debug_batches" not in compact_output_result
+            ):
+                compact_output_result["cross_cluster_debug_batches"] = cross_cluster_debug_batches
         elif profile:
             telemetry_summary = telemetry_recorder.build_summary()
             logger.info(

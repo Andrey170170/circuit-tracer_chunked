@@ -62,6 +62,8 @@ class AttributionContext:
         error_vector_prefetch_lookahead: int = 2,
         chunked_feature_replay_window: int = 4,
         row_subchunk_size: int | None = None,
+        internal_precision_requested: str | None = None,
+        resolved_dtype_map: dict[str, str] | None = None,
     ) -> None:
         n_layers, n_pos, _ = activation_matrix.shape
 
@@ -116,6 +118,8 @@ class AttributionContext:
         self._chunked_layer_spans: list[tuple[int, int] | None] | None = None
         self.setup_diagnostic_stats: dict[str, object] | None = None
         self.sparsification_stats: dict[str, object] | None = None
+        self.internal_precision_requested = internal_precision_requested
+        self.resolved_dtype_map = dict(resolved_dtype_map) if resolved_dtype_map else None
         self.diagnostic_mode = False
         self._trace_logger = None
         self._telemetry_recorder: TelemetryRecorder | None = None
@@ -402,6 +406,8 @@ class AttributionContext:
         if self.chunked_decoder_state is not None:
             snapshot["row_subchunk_size"] = float(self._effective_row_subchunk_size())
         snapshot["logit_retention"] = self.logit_retention
+        snapshot["internal_precision_requested"] = self.internal_precision_requested
+        snapshot["resolved_dtype_map"] = self.resolved_dtype_map
         return snapshot
 
     def _add_stat(self, key: str, value: float) -> None:
