@@ -863,6 +863,40 @@ def _compute_row_abs_sums(
     return row_abs_max * row_l1_scaled
 
 
+def _copy_rows_to_cpu_staging(
+    rows: torch.Tensor,
+    *,
+    staging_buffer: torch.Tensor | None,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Copy a row block into a reusable CPU tensor and return a row-aligned view."""
+
+    target_dtype = rows.dtype if dtype is None else dtype
+    if rows.ndim != 2:
+        raise ValueError("rows must be rank-2")
+
+    if rows.device.type == "cpu" and rows.dtype == target_dtype:
+        return rows, staging_buffer
+
+    source = rows.detach()
+
+    n_rows = int(rows.shape[0])
+    n_cols = int(rows.shape[1])
+    needs_new_buffer = (
+        staging_buffer is None
+        or staging_buffer.device.type != "cpu"
+        or staging_buffer.dtype != target_dtype
+        or int(staging_buffer.shape[0]) < n_rows
+        or int(staging_buffer.shape[1]) < n_cols
+    )
+    if needs_new_buffer:
+        staging_buffer = torch.empty((n_rows, n_cols), dtype=target_dtype, device="cpu")
+
+    rows_cpu = staging_buffer[:n_rows, :n_cols]
+    rows_cpu.copy_(source, non_blocking=False)
+    return rows_cpu, staging_buffer
+
+
 def _row_denominator_to_row_abs_sums(
     row_denominator: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -1554,6 +1588,7 @@ def _plan_phase4_feature_batch_size_preflight(
             logit_row_abs_max = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
             logit_row_l1_scaled = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
             row_to_node_index = torch.arange(n_logits, dtype=torch.long) + int(logit_offset)
+            rows_cpu_staging: torch.Tensor | None = None
             for i in range(0, n_logits, effective_logit_batch_size):
                 batch = targets.logit_vectors[i : i + effective_logit_batch_size]
                 rows = ctx.compute_batch(
@@ -1563,7 +1598,11 @@ def _plan_phase4_feature_batch_size_preflight(
                     retain_graph=True,
                     phase_label="phase3_logits_probe",
                 )
-                rows_cpu = rows.to(device="cpu", dtype=exact_trace_internal_dtype)
+                rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                    rows,
+                    staging_buffer=rows_cpu_staging,
+                    dtype=exact_trace_internal_dtype,
+                )
                 end = i + batch.shape[0]
                 logit_feature_rows[i:end] = rows_cpu[:, :total_active_feats]
                 row_abs_max_chunk, row_l1_scaled_chunk = _compute_row_denominator_scaled_l1(
@@ -2556,6 +2595,7 @@ def _run_attribution(
             (len(targets) + effective_logit_batch_size - 1) // effective_logit_batch_size,
             1,
         )
+        rows_cpu_staging: torch.Tensor | None = None
         for i in range(0, len(targets), effective_logit_batch_size):
             batch = targets.logit_vectors[i : i + effective_logit_batch_size]
             ctx_before = _snapshot_diagnostics(ctx) if profile else None
@@ -2567,7 +2607,10 @@ def _run_attribution(
                 inject_values=batch,
                 phase_label="phase3_logits",
             )
-            rows_cpu = rows.cpu()
+            rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                rows,
+                staging_buffer=rows_cpu_staging,
+            )
             row_input_slice = rows_cpu[:, :logit_offset]
             feature_row_slice = rows_cpu[:, :total_active_feats]
             row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
@@ -3415,7 +3458,10 @@ def _run_attribution(
 
                 row_count = rows.shape[0]
                 end = st + row_count
-                rows_cpu = rows.cpu()
+                rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                    rows,
+                    staging_buffer=rows_cpu_staging,
+                )
                 row_input_slice = rows_cpu[:, :logit_offset]
                 feature_row_slice = rows_cpu[:, :total_active_feats]
                 row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(

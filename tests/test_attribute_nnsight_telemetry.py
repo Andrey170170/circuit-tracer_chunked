@@ -5,6 +5,7 @@ import torch
 
 from circuit_tracer.attribution.attribute import attribute as attribute_entrypoint
 from circuit_tracer.attribution.attribute_nnsight import (
+    _copy_rows_to_cpu_staging,
     _compute_row_abs_sums,
     _compute_row_denominator_scaled_l1,
     _FileBackedFeatureRowStore,
@@ -156,6 +157,66 @@ def test_compute_row_abs_sums_uses_requested_dtype() -> None:
     assert row_abs_fp32.dtype == torch.float32
     assert row_abs_fp64.dtype == torch.float64
     assert torch.allclose(row_abs_fp32.to(dtype=torch.float64), row_abs_fp64)
+
+
+def test_copy_rows_to_cpu_staging_reuses_existing_buffer() -> None:
+    first = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    rows_cpu, staging = _copy_rows_to_cpu_staging(first, staging_buffer=None)
+
+    assert staging is None
+    assert rows_cpu.data_ptr() == first.data_ptr()
+
+    second = torch.tensor([[100.0, 101.0, 102.0, 103.0]], dtype=torch.float32)
+    rows_cpu, staging = _copy_rows_to_cpu_staging(
+        second,
+        staging_buffer=staging,
+        dtype=torch.float64,
+    )
+    assert staging is not None
+    assert rows_cpu.dtype == torch.float64
+    assert torch.allclose(rows_cpu, second.to(dtype=torch.float64))
+
+    smaller = torch.tensor([[7.0, 8.0, 9.0, 10.0]], dtype=torch.float64)
+    prior_ptr = staging.data_ptr()
+    rows_cpu, staging = _copy_rows_to_cpu_staging(smaller, staging_buffer=staging)
+    assert staging is not None
+    assert staging.data_ptr() == prior_ptr
+    assert torch.allclose(rows_cpu, smaller)
+
+
+def test_copy_rows_to_cpu_staging_resizes_when_batch_grows() -> None:
+    small = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
+    rows_cpu, staging = _copy_rows_to_cpu_staging(small, staging_buffer=None)
+
+    assert staging is None
+    assert rows_cpu.data_ptr() == small.data_ptr()
+
+    grow = torch.arange(12, dtype=torch.float64).reshape(3, 4)
+    rows_cpu, staging = _copy_rows_to_cpu_staging(grow, staging_buffer=staging)
+    assert staging is None
+    assert rows_cpu.data_ptr() == grow.data_ptr()
+
+    needs_copy = grow.to(dtype=torch.float32)
+    rows_cpu, staging = _copy_rows_to_cpu_staging(
+        needs_copy,
+        staging_buffer=staging,
+        dtype=torch.float64,
+    )
+    assert staging is not None
+    assert staging.shape == (3, 4)
+    assert torch.allclose(rows_cpu, grow)
+
+    larger = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    prior_ptr = staging.data_ptr()
+    rows_cpu, staging = _copy_rows_to_cpu_staging(
+        larger,
+        staging_buffer=staging,
+        dtype=torch.float64,
+    )
+    assert staging is not None
+    assert staging.shape == (5, 4)
+    assert staging.data_ptr() != prior_ptr
+    assert torch.allclose(rows_cpu, larger.to(dtype=torch.float64))
 
 
 def test_compute_row_denominator_scaled_l1_builds_stable_components() -> None:
