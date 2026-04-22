@@ -7,6 +7,7 @@ import torch
 from safetensors.torch import save_file
 
 from circuit_tracer.transcoder.cross_layer_transcoder import (
+    CrossLayerTranscoder,
     load_clt,
 )
 
@@ -292,3 +293,87 @@ def test_forward_pass_consistency(create_test_clt_files):
     # Outputs should be identical
     assert torch.allclose(eager_output, lazy_output, rtol=1e-5)
     assert eager_output.shape == (eager_clt.n_layers, n_pos, eager_clt.d_model)
+
+
+def test_phase0_compare_mode_can_change_jumprelu_membership() -> None:
+    clt = CrossLayerTranscoder(
+        n_layers=1,
+        d_transcoder=1,
+        d_model=1,
+        activation_function="jump_relu",
+        lazy_encoder=False,
+        lazy_decoder=False,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        clt.W_enc[0, 0, 0] = 1.0
+        clt.b_enc[0, 0] = 0.0
+        clt.activation_function.threshold[0, 0, 0] = 1.0
+
+    inputs = torch.tensor([[[1.001]]], dtype=torch.float32)
+
+    clt.configure_phase0_activation_threshold_compare(mode="baseline")
+    sparse_baseline, _ = clt.encode_sparse(inputs, zero_positions=slice(0, 0))
+
+    clt.configure_phase0_activation_threshold_compare(mode="bf16")
+    sparse_bf16, _ = clt.encode_sparse(inputs, zero_positions=slice(0, 0))
+
+    assert sparse_baseline._nnz() == 1
+    assert sparse_bf16._nnz() == 0
+
+
+def test_phase0_threshold_membership_diagnostics_are_emitted_when_enabled() -> None:
+    clt = CrossLayerTranscoder(
+        n_layers=1,
+        d_transcoder=3,
+        d_model=2,
+        activation_function="jump_relu",
+        lazy_encoder=False,
+        lazy_decoder=False,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        clt.W_enc[0] = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        clt.b_enc[0] = 0.0
+        clt.activation_function.threshold[0, 0] = torch.tensor(
+            [0.5, 0.5, 1.0],
+            dtype=torch.float32,
+        )
+
+    inputs = torch.tensor(
+        [
+            [
+                [0.50001, 0.49],
+                [0.5, 0.50001],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    clt.configure_phase0_activation_threshold_compare(
+        mode="fp64",
+        collect_diagnostics=True,
+        sample_limit_per_layer=2,
+    )
+    _ = clt.encode_sparse(inputs, zero_positions=slice(0, 0))
+
+    diagnostics = clt.get_diagnostic_snapshot()
+    assert diagnostics["phase0_activation_threshold_compare_mode"] == "fp64"
+    assert diagnostics["phase0_activation_threshold_compare_dtype"] == "float64"
+    membership = diagnostics["phase0_threshold_membership"]
+    assert isinstance(membership, dict)
+    assert membership["compare_mode"] == "fp64"
+    assert membership["borderline_sample_count"] > 0
+    assert "0" in membership["per_layer"]
+    layer_zero = membership["per_layer"]["0"]
+    assert layer_zero["near_counts_by_epsilon"]["abs_lte_1e-04"] >= 0
+    assert len(layer_zero["borderline_samples"]) <= 2

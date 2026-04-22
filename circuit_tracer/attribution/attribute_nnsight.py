@@ -124,6 +124,19 @@ _EXACT_TRACE_INTERNAL_DTYPE_BY_NAME: dict[str, torch.dtype] = {
     "torch.float64": torch.float64,
 }
 
+_PHASE0_ACTIVATION_THRESHOLD_COMPARE_MODE_BY_NAME: dict[str, str] = {
+    "baseline": "baseline",
+    "default": "baseline",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp32": "fp32",
+    "float32": "fp32",
+    "torch.float32": "fp32",
+    "fp64": "fp64",
+    "float64": "fp64",
+    "torch.float64": "fp64",
+}
+
 
 def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype:
     if isinstance(value, torch.dtype):
@@ -144,6 +157,47 @@ def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype
 def _exact_trace_internal_dtype_name(dtype: torch.dtype) -> str:
     resolved = _resolve_exact_trace_internal_dtype(dtype)
     return "fp32" if resolved == torch.float32 else "fp64"
+
+
+def _resolve_phase0_activation_threshold_compare_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    resolved = _PHASE0_ACTIVATION_THRESHOLD_COMPARE_MODE_BY_NAME.get(normalized)
+    if resolved is None:
+        allowed = ", ".join(sorted(_PHASE0_ACTIVATION_THRESHOLD_COMPARE_MODE_BY_NAME))
+        raise ValueError(
+            f"phase0_activation_threshold_compare_mode must be one of: {allowed} (got {value!r})"
+        )
+    return resolved
+
+
+def _hash_sparse_membership_indices(
+    indices: torch.Tensor,
+    *,
+    shape: Sequence[int],
+    canonicalize: bool,
+) -> str:
+    indices_cpu = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    hasher = hashlib.blake2s(digest_size=8)
+    hasher.update(np.asarray(list(shape), dtype=np.int64).tobytes())
+    if indices_cpu.numel() == 0:
+        hasher.update(b"empty")
+        return hasher.hexdigest()
+
+    if not canonicalize:
+        hasher.update(indices_cpu.numpy().tobytes())
+        return hasher.hexdigest()
+
+    if len(shape) != 3:
+        raise ValueError(f"Expected sparse membership shape of length 3, got {shape}")
+
+    _, n_positions, n_features = [int(v) for v in shape]
+    n_positions_n_features = int(n_positions) * int(n_features)
+    flat_membership = (
+        indices_cpu[0] * n_positions_n_features + indices_cpu[1] * int(n_features) + indices_cpu[2]
+    )
+    flat_membership_sorted = torch.sort(flat_membership).values.contiguous()
+    hasher.update(flat_membership_sorted.numpy().tobytes())
+    return hasher.hexdigest()
 
 
 class _FileBackedFeatureRowStore:
@@ -981,6 +1035,41 @@ def _build_phase4_cutoff_debug(
     }
 
 
+def _build_phase3_seed_influence_topk(
+    *,
+    ranked_feature_indices: torch.Tensor,
+    seed_feature_influences: torch.Tensor,
+    feat_layers: torch.Tensor,
+    feat_positions: torch.Tensor,
+    feat_ids: torch.Tensor,
+    top_k: int = 8,
+) -> list[dict[str, object]]:
+    ranked_cpu = ranked_feature_indices.detach().to(device="cpu", dtype=torch.int64)
+    influences_cpu = seed_feature_influences.detach().to(device="cpu", dtype=torch.float64)
+    layers_cpu = feat_layers.detach().to(device="cpu", dtype=torch.int64)
+    positions_cpu = feat_positions.detach().to(device="cpu", dtype=torch.int64)
+    feat_ids_cpu = feat_ids.detach().to(device="cpu", dtype=torch.int64)
+
+    limit = min(max(int(top_k), 0), int(ranked_cpu.numel()))
+    if limit == 0:
+        return []
+
+    entries: list[dict[str, object]] = []
+    for rank in range(limit):
+        feature_idx = int(ranked_cpu[rank].item())
+        entries.append(
+            {
+                "rank": rank + 1,
+                "feature_index": feature_idx,
+                "influence": float(influences_cpu[feature_idx].item()),
+                "layer": int(layers_cpu[feature_idx].item()),
+                "position": int(positions_cpu[feature_idx].item()),
+                "feature_id": int(feat_ids_cpu[feature_idx].item()),
+            }
+        )
+    return entries
+
+
 def _record_phase4_refresh_debug(
     anomaly_debug_result: dict[str, object] | None,
     *,
@@ -1051,24 +1140,47 @@ def _compare_phase4_frontiers(
 ) -> dict[str, object]:
     actual_cpu = actual_pending.detach().to(device="cpu", dtype=torch.int64)
     shadow_cpu = shadow_pending.detach().to(device="cpu", dtype=torch.int64)
-    actual_set = set(int(value) for value in actual_cpu.tolist())
-    shadow_set = set(int(value) for value in shadow_cpu.tolist())
+    actual_list = [int(value) for value in actual_cpu.tolist()]
+    shadow_list = [int(value) for value in shadow_cpu.tolist()]
+    actual_set = set(actual_list)
+    shadow_set = set(shadow_list)
     overlap_count = len(actual_set & shadow_set)
+    union_count = len(actual_set | shadow_set)
     overlap_fraction = overlap_count / len(actual_set) if actual_set else None
+    jaccard_similarity = (overlap_count / union_count) if union_count else None
     first_differing_rank = None
-    for idx, (actual_value, shadow_value) in enumerate(
-        zip(actual_cpu.tolist(), shadow_cpu.tolist())
-    ):
+    for idx, (actual_value, shadow_value) in enumerate(zip(actual_list, shadow_list)):
         if actual_value != shadow_value:
             first_differing_rank = int(idx)
             break
+
+    prefix_match_count = 0
+    for actual_value, shadow_value in zip(actual_list, shadow_list):
+        if actual_value != shadow_value:
+            break
+        prefix_match_count += 1
+
+    shared_rank_count = min(len(actual_list), len(shadow_list))
+    rank_disagreement_count = sum(
+        1 for idx in range(shared_rank_count) if actual_list[idx] != shadow_list[idx]
+    ) + abs(len(actual_list) - len(shadow_list))
+
+    added_nodes = sorted(shadow_set - actual_set)
+    removed_nodes = sorted(actual_set - shadow_set)
+    overlap_nodes = sorted(actual_set & shadow_set)
     return {
         "actual_hash": _hash_index_tensor(actual_cpu),
         "shadow_hash": _hash_index_tensor(shadow_cpu),
         "overlap_count": int(overlap_count),
         "overlap_fraction": overlap_fraction,
+        "jaccard_similarity": jaccard_similarity,
+        "prefix_match_count": int(prefix_match_count),
+        "rank_disagreement_count": int(rank_disagreement_count),
         "changed_selected_nodes": int(len(actual_set ^ shadow_set)),
         "first_differing_rank": first_differing_rank,
+        "added_nodes_sample": [int(value) for value in added_nodes[:16]],
+        "removed_nodes_sample": [int(value) for value in removed_nodes[:16]],
+        "overlap_nodes_sample": [int(value) for value in overlap_nodes[:16]],
         "actual_sample": [int(value) for value in actual_cpu[:16].tolist()],
         "shadow_sample": [int(value) for value in shadow_cpu[:16].tolist()],
     }
@@ -1577,6 +1689,9 @@ def attribute(
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
+    phase0_activation_threshold_compare_mode: Literal[
+        "baseline", "bf16", "fp32", "fp64"
+    ] = "baseline",
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -1644,6 +1759,9 @@ def attribute(
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
             normalization/influence ranking path. ``"fp64"`` uses float64
             internals; ``"fp32"`` uses float32 internals.
+        phase0_activation_threshold_compare_mode: Phase-0-only activation/
+            threshold compare mode for JumpReLU membership decisions.
+            ``"baseline"`` preserves default compare behavior.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -1698,6 +1816,7 @@ def attribute(
             telemetry_max_events=telemetry_max_events,
             compact_output=compact_output,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
+            phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
             logger=logger,
         )
     finally:
@@ -1744,6 +1863,9 @@ def _run_attribution(
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
+    phase0_activation_threshold_compare_mode: Literal[
+        "baseline", "bf16", "fp32", "fp64"
+    ] = "baseline",
 ):
     start_time = time.time()
     run_start = time.perf_counter()
@@ -1752,6 +1874,9 @@ def _run_attribution(
     )
     exact_trace_internal_dtype_name = _exact_trace_internal_dtype_name(
         exact_trace_internal_dtype_resolved
+    )
+    phase0_activation_threshold_compare_mode_resolved = (
+        _resolve_phase0_activation_threshold_compare_mode(phase0_activation_threshold_compare_mode)
     )
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
@@ -1808,6 +1933,9 @@ def _run_attribution(
             "logit_batch_size": logit_batch_size,
             "telemetry_max_events": telemetry_max_events_resolved,
             "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
+            "phase0_activation_threshold_compare_mode": (
+                phase0_activation_threshold_compare_mode_resolved
+            ),
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
@@ -1868,6 +1996,9 @@ def _run_attribution(
             "enabled": True,
             "status": "collecting",
             "mode": "early_phase_scalar_summary",
+            "phase0_activation_threshold_compare_mode": (
+                phase0_activation_threshold_compare_mode_resolved
+            ),
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "environment": _build_phase4_environment_fingerprint(),
@@ -1960,6 +2091,18 @@ def _run_attribution(
     reset_diagnostics = getattr(model.transcoders, "reset_diagnostic_stats", None)
     if callable(reset_diagnostics):
         reset_diagnostics()
+
+    configure_phase0_compare_mode = getattr(
+        model.transcoders,
+        "configure_phase0_activation_threshold_compare",
+        None,
+    )
+    if callable(configure_phase0_compare_mode):
+        configure_phase0_compare_mode(
+            mode=phase0_activation_threshold_compare_mode_resolved,
+            collect_diagnostics=cross_cluster_debug_enabled,
+            sample_limit_per_layer=3,
+        )
 
     if profile:
         logger.info(
@@ -2058,12 +2201,30 @@ def _run_attribution(
             activation_matrix = activation_matrix.coalesce()
             activation_indices = activation_matrix.indices().detach().cpu()
             activation_values = activation_matrix.values().detach().cpu()
+            raw_sparse_index_hash = _hash_sparse_membership_indices(
+                activation_indices,
+                shape=activation_matrix.shape,
+                canonicalize=False,
+            )
+            canonical_membership_hash = _hash_sparse_membership_indices(
+                activation_indices,
+                shape=activation_matrix.shape,
+                canonicalize=True,
+            )
             phase0_n_layers = int(activation_matrix.shape[0])
             layer_counts = (
                 torch.bincount(activation_indices[0], minlength=phase0_n_layers).tolist()
                 if activation_indices.numel() > 0
                 else [0] * phase0_n_layers
             )
+            transcoder_snapshot = phase0_runtime_summary.get("transcoder_diagnostic_snapshot")
+            phase0_threshold_membership = (
+                transcoder_snapshot.get("phase0_threshold_membership")
+                if isinstance(transcoder_snapshot, dict)
+                else None
+            )
+            if not isinstance(phase0_threshold_membership, dict):
+                phase0_threshold_membership = None
             activation_value_stats = _build_vector_stats(
                 activation_values,
                 epsilon=1e-12,
@@ -2072,8 +2233,14 @@ def _run_attribution(
             phase0_summary_checkpoint = {
                 "active_feature_count": int(activation_matrix._nnz()),
                 "per_layer_retained_counts": [int(v) for v in layer_counts],
-                "active_feature_indices_hash": _hash_index_tensor(activation_indices.flatten()),
+                "active_feature_indices_hash": raw_sparse_index_hash,
+                "active_feature_indices_hash_raw_order": raw_sparse_index_hash,
+                "active_feature_membership_hash_canonical": canonical_membership_hash,
                 "activation_value_stats": activation_value_stats,
+                "phase0_activation_threshold_compare_mode": (
+                    phase0_activation_threshold_compare_mode_resolved
+                ),
+                "phase0_threshold_membership": phase0_threshold_membership,
                 "logit_retention": getattr(ctx, "logit_retention", None),
                 "staging_flags": {
                     "stage_encoder_vecs_on_cpu": bool(stage_encoder_vecs_on_cpu),
@@ -2091,12 +2258,36 @@ def _run_attribution(
                 "active_feature_indices_hash": phase0_summary_checkpoint[
                     "active_feature_indices_hash"
                 ],
+                "active_feature_membership_hash_canonical": canonical_membership_hash,
+                "phase0_activation_threshold_compare_mode": (
+                    phase0_activation_threshold_compare_mode_resolved
+                ),
                 "activation_value_count": int(activation_value_stats["count"]),
                 "activation_value_nonfinite_count": int(activation_value_stats["nonfinite_count"]),
                 "activation_value_abs_sum": _safe_float(activation_value_stats.get("abs_sum")),
                 "activation_value_max": _safe_float(activation_value_stats.get("max")),
                 "activation_value_effectively_all_zero": bool(
                     activation_value_stats["effectively_all_zero"]
+                ),
+                "phase0_threshold_membership_layer_count": (
+                    int(len(phase0_threshold_membership.get("per_layer", {})))
+                    if isinstance(phase0_threshold_membership, dict)
+                    else None
+                ),
+                "phase0_threshold_membership_borderline_sample_count": (
+                    int(phase0_threshold_membership.get("borderline_sample_count", 0))
+                    if isinstance(phase0_threshold_membership, dict)
+                    else None
+                ),
+                "phase0_threshold_membership_near_count_abs_lte_1e_04": (
+                    int(
+                        phase0_threshold_membership.get("near_counts_by_epsilon", {}).get(
+                            "abs_lte_1e-04",
+                            0,
+                        )
+                    )
+                    if isinstance(phase0_threshold_membership, dict)
+                    else None
                 ),
                 "logit_retention": getattr(ctx, "logit_retention", None),
                 "stage_encoder_vecs_on_cpu": bool(stage_encoder_vecs_on_cpu),
@@ -2581,6 +2772,7 @@ def _run_attribution(
                     seed_feature_influences,
                     descending=True,
                 ).cpu()
+                candidate_scores = seed_feature_influences[unvisited_feature_rank].detach().cpu()
                 queue_size = min(
                     update_interval * effective_feature_batch_size,
                     actual_max_feature_nodes,
@@ -2604,6 +2796,18 @@ def _run_attribution(
                     exact_chunked_decoder=exact_chunked_decoder,
                     decoder_chunk_size=getattr(model.transcoders, "decoder_chunk_size", None),
                 )
+                seed_cutoff_debug = _build_phase4_cutoff_debug(
+                    candidate_scores,
+                    queue_size=queue_size,
+                )
+                seed_influence_topk = _build_phase3_seed_influence_topk(
+                    ranked_feature_indices=unvisited_feature_rank,
+                    seed_feature_influences=seed_feature_influences,
+                    feat_layers=feat_layers,
+                    feat_positions=feat_pos,
+                    feat_ids=feat_ids,
+                    top_k=8,
+                )
 
                 phase3_seed_summary.update(
                     {
@@ -2626,6 +2830,9 @@ def _run_attribution(
                         "frontier_post_locality_sample": [
                             int(v) for v in post_locality_pending[:16].tolist()
                         ],
+                        "seed_influence_topk": seed_influence_topk,
+                        "seed_influence_topk_hash": _hash_json_payload(seed_influence_topk),
+                        "seed_cutoff": seed_cutoff_debug,
                         "deterministic_shadow": _compare_phase4_frontiers(
                             post_locality_pending,
                             deterministic_pending,
@@ -2705,9 +2912,35 @@ def _run_attribution(
                     if isinstance(deterministic_shadow, dict)
                     else None
                 ),
+                "deterministic_shadow_jaccard": (
+                    _safe_float(deterministic_shadow.get("jaccard_similarity"))
+                    if isinstance(deterministic_shadow, dict)
+                    else None
+                ),
+                "deterministic_shadow_prefix_match_count": (
+                    int(deterministic_shadow.get("prefix_match_count", 0))
+                    if isinstance(deterministic_shadow, dict)
+                    else None
+                ),
                 "shadow_debug_overlap_fraction": (
                     _safe_float(shadow_debug.get("overlap_fraction"))
                     if isinstance(shadow_debug, dict)
+                    else None
+                ),
+                "seed_influence_topk_hash": phase3_seed_summary.get("seed_influence_topk_hash"),
+                "seed_cutoff_margin": (
+                    _safe_float(phase3_seed_summary.get("seed_cutoff", {}).get("cutoff_margin"))
+                    if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
+                    else None
+                ),
+                "seed_cutoff_near_tie_count": (
+                    int(phase3_seed_summary.get("seed_cutoff", {}).get("near_cutoff_count", 0))
+                    if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
+                    else None
+                ),
+                "seed_cutoff_exact_tie_count": (
+                    int(phase3_seed_summary.get("seed_cutoff", {}).get("exact_cutoff_count", 0))
+                    if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
                     else None
                 ),
                 "feature_influence_nonfinite_count": (
@@ -3773,6 +4006,9 @@ def _run_attribution(
                     6,
                 ),
                 "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
+                "phase0_activation_threshold_compare_mode": (
+                    phase0_activation_threshold_compare_mode_resolved
+                ),
                 "telemetry_max_events": int(telemetry_max_events_resolved),
                 "cfg": model.config,
                 "scan": model.scan,

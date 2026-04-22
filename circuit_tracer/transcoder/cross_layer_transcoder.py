@@ -144,6 +144,10 @@ class CrossLayerTranscoder(torch.nn.Module):
         self._telemetry_recorder: TelemetryRecorder | None = None
         self._trace_chunk_interval = 16
         self._trace_decoder_load_interval = 32
+        self._phase0_activation_threshold_compare_mode = "baseline"
+        self._phase0_threshold_membership_debug_enabled = False
+        self._phase0_threshold_membership_sample_limit_per_layer = 3
+        self._phase0_threshold_near_epsilons = (1e-5, 1e-4)
 
         self.feature_input_hook = feature_input_hook
         self.feature_output_hook = feature_output_hook
@@ -227,6 +231,163 @@ class CrossLayerTranscoder(torch.nn.Module):
             "reconstruction_seconds": 0.0,
             "reconstruction_by_layer": {},
             "reconstruction_chunks_by_layer": {},
+            "phase0_activation_threshold_compare_mode": "baseline",
+            "phase0_activation_threshold_compare_dtype": None,
+            "phase0_threshold_membership_debug_enabled": False,
+            "phase0_threshold_membership_sample_limit_per_layer": 0,
+            "phase0_threshold_membership": None,
+        }
+
+    @staticmethod
+    def _resolve_phase0_activation_threshold_compare_mode(mode: str) -> str:
+        aliases = {
+            "baseline": "baseline",
+            "default": "baseline",
+            "bf16": "bf16",
+            "bfloat16": "bf16",
+            "fp32": "fp32",
+            "float32": "fp32",
+            "torch.float32": "fp32",
+            "fp64": "fp64",
+            "float64": "fp64",
+            "torch.float64": "fp64",
+        }
+        normalized = str(mode).strip().lower()
+        resolved = aliases.get(normalized)
+        if resolved is None:
+            allowed = "baseline, bf16, fp32, fp64"
+            raise ValueError(
+                "phase0_activation_threshold_compare_mode must be one of "
+                f"{{{allowed}}} (got {mode!r})"
+            )
+        return resolved
+
+    @staticmethod
+    def _dtype_name(dtype: torch.dtype) -> str:
+        if dtype == torch.bfloat16:
+            return "bfloat16"
+        if dtype == torch.float32:
+            return "float32"
+        if dtype == torch.float64:
+            return "float64"
+        return str(dtype)
+
+    def configure_phase0_activation_threshold_compare(
+        self,
+        *,
+        mode: str = "baseline",
+        collect_diagnostics: bool = False,
+        sample_limit_per_layer: int = 3,
+    ) -> None:
+        resolved_mode = self._resolve_phase0_activation_threshold_compare_mode(mode)
+        self._phase0_activation_threshold_compare_mode = resolved_mode
+        self._phase0_threshold_membership_debug_enabled = bool(collect_diagnostics)
+        self._phase0_threshold_membership_sample_limit_per_layer = max(
+            0,
+            int(sample_limit_per_layer),
+        )
+
+    def _resolve_phase0_compare_dtype(self) -> torch.dtype | None:
+        mode = self._phase0_activation_threshold_compare_mode
+        if mode == "bf16":
+            return torch.bfloat16
+        if mode == "fp32":
+            return torch.float32
+        if mode == "fp64":
+            return torch.float64
+        return None
+
+    def _compute_jump_relu_mask(
+        self,
+        *,
+        layer_id: int,
+        features: torch.Tensor,
+        collect_diagnostics: bool,
+    ) -> tuple[torch.Tensor, dict[str, object] | None]:
+        thresholds = cast(JumpReLU, self.activation_function).threshold[layer_id]
+        compare_dtype = self._resolve_phase0_compare_dtype()
+        if compare_dtype is None:
+            compare_features = features
+            compare_thresholds = thresholds
+            compare_dtype_name = self._dtype_name(features.dtype)
+        else:
+            compare_features = features.to(dtype=compare_dtype)
+            compare_thresholds = thresholds.to(device=features.device, dtype=compare_dtype)
+            compare_dtype_name = self._dtype_name(compare_dtype)
+
+        mask = compare_features > compare_thresholds
+        self._diagnostic_stats["phase0_activation_threshold_compare_dtype"] = compare_dtype_name
+
+        if not collect_diagnostics:
+            return mask, None
+
+        margin_cpu = (
+            (compare_features - compare_thresholds)
+            .detach()
+            .to(
+                device="cpu",
+                dtype=torch.float64,
+            )
+        )
+        abs_margin_flat = margin_cpu.abs().flatten()
+        mask_flat_cpu = mask.detach().to(device="cpu").flatten()
+        total_entries = int(mask_flat_cpu.numel())
+        active_entries = int(mask_flat_cpu.sum().item())
+
+        near_counts_by_epsilon: dict[str, int] = {}
+        near_active_counts_by_epsilon: dict[str, int] = {}
+        near_inactive_counts_by_epsilon: dict[str, int] = {}
+        for epsilon in self._phase0_threshold_near_epsilons:
+            epsilon_key = f"abs_lte_{epsilon:.0e}"
+            near_mask = abs_margin_flat <= float(epsilon)
+            near_count = int(near_mask.sum().item())
+            near_active_count = int((near_mask & mask_flat_cpu).sum().item())
+            near_counts_by_epsilon[epsilon_key] = near_count
+            near_active_counts_by_epsilon[epsilon_key] = near_active_count
+            near_inactive_counts_by_epsilon[epsilon_key] = near_count - near_active_count
+
+        sample_limit = min(
+            self._phase0_threshold_membership_sample_limit_per_layer,
+            total_entries,
+        )
+        borderline_samples: list[dict[str, object]] = []
+        if sample_limit > 0 and total_entries > 0:
+            _, sample_indices = torch.topk(
+                abs_margin_flat,
+                k=sample_limit,
+                largest=False,
+            )
+            margin_flat = margin_cpu.flatten()
+            raw_features_flat = features.detach().to(device="cpu", dtype=torch.float64).flatten()
+            thresholds_flat = thresholds.detach().to(device="cpu", dtype=torch.float64).flatten()
+            for rank, flat_idx in enumerate(sample_indices.tolist(), start=1):
+                flat_idx_int = int(flat_idx)
+                pos_idx = flat_idx_int // self.d_transcoder
+                feat_idx = flat_idx_int % self.d_transcoder
+                borderline_samples.append(
+                    {
+                        "rank": rank,
+                        "position": int(pos_idx),
+                        "feature_id": int(feat_idx),
+                        "active": bool(mask_flat_cpu[flat_idx_int].item()),
+                        "pre_activation": float(raw_features_flat[flat_idx_int].item()),
+                        "threshold": float(thresholds_flat[feat_idx].item()),
+                        "compare_margin": float(margin_flat[flat_idx_int].item()),
+                        "abs_compare_margin": float(abs_margin_flat[flat_idx_int].item()),
+                    }
+                )
+
+        return mask, {
+            "layer": int(layer_id),
+            "compare_mode": self._phase0_activation_threshold_compare_mode,
+            "compare_dtype": compare_dtype_name,
+            "total_entries": total_entries,
+            "active_entries": active_entries,
+            "inactive_entries": int(total_entries - active_entries),
+            "near_counts_by_epsilon": near_counts_by_epsilon,
+            "near_active_counts_by_epsilon": near_active_counts_by_epsilon,
+            "near_inactive_counts_by_epsilon": near_inactive_counts_by_epsilon,
+            "borderline_samples": borderline_samples,
         }
 
     def reset_diagnostic_stats(self) -> None:
@@ -548,6 +709,47 @@ class CrossLayerTranscoder(torch.nn.Module):
         """
         sparse_layers = []
         feature_ids_by_layer = [] if return_encoder_vectors else None
+        collect_threshold_membership = bool(
+            self._phase0_threshold_membership_debug_enabled
+            and isinstance(self.activation_function, JumpReLU)
+        )
+        self._diagnostic_stats["phase0_activation_threshold_compare_mode"] = (
+            self._phase0_activation_threshold_compare_mode
+        )
+        self._diagnostic_stats["phase0_threshold_membership_debug_enabled"] = (
+            collect_threshold_membership
+        )
+        self._diagnostic_stats["phase0_threshold_membership_sample_limit_per_layer"] = (
+            int(self._phase0_threshold_membership_sample_limit_per_layer)
+            if collect_threshold_membership
+            else 0
+        )
+        self._diagnostic_stats["phase0_activation_threshold_compare_dtype"] = None
+        phase0_threshold_membership_summary: dict[str, object] | None = None
+        if collect_threshold_membership:
+            phase0_threshold_membership_summary = {
+                "compare_mode": self._phase0_activation_threshold_compare_mode,
+                "sample_limit_per_layer": int(
+                    self._phase0_threshold_membership_sample_limit_per_layer
+                ),
+                "near_epsilons": [
+                    f"abs_lte_{epsilon:.0e}" for epsilon in self._phase0_threshold_near_epsilons
+                ],
+                "per_layer": {},
+                "total_entries": 0,
+                "total_active_entries": 0,
+                "near_counts_by_epsilon": {
+                    f"abs_lte_{epsilon:.0e}": 0 for epsilon in self._phase0_threshold_near_epsilons
+                },
+                "near_active_counts_by_epsilon": {
+                    f"abs_lte_{epsilon:.0e}": 0 for epsilon in self._phase0_threshold_near_epsilons
+                },
+                "near_inactive_counts_by_epsilon": {
+                    f"abs_lte_{epsilon:.0e}": 0 for epsilon in self._phase0_threshold_near_epsilons
+                },
+                "borderline_sample_count": 0,
+            }
+        self._diagnostic_stats["phase0_threshold_membership"] = None
         encode_start = time.perf_counter()
         self.emit_trace_event(
             "phase0.encode_sparse.start",
@@ -564,7 +766,16 @@ class CrossLayerTranscoder(torch.nn.Module):
                 torch.einsum("bd,fd->bf", x[layer_id], W_enc_layer) + self.b_enc[layer_id]
             )
 
-            layer_features = self.apply_activation_function(layer_id, layer_features)
+            layer_threshold_diag: dict[str, object] | None = None
+            if isinstance(self.activation_function, JumpReLU):
+                mask, layer_threshold_diag = self._compute_jump_relu_mask(
+                    layer_id=layer_id,
+                    features=layer_features,
+                    collect_diagnostics=collect_threshold_membership,
+                )
+                layer_features = layer_features * mask
+            else:
+                layer_features = self.activation_function(layer_features)
 
             layer_features[zero_positions] = 0
 
@@ -574,6 +785,55 @@ class CrossLayerTranscoder(torch.nn.Module):
             _, feat_idx = sparse_layer.indices()
             if feature_ids_by_layer is not None:
                 feature_ids_by_layer.append(feat_idx)
+            if phase0_threshold_membership_summary is not None and layer_threshold_diag is not None:
+                per_layer = phase0_threshold_membership_summary["per_layer"]
+                assert isinstance(per_layer, dict)
+                per_layer[str(layer_id)] = layer_threshold_diag
+
+                phase0_threshold_membership_summary["total_entries"] = int(
+                    phase0_threshold_membership_summary["total_entries"]
+                    + int(layer_threshold_diag["total_entries"])
+                )
+                phase0_threshold_membership_summary["total_active_entries"] = int(
+                    phase0_threshold_membership_summary["total_active_entries"]
+                    + int(layer_threshold_diag["active_entries"])
+                )
+
+                near_counts = phase0_threshold_membership_summary["near_counts_by_epsilon"]
+                near_active_counts = phase0_threshold_membership_summary[
+                    "near_active_counts_by_epsilon"
+                ]
+                near_inactive_counts = phase0_threshold_membership_summary[
+                    "near_inactive_counts_by_epsilon"
+                ]
+                assert isinstance(near_counts, dict)
+                assert isinstance(near_active_counts, dict)
+                assert isinstance(near_inactive_counts, dict)
+
+                layer_near_counts = layer_threshold_diag["near_counts_by_epsilon"]
+                layer_near_active_counts = layer_threshold_diag["near_active_counts_by_epsilon"]
+                layer_near_inactive_counts = layer_threshold_diag["near_inactive_counts_by_epsilon"]
+                assert isinstance(layer_near_counts, dict)
+                assert isinstance(layer_near_active_counts, dict)
+                assert isinstance(layer_near_inactive_counts, dict)
+
+                for epsilon_key, value in layer_near_counts.items():
+                    near_counts[epsilon_key] = int(near_counts.get(epsilon_key, 0)) + int(value)
+                for epsilon_key, value in layer_near_active_counts.items():
+                    near_active_counts[epsilon_key] = int(
+                        near_active_counts.get(epsilon_key, 0)
+                    ) + int(value)
+                for epsilon_key, value in layer_near_inactive_counts.items():
+                    near_inactive_counts[epsilon_key] = int(
+                        near_inactive_counts.get(epsilon_key, 0)
+                    ) + int(value)
+
+                borderline_samples = layer_threshold_diag.get("borderline_samples")
+                if isinstance(borderline_samples, list):
+                    phase0_threshold_membership_summary["borderline_sample_count"] = int(
+                        phase0_threshold_membership_summary["borderline_sample_count"]
+                        + len(borderline_samples)
+                    )
             layer_elapsed = time.perf_counter() - layer_start
             self._add_diagnostic_layer_value("encode_sparse_by_layer", layer_id, layer_elapsed)
             self._add_diagnostic_layer_value(
@@ -595,6 +855,10 @@ class CrossLayerTranscoder(torch.nn.Module):
         )
         encode_elapsed = time.perf_counter() - encode_start
         self._add_diagnostic_value("encode_sparse_seconds", encode_elapsed)
+        if phase0_threshold_membership_summary is not None:
+            self._diagnostic_stats["phase0_threshold_membership"] = (
+                phase0_threshold_membership_summary
+            )
         self.emit_trace_event(
             "phase0.encode_sparse.done",
             total_active_features=sparse_features._nnz(),

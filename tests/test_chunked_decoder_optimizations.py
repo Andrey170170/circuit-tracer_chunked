@@ -22,8 +22,10 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _reorder_pending_for_phase4_locality,
     _resolve_internal_dtype_map,
     _resolve_internal_precision_requested,
+    _resolve_phase0_activation_threshold_compare_mode,
     _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
+    _hash_sparse_membership_indices,
 )
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
@@ -893,6 +895,8 @@ def test_compare_phase4_frontiers_reports_overlap_and_first_difference() -> None
     assert result["overlap_count"] == 2
     assert result["changed_selected_nodes"] == 2
     assert result["first_differing_rank"] == 1
+    assert result["prefix_match_count"] == 1
+    assert result["jaccard_similarity"] == pytest.approx(0.5)
 
 
 def test_build_phase4_deterministic_shadow_pending_breaks_ties_stably() -> None:
@@ -914,6 +918,51 @@ def test_build_phase4_deterministic_shadow_pending_breaks_ties_stably() -> None:
     )
 
     assert torch.equal(pending, torch.tensor([1, 2, 4], dtype=torch.long))
+
+
+def test_phase0_activation_threshold_compare_mode_resolution() -> None:
+    assert _resolve_phase0_activation_threshold_compare_mode("DEFAULT") == "baseline"
+    assert _resolve_phase0_activation_threshold_compare_mode("bfloat16") == "bf16"
+    assert _resolve_phase0_activation_threshold_compare_mode("fp64") == "fp64"
+
+    with pytest.raises(ValueError, match="phase0_activation_threshold_compare_mode"):
+        _resolve_phase0_activation_threshold_compare_mode("float16")
+
+
+def test_hash_sparse_membership_indices_canonicalizes_ordering() -> None:
+    indices_a = torch.tensor(
+        [
+            [0, 1, 0],
+            [1, 0, 2],
+            [3, 4, 1],
+        ],
+        dtype=torch.long,
+    )
+    indices_b = torch.tensor(
+        [
+            [0, 0, 1],
+            [2, 1, 0],
+            [1, 3, 4],
+        ],
+        dtype=torch.long,
+    )
+    shape = (2, 3, 8)
+
+    raw_hash_a = _hash_sparse_membership_indices(indices_a, shape=shape, canonicalize=False)
+    raw_hash_b = _hash_sparse_membership_indices(indices_b, shape=shape, canonicalize=False)
+    canonical_hash_a = _hash_sparse_membership_indices(
+        indices_a,
+        shape=shape,
+        canonicalize=True,
+    )
+    canonical_hash_b = _hash_sparse_membership_indices(
+        indices_b,
+        shape=shape,
+        canonicalize=True,
+    )
+
+    assert raw_hash_a != raw_hash_b
+    assert canonical_hash_a == canonical_hash_b
 
 
 def test_phase4_probe_frontier_uses_ranked_first_frontier_then_locality() -> None:
