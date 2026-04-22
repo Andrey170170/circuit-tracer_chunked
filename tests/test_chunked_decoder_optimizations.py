@@ -530,12 +530,13 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
         check_invariants=True,
     ).coalesce()
     encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    staged_encoder_source = encoder_vecs.clone()
     ctx = NNSightAttributionContext(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(2, 2, 4),
         token_vectors=torch.zeros(2, 4),
         decoder_vecs=torch.empty((0, 4)),
-        encoder_vecs=encoder_vecs.clone(),
+        encoder_vecs=staged_encoder_source,
         encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
         decoder_locations=torch.empty((2, 0), dtype=torch.long),
         logits=torch.zeros(1, 1, 5),
@@ -549,8 +550,22 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
     )
 
     assert ctx.encoder_vecs.device.type == "cpu"
+    assert ctx.encoder_vecs.data_ptr() != staged_encoder_source.data_ptr()
     batch = ctx.materialize_encoder_vectors(torch.tensor([2, 0]), device=torch.device("cpu"))
     assert torch.equal(batch, encoder_vecs[torch.tensor([2, 0])])
+
+
+def test_stage_tensor_on_cpu_preserves_existing_cpu_layout() -> None:
+    source = torch.arange(24, dtype=torch.float32, requires_grad=True).reshape(4, 6).transpose(0, 1)
+    assert source.device.type == "cpu"
+    assert not source.is_contiguous()
+
+    staged = NNSightAttributionContext._stage_tensor_on_cpu(source)
+
+    assert staged.device.type == "cpu"
+    assert staged.data_ptr() != source.data_ptr()
+    assert staged.stride() == source.stride()
+    assert not staged.requires_grad
 
 
 def test_exact_chunked_lazy_encoder_materialization_matches_eager_rows(tmp_path: Path) -> None:
@@ -642,6 +657,7 @@ def test_exact_chunked_error_vector_prefetch_window_stays_bounded() -> None:
         error_vector_prefetch_lookahead=2,
     )
 
+    assert ctx.error_vectors.data_ptr() != error_vectors.data_ptr()
     assert torch.equal(
         ctx.get_error_vectors_for_layer(3, device=torch.device("cpu")), error_vectors[3]
     )

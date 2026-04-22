@@ -150,11 +150,8 @@ class AttributionContext:
         staged = tensor.detach()
         if staged.device.type != "cpu":
             staged = staged.to(device="cpu", non_blocking=staged.device.type == "cuda")
-        staged = staged.contiguous()
-        try:
-            staged = staged.pin_memory()
-        except RuntimeError:
-            pass
+        else:
+            staged = staged.clone()
         return staged
 
     def _materialize_tensor(
