@@ -1035,6 +1035,7 @@ def _build_cross_cluster_runtime_snapshot(
         ),
     }
     stream_payload: dict[str, object] = {
+        "rss_current_gib": memory_snapshot.get("rss_current_gib"),
         "rss_gib": memory_snapshot.get("rss_gib"),
         "cuda_allocated_gib": memory_snapshot.get("cuda_allocated_gib"),
         "cuda_reserved_gib": memory_snapshot.get("cuda_reserved_gib"),
@@ -1905,6 +1906,7 @@ def _run_attribution(
     planner_compute_dtype = _dtype_from_name(resolved_dtype_map["planner_compute_dtype"])
     shadow_debug_compute_dtype = _dtype_from_name(resolved_dtype_map["shadow_debug_compute_dtype"])
     cross_cluster_debug_enabled = bool(cross_cluster_debug)
+    phase4_debug_summary_enabled = phase4_anomaly_debug_enabled or cross_cluster_debug_enabled
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
         compact_output=compact_output,
@@ -2928,19 +2930,17 @@ def _run_attribution(
         phase4_refresh_elapsed_ms_total = 0.0
         previous_phase4_pending: torch.Tensor | None = None
         first_phase4_pending: torch.Tensor | None = None
-        phase4_logit_probability_stats = _build_vector_stats(
-            targets.logit_probabilities.detach().to(
-                device="cpu",
-                dtype=exact_trace_internal_dtype_resolved,
-            ),
-            epsilon=1e-12,
-            top_k=8,
-        )
+        phase4_logit_probability_stats: dict[str, object] | None = None
         phase4_logit_probabilities = targets.logit_probabilities.detach().to(
             device="cpu",
             dtype=exact_trace_internal_dtype_resolved,
         )
         if anomaly_debug_result is not None:
+            phase4_logit_probability_stats = _build_vector_stats(
+                phase4_logit_probabilities,
+                epsilon=1e-12,
+                top_k=8,
+            )
             anomaly_debug_result["logit_probability_stats"] = phase4_logit_probability_stats
 
         pbar = tqdm(
@@ -2993,24 +2993,28 @@ def _run_attribution(
 
                 feature_rank = torch.argsort(feature_influences, descending=True).cpu()
                 unvisited_feature_rank = feature_rank[~visited[feature_rank]]
-                candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
-                rank_signal_stats = _build_vector_stats(
-                    candidate_scores,
-                    epsilon=1e-12,
-                    top_k=8,
-                )
-                if use_compact_feature_row_store:
-                    assert feature_row_store is not None
-                    normalization_input_stats = _build_phase4_normalization_stats(
-                        (
-                            feature_row_store.row_abs_max[:st].detach().cpu(),
-                            feature_row_store.row_l1_scaled[:st].detach().cpu(),
-                        ),
+                candidate_scores: torch.Tensor | None = None
+                rank_signal_stats: dict[str, object] | None = None
+                normalization_input_stats: dict[str, object] | None = None
+                if phase4_debug_summary_enabled:
+                    candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
+                    rank_signal_stats = _build_vector_stats(
+                        candidate_scores,
+                        epsilon=1e-12,
+                        top_k=8,
                     )
-                else:
-                    normalization_input_stats = _build_phase4_normalization_stats(
-                        edge_matrix[:st, :logit_offset].abs().sum(dim=1).detach().cpu(),
-                    )
+                    if use_compact_feature_row_store:
+                        assert feature_row_store is not None
+                        normalization_input_stats = _build_phase4_normalization_stats(
+                            (
+                                feature_row_store.row_abs_max[:st].detach().cpu(),
+                                feature_row_store.row_l1_scaled[:st].detach().cpu(),
+                            ),
+                        )
+                    else:
+                        normalization_input_stats = _build_phase4_normalization_stats(
+                            edge_matrix[:st, :logit_offset].abs().sum(dim=1).detach().cpu(),
+                        )
                 feature_row_store_snapshot_after = (
                     feature_row_store.get_diagnostic_snapshot()
                     if use_compact_feature_row_store and feature_row_store is not None
@@ -3049,23 +3053,47 @@ def _run_attribution(
                         "refresh_index": int(phase4_refresh_count),
                         "stored_rows": int(st),
                         "visited_features": int(n_visited),
-                        "frontier_candidate_count": int(candidate_scores.numel()),
+                        "frontier_candidate_count": int(unvisited_feature_rank.numel()),
                         "queue_size": int(queue_size),
-                        "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
-                        "rank_effective_nonzero_count": int(
-                            rank_signal_stats["effective_nonzero_count"]
+                        "rank_nonzero_count": (
+                            int(rank_signal_stats["nonzero_count"])
+                            if rank_signal_stats is not None
+                            else None
                         ),
-                        "rank_max": _safe_float(rank_signal_stats.get("max")),
-                        "rank_abs_sum": _safe_float(rank_signal_stats.get("abs_sum")),
-                        "rank_all_zero": bool(rank_signal_stats["all_zero"]),
-                        "rank_effectively_all_zero": bool(
-                            rank_signal_stats["effectively_all_zero"]
+                        "rank_effective_nonzero_count": (
+                            int(rank_signal_stats["effective_nonzero_count"])
+                            if rank_signal_stats is not None
+                            else None
                         ),
-                        "normalization_clamped_row_count": int(
-                            normalization_input_stats["clamped_row_count"]
+                        "rank_max": (
+                            _safe_float(rank_signal_stats.get("max"))
+                            if rank_signal_stats is not None
+                            else None
                         ),
-                        "normalization_clamped_row_fraction": _safe_float(
-                            normalization_input_stats.get("clamped_row_fraction")
+                        "rank_abs_sum": (
+                            _safe_float(rank_signal_stats.get("abs_sum"))
+                            if rank_signal_stats is not None
+                            else None
+                        ),
+                        "rank_all_zero": (
+                            bool(rank_signal_stats["all_zero"])
+                            if rank_signal_stats is not None
+                            else None
+                        ),
+                        "rank_effectively_all_zero": (
+                            bool(rank_signal_stats["effectively_all_zero"])
+                            if rank_signal_stats is not None
+                            else None
+                        ),
+                        "normalization_clamped_row_count": (
+                            int(normalization_input_stats["clamped_row_count"])
+                            if normalization_input_stats is not None
+                            else None
+                        ),
+                        "normalization_clamped_row_fraction": (
+                            _safe_float(normalization_input_stats.get("clamped_row_fraction"))
+                            if normalization_input_stats is not None
+                            else None
                         ),
                         "feature_row_store_read_calls": _safe_float(
                             (feature_row_store_read_stats or {}).get("read_call_count")
@@ -3132,6 +3160,8 @@ def _run_attribution(
                     elapsed_ms=refresh_elapsed_ms,
                 )
                 if cross_cluster_debug_batches is not None:
+                    assert rank_signal_stats is not None
+                    assert normalization_input_stats is not None
                     _record_cross_cluster_batch_event(
                         cross_cluster_debug_batches=cross_cluster_debug_batches,
                         event_name="phase4.refresh",
@@ -3141,7 +3171,7 @@ def _run_attribution(
                             "refresh_index": int(phase4_refresh_count),
                             "stored_rows": int(st),
                             "visited_features": int(n_visited),
-                            "frontier_candidate_count": int(candidate_scores.numel()),
+                            "frontier_candidate_count": int(unvisited_feature_rank.numel()),
                             "queue_size": int(queue_size),
                             "pending_count": int(pending.numel()),
                             "pending_hash": (
@@ -3174,6 +3204,8 @@ def _run_attribution(
                         },
                     )
                 if anomaly_debug_result is not None:
+                    assert candidate_scores is not None
+                    assert phase4_logit_probability_stats is not None
                     _record_phase4_refresh_debug(
                         anomaly_debug_result,
                         refresh_index=phase4_refresh_count,

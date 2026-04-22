@@ -879,6 +879,7 @@ def test_build_cross_cluster_runtime_snapshot_emits_memory_and_hashes() -> None:
     )
 
     assert "memory_snapshot" in summary_payload
+    assert "rss_current_gib" in stream_payload
     assert "rss_gib" in stream_payload
     assert "ctx_diagnostic_snapshot_hash" in stream_payload
     assert "transcoder_diagnostic_snapshot_hash" in stream_payload

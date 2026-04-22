@@ -1,6 +1,10 @@
 import torch
 
-from circuit_tracer.utils.telemetry import TelemetryRecorder, sanitize_attrs
+from circuit_tracer.utils.telemetry import (
+    TelemetryRecorder,
+    get_memory_snapshot,
+    sanitize_attrs,
+)
 
 
 def test_sanitize_attrs_scalarizes_complex_values() -> None:
@@ -87,3 +91,12 @@ def test_telemetry_timer_records_elapsed_and_error_type() -> None:
     assert event["phase"] == "phase4"
     assert event["elapsed_ms"] >= 0
     assert event["attrs"]["error_type"] == "RuntimeError"
+
+
+def test_get_memory_snapshot_reports_current_and_peak_rss_keys() -> None:
+    snapshot = get_memory_snapshot(torch.device("cpu"))
+
+    assert "rss_current_gib" in snapshot
+    assert "rss_gib" in snapshot
+    if snapshot["rss_current_gib"] is not None:
+        assert snapshot["rss_current_gib"] >= 0

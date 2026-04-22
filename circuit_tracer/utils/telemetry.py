@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections import defaultdict
 from collections.abc import Mapping
@@ -341,11 +342,35 @@ def _format_optional_gib(value: float | None) -> str:
     return f"{value:.2f} GiB"
 
 
+def _get_current_rss_gib_from_proc() -> float | None:
+    """Best-effort Linux RSS snapshot using /proc/self/statm."""
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, ValueError):
+        return None
+    if page_size <= 0:
+        return None
+
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as handle:
+            fields = handle.readline().split()
+        if len(fields) < 2:
+            return None
+        resident_pages = int(fields[1])
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+    return (resident_pages * page_size) / (1024**3)
+
+
 def get_memory_snapshot(device: torch.device | None = None) -> dict[str, float | None]:
+    rss_current_gib = _get_current_rss_gib_from_proc()
     rss_gib = None
     if resource is not None:
         rss_gib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024**2)
     snapshot: dict[str, float | None] = {
+        "rss_current_gib": rss_current_gib,
         "rss_gib": rss_gib,
         "cuda_allocated_gib": None,
         "cuda_reserved_gib": None,
@@ -372,6 +397,7 @@ def format_memory_snapshot(
     snapshot = get_memory_snapshot(device)
     parts = [
         f"rss={_format_optional_gib(snapshot['rss_gib'])}",
+        f"rss_current={_format_optional_gib(snapshot['rss_current_gib'])}",
         f"cuda_alloc={_format_optional_gib(snapshot['cuda_allocated_gib'])}",
         f"cuda_reserved={_format_optional_gib(snapshot['cuda_reserved_gib'])}",
         f"cuda_peak_alloc={_format_optional_gib(snapshot['cuda_max_allocated_gib'])}",
