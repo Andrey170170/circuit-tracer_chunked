@@ -1,11 +1,15 @@
+import inspect
+
 import pytest
 import torch
 
+from circuit_tracer.attribution.attribute import attribute as attribute_entrypoint
 from circuit_tracer.attribution.attribute_nnsight import (
     _compute_row_abs_sums,
     _compute_row_denominator_scaled_l1,
     _FileBackedFeatureRowStore,
     _resolve_exact_trace_internal_dtype,
+    attribute as nnsight_attribute,
 )
 from circuit_tracer.utils.telemetry import TelemetryRecorder
 
@@ -125,6 +129,17 @@ def test_file_backed_feature_row_store_read_cache_too_large_is_reported() -> Non
 def test_exact_trace_internal_dtype_resolution_supports_fp32_and_fp64() -> None:
     assert _resolve_exact_trace_internal_dtype("fp32") == torch.float32
     assert _resolve_exact_trace_internal_dtype("FP64") == torch.float64
+
+
+def test_exact_trace_internal_dtype_default_is_fp32_on_public_entrypoints() -> None:
+    assert (
+        inspect.signature(attribute_entrypoint).parameters["exact_trace_internal_dtype"].default
+        == "fp32"
+    )
+    assert (
+        inspect.signature(nnsight_attribute).parameters["exact_trace_internal_dtype"].default
+        == "fp32"
+    )
 
 
 def test_exact_trace_internal_dtype_resolution_rejects_unknown_value() -> None:

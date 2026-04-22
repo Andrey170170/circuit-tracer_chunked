@@ -1694,7 +1694,7 @@ def attribute(
     cross_cluster_debug: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
-    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -1760,8 +1760,9 @@ def attribute(
         telemetry_max_events: Optional cap for in-memory telemetry event storage.
             If omitted, an environment/default policy is used.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
-            normalization/influence ranking path. ``"fp64"`` uses float64
-            internals; ``"fp32"`` uses float32 internals.
+            normalization/influence ranking path. ``"fp32"`` uses float32
+            internals and is the post-fix default; ``"fp64"`` uses float64
+            internals.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -1861,7 +1862,7 @@ def _run_attribution(
     cross_cluster_debug: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
-    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ):
     start_time = time.time()
     run_start = time.perf_counter()

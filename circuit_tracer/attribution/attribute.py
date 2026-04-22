@@ -146,7 +146,7 @@ def attribute(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
-    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -184,7 +184,8 @@ def attribute(
             keeps only retained feature candidates before reconstruction, and later
             attribution phases reuse the same candidate set.
         exact_trace_internal_dtype: Internal dtype used by compact exact-trace
-            normalization/ranking internals ("fp32" or "fp64").
+            normalization/ranking internals ("fp32" or "fp64"). Defaults to
+            ``"fp32"`` on the post-fix stable path.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
