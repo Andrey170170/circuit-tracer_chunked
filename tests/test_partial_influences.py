@@ -4,6 +4,7 @@ from circuit_tracer.graph import (
     compute_partial_feature_influences,
     compute_partial_feature_influences_streaming,
     compute_partial_influences,
+    normalize_matrix,
 )
 
 
@@ -62,6 +63,51 @@ def test_compute_partial_influences_keeps_cpu_ownership_by_default():
     influences = compute_partial_influences(edge_matrix, logit_p, row_to_node_index)
 
     assert influences.device.type == "cpu"
+
+
+def test_normalize_matrix_matches_raw_row_l1_for_finite_values():
+    matrix = torch.tensor(
+        [
+            [3.0, -1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1e-9, 1e-9, -2e-9],
+        ],
+        dtype=torch.float32,
+    )
+
+    expected = matrix.abs()
+    expected = expected / expected.sum(dim=1, keepdim=True).clamp(min=1e-10)
+
+    actual = normalize_matrix(matrix)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_normalize_matrix_avoids_float32_row_l1_overflow_regression():
+    matrix = torch.tensor([[1e38, 1e38, 1e38, 1e38]], dtype=torch.float32)
+
+    actual = normalize_matrix(matrix)
+    expected = torch.full_like(actual, 0.25)
+
+    assert torch.isfinite(actual).all()
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert torch.all(actual > 0)
+
+
+def test_compute_partial_influences_avoids_float32_row_l1_overflow_regression():
+    edge_matrix = torch.tensor(
+        [[1e38, 1e38, 1e38, 1e38, 0.0]],
+        dtype=torch.float32,
+    )
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([4], dtype=torch.int32)
+
+    actual = compute_partial_influences(edge_matrix, logit_p, row_to_node_index, row_chunk_size=1)
+    expected = torch.tensor([0.25, 0.25, 0.25, 0.25, 0.0], dtype=torch.float32)
+
+    assert torch.isfinite(actual).all()
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert actual[:4].sum().item() > 0
 
 
 def test_compute_partial_feature_influences_matches_dense_feature_slice():

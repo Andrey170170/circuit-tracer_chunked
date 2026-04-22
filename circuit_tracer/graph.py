@@ -181,7 +181,15 @@ class Graph:
 
 def normalize_matrix(matrix: torch.Tensor) -> torch.Tensor:
     normalized = matrix.abs()
-    return normalized / normalized.sum(dim=1, keepdim=True).clamp(min=1e-10)
+    row_denominator = _compute_row_denominator_scaled_l1(normalized, already_abs=True)
+    normalized_row_weights = _normalize_row_weights_from_denominator(
+        torch.ones(normalized.shape[0], device=normalized.device, dtype=normalized.dtype),
+        denom_mode="scaled_row_l1",
+        denom_primary=row_denominator.row_abs_max,
+        denom_secondary=row_denominator.row_l1_scaled,
+        clamp_epsilon=1e-10,
+    )
+    return normalized_row_weights.unsqueeze(1) * normalized
 
 
 def compute_influence(A: torch.Tensor, logit_weights: torch.Tensor, max_iter: int = 1000):
@@ -243,6 +251,34 @@ class RowL1ScaledDenominator(NamedTuple):
 
     row_abs_max: torch.Tensor
     row_l1_scaled: torch.Tensor
+
+
+def _compute_row_denominator_scaled_l1(
+    row_values: torch.Tensor,
+    *,
+    already_abs: bool = False,
+) -> RowL1ScaledDenominator:
+    abs_values = row_values if already_abs else row_values.abs()
+    if abs_values.ndim != 2:
+        raise ValueError("row_values must be rank-2")
+
+    n_rows = int(abs_values.shape[0])
+    if abs_values.shape[1] == 0:
+        zeros = torch.zeros(n_rows, device=abs_values.device, dtype=abs_values.dtype)
+        return RowL1ScaledDenominator(row_abs_max=zeros, row_l1_scaled=zeros)
+
+    row_abs_max = abs_values.amax(dim=1)
+    row_l1_scaled = torch.zeros_like(row_abs_max)
+    nonzero_rows = (row_abs_max > 0) & torch.isfinite(row_abs_max)
+    if bool(nonzero_rows.any()):
+        scaled_rows = abs_values[nonzero_rows] / row_abs_max[nonzero_rows].unsqueeze(1)
+        row_l1_scaled[nonzero_rows] = scaled_rows.sum(dim=1)
+
+    infinite_rows = torch.isinf(row_abs_max)
+    if bool(infinite_rows.any()):
+        row_l1_scaled[infinite_rows] = 1
+
+    return RowL1ScaledDenominator(row_abs_max=row_abs_max, row_l1_scaled=row_l1_scaled)
 
 
 def _normalize_row_weights_from_denominator(
@@ -506,8 +542,14 @@ def compute_partial_influences(
             if not row_weights.any():
                 continue
 
-            chunk /= chunk.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            next_prod += row_weights @ chunk
+            chunk_row_denominator = _compute_row_denominator_scaled_l1(chunk, already_abs=True)
+            normalized_row_weights = _normalize_row_weights_from_denominator(
+                row_weights,
+                denom_mode="scaled_row_l1",
+                denom_primary=chunk_row_denominator.row_abs_max,
+                denom_secondary=chunk_row_denominator.row_l1_scaled,
+            )
+            next_prod += normalized_row_weights @ chunk
 
         prod = next_prod
         if not prod.any():

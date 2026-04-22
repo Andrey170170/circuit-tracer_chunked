@@ -36,6 +36,31 @@ def _layer_count_dict(layer_ids: torch.Tensor, n_layers: int) -> dict[int, int]:
     return {layer: int(counts[layer].item()) for layer in range(n_layers)}
 
 
+def _compute_retained_activation_mass(values: torch.Tensor, selected: torch.Tensor) -> float:
+    abs_values = values.abs()
+    if abs_values.numel() == 0:
+        return 1.0
+
+    max_abs = abs_values.max()
+    if bool(torch.isnan(max_abs)):
+        return float("nan")
+    if bool(torch.isinf(max_abs)):
+        selected_has_inf = (
+            bool(torch.isinf(abs_values[selected]).any()) if selected.numel() else False
+        )
+        return float("nan") if selected_has_inf else 0.0
+    if bool(max_abs <= 0):
+        return 1.0
+
+    scaled_abs = abs_values / max_abs
+    total_scaled_mass = scaled_abs.sum(dtype=torch.float64)
+    if bool(total_scaled_mass <= 0):
+        return 1.0
+
+    retained_scaled_mass = scaled_abs[selected].sum(dtype=torch.float64)
+    return float((retained_scaled_mass / total_scaled_mass).item())
+
+
 def select_candidate_feature_indices(
     activation_matrix: torch.Tensor,
     config: SparsificationConfig,
@@ -90,12 +115,7 @@ def select_candidate_feature_indices(
         selected = selected[top_global]
 
     selected = selected.sort().values
-    total_activation_mass = float(values.abs().sum().item())
-    retained_activation_mass = (
-        float(values[selected].abs().sum().item()) / total_activation_mass
-        if total_activation_mass > 0.0
-        else 1.0
-    )
+    retained_activation_mass = _compute_retained_activation_mass(values, selected)
 
     stats = {
         "strategy": "per_layer_position_topk",

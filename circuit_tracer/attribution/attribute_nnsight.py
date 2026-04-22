@@ -2402,6 +2402,7 @@ def _run_attribution(
             phase2_extra.update(
                 feature_row_store="dense_memmap",
                 feature_row_store_path=feature_row_store.path,
+                row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_l1_scaled_shape=f"{tuple(feature_row_store.row_l1_scaled.shape)}",
                 feature_edge_columns=total_active_feats,
@@ -2449,6 +2450,7 @@ def _run_attribution(
                 if use_compact_feature_row_store
                 else row_abs_sum_dtype
             )
+            row_denominator_component_count = 2 if use_compact_feature_row_store else 1
             row_count = int(actual_max_feature_nodes + n_logits)
             row_store_expected_bytes = (
                 row_count
@@ -2456,7 +2458,9 @@ def _run_attribution(
                 * torch.empty((), dtype=row_store_dtype_for_metrics).element_size()
             )
             row_abs_sums_expected_bytes = (
-                2 * row_count * torch.empty((), dtype=row_abs_sum_dtype_for_metrics).element_size()
+                row_denominator_component_count
+                * row_count
+                * torch.empty((), dtype=row_abs_sum_dtype_for_metrics).element_size()
             )
             phase2_summary_checkpoint = {
                 "feat_layers_hash": _hash_index_tensor(feat_layers),
@@ -2469,8 +2473,10 @@ def _run_attribution(
                     else None
                 ),
                 "row_store_mode": phase2_extra.get("row_store_mode"),
+                "row_denominator_component_count": int(row_denominator_component_count),
                 "row_store_expected_bytes": int(row_store_expected_bytes),
                 "row_abs_sums_expected_bytes": int(row_abs_sums_expected_bytes),
+                "row_denominator_expected_bytes": int(row_abs_sums_expected_bytes),
                 "phase4_feature_batch_size_initial": int(effective_feature_batch_size),
                 **phase2_runtime_summary,
             }
@@ -2481,8 +2487,10 @@ def _run_attribution(
                 "feature_count": int(total_active_feats),
                 "decoder_chunk_size": phase2_summary_checkpoint["decoder_chunk_size"],
                 "row_store_mode": phase2_summary_checkpoint["row_store_mode"],
+                "row_denominator_component_count": int(row_denominator_component_count),
                 "row_store_expected_bytes": int(row_store_expected_bytes),
                 "row_abs_sums_expected_bytes": int(row_abs_sums_expected_bytes),
+                "row_denominator_expected_bytes": int(row_abs_sums_expected_bytes),
                 "phase4_feature_batch_size_initial": int(effective_feature_batch_size),
                 **phase2_runtime_stream,
             }
