@@ -23,7 +23,7 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
 import logging
 import time
 from collections.abc import Sequence
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -34,6 +34,9 @@ from circuit_tracer.attribution.targets import (
     log_attribution_target_info,
 )
 from circuit_tracer.attribution.sparsification import SparsificationConfig
+
+if TYPE_CHECKING:
+    from circuit_tracer.attribution.prefix_cache import PrefixActivationCache
 from circuit_tracer.graph import Graph, compute_partial_influences
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 from circuit_tracer.utils.disk_offload import offload_modules
@@ -118,6 +121,7 @@ def attribute(
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
     compact_output: bool = False,
+    prefix_cache: "PrefixActivationCache | None" = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -190,6 +194,7 @@ def attribute(
             sparsification=sparsification,
             compact_output=compact_output,
             logger=logger,
+            prefix_cache=prefix_cache,
         )
     finally:
         for reload_handle in offload_handles:
@@ -219,6 +224,7 @@ def _run_attribution(
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
     compact_output: bool = False,
+    prefix_cache: "PrefixActivationCache | None" = None,
 ):
     start_time = time.time()
     if batch_size <= 0:
@@ -263,6 +269,7 @@ def _run_attribution(
         input_ids,
         sparsification=sparsification,
         retain_full_logits=False,
+        prefix_cache=prefix_cache,
     )
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)

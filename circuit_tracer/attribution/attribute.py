@@ -11,6 +11,7 @@ from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.graph import Graph
 
 if TYPE_CHECKING:
+    from circuit_tracer.attribution.prefix_cache import PrefixActivationCache
     from circuit_tracer.attribution.targets import TargetSpec
     from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
     from circuit_tracer.replacement_model.replacement_model_transformerlens import (
@@ -135,6 +136,7 @@ def attribute(
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
+    prefix_cache: "PrefixActivationCache | None" = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -196,8 +198,17 @@ def attribute(
             profile_log_interval=profile_log_interval,
             diagnostic_feature_cap=diagnostic_feature_cap,
             sparsification=sparsification,
+            prefix_cache=prefix_cache,
         )
     else:
+        if prefix_cache is not None:
+            import warnings
+            warnings.warn(
+                "prefix_cache is only supported for the nnsight backend; "
+                "ignoring it for the transformerlens backend.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         from .attribute_transformerlens import attribute as attribute_transformerlens
 
         return attribute_transformerlens(

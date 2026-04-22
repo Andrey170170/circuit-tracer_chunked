@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import partial
 import time
-from typing import Callable, Iterator, Literal, cast
+from typing import Callable, Iterator, Literal, TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -14,6 +14,9 @@ from nnsight import LanguageModel, Envoy, save, CONFIG as NNSIGHT_CONFIG
 
 from circuit_tracer.attribution.context_nnsight import AttributionContext
 from circuit_tracer.attribution.sparsification import SparsificationConfig
+
+if TYPE_CHECKING:
+    from circuit_tracer.attribution.prefix_cache import PrefixActivationCache
 from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 from circuit_tracer.utils import get_default_device
@@ -486,6 +489,7 @@ class NNSightReplacementModel(LanguageModel):
         *,
         sparsification: SparsificationConfig | None = None,
         retain_full_logits: bool = False,
+        prefix_cache: "PrefixActivationCache | None" = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
@@ -493,6 +497,11 @@ class NNSightReplacementModel(LanguageModel):
         Args:
             inputs (str): the inputs to attribute - hard coded to be a single string (no
                 batching) for now
+            prefix_cache: Optional ``PrefixActivationCache`` instance.  When supplied, the
+                method emits diagnostic events comparing the current prompt against the
+                cached prefix and populates the cache with this run's pre-sparsification
+                ``mlp_in``/``mlp_out`` tensors so a subsequent temporal-tracing step can
+                reuse them.  Passing ``None`` preserves the original behavior exactly.
         """
 
         setup_start = time.perf_counter()
@@ -509,6 +518,28 @@ class NNSightReplacementModel(LanguageModel):
 
         transcoders = self.transcoders
         trace_event = getattr(transcoders, "emit_trace_event", None)
+
+        # Prefix-cache lookup for temporal tracing.  Always ran and logged
+        # when a cache is passed; compute-skipping lives in downstream work
+        # (see Direction 2 plan — backward reuse / KV integration).
+        cache_fingerprint: str | None = None
+        cache_diag = None
+        if prefix_cache is not None:
+            cache_fingerprint = prefix_cache.compute_model_fingerprint(self)
+            _entry, cache_diag = prefix_cache.lookup(
+                tokens, model_fingerprint=cache_fingerprint
+            )
+            if callable(trace_event):
+                trace_event(
+                    "phase0.setup.prefix_cache_lookup",
+                    backend="nnsight",
+                    cache_state=cache_diag.cache_state,
+                    cached_prefix_len=cache_diag.cached_prefix_len,
+                    reused_positions=cache_diag.reused_positions,
+                    recomputed_positions=cache_diag.recomputed_positions,
+                    reason=cache_diag.reason,
+                )
+
         trace_start = time.perf_counter()
         if callable(trace_event):
             trace_event(
@@ -540,6 +571,27 @@ class NNSightReplacementModel(LanguageModel):
                 mlp_in_shape=tuple(mlp_in_cache.shape),
                 mlp_out_shape=tuple(mlp_out_cache.shape),
             )
+
+        # Populate the prefix cache with this run's raw pre-sparsification
+        # tensors so future temporal-tracing steps can reuse them.  We cache
+        # the pre-sparsification activations deliberately (see
+        # prefix_cache.py docstring) — sparsification picks a global top-K
+        # that fluctuates at the boundary when the prompt grows; caching
+        # the raw tensors and re-sparsifying each step preserves byte-exact
+        # uncached behavior.
+        if prefix_cache is not None and cache_fingerprint is not None:
+            prefix_cache.store(
+                token_ids=tokens,
+                mlp_in=mlp_in_cache,
+                mlp_out=mlp_out_cache,
+                model_fingerprint=cache_fingerprint,
+            )
+            if callable(trace_event):
+                trace_event(
+                    "phase0.setup.prefix_cache_store",
+                    backend="nnsight",
+                    stored_prefix_len=int(tokens.numel()),
+                )
 
         component_start = time.perf_counter()
         if callable(trace_event):
