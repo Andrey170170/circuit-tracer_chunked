@@ -7,8 +7,10 @@ from safetensors.torch import save_file
 
 from circuit_tracer.attribution.attribute import attribute as attribute_top_level
 from circuit_tracer.attribution.attribute_nnsight import (
+    _annotate_phase4_selection_on_feature_semantic_descriptors,
     _build_cross_cluster_runtime_snapshot,
     _build_matrix_abs_stats,
+    _build_feature_semantic_descriptors_payload,
     _build_phase4_normalization_stats,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
@@ -825,6 +827,119 @@ def test_build_phase3_seed_bundle_payload_canonicalizes_cpu_tensors() -> None:
     assert torch.equal(
         payload["frontier_post_locality"],
         torch.tensor([0, 2], dtype=torch.int64),
+    )
+
+
+def test_build_feature_semantic_descriptors_payload_is_bounded_and_deterministic() -> None:
+    payload = _build_feature_semantic_descriptors_payload(
+        active_features=torch.tensor(
+            [[0, 0, 7], [0, 1, 3], [1, 0, 4], [1, 1, 9], [2, 0, 5]],
+            dtype=torch.int64,
+        ),
+        activation_values=torch.tensor([0.2, -0.5, 0.1, 0.9, -0.1], dtype=torch.float32),
+        seed_feature_influences=torch.tensor([0.4, 0.2, 0.7, 0.1, 0.3], dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([2, 1], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([1, 4], dtype=torch.int64),
+        total_active_features=5,
+        status="captured",
+        semantic_descriptor_top_k=3,
+        semantic_descriptor_dim=8,
+    )
+    payload_again = _build_feature_semantic_descriptors_payload(
+        active_features=torch.tensor(
+            [[0, 0, 7], [0, 1, 3], [1, 0, 4], [1, 1, 9], [2, 0, 5]],
+            dtype=torch.int64,
+        ),
+        activation_values=torch.tensor([0.2, -0.5, 0.1, 0.9, -0.1], dtype=torch.float32),
+        seed_feature_influences=torch.tensor([0.4, 0.2, 0.7, 0.1, 0.3], dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([2, 1], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([1, 4], dtype=torch.int64),
+        total_active_features=5,
+        status="captured",
+        semantic_descriptor_top_k=3,
+        semantic_descriptor_dim=8,
+    )
+
+    assert payload["status"] == "captured"
+    assert payload["descriptor_version"] == "v1"
+    assert payload["descriptor_kind"] == "fallback_identity_metadata_v1"
+    assert payload["descriptor_dim"] == 8
+    assert payload["semantic_descriptor_top_k"] == 3
+    assert payload["candidate_count"] == 3
+    assert payload["total_active_features"] == 5
+    assert cast(torch.Tensor, payload["candidate_features"]).shape == (3, 3)
+    assert cast(torch.Tensor, payload["candidate_row_indices"]).shape == (3,)
+    assert cast(torch.Tensor, payload["activation_value"]).shape == (3,)
+    assert cast(torch.Tensor, payload["seed_influence"]).shape == (3,)
+    assert cast(torch.Tensor, payload["seed_rank"]).shape == (3,)
+    assert cast(torch.Tensor, payload["is_top_seed"]).dtype == torch.bool
+    assert cast(torch.Tensor, payload["is_frontier_pre"]).dtype == torch.bool
+    assert cast(torch.Tensor, payload["is_frontier_post"]).dtype == torch.bool
+    assert cast(torch.Tensor, payload["frontier_pre_rank"]).dtype == torch.int64
+    assert cast(torch.Tensor, payload["frontier_post_rank"]).dtype == torch.int64
+    assert cast(torch.Tensor, payload["semantic_sketch"]).shape == (3, 8)
+    assert cast(torch.Tensor, payload["semantic_sketch"]).dtype == torch.float32
+
+    assert torch.equal(
+        cast(torch.Tensor, payload["candidate_row_indices"]),
+        cast(torch.Tensor, payload_again["candidate_row_indices"]),
+    )
+    assert torch.allclose(
+        cast(torch.Tensor, payload["semantic_sketch"]),
+        cast(torch.Tensor, payload_again["semantic_sketch"]),
+    )
+
+
+def test_build_feature_semantic_descriptors_payload_handles_missing_seed_scores() -> None:
+    payload = _build_feature_semantic_descriptors_payload(
+        active_features=torch.tensor([[0, 0, 1], [0, 1, 2], [1, 0, 3]], dtype=torch.int64),
+        activation_values=torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        seed_feature_influences=torch.empty(0, dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([1], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([2], dtype=torch.int64),
+        total_active_features=3,
+        status="skipped_all_features_included",
+        semantic_descriptor_top_k=4,
+        semantic_descriptor_dim=6,
+    )
+
+    assert payload["seed_influence_available"] is False
+    assert torch.equal(
+        cast(torch.Tensor, payload["seed_rank"]),
+        torch.full((2,), -1, dtype=torch.int64),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, payload["is_top_seed"]),
+        torch.zeros(2, dtype=torch.bool),
+    )
+
+
+def test_annotate_phase4_selection_on_feature_semantic_descriptors_marks_membership() -> None:
+    payload = _build_feature_semantic_descriptors_payload(
+        active_features=torch.tensor([[0, 0, 1], [0, 1, 2], [1, 0, 3]], dtype=torch.int64),
+        activation_values=torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        seed_feature_influences=torch.tensor([0.5, 0.3, 0.1], dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([0, 1], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([1, 2], dtype=torch.int64),
+        total_active_features=3,
+        status="captured",
+        semantic_descriptor_top_k=3,
+        semantic_descriptor_dim=4,
+    )
+
+    _annotate_phase4_selection_on_feature_semantic_descriptors(
+        payload,
+        selected_features=torch.tensor([2, 0], dtype=torch.int64),
+    )
+
+    assert payload["phase4_selection_available"] is True
+    assert torch.equal(
+        cast(torch.Tensor, payload["is_selected_phase4"]),
+        torch.tensor([True, False, True], dtype=torch.bool),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, payload["phase4_selected_rank"]),
+        torch.tensor([1, -1, 0], dtype=torch.int64),
     )
 
 

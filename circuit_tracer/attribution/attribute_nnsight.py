@@ -1101,6 +1101,283 @@ def _build_phase3_seed_bundle_payload(
     }
 
 
+def _build_semantic_sketch_fallback(
+    *,
+    candidate_features: torch.Tensor,
+    activation_value: torch.Tensor,
+    seed_influence: torch.Tensor,
+    seed_rank: torch.Tensor,
+    frontier_pre_rank: torch.Tensor,
+    frontier_post_rank: torch.Tensor,
+    is_top_seed: torch.Tensor,
+    is_frontier_pre: torch.Tensor,
+    is_frontier_post: torch.Tensor,
+    descriptor_dim: int,
+) -> torch.Tensor:
+    candidate_cpu = candidate_features.detach().to(device="cpu", dtype=torch.int64)
+    candidate_count = int(candidate_cpu.shape[0])
+    descriptor_dim = int(descriptor_dim)
+    if descriptor_dim <= 0:
+        raise ValueError("semantic_descriptor_dim must be > 0")
+    if candidate_count == 0:
+        return torch.empty((0, descriptor_dim), dtype=torch.float32)
+
+    candidate_np = candidate_cpu.numpy().astype(np.uint64, copy=False)
+    layer_ids = candidate_np[:, 0]
+    position_ids = candidate_np[:, 1]
+    feature_ids = candidate_np[:, 2]
+
+    seeds = (
+        layer_ids * np.uint64(0x9E3779B185EBCA87)
+        ^ position_ids * np.uint64(0xC2B2AE3D27D4EB4F)
+        ^ feature_ids * np.uint64(0x165667B19E3779F9)
+        ^ np.uint64(0xD6E8FEB86659FD93)
+    )
+    dim_offsets = np.arange(descriptor_dim, dtype=np.uint64)[None, :]
+    z = seeds[:, None] + dim_offsets * np.uint64(0x9E3779B97F4A7C15)
+    z = (z + np.uint64(0x9E3779B97F4A7C15)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    z = z ^ (z >> np.uint64(31))
+    base = ((z >> np.uint64(11)).astype(np.float64) / float(1 << 53)) * 2.0 - 1.0
+
+    activation_np = activation_value.detach().to(device="cpu", dtype=torch.float64).numpy()
+    seed_influence_np = seed_influence.detach().to(device="cpu", dtype=torch.float64).numpy()
+    seed_rank_np = seed_rank.detach().to(device="cpu", dtype=torch.int64).numpy()
+    frontier_pre_rank_np = frontier_pre_rank.detach().to(device="cpu", dtype=torch.int64).numpy()
+    frontier_post_rank_np = frontier_post_rank.detach().to(device="cpu", dtype=torch.int64).numpy()
+    is_top_seed_np = is_top_seed.detach().to(device="cpu", dtype=torch.float64).numpy()
+    is_frontier_pre_np = is_frontier_pre.detach().to(device="cpu", dtype=torch.float64).numpy()
+    is_frontier_post_np = is_frontier_post.detach().to(device="cpu", dtype=torch.float64).numpy()
+
+    def _inverse_rank(rank_values: np.ndarray) -> np.ndarray:
+        out = np.zeros(rank_values.shape[0], dtype=np.float64)
+        valid = rank_values >= 0
+        out[valid] = 1.0 / (rank_values[valid].astype(np.float64) + 1.0)
+        return out
+
+    inverse_seed_rank = _inverse_rank(seed_rank_np)
+    inverse_pre_rank = _inverse_rank(frontier_pre_rank_np)
+    inverse_post_rank = _inverse_rank(frontier_post_rank_np)
+
+    metadata = np.stack(
+        [
+            np.tanh(activation_np),
+            np.tanh(seed_influence_np),
+            inverse_seed_rank,
+            inverse_pre_rank,
+            inverse_post_rank,
+            is_top_seed_np,
+            is_frontier_pre_np,
+            is_frontier_post_np,
+        ],
+        axis=1,
+    )
+    dim_positions = np.arange(descriptor_dim, dtype=np.float64) + 1.0
+    projection = np.vstack(
+        [
+            np.cos(dim_positions * 0.17),
+            np.sin(dim_positions * 0.31),
+            np.cos(dim_positions * 0.47),
+            np.sin(dim_positions * 0.73),
+            np.cos(dim_positions * 0.89),
+            np.sin(dim_positions * 1.07),
+            np.cos(dim_positions * 1.21),
+            np.sin(dim_positions * 1.37),
+        ]
+    )
+    sketch = np.tanh(base + 0.25 * (metadata @ projection)).astype(np.float32, copy=False)
+
+    if descriptor_dim > 0:
+        sketch[:, 0] = np.tanh(activation_np).astype(np.float32, copy=False)
+    if descriptor_dim > 1:
+        sketch[:, 1] = np.tanh(seed_influence_np).astype(np.float32, copy=False)
+    if descriptor_dim > 2:
+        sketch[:, 2] = inverse_seed_rank.astype(np.float32, copy=False)
+    if descriptor_dim > 3:
+        sketch[:, 3] = inverse_pre_rank.astype(np.float32, copy=False)
+    if descriptor_dim > 4:
+        sketch[:, 4] = inverse_post_rank.astype(np.float32, copy=False)
+    if descriptor_dim > 5:
+        sketch[:, 5] = is_top_seed_np.astype(np.float32, copy=False)
+    if descriptor_dim > 6:
+        sketch[:, 6] = is_frontier_pre_np.astype(np.float32, copy=False)
+    if descriptor_dim > 7:
+        sketch[:, 7] = is_frontier_post_np.astype(np.float32, copy=False)
+
+    return torch.from_numpy(np.ascontiguousarray(sketch))
+
+
+def _build_feature_semantic_descriptors_payload(
+    *,
+    active_features: torch.Tensor,
+    activation_values: torch.Tensor,
+    seed_feature_influences: torch.Tensor,
+    frontier_pre_locality: torch.Tensor,
+    frontier_post_locality: torch.Tensor,
+    total_active_features: int,
+    status: str,
+    semantic_descriptor_top_k: int,
+    semantic_descriptor_dim: int,
+) -> dict[str, object]:
+    top_k = int(semantic_descriptor_top_k)
+    descriptor_dim = int(semantic_descriptor_dim)
+    if top_k <= 0:
+        raise ValueError("semantic_descriptor_top_k must be > 0")
+    if descriptor_dim <= 0:
+        raise ValueError("semantic_descriptor_dim must be > 0")
+
+    active_features_cpu = active_features.detach().to(device="cpu", dtype=torch.int64)
+    activation_values_cpu = activation_values.detach().to(device="cpu", dtype=torch.float32)
+    feature_count = int(active_features_cpu.shape[0])
+    if activation_values_cpu.numel() != feature_count:
+        raise ValueError(
+            "activation_values length must match active_features row count "
+            f"({activation_values_cpu.numel()} != {feature_count})"
+        )
+
+    seed_influences_cpu = seed_feature_influences.detach().to(device="cpu", dtype=torch.float64)
+    seed_influence_available = seed_influences_cpu.numel() == feature_count
+    if not seed_influence_available:
+        seed_influences_cpu = torch.zeros(feature_count, dtype=torch.float64)
+
+    frontier_pre_cpu = frontier_pre_locality.detach().to(device="cpu", dtype=torch.int64)
+    frontier_post_cpu = frontier_post_locality.detach().to(device="cpu", dtype=torch.int64)
+    valid_frontier_pre = frontier_pre_cpu[
+        (frontier_pre_cpu >= 0) & (frontier_pre_cpu < feature_count)
+    ]
+    valid_frontier_post = frontier_post_cpu[
+        (frontier_post_cpu >= 0) & (frontier_post_cpu < feature_count)
+    ]
+
+    seed_rank_full = torch.full((feature_count,), -1, dtype=torch.int64)
+    top_seed_mask_full = torch.zeros(feature_count, dtype=torch.bool)
+    if seed_influence_available and feature_count > 0:
+        ranked = torch.argsort(seed_influences_cpu, descending=True)
+        seed_rank_full[ranked] = torch.arange(ranked.numel(), dtype=torch.int64)
+        top_seed_indices = ranked[: min(feature_count, top_k)]
+        top_seed_mask_full[top_seed_indices] = True
+
+    frontier_pre_rank_full = torch.full((feature_count,), -1, dtype=torch.int64)
+    for rank, feature_idx in enumerate(valid_frontier_pre.tolist()):
+        if frontier_pre_rank_full[feature_idx] < 0:
+            frontier_pre_rank_full[feature_idx] = int(rank)
+
+    frontier_post_rank_full = torch.full((feature_count,), -1, dtype=torch.int64)
+    for rank, feature_idx in enumerate(valid_frontier_post.tolist()):
+        if frontier_post_rank_full[feature_idx] < 0:
+            frontier_post_rank_full[feature_idx] = int(rank)
+
+    candidate_mask = torch.zeros(feature_count, dtype=torch.bool)
+    candidate_mask[top_seed_mask_full] = True
+    candidate_mask[frontier_pre_rank_full >= 0] = True
+    candidate_mask[frontier_post_rank_full >= 0] = True
+    candidate_row_indices = torch.where(candidate_mask)[0].to(dtype=torch.int64)
+
+    if candidate_row_indices.numel() > top_k:
+        max_rank = max(feature_count, top_k) + 1
+        candidate_rows = [int(value) for value in candidate_row_indices.tolist()]
+
+        def _candidate_sort_key(feature_idx: int) -> tuple[int, int, int, int, int, int, int]:
+            seed_rank = int(seed_rank_full[feature_idx].item())
+            pre_rank = int(frontier_pre_rank_full[feature_idx].item())
+            post_rank = int(frontier_post_rank_full[feature_idx].item())
+            return (
+                0 if seed_rank >= 0 else 1,
+                seed_rank if seed_rank >= 0 else max_rank,
+                0 if pre_rank >= 0 else 1,
+                pre_rank if pre_rank >= 0 else max_rank,
+                0 if post_rank >= 0 else 1,
+                post_rank if post_rank >= 0 else max_rank,
+                feature_idx,
+            )
+
+        candidate_rows = sorted(candidate_rows, key=_candidate_sort_key)[:top_k]
+        candidate_row_indices = torch.tensor(candidate_rows, dtype=torch.int64)
+
+    candidate_features = active_features_cpu[candidate_row_indices]
+    candidate_activation = activation_values_cpu[candidate_row_indices]
+    candidate_seed_influence = seed_influences_cpu[candidate_row_indices]
+    candidate_seed_rank = seed_rank_full[candidate_row_indices]
+    candidate_is_top_seed = top_seed_mask_full[candidate_row_indices]
+    candidate_frontier_pre_rank = frontier_pre_rank_full[candidate_row_indices]
+    candidate_is_frontier_pre = candidate_frontier_pre_rank >= 0
+    candidate_frontier_post_rank = frontier_post_rank_full[candidate_row_indices]
+    candidate_is_frontier_post = candidate_frontier_post_rank >= 0
+    candidate_count = int(candidate_row_indices.numel())
+
+    semantic_sketch = _build_semantic_sketch_fallback(
+        candidate_features=candidate_features,
+        activation_value=candidate_activation,
+        seed_influence=candidate_seed_influence,
+        seed_rank=candidate_seed_rank,
+        frontier_pre_rank=candidate_frontier_pre_rank,
+        frontier_post_rank=candidate_frontier_post_rank,
+        is_top_seed=candidate_is_top_seed,
+        is_frontier_pre=candidate_is_frontier_pre,
+        is_frontier_post=candidate_is_frontier_post,
+        descriptor_dim=descriptor_dim,
+    )
+
+    return {
+        "status": str(status),
+        "descriptor_version": "v1",
+        "descriptor_kind": "fallback_identity_metadata_v1",
+        "descriptor_dim": int(descriptor_dim),
+        "semantic_descriptor_top_k": int(top_k),
+        "candidate_count": int(candidate_count),
+        "total_active_features": int(total_active_features),
+        "candidate_features": candidate_features,
+        "candidate_row_indices": candidate_row_indices,
+        "activation_value": candidate_activation,
+        "seed_influence": candidate_seed_influence,
+        "seed_rank": candidate_seed_rank,
+        "is_top_seed": candidate_is_top_seed,
+        "is_frontier_pre": candidate_is_frontier_pre,
+        "frontier_pre_rank": candidate_frontier_pre_rank,
+        "is_frontier_post": candidate_is_frontier_post,
+        "frontier_post_rank": candidate_frontier_post_rank,
+        "is_selected_phase4": torch.zeros(candidate_count, dtype=torch.bool),
+        "phase4_selected_rank": torch.full((candidate_count,), -1, dtype=torch.int64),
+        "phase4_selection_available": False,
+        "seed_influence_available": bool(seed_influence_available),
+        "semantic_sketch": semantic_sketch,
+    }
+
+
+def _annotate_phase4_selection_on_feature_semantic_descriptors(
+    payload: dict[str, object], *, selected_features: torch.Tensor
+) -> None:
+    candidate_row_indices = payload.get("candidate_row_indices")
+    if not isinstance(candidate_row_indices, torch.Tensor):
+        return
+
+    candidate_row_indices_cpu = candidate_row_indices.detach().to(device="cpu", dtype=torch.int64)
+    selected_features_cpu = selected_features.detach().to(device="cpu", dtype=torch.int64)
+    selected_rank_lookup = {
+        int(feature_idx): int(rank)
+        for rank, feature_idx in enumerate(selected_features_cpu.tolist())
+    }
+
+    selected_mask = torch.tensor(
+        [
+            int(feature_idx) in selected_rank_lookup
+            for feature_idx in candidate_row_indices_cpu.tolist()
+        ],
+        dtype=torch.bool,
+    )
+    selected_rank = torch.tensor(
+        [
+            selected_rank_lookup.get(int(feature_idx), -1)
+            for feature_idx in candidate_row_indices_cpu
+        ],
+        dtype=torch.int64,
+    )
+    payload["is_selected_phase4"] = selected_mask
+    payload["phase4_selected_rank"] = selected_rank
+    payload["phase4_selection_available"] = True
+
+
 def _record_phase4_refresh_debug(
     anomaly_debug_result: dict[str, object] | None,
     *,
@@ -1718,6 +1995,9 @@ def attribute(
     phase4_anomaly_debug: bool = False,
     cross_cluster_debug: bool = False,
     capture_phase3_seed_bundle: bool = False,
+    capture_feature_semantic_descriptors: bool = False,
+    semantic_descriptor_top_k: int = 2048,
+    semantic_descriptor_dim: int = 64,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
@@ -1788,6 +2068,12 @@ def attribute(
             scaffolding (Phase 0 through pre-Phase-4 checkpoints).
         capture_phase3_seed_bundle: Enable opt-in Phase-3 seed-bundle payload
             capture for compact exact-chunked runs.
+        capture_feature_semantic_descriptors: Enable opt-in bounded semantic
+            descriptor payload for Phase-3 candidate features.
+        semantic_descriptor_top_k: Maximum number of candidate features to
+            include in semantic descriptor payloads.
+        semantic_descriptor_dim: Descriptor width (number of float values)
+            for each candidate feature sketch.
         telemetry_max_events: Optional cap for in-memory telemetry event storage.
             If omitted, an environment/default policy is used.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
@@ -1848,6 +2134,9 @@ def attribute(
             phase4_anomaly_debug=phase4_anomaly_debug,
             cross_cluster_debug=cross_cluster_debug,
             capture_phase3_seed_bundle=capture_phase3_seed_bundle,
+            capture_feature_semantic_descriptors=capture_feature_semantic_descriptors,
+            semantic_descriptor_top_k=semantic_descriptor_top_k,
+            semantic_descriptor_dim=semantic_descriptor_dim,
             telemetry_max_events=telemetry_max_events,
             compact_output=compact_output,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
@@ -1896,6 +2185,9 @@ def _run_attribution(
     phase4_anomaly_debug: bool = False,
     cross_cluster_debug: bool = False,
     capture_phase3_seed_bundle: bool = False,
+    capture_feature_semantic_descriptors: bool = False,
+    semantic_descriptor_top_k: int = 2048,
+    semantic_descriptor_dim: int = 64,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
@@ -1948,6 +2240,13 @@ def _run_attribution(
     shadow_debug_compute_dtype = _dtype_from_name(resolved_dtype_map["shadow_debug_compute_dtype"])
     cross_cluster_debug_enabled = bool(cross_cluster_debug)
     capture_phase3_seed_bundle_enabled = bool(capture_phase3_seed_bundle)
+    capture_feature_semantic_descriptors_enabled = bool(capture_feature_semantic_descriptors)
+    semantic_descriptor_top_k = int(semantic_descriptor_top_k)
+    semantic_descriptor_dim = int(semantic_descriptor_dim)
+    if semantic_descriptor_top_k <= 0:
+        raise ValueError("semantic_descriptor_top_k must be > 0")
+    if semantic_descriptor_dim <= 0:
+        raise ValueError("semantic_descriptor_dim must be > 0")
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
         compact_output=compact_output,
@@ -1977,6 +2276,11 @@ def _run_attribution(
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
             "capture_phase3_seed_bundle_enabled": capture_phase3_seed_bundle_enabled,
+            "capture_feature_semantic_descriptors_enabled": (
+                capture_feature_semantic_descriptors_enabled
+            ),
+            "semantic_descriptor_top_k": semantic_descriptor_top_k,
+            "semantic_descriptor_dim": semantic_descriptor_dim,
         },
     )
 
@@ -2019,6 +2323,13 @@ def _run_attribution(
     if capture_phase3_seed_bundle_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "capture_phase3_seed_bundle requires compact_output=True and exact_chunked_decoder=True"
+        )
+    if capture_feature_semantic_descriptors_enabled and not (
+        compact_output and exact_chunked_decoder
+    ):
+        raise ValueError(
+            "capture_feature_semantic_descriptors requires compact_output=True and "
+            "exact_chunked_decoder=True"
         )
     if phase4_anomaly_debug_enabled:
         anomaly_debug_result = {
@@ -2117,6 +2428,7 @@ def _run_attribution(
     feature_row_store: _FileBackedFeatureRowStore | None = None
     compact_output_result: dict[str, object] | None = None
     phase3_seed_bundle_payload: dict[str, object] | None = None
+    feature_semantic_descriptors_payload: dict[str, object] | None = None
 
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
@@ -2831,7 +3143,11 @@ def _run_attribution(
         if callable(reset_decoder_cache):
             reset_decoder_cache()
 
-        if cross_cluster_debug_summary is not None or capture_phase3_seed_bundle_enabled:
+        if (
+            cross_cluster_debug_summary is not None
+            or capture_phase3_seed_bundle_enabled
+            or capture_feature_semantic_descriptors_enabled
+        ):
             phase3_runtime_summary: dict[str, object] = {}
             phase3_runtime_stream: dict[str, object] = {}
             if cross_cluster_debug_summary is not None:
@@ -2932,6 +3248,20 @@ def _run_attribution(
                         status="captured",
                         planner_compute_dtype=planner_compute_dtype,
                         influence_compute_dtype=influence_compute_dtype,
+                    )
+                if capture_feature_semantic_descriptors_enabled:
+                    feature_semantic_descriptors_payload = (
+                        _build_feature_semantic_descriptors_payload(
+                            active_features=activation_matrix.indices().T,
+                            activation_values=activation_matrix.values(),
+                            seed_feature_influences=seed_feature_influences,
+                            frontier_pre_locality=pre_locality_pending,
+                            frontier_post_locality=post_locality_pending,
+                            total_active_features=int(total_active_feats),
+                            status="captured",
+                            semantic_descriptor_top_k=semantic_descriptor_top_k,
+                            semantic_descriptor_dim=semantic_descriptor_dim,
+                        )
                     )
 
                 if cross_cluster_debug_summary is not None:
@@ -3059,6 +3389,20 @@ def _run_attribution(
                         status="skipped_all_features_included",
                         planner_compute_dtype=planner_compute_dtype,
                         influence_compute_dtype=influence_compute_dtype,
+                    )
+                if capture_feature_semantic_descriptors_enabled:
+                    feature_semantic_descriptors_payload = (
+                        _build_feature_semantic_descriptors_payload(
+                            active_features=activation_matrix.indices().T,
+                            activation_values=activation_matrix.values(),
+                            seed_feature_influences=torch.empty(0, dtype=planner_compute_dtype),
+                            frontier_pre_locality=torch.empty(0, dtype=torch.long),
+                            frontier_post_locality=torch.empty(0, dtype=torch.long),
+                            total_active_features=int(total_active_feats),
+                            status="skipped_all_features_included",
+                            semantic_descriptor_top_k=semantic_descriptor_top_k,
+                            semantic_descriptor_dim=semantic_descriptor_dim,
+                        )
                     )
             if cross_cluster_debug_summary is not None:
                 deterministic_shadow = phase3_seed_summary.get("deterministic_shadow")
@@ -4128,6 +4472,13 @@ def _run_attribution(
         # Phase 5: packaging graph / compact output
         phase5_start = time.perf_counter()
         selected_features = torch.where(visited)[0]
+        if capture_feature_semantic_descriptors_enabled and isinstance(
+            feature_semantic_descriptors_payload, dict
+        ):
+            _annotate_phase4_selection_on_feature_semantic_descriptors(
+                feature_semantic_descriptors_payload,
+                selected_features=selected_features,
+            )
         if compact_output:
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
@@ -4173,6 +4524,11 @@ def _run_attribution(
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
                 "cross_cluster_debug_enabled": bool(cross_cluster_debug_enabled),
                 "capture_phase3_seed_bundle_enabled": bool(capture_phase3_seed_bundle_enabled),
+                "capture_feature_semantic_descriptors_enabled": bool(
+                    capture_feature_semantic_descriptors_enabled
+                ),
+                "semantic_descriptor_top_k": int(semantic_descriptor_top_k),
+                "semantic_descriptor_dim": int(semantic_descriptor_dim),
                 "phase4_refresh_count": int(phase4_refresh_count),
                 "phase4_batch_count": int(phase4_batch_count),
                 "phase4_refresh_elapsed_seconds_total": round(
@@ -4189,6 +4545,10 @@ def _run_attribution(
             }
             if capture_phase3_seed_bundle_enabled:
                 compact_output_result["phase3_seed_bundle"] = phase3_seed_bundle_payload
+            if capture_feature_semantic_descriptors_enabled:
+                compact_output_result["feature_semantic_descriptors"] = (
+                    feature_semantic_descriptors_payload
+                )
             if cross_cluster_debug_summary is not None:
                 cross_cluster_debug_summary["status"] = "captured"
                 phase4_runtime_summary, phase4_runtime_stream = (
