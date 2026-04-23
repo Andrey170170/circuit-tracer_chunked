@@ -21,11 +21,13 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _compute_phase4_planned_feature_batch_size,
     _compute_phase4_locality_shaped_batch_end,
     _compute_phase4_locality_shaped_frontier_size,
+    _plan_phase4_frontier_membership_preserving_v1,
     _reorder_pending_for_phase4_locality,
     _resolve_internal_dtype_map,
     _resolve_internal_precision_requested,
     _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
+    _resolve_phase4_scheduler_mode,
 )
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
@@ -687,6 +689,74 @@ def test_reorder_pending_for_phase4_locality_groups_layer_then_chunk_then_positi
     )
 
     assert torch.equal(reordered, torch.tensor([5, 1, 3, 2, 4, 0], dtype=torch.long))
+
+
+def test_phase4_scheduler_mode_resolves_and_accepts_legacy_alias() -> None:
+    assert _resolve_phase4_scheduler_mode("locality") == "locality"
+    assert _resolve_phase4_scheduler_mode("planner_v1") == "planner_v1"
+    assert _resolve_phase4_scheduler_mode("legacy") == "locality"
+
+
+def test_phase4_scheduler_mode_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="phase4_scheduler_mode must be one of"):
+        _resolve_phase4_scheduler_mode("unsupported")
+
+
+def test_phase4_planner_v1_preserves_membership_and_boundaries() -> None:
+    pending_candidates = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+    feat_layers = torch.zeros(6, dtype=torch.long)
+    feat_positions = torch.arange(6, dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+
+    plan = _plan_phase4_frontier_membership_preserving_v1(
+        pending_candidates,
+        max_batch_size=3,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert torch.equal(plan.selected_frontier, torch.tensor([0, 1, 2, 3], dtype=torch.long))
+    assert plan.batch_boundaries == [(0, 2), (2, 4)]
+    assert plan.boundary_reason_counts == {"split_at_last_boundary": 1, "tail_complete": 1}
+    assert plan.selected_membership_hash is not None
+    assert plan.selected_order_hash is not None
+    assert plan.invariant_summary["membership_preserved"] is True
+    assert plan.locality_fragmentation_summary["selected_count"] == 4
+    assert plan.locality_fragmentation_summary["batch_count"] == 2
+
+
+def test_phase4_planner_v1_rejects_invalid_parameters_and_duplicates() -> None:
+    feat_layers = torch.zeros(4, dtype=torch.long)
+    feat_positions = torch.arange(4, dtype=torch.long)
+    feat_ids = torch.arange(4, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="max_batch_size must be > 0"):
+        _plan_phase4_frontier_membership_preserving_v1(
+            torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            max_batch_size=0,
+            max_batches=1,
+            feat_layers=feat_layers,
+            feat_positions=feat_positions,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=False,
+            decoder_chunk_size=None,
+        )
+
+    with pytest.raises(RuntimeError, match="duplicate"):
+        _plan_phase4_frontier_membership_preserving_v1(
+            torch.tensor([0, 1, 1, 2], dtype=torch.long),
+            max_batch_size=2,
+            max_batches=2,
+            feat_layers=feat_layers,
+            feat_positions=feat_positions,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=False,
+            decoder_chunk_size=None,
+        )
 
 
 def test_phase4_locality_shaped_batch_end_prefers_layer_chunk_boundaries() -> None:

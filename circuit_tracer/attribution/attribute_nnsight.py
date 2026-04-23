@@ -31,6 +31,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Literal, cast
 
 import numpy as np
@@ -138,6 +139,39 @@ _PHASE4_REFRESH_MEMORY_ATTR_KEYS: tuple[str, ...] = (
     "cuda_allocated_gib",
     "cuda_reserved_gib",
 )
+
+_PHASE4_SCHEDULER_MODE_ALIAS: dict[str, str] = {
+    "legacy": "locality",
+}
+
+_PHASE4_SCHEDULER_VERSION_BY_MODE: dict[str, str] = {
+    "locality": "locality_v1",
+    "planner_v1": "planner_v1",
+}
+
+_PHASE4_SCHEDULER_POLICY_BY_MODE: dict[str, str] = {
+    "locality": "fixed_frontier_locality",
+    "planner_v1": "membership_preserving_locality",
+}
+
+
+@dataclass(frozen=True)
+class _Phase4SchedulerConfig:
+    mode: Literal["locality", "planner_v1"]
+    version: str
+    policy: str
+    debug: bool
+
+
+@dataclass(frozen=True)
+class _Phase4FrontierPlan:
+    selected_frontier: torch.Tensor
+    batch_boundaries: list[tuple[int, int]]
+    selected_membership_hash: str | None
+    selected_order_hash: str | None
+    locality_fragmentation_summary: dict[str, object]
+    boundary_reason_counts: dict[str, int]
+    invariant_summary: dict[str, object]
 
 
 def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype:
@@ -644,7 +678,7 @@ def _reorder_pending_for_phase4_locality(
     return torch.tensor(pending_list, dtype=pending.dtype, device=pending.device)
 
 
-def _compute_phase4_locality_shaped_batch_end(
+def _compute_phase4_locality_shaped_batch_end_with_reason(
     pending: torch.Tensor,
     *,
     pending_offset: int,
@@ -653,7 +687,7 @@ def _compute_phase4_locality_shaped_batch_end(
     feat_ids: torch.Tensor,
     exact_chunked_decoder: bool,
     decoder_chunk_size: int | None,
-) -> int:
+) -> tuple[int, str]:
     """Pick a Phase-4 batch end that prefers layer/chunk run boundaries.
 
     This keeps the frontier membership fixed and preserves ordering while avoiding
@@ -666,17 +700,17 @@ def _compute_phase4_locality_shaped_batch_end(
 
     total_pending = int(pending.numel())
     if pending_offset >= total_pending:
-        return total_pending
+        return total_pending, "pending_exhausted"
 
     if max_batch_size <= 0:
         raise ValueError("max_batch_size must be > 0")
 
     if max_batch_size == 1:
-        return min(pending_offset + max_batch_size, total_pending)
+        return min(pending_offset + max_batch_size, total_pending), "max_batch_size_one"
 
     baseline_end = min(pending_offset + max_batch_size, total_pending)
     if baseline_end >= total_pending:
-        return baseline_end
+        return baseline_end, "tail_complete"
 
     use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
     probe = pending[pending_offset : baseline_end + 1]
@@ -692,9 +726,9 @@ def _compute_phase4_locality_shaped_batch_end(
 
     split_index = max_batch_size - 1
     if int(probe_layers[split_index].item()) != int(probe_layers[split_index + 1].item()):
-        return baseline_end
+        return baseline_end, "boundary_aligned"
     if int(probe_chunks[split_index].item()) != int(probe_chunks[split_index + 1].item()):
-        return baseline_end
+        return baseline_end, "boundary_aligned"
 
     prefix_layers = probe_layers[:max_batch_size]
     prefix_chunks = probe_chunks[:max_batch_size]
@@ -703,7 +737,7 @@ def _compute_phase4_locality_shaped_batch_end(
     )
     boundary_positions = torch.nonzero(boundaries, as_tuple=False)
     if boundary_positions.numel() == 0:
-        return baseline_end
+        return baseline_end, "split_unavailable"
 
     last_boundary = int(boundary_positions[-1].item())
     split_batch_size = last_boundary + 1
@@ -714,11 +748,33 @@ def _compute_phase4_locality_shaped_batch_end(
     min_split_batch_size = max(2, max_batch_size // 2)
     max_preserved_suffix_run = max(1, max_batch_size // 3)
     if split_batch_size < min_split_batch_size:
-        return baseline_end
+        return baseline_end, "split_too_small"
     if preserved_suffix_run > max_preserved_suffix_run:
-        return baseline_end
+        return baseline_end, "preserved_suffix_too_long"
 
-    return pending_offset + split_batch_size
+    return pending_offset + split_batch_size, "split_at_last_boundary"
+
+
+def _compute_phase4_locality_shaped_batch_end(
+    pending: torch.Tensor,
+    *,
+    pending_offset: int,
+    max_batch_size: int,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> int:
+    batch_end, _ = _compute_phase4_locality_shaped_batch_end_with_reason(
+        pending,
+        pending_offset=pending_offset,
+        max_batch_size=max_batch_size,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=exact_chunked_decoder,
+        decoder_chunk_size=decoder_chunk_size,
+    )
+    return batch_end
 
 
 def _compute_phase4_locality_shaped_frontier_size(
@@ -754,6 +810,235 @@ def _compute_phase4_locality_shaped_frontier_size(
             raise RuntimeError("Phase 4 locality shaping produced a non-advancing batch boundary")
         pending_offset = batch_end
     return pending_offset
+
+
+def _resolve_phase4_scheduler_mode(
+    phase4_scheduler_mode: str,
+) -> Literal["locality", "planner_v1"]:
+    normalized = str(phase4_scheduler_mode).strip().lower()
+    normalized = _PHASE4_SCHEDULER_MODE_ALIAS.get(normalized, normalized)
+    if normalized not in _PHASE4_SCHEDULER_POLICY_BY_MODE:
+        allowed = ", ".join(
+            sorted(set(_PHASE4_SCHEDULER_POLICY_BY_MODE) | set(_PHASE4_SCHEDULER_MODE_ALIAS))
+        )
+        raise ValueError(
+            f"phase4_scheduler_mode must be one of: {allowed} (got {phase4_scheduler_mode!r})"
+        )
+    return cast(Literal["locality", "planner_v1"], normalized)
+
+
+def _resolve_phase4_scheduler_config(
+    *,
+    phase4_scheduler_mode: str,
+    phase4_scheduler_debug: bool,
+) -> _Phase4SchedulerConfig:
+    mode = _resolve_phase4_scheduler_mode(phase4_scheduler_mode)
+    return _Phase4SchedulerConfig(
+        mode=mode,
+        version=_PHASE4_SCHEDULER_VERSION_BY_MODE[mode],
+        policy=_PHASE4_SCHEDULER_POLICY_BY_MODE[mode],
+        debug=bool(phase4_scheduler_debug),
+    )
+
+
+def _build_phase4_frontier_locality_fragmentation_summary(
+    selected_frontier: torch.Tensor,
+    *,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+    batch_count: int,
+) -> dict[str, object]:
+    selected_count = int(selected_frontier.numel())
+    if selected_count <= 0:
+        return {
+            "selected_count": 0,
+            "layer_chunk_run_count": 0,
+            "layer_chunk_transition_count": 0,
+            "layer_chunk_fragmentation_ratio": 0.0,
+            "batch_count": int(batch_count),
+            "batch_fragmentation_ratio": 0.0,
+        }
+
+    layers = feat_layers[selected_frontier]
+    use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
+    if use_chunk_key:
+        chunks = torch.div(
+            feat_ids[selected_frontier],
+            int(decoder_chunk_size),
+            rounding_mode="floor",
+        )
+    else:
+        chunks = torch.zeros_like(layers)
+
+    transitions = (layers[1:] != layers[:-1]) | (chunks[1:] != chunks[:-1])
+    transition_count = int(transitions.sum().item()) if transitions.numel() > 0 else 0
+    run_count = 1 + transition_count
+
+    return {
+        "selected_count": selected_count,
+        "layer_chunk_run_count": int(run_count),
+        "layer_chunk_transition_count": int(transition_count),
+        "layer_chunk_fragmentation_ratio": float(transition_count / max(1, selected_count - 1)),
+        "batch_count": int(batch_count),
+        "batch_fragmentation_ratio": float(batch_count / max(1, run_count)),
+    }
+
+
+def _plan_phase4_frontier_membership_preserving_v1(
+    pending_candidates: torch.Tensor,
+    *,
+    max_batch_size: int,
+    max_batches: int | None,
+    feat_layers: torch.Tensor,
+    feat_positions: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+    apply_locality_reorder: bool = True,
+) -> _Phase4FrontierPlan:
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be > 0")
+    if max_batches is not None and max_batches <= 0:
+        raise ValueError("max_batches must be > 0 when provided")
+
+    if apply_locality_reorder:
+        planned_candidates = _reorder_pending_for_phase4_locality(
+            pending_candidates,
+            feat_layers=feat_layers,
+            feat_positions=feat_positions,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+    else:
+        planned_candidates = pending_candidates
+
+    if max_batches is None:
+        selected_count = int(planned_candidates.numel())
+    else:
+        selected_count = _compute_phase4_locality_shaped_frontier_size(
+            planned_candidates,
+            max_batch_size=max_batch_size,
+            max_batches=max_batches,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+    selected_frontier = planned_candidates[:selected_count]
+
+    if apply_locality_reorder:
+        expected_candidates = _reorder_pending_for_phase4_locality(
+            pending_candidates,
+            feat_layers=feat_layers,
+            feat_positions=feat_positions,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+    else:
+        expected_candidates = pending_candidates
+    if max_batches is None:
+        expected_selected = expected_candidates
+    else:
+        expected_count = _compute_phase4_locality_shaped_frontier_size(
+            expected_candidates,
+            max_batch_size=max_batch_size,
+            max_batches=max_batches,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        expected_selected = expected_candidates[:expected_count]
+    expected_sorted = torch.sort(
+        expected_selected.detach().to(device="cpu", dtype=torch.long)
+    ).values
+    selected_sorted = torch.sort(
+        selected_frontier.detach().to(device="cpu", dtype=torch.long)
+    ).values
+    expected_set = set(expected_sorted.tolist())
+    selected_set = set(selected_sorted.tolist())
+    missing_count = int(len(expected_set - selected_set))
+    unexpected_count = int(len(selected_set - expected_set))
+    duplicate_count = int(selected_frontier.numel() - torch.unique(selected_frontier).numel())
+    if duplicate_count > 0:
+        raise RuntimeError(
+            "Planner v1 selected frontier contains duplicate nodes "
+            f"(duplicate_count={duplicate_count})"
+        )
+    if selected_frontier.numel() != expected_selected.numel() or not torch.equal(
+        selected_sorted,
+        expected_sorted,
+    ):
+        raise RuntimeError(
+            "Planner v1 selected frontier membership mismatch against locality semantics "
+            f"(missing={missing_count}, unexpected={unexpected_count})"
+        )
+
+    batch_boundaries: list[tuple[int, int]] = []
+    boundary_reason_counts: dict[str, int] = {}
+    pending_offset = 0
+    while pending_offset < int(selected_frontier.numel()):
+        batch_end, boundary_reason = _compute_phase4_locality_shaped_batch_end_with_reason(
+            selected_frontier,
+            pending_offset=pending_offset,
+            max_batch_size=max_batch_size,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        boundary_reason_counts[boundary_reason] = boundary_reason_counts.get(boundary_reason, 0) + 1
+        if batch_end <= pending_offset:
+            raise RuntimeError(
+                "Planner v1 produced a non-advancing batch boundary "
+                f"(offset={pending_offset}, batch_end={batch_end})"
+            )
+        batch_boundaries.append((pending_offset, batch_end))
+        pending_offset = batch_end
+
+    selected_membership_hash = (
+        _hash_index_tensor(selected_sorted) if selected_frontier.numel() > 0 else None
+    )
+    selected_order_hash = (
+        _hash_index_tensor(selected_frontier) if selected_frontier.numel() > 0 else None
+    )
+    membership_preserved = bool(
+        duplicate_count == 0
+        and missing_count == 0
+        and unexpected_count == 0
+        and selected_frontier.numel() == expected_selected.numel()
+    )
+    invariant_summary: dict[str, object] = {
+        "candidate_count": int(pending_candidates.numel()),
+        "selected_count": int(selected_frontier.numel()),
+        "batch_count": int(len(batch_boundaries)),
+        "membership_preserved": membership_preserved,
+        "duplicate_count": int(duplicate_count),
+        "missing_count": int(missing_count),
+        "unexpected_count": int(unexpected_count),
+        "non_advancing_boundary_count": 0,
+    }
+
+    return _Phase4FrontierPlan(
+        selected_frontier=selected_frontier,
+        batch_boundaries=batch_boundaries,
+        selected_membership_hash=selected_membership_hash,
+        selected_order_hash=selected_order_hash,
+        locality_fragmentation_summary=_build_phase4_frontier_locality_fragmentation_summary(
+            selected_frontier,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+            batch_count=len(batch_boundaries),
+        ),
+        boundary_reason_counts=boundary_reason_counts,
+        invariant_summary=invariant_summary,
+    )
 
 
 def _resolve_phase4_feature_batch_planner_enabled(
@@ -1948,6 +2233,8 @@ def attribute(
     cross_cluster_debug: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "legacy"] = "locality",
+    phase4_scheduler_debug: bool = False,
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -2013,6 +2300,12 @@ def attribute(
             scaffolding (Phase 0 through pre-Phase-4 checkpoints).
         telemetry_max_events: Optional cap for in-memory telemetry event storage.
             If omitted, an environment/default policy is used.
+        phase4_scheduler_mode: Phase-4 frontier scheduler mode. ``"locality"``
+            keeps current behavior. ``"planner_v1"`` routes frontier selection and
+            intra-frontier batching through the membership-preserving planner core.
+            ``"legacy"`` is accepted as an alias for ``"locality"``.
+        phase4_scheduler_debug: Emit additional planner-v1 scheduler diagnostics in
+            Phase 4 logs.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
             normalization/influence ranking path. ``"fp32"`` uses float32
             internals and is the post-fix default; ``"fp64"`` uses float64
@@ -2070,6 +2363,8 @@ def attribute(
             cross_cluster_debug=cross_cluster_debug,
             telemetry_max_events=telemetry_max_events,
             compact_output=compact_output,
+            phase4_scheduler_mode=phase4_scheduler_mode,
+            phase4_scheduler_debug=phase4_scheduler_debug,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             logger=logger,
         )
@@ -2116,6 +2411,8 @@ def _run_attribution(
     cross_cluster_debug: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "legacy"] = "locality",
+    phase4_scheduler_debug: bool = False,
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ):
     start_time = time.time()
@@ -2159,6 +2456,10 @@ def _run_attribution(
     planner_compute_dtype = _dtype_from_name(resolved_dtype_map["planner_compute_dtype"])
     shadow_debug_compute_dtype = _dtype_from_name(resolved_dtype_map["shadow_debug_compute_dtype"])
     cross_cluster_debug_enabled = bool(cross_cluster_debug)
+    phase4_scheduler_config = _resolve_phase4_scheduler_config(
+        phase4_scheduler_mode=phase4_scheduler_mode,
+        phase4_scheduler_debug=phase4_scheduler_debug,
+    )
     phase4_debug_summary_enabled = phase4_anomaly_debug_enabled or cross_cluster_debug_enabled
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
@@ -2185,6 +2486,10 @@ def _run_attribution(
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
+            "phase4_scheduler_mode": phase4_scheduler_config.mode,
+            "phase4_scheduler_version": phase4_scheduler_config.version,
+            "phase4_scheduler_policy": phase4_scheduler_config.policy,
+            "phase4_scheduler_debug": phase4_scheduler_config.debug,
         },
     )
 
@@ -3145,8 +3450,11 @@ def _run_attribution(
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
         phase4_feature_batch_size = effective_feature_batch_size
         logger.info(
-            "Phase 4 frontier order | "
-            "mode=fixed_frontier_locality | "
+            "Phase 4 frontier scheduler | "
+            f"mode={phase4_scheduler_config.mode} | "
+            f"version={phase4_scheduler_config.version} | "
+            f"policy={phase4_scheduler_config.policy} | "
+            f"debug={phase4_scheduler_config.debug} | "
             f"exact_chunked_decoder={exact_chunked_decoder} | "
             f"decoder_chunk_size={decoder_chunk_size}"
         )
@@ -3175,6 +3483,10 @@ def _run_attribution(
                     "planner_enabled": bool(planner_enabled),
                     "planner_status": planner_status,
                     "planner_skip_reason": planner_skip_reason,
+                    "scheduler_mode": phase4_scheduler_config.mode,
+                    "scheduler_version": phase4_scheduler_config.version,
+                    "scheduler_policy": phase4_scheduler_config.policy,
+                    "scheduler_debug": bool(phase4_scheduler_config.debug),
                     "actual_max_feature_nodes": int(actual_max_feature_nodes),
                     "total_active_features": int(total_active_feats),
                     "update_interval": int(update_interval),
@@ -3208,8 +3520,29 @@ def _run_attribution(
         )
 
         while n_visited < actual_max_feature_nodes:
+            phase4_frontier_plan: _Phase4FrontierPlan | None = None
             if actual_max_feature_nodes == total_active_feats:
                 pending = torch.arange(total_active_feats)
+                if phase4_scheduler_config.mode == "planner_v1":
+                    phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
+                        pending,
+                        max_batch_size=phase4_feature_batch_size,
+                        max_batches=None,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                        apply_locality_reorder=False,
+                    )
+                    pending = phase4_frontier_plan.selected_frontier
+                    if phase4_scheduler_config.debug:
+                        logger.info(
+                            "Phase 4 scheduler plan | "
+                            f"selected_count={phase4_frontier_plan.invariant_summary.get('selected_count')} | "
+                            f"batch_count={phase4_frontier_plan.invariant_summary.get('batch_count')} | "
+                            f"boundary_reasons={phase4_frontier_plan.boundary_reason_counts}"
+                        )
             else:
                 refresh_start = time.perf_counter()
                 refresh_memory_before = get_memory_snapshot(model.device)
@@ -3291,25 +3624,49 @@ def _run_attribution(
                     update_interval * phase4_feature_batch_size,
                     actual_max_feature_nodes - n_visited,
                 )
-                pending = unvisited_feature_rank[:max_frontier_size]
-                pending = _reorder_pending_for_phase4_locality(
-                    pending,
-                    feat_layers=feat_layers,
-                    feat_positions=feat_pos,
-                    feat_ids=feat_ids,
-                    exact_chunked_decoder=exact_chunked_decoder,
-                    decoder_chunk_size=decoder_chunk_size,
-                )
-                queue_size = _compute_phase4_locality_shaped_frontier_size(
-                    pending,
-                    max_batch_size=phase4_feature_batch_size,
-                    max_batches=update_interval,
-                    feat_layers=feat_layers,
-                    feat_ids=feat_ids,
-                    exact_chunked_decoder=exact_chunked_decoder,
-                    decoder_chunk_size=decoder_chunk_size,
-                )
-                pending = pending[:queue_size]
+                pending_candidates = unvisited_feature_rank[:max_frontier_size]
+                if phase4_scheduler_config.mode == "planner_v1":
+                    phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
+                        pending_candidates,
+                        max_batch_size=phase4_feature_batch_size,
+                        max_batches=update_interval,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                        apply_locality_reorder=True,
+                    )
+                    pending = phase4_frontier_plan.selected_frontier
+                    queue_size = int(pending.numel())
+                    if phase4_scheduler_config.debug:
+                        logger.info(
+                            "Phase 4 scheduler plan | "
+                            f"membership_hash={phase4_frontier_plan.selected_membership_hash} | "
+                            f"order_hash={phase4_frontier_plan.selected_order_hash} | "
+                            f"fragmentation={phase4_frontier_plan.locality_fragmentation_summary} | "
+                            f"boundary_reasons={phase4_frontier_plan.boundary_reason_counts} | "
+                            f"invariants={phase4_frontier_plan.invariant_summary}"
+                        )
+                else:
+                    pending = _reorder_pending_for_phase4_locality(
+                        pending_candidates,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                    queue_size = _compute_phase4_locality_shaped_frontier_size(
+                        pending,
+                        max_batch_size=phase4_feature_batch_size,
+                        max_batches=update_interval,
+                        feat_layers=feat_layers,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                    pending = pending[:queue_size]
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
                 phase4_refresh_elapsed_ms_total += refresh_elapsed_ms
@@ -3325,6 +3682,15 @@ def _run_attribution(
                         "visited_features": int(n_visited),
                         "frontier_candidate_count": int(unvisited_feature_rank.numel()),
                         "queue_size": int(queue_size),
+                        "scheduler_mode": phase4_scheduler_config.mode,
+                        "scheduler_version": phase4_scheduler_config.version,
+                        "scheduler_policy": phase4_scheduler_config.policy,
+                        "scheduler_debug": bool(phase4_scheduler_config.debug),
+                        "scheduler_plan_batch_count": (
+                            int(len(phase4_frontier_plan.batch_boundaries))
+                            if phase4_frontier_plan is not None
+                            else None
+                        ),
                         "rank_nonzero_count": (
                             int(rank_signal_stats["nonzero_count"])
                             if rank_signal_stats is not None
@@ -3461,6 +3827,10 @@ def _run_attribution(
                             "pending_hash": (
                                 _hash_index_tensor(pending) if pending.numel() > 0 else None
                             ),
+                            "scheduler_mode": phase4_scheduler_config.mode,
+                            "scheduler_version": phase4_scheduler_config.version,
+                            "scheduler_policy": phase4_scheduler_config.policy,
+                            "scheduler_debug": bool(phase4_scheduler_config.debug),
                             "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
                             "rank_effective_nonzero_count": int(
                                 rank_signal_stats["effective_nonzero_count"]
@@ -3638,16 +4008,40 @@ def _run_attribution(
                 phase4_refresh_count += 1
 
             pending_offset = 0
+            planned_boundaries = (
+                phase4_frontier_plan.batch_boundaries
+                if phase4_scheduler_config.mode == "planner_v1" and phase4_frontier_plan is not None
+                else None
+            )
+            planned_boundary_offset = 0
             while pending_offset < len(pending):
-                batch_end = _compute_phase4_locality_shaped_batch_end(
-                    pending,
-                    pending_offset=pending_offset,
-                    max_batch_size=phase4_feature_batch_size,
-                    feat_layers=feat_layers,
-                    feat_ids=feat_ids,
-                    exact_chunked_decoder=exact_chunked_decoder,
-                    decoder_chunk_size=decoder_chunk_size,
-                )
+                if planned_boundaries is not None:
+                    if planned_boundary_offset >= len(planned_boundaries):
+                        raise RuntimeError(
+                            "Planner v1 exhausted planned boundaries before pending frontier completion"
+                        )
+                    boundary_start, batch_end = planned_boundaries[planned_boundary_offset]
+                    if boundary_start != pending_offset:
+                        raise RuntimeError(
+                            "Planner v1 planned boundary start mismatch "
+                            f"(expected={pending_offset}, got={boundary_start})"
+                        )
+                    planned_boundary_offset += 1
+                else:
+                    batch_end = _compute_phase4_locality_shaped_batch_end(
+                        pending,
+                        pending_offset=pending_offset,
+                        max_batch_size=phase4_feature_batch_size,
+                        feat_layers=feat_layers,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                if batch_end <= pending_offset:
+                    raise RuntimeError(
+                        "Phase 4 scheduling produced a non-advancing batch boundary "
+                        f"(offset={pending_offset}, batch_end={batch_end})"
+                    )
                 idx_batch = pending[pending_offset:batch_end]
                 pending_offset = batch_end
                 n_visited += len(idx_batch)
@@ -3782,6 +4176,13 @@ def _run_attribution(
                             **get_memory_snapshot(model.device),
                         },
                     )
+            if planned_boundaries is not None and planned_boundary_offset != len(
+                planned_boundaries
+            ):
+                raise RuntimeError(
+                    "Planner v1 produced unused planned boundaries "
+                    f"(used={planned_boundary_offset}, planned={len(planned_boundaries)})"
+                )
 
         pbar.close()
         _log_phase_metrics(
@@ -3805,6 +4206,10 @@ def _run_attribution(
                 "phase4_batches": int(phase4_batch_count),
                 "phase4_refreshes": int(phase4_refresh_count),
                 "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
+                "scheduler_mode": phase4_scheduler_config.mode,
+                "scheduler_version": phase4_scheduler_config.version,
+                "scheduler_policy": phase4_scheduler_config.policy,
+                "scheduler_debug": bool(phase4_scheduler_config.debug),
             },
         )
         telemetry_recorder.record_wall_clock_duration(
@@ -4246,6 +4651,10 @@ def _run_attribution(
                 "phase4_feature_batch_planner_enabled": bool(planner_enabled),
                 "phase4_feature_batch_planner_status": planner_status,
                 "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
+                "phase4_scheduler_mode": phase4_scheduler_config.mode,
+                "phase4_scheduler_version": phase4_scheduler_config.version,
+                "phase4_scheduler_policy": phase4_scheduler_config.policy,
+                "phase4_scheduler_debug": bool(phase4_scheduler_config.debug),
                 "internal_precision_requested": internal_precision_requested,
                 "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
