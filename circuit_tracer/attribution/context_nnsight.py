@@ -10,13 +10,30 @@ import numpy as np
 import torch
 from einops import einsum
 
-from circuit_tracer.utils.telemetry import TelemetryRecorder
+from circuit_tracer.utils.telemetry import (
+    TelemetryRecorder,
+    build_memory_before_after_attrs,
+    build_memory_snapshot_attrs,
+    get_memory_snapshot,
+)
 
 
 if TYPE_CHECKING:
     from circuit_tracer.replacement_model.replacement_model_nnsight import (
         NNSightReplacementModel,
     )
+
+
+_COMPUTE_BATCH_MEMORY_ATTR_KEYS: tuple[str, ...] = (
+    "rss_current_gib",
+    "proc_rss_anon_gib",
+    "proc_rss_file_gib",
+    "cgroup_memory_current_gib",
+    "cgroup_memory_anon_gib",
+    "cgroup_memory_file_gib",
+    "cuda_allocated_gib",
+    "cuda_reserved_gib",
+)
 
 
 class AttributionContext:
@@ -834,15 +851,30 @@ class AttributionContext:
         batch_start = time.perf_counter()
         self._compute_batch_call_index += 1
         batch_call_index = self._compute_batch_call_index
+        batch_nodes = int(len(layers))
+        unique_layers_count = int(layers.unique().numel())
+        execution_device = self._resid_activations[0].device
+        memory_before = get_memory_snapshot(execution_device)
+        inject_values_input_nbytes = int(inject_values.numel() * inject_values.element_size())
+        planned_batch_buffer_nbytes = int(
+            self._row_size * batch_size * torch.tensor([], dtype=torch.float32).element_size()
+        )
         self._emit_trace(
             "compute_batch.start",
             phase=phase_label,
-            batch_nodes=len(layers),
-            unique_layers=len(layers.unique()),
+            batch_nodes=batch_nodes,
+            unique_layers=unique_layers_count,
             retain_graph=retain_graph,
+            inject_values_input_nbytes=inject_values_input_nbytes,
+            planned_batch_buffer_nbytes=planned_batch_buffer_nbytes,
+            chunked_feature_replay_window=int(self._chunked_feature_replay_window),
+            **build_memory_snapshot_attrs(
+                memory_before,
+                keys=_COMPUTE_BATCH_MEMORY_ATTR_KEYS,
+                prefix="memory_before",
+            ),
         )
         self._clear_saved_grads()
-        execution_device = self._resid_activations[0].device
         layers = layers.to(
             device=execution_device,
             dtype=torch.long,
@@ -858,12 +890,14 @@ class AttributionContext:
             device=execution_device,
             dtype=inject_values.dtype,
         )
+        inject_values_nbytes = int(inject_values.numel() * inject_values.element_size())
         self._batch_buffer = torch.zeros(
             self._row_size,
             batch_size,
             dtype=torch.float32,
             device=inject_values.device,
         )
+        batch_buffer_nbytes = int(self._batch_buffer.numel() * self._batch_buffer.element_size())
 
         # Custom gradient injection (per-layer registration)
         batch_idx = torch.arange(len(layers), device=layers.device)
@@ -895,6 +929,7 @@ class AttributionContext:
         layers_in_batch = sorted(layers.unique().tolist(), reverse=True)
         chunked_feature_grads = {} if self.chunked_decoder_state is not None else None
         chunked_feature_grad_layers: list[int] = []
+        chunked_feature_grad_window_peak = 0
 
         last_layer = max(layers_in_batch)
         try:
@@ -922,6 +957,10 @@ class AttributionContext:
                         else:
                             chunked_feature_grads[layer] = grad
                             chunked_feature_grad_layers.append(layer)
+                            chunked_feature_grad_window_peak = max(
+                                chunked_feature_grad_window_peak,
+                                len(chunked_feature_grad_layers),
+                            )
                             if self.diagnostic_mode:
                                 peak = cast(
                                     float, self._diagnostic_stats["chunked_attr_grad_window_peak"]
@@ -975,6 +1014,7 @@ class AttributionContext:
 
         buf, self._batch_buffer = self._batch_buffer, None
         elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+        memory_after = get_memory_snapshot(execution_device)
         if self.diagnostic_mode:
             self._add_stat("compute_batch_calls", 1)
             elapsed = elapsed_ms / 1000.0
@@ -991,17 +1031,40 @@ class AttributionContext:
             batch_index=batch_call_index,
             elapsed_ms=elapsed_ms,
             attrs={
-                "batch_nodes": len(layers),
+                "batch_nodes": batch_nodes,
+                "batch_size": int(batch_size),
+                "row_size": int(self._row_size),
                 "unique_layers": len(layers_in_batch),
                 "retain_graph": retain_graph,
                 "chunked_decoder": self.chunked_decoder_state is not None,
+                "inject_values_input_nbytes": inject_values_input_nbytes,
+                "inject_values_nbytes": inject_values_nbytes,
+                "batch_buffer_nbytes": batch_buffer_nbytes,
+                "chunked_feature_replay_window": int(self._chunked_feature_replay_window),
+                "chunked_feature_grad_window_peak": int(chunked_feature_grad_window_peak),
+                **build_memory_before_after_attrs(
+                    before=memory_before,
+                    after=memory_after,
+                    keys=_COMPUTE_BATCH_MEMORY_ATTR_KEYS,
+                ),
             },
         )
         self._emit_trace(
             "compute_batch.done",
             phase=phase_label,
-            batch_nodes=len(layers),
+            batch_nodes=batch_nodes,
+            unique_layers=unique_layers_count,
+            retain_graph=retain_graph,
+            inject_values_nbytes=inject_values_nbytes,
+            batch_buffer_nbytes=batch_buffer_nbytes,
+            chunked_feature_replay_window=int(self._chunked_feature_replay_window),
+            chunked_feature_grad_window_peak=int(chunked_feature_grad_window_peak),
             elapsed_s=f"{elapsed_ms / 1000.0:.2f}",
             elapsed_ms=elapsed_ms,
+            **build_memory_before_after_attrs(
+                before=memory_before,
+                after=memory_after,
+                keys=_COMPUTE_BATCH_MEMORY_ATTR_KEYS,
+            ),
         )
         return buf.T[: len(layers)]

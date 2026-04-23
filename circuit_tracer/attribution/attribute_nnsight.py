@@ -53,6 +53,7 @@ from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightRe
 from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.utils.telemetry import (
     TelemetryRecorder,
+    build_memory_before_after_attrs,
     diff_numeric_metrics,
     get_memory_snapshot,
     format_memory_snapshot,
@@ -123,6 +124,17 @@ _EXACT_TRACE_INTERNAL_DTYPE_BY_NAME: dict[str, torch.dtype] = {
     "float64": torch.float64,
     "torch.float64": torch.float64,
 }
+
+_PHASE4_REFRESH_MEMORY_ATTR_KEYS: tuple[str, ...] = (
+    "rss_current_gib",
+    "proc_rss_anon_gib",
+    "proc_rss_file_gib",
+    "cgroup_memory_current_gib",
+    "cgroup_memory_anon_gib",
+    "cgroup_memory_file_gib",
+    "cuda_allocated_gib",
+    "cuda_reserved_gib",
+)
 
 
 def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype:
@@ -3039,6 +3051,7 @@ def _run_attribution(
                 pending = torch.arange(total_active_feats)
             else:
                 refresh_start = time.perf_counter()
+                refresh_memory_before = get_memory_snapshot(model.device)
                 feature_row_store_snapshot_before = (
                     feature_row_store.get_diagnostic_snapshot()
                     if use_compact_feature_row_store and feature_row_store is not None
@@ -3126,6 +3139,7 @@ def _run_attribution(
                     exact_chunked_decoder=exact_chunked_decoder,
                     decoder_chunk_size=decoder_chunk_size,
                 )
+                refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
                 phase4_refresh_elapsed_ms_total += refresh_elapsed_ms
                 telemetry_recorder.record_event(
@@ -3236,6 +3250,20 @@ def _run_attribution(
                             (streaming_chunk_reuse_stats or {}).get(
                                 "chunk_cache_store_skip_too_large_count"
                             )
+                        ),
+                        "feature_row_store_materialize_calls": _safe_float(
+                            (feature_row_store_read_stats or {}).get("materialize_call_count")
+                        ),
+                        "feature_row_store_materialize_rows": _safe_float(
+                            (feature_row_store_read_stats or {}).get("materialize_row_count")
+                        ),
+                        "feature_row_store_materialize_columns": _safe_float(
+                            (feature_row_store_read_stats or {}).get("materialize_column_count")
+                        ),
+                        **build_memory_before_after_attrs(
+                            before=refresh_memory_before,
+                            after=refresh_memory_after,
+                            keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
                         ),
                     },
                 )

@@ -4,7 +4,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from numbers import Number
@@ -20,6 +20,16 @@ except ImportError:  # pragma: no cover - non-Unix fallback
 
 TelemetryScalar = str | int | float | bool | None
 _ALLOWED_TELEMETRY_SCOPES = {"run", "phase", "batch", "op"}
+_DEFAULT_MEMORY_ATTR_KEYS: tuple[str, ...] = (
+    "rss_current_gib",
+    "proc_rss_anon_gib",
+    "proc_rss_file_gib",
+    "cgroup_memory_current_gib",
+    "cgroup_memory_anon_gib",
+    "cgroup_memory_file_gib",
+    "cuda_allocated_gib",
+    "cuda_reserved_gib",
+)
 
 
 def _truncate_text(value: str, *, max_length: int = 256) -> str:
@@ -342,6 +352,60 @@ def _format_optional_gib(value: float | None) -> str:
     return f"{value:.2f} GiB"
 
 
+def _bytes_to_gib(value: int | None) -> float | None:
+    if value is None:
+        return None
+    return float(value) / float(1024**3)
+
+
+def _kib_to_gib(value: int | None) -> float | None:
+    if value is None:
+        return None
+    return float(value) / float(1024**2)
+
+
+def _read_file_first_line(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.readline().strip()
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _parse_memory_bytes_value(raw_value: str | None) -> int | None:
+    if not raw_value:
+        return None
+    normalized = raw_value.strip().lower()
+    if normalized in {"", "max"}:
+        return None
+    try:
+        value = int(normalized)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _read_memory_bytes_file(path: str) -> int | None:
+    return _parse_memory_bytes_value(_read_file_first_line(path))
+
+
+def _read_memory_stat_file(path: str) -> dict[str, int]:
+    stats: dict[str, int] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) != 2:
+                    continue
+                key, value_text = parts
+                parsed = _parse_memory_bytes_value(value_text)
+                if parsed is not None:
+                    stats[key] = parsed
+    except (FileNotFoundError, OSError):
+        return {}
+    return stats
+
+
 def _get_current_rss_gib_from_proc() -> float | None:
     """Best-effort Linux RSS snapshot using /proc/self/statm."""
 
@@ -364,6 +428,181 @@ def _get_current_rss_gib_from_proc() -> float | None:
     return (resident_pages * page_size) / (1024**3)
 
 
+def _get_process_status_memory_gib_from_proc() -> dict[str, float | None]:
+    status_fields: dict[str, float | None] = {
+        "proc_rss_gib": None,
+        "proc_rss_anon_gib": None,
+        "proc_rss_file_gib": None,
+        "proc_rss_shmem_gib": None,
+    }
+    field_map = {
+        "VmRSS": "proc_rss_gib",
+        "RssAnon": "proc_rss_anon_gib",
+        "RssFile": "proc_rss_file_gib",
+        "RssShmem": "proc_rss_shmem_gib",
+    }
+
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if ":" not in line:
+                    continue
+                key, raw_value = line.split(":", 1)
+                attr_name = field_map.get(key)
+                if attr_name is None:
+                    continue
+                value_parts = raw_value.strip().split()
+                if not value_parts:
+                    continue
+                try:
+                    kib_value = int(value_parts[0])
+                except ValueError:
+                    continue
+                if kib_value < 0:
+                    continue
+                status_fields[attr_name] = _kib_to_gib(kib_value)
+    except (FileNotFoundError, OSError):
+        return status_fields
+
+    return status_fields
+
+
+def _resolve_cgroup_memory_dir() -> str | None:
+    try:
+        with open("/proc/self/cgroup", "r", encoding="utf-8") as handle:
+            cgroup_lines = handle.readlines()
+    except (FileNotFoundError, OSError):
+        cgroup_lines = []
+
+    unified_path: str | None = None
+    legacy_memory_path: str | None = None
+    for line in cgroup_lines:
+        parts = line.strip().split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, rel_path = parts
+        if controllers == "":
+            unified_path = rel_path
+            break
+        controller_set = set(filter(None, controllers.split(",")))
+        if "memory" in controller_set:
+            legacy_memory_path = rel_path
+
+    if unified_path is not None:
+        base = "/sys/fs/cgroup"
+        candidate = (
+            os.path.normpath(os.path.join(base, unified_path.lstrip("/")))
+            if unified_path not in {"", "/"}
+            else base
+        )
+        if os.path.isdir(candidate):
+            return candidate
+
+    if legacy_memory_path is not None:
+        for base in ("/sys/fs/cgroup/memory", "/sys/fs/cgroup"):
+            candidate = (
+                os.path.normpath(os.path.join(base, legacy_memory_path.lstrip("/")))
+                if legacy_memory_path not in {"", "/"}
+                else base
+            )
+            if os.path.isdir(candidate):
+                return candidate
+
+    fallback = "/sys/fs/cgroup"
+    if os.path.isfile(os.path.join(fallback, "memory.current")):
+        return fallback
+    return None
+
+
+def _get_cgroup_memory_snapshot_gib() -> dict[str, float | None]:
+    snapshot: dict[str, float | None] = {
+        "cgroup_memory_current_gib": None,
+        "cgroup_memory_peak_gib": None,
+        "cgroup_memory_anon_gib": None,
+        "cgroup_memory_file_gib": None,
+        "cgroup_memory_active_file_gib": None,
+        "cgroup_memory_inactive_file_gib": None,
+        "cgroup_memory_shmem_gib": None,
+        "cgroup_memory_slab_reclaimable_gib": None,
+        "cgroup_memory_slab_unreclaimable_gib": None,
+    }
+    cgroup_dir = _resolve_cgroup_memory_dir()
+    if cgroup_dir is None:
+        return snapshot
+
+    snapshot["cgroup_memory_current_gib"] = _bytes_to_gib(
+        _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.current"))
+    )
+    snapshot["cgroup_memory_peak_gib"] = _bytes_to_gib(
+        _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.peak"))
+    )
+
+    memory_stats = _read_memory_stat_file(os.path.join(cgroup_dir, "memory.stat"))
+    stat_keys = {
+        "anon": "cgroup_memory_anon_gib",
+        "file": "cgroup_memory_file_gib",
+        "active_file": "cgroup_memory_active_file_gib",
+        "inactive_file": "cgroup_memory_inactive_file_gib",
+        "shmem": "cgroup_memory_shmem_gib",
+        "slab_reclaimable": "cgroup_memory_slab_reclaimable_gib",
+        "slab_unreclaimable": "cgroup_memory_slab_unreclaimable_gib",
+    }
+    for stat_key, attr_name in stat_keys.items():
+        snapshot[attr_name] = _bytes_to_gib(memory_stats.get(stat_key))
+
+    return snapshot
+
+
+def _coerce_finite_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, Number):
+        numeric = float(value)
+        if math.isfinite(numeric):
+            return numeric
+    return None
+
+
+def build_memory_snapshot_attrs(
+    snapshot: Mapping[str, object] | None,
+    *,
+    keys: Sequence[str] | None = None,
+    prefix: str = "memory",
+) -> dict[str, float | None]:
+    selected_keys = tuple(keys) if keys is not None else _DEFAULT_MEMORY_ATTR_KEYS
+    attrs: dict[str, float | None] = {}
+    for key in selected_keys:
+        value = snapshot.get(key) if snapshot is not None else None
+        attrs[f"{prefix}_{key}"] = _coerce_finite_float(value)
+    return attrs
+
+
+def build_memory_before_after_attrs(
+    *,
+    before: Mapping[str, object] | None,
+    after: Mapping[str, object] | None,
+    keys: Sequence[str] | None = None,
+    before_prefix: str = "memory_before",
+    after_prefix: str = "memory_after",
+    delta_prefix: str = "memory_delta",
+) -> dict[str, float | None]:
+    selected_keys = tuple(keys) if keys is not None else _DEFAULT_MEMORY_ATTR_KEYS
+    attrs: dict[str, float | None] = {}
+    attrs.update(build_memory_snapshot_attrs(before, keys=selected_keys, prefix=before_prefix))
+    attrs.update(build_memory_snapshot_attrs(after, keys=selected_keys, prefix=after_prefix))
+    for key in selected_keys:
+        before_value = _coerce_finite_float(before.get(key) if before is not None else None)
+        after_value = _coerce_finite_float(after.get(key) if after is not None else None)
+        attrs[f"{delta_prefix}_{key}"] = (
+            (after_value - before_value)
+            if before_value is not None and after_value is not None
+            else None
+        )
+    return attrs
+
+
 def get_memory_snapshot(device: torch.device | None = None) -> dict[str, float | None]:
     rss_current_gib = _get_current_rss_gib_from_proc()
     rss_gib = None
@@ -372,11 +611,26 @@ def get_memory_snapshot(device: torch.device | None = None) -> dict[str, float |
     snapshot: dict[str, float | None] = {
         "rss_current_gib": rss_current_gib,
         "rss_gib": rss_gib,
+        "proc_rss_gib": None,
+        "proc_rss_anon_gib": None,
+        "proc_rss_file_gib": None,
+        "proc_rss_shmem_gib": None,
+        "cgroup_memory_current_gib": None,
+        "cgroup_memory_peak_gib": None,
+        "cgroup_memory_anon_gib": None,
+        "cgroup_memory_file_gib": None,
+        "cgroup_memory_active_file_gib": None,
+        "cgroup_memory_inactive_file_gib": None,
+        "cgroup_memory_shmem_gib": None,
+        "cgroup_memory_slab_reclaimable_gib": None,
+        "cgroup_memory_slab_unreclaimable_gib": None,
         "cuda_allocated_gib": None,
         "cuda_reserved_gib": None,
         "cuda_max_allocated_gib": None,
         "cuda_max_reserved_gib": None,
     }
+    snapshot.update(_get_process_status_memory_gib_from_proc())
+    snapshot.update(_get_cgroup_memory_snapshot_gib())
 
     if device is not None and device.type == "cuda" and torch.cuda.is_available():
         snapshot.update(
@@ -398,6 +652,12 @@ def format_memory_snapshot(
     parts = [
         f"rss={_format_optional_gib(snapshot['rss_gib'])}",
         f"rss_current={_format_optional_gib(snapshot['rss_current_gib'])}",
+        f"proc_anon={_format_optional_gib(snapshot['proc_rss_anon_gib'])}",
+        f"proc_file={_format_optional_gib(snapshot['proc_rss_file_gib'])}",
+        f"cg_current={_format_optional_gib(snapshot['cgroup_memory_current_gib'])}",
+        f"cg_peak={_format_optional_gib(snapshot['cgroup_memory_peak_gib'])}",
+        f"cg_anon={_format_optional_gib(snapshot['cgroup_memory_anon_gib'])}",
+        f"cg_file={_format_optional_gib(snapshot['cgroup_memory_file_gib'])}",
         f"cuda_alloc={_format_optional_gib(snapshot['cuda_allocated_gib'])}",
         f"cuda_reserved={_format_optional_gib(snapshot['cuda_reserved_gib'])}",
         f"cuda_peak_alloc={_format_optional_gib(snapshot['cuda_max_allocated_gib'])}",
