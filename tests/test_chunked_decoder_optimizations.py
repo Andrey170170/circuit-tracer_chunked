@@ -745,6 +745,42 @@ def test_phase4_locality_shaped_batch_end_keeps_baseline_when_split_unavoidable(
     assert end == 2
 
 
+def test_phase4_locality_shaped_batch_end_avoids_tiny_split_batches() -> None:
+    pending = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    feat_layers = torch.zeros(4, dtype=torch.long)
+    feat_ids = torch.tensor([0, 2, 3, 3], dtype=torch.long)
+
+    end = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=0,
+        max_batch_size=3,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert end == 3
+
+
+def test_phase4_locality_shaped_batch_end_avoids_preserving_long_suffix_run() -> None:
+    pending = torch.tensor([0, 1, 2, 3, 4, 5, 6], dtype=torch.long)
+    feat_layers = torch.tensor([0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+    feat_ids = torch.zeros(7, dtype=torch.long)
+
+    end = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=0,
+        max_batch_size=6,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert end == 6
+
+
 def test_phase4_locality_shaped_frontier_size_preserves_update_interval_batch_cadence() -> None:
     pending = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
     feat_layers = torch.zeros(6, dtype=torch.long)

@@ -659,6 +659,9 @@ def _compute_phase4_locality_shaped_batch_end(
     This keeps the frontier membership fixed and preserves ordering while avoiding
     unnecessary splits of contiguous ``(source_layer, decoder_chunk)`` runs when
     a boundary is available within the current max-size slice.
+
+    To avoid over-splitting, only take the earlier boundary when the resulting
+    split batch is not too small and the preserved suffix run is short.
     """
 
     total_pending = int(pending.numel())
@@ -703,7 +706,19 @@ def _compute_phase4_locality_shaped_batch_end(
         return baseline_end
 
     last_boundary = int(boundary_positions[-1].item())
-    return pending_offset + last_boundary + 1
+    split_batch_size = last_boundary + 1
+    preserved_suffix_run = max_batch_size - split_batch_size
+
+    # Keep the shaping heuristic intentionally conservative so easy prompts do
+    # not fragment into many tiny refresh batches.
+    min_split_batch_size = max(2, max_batch_size // 2)
+    max_preserved_suffix_run = max(1, max_batch_size // 3)
+    if split_batch_size < min_split_batch_size:
+        return baseline_end
+    if preserved_suffix_run > max_preserved_suffix_run:
+        return baseline_end
+
+    return pending_offset + split_batch_size
 
 
 def _compute_phase4_locality_shaped_frontier_size(
