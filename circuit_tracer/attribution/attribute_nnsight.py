@@ -1070,6 +1070,37 @@ def _build_phase3_seed_influence_topk(
     return entries
 
 
+def _build_phase3_seed_bundle_payload(
+    *,
+    active_features: torch.Tensor,
+    activation_values: torch.Tensor,
+    seed_feature_influences: torch.Tensor,
+    frontier_pre_locality: torch.Tensor,
+    frontier_post_locality: torch.Tensor,
+    queue_size: int,
+    actual_max_feature_nodes: int,
+    total_active_features: int,
+    status: str,
+    planner_compute_dtype: torch.dtype,
+    influence_compute_dtype: torch.dtype,
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "active_features": active_features.detach().to(device="cpu", dtype=torch.int64),
+        "activation_values": activation_values.detach().to(device="cpu"),
+        "seed_feature_influences": seed_feature_influences.detach().to(device="cpu"),
+        "frontier_pre_locality": frontier_pre_locality.detach().to(device="cpu", dtype=torch.int64),
+        "frontier_post_locality": frontier_post_locality.detach().to(
+            device="cpu", dtype=torch.int64
+        ),
+        "queue_size": int(queue_size),
+        "actual_max_feature_nodes": int(actual_max_feature_nodes),
+        "total_active_features": int(total_active_features),
+        "planner_compute_dtype": _dtype_to_name(planner_compute_dtype),
+        "influence_compute_dtype": _dtype_to_name(influence_compute_dtype),
+    }
+
+
 def _record_phase4_refresh_debug(
     anomaly_debug_result: dict[str, object] | None,
     *,
@@ -1686,6 +1717,7 @@ def attribute(
     internal_precision: Literal["float32", "float64"] = "float64",
     phase4_anomaly_debug: bool = False,
     cross_cluster_debug: bool = False,
+    capture_phase3_seed_bundle: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
@@ -1754,6 +1786,8 @@ def attribute(
             Can also be activated via ``PHASE4_ANOMALY_DEBUG=1``.
         cross_cluster_debug: Enable broad scalar-only cross-cluster debug summary
             scaffolding (Phase 0 through pre-Phase-4 checkpoints).
+        capture_phase3_seed_bundle: Enable opt-in Phase-3 seed-bundle payload
+            capture for compact exact-chunked runs.
         telemetry_max_events: Optional cap for in-memory telemetry event storage.
             If omitted, an environment/default policy is used.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
@@ -1813,6 +1847,7 @@ def attribute(
             internal_precision=internal_precision,
             phase4_anomaly_debug=phase4_anomaly_debug,
             cross_cluster_debug=cross_cluster_debug,
+            capture_phase3_seed_bundle=capture_phase3_seed_bundle,
             telemetry_max_events=telemetry_max_events,
             compact_output=compact_output,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
@@ -1860,6 +1895,7 @@ def _run_attribution(
     internal_precision: Literal["float32", "float64"] = "float64",
     phase4_anomaly_debug: bool = False,
     cross_cluster_debug: bool = False,
+    capture_phase3_seed_bundle: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
@@ -1911,6 +1947,7 @@ def _run_attribution(
     planner_compute_dtype = _dtype_from_name(resolved_dtype_map["planner_compute_dtype"])
     shadow_debug_compute_dtype = _dtype_from_name(resolved_dtype_map["shadow_debug_compute_dtype"])
     cross_cluster_debug_enabled = bool(cross_cluster_debug)
+    capture_phase3_seed_bundle_enabled = bool(capture_phase3_seed_bundle)
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
         compact_output=compact_output,
@@ -1939,6 +1976,7 @@ def _run_attribution(
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
+            "capture_phase3_seed_bundle_enabled": capture_phase3_seed_bundle_enabled,
         },
     )
 
@@ -1977,6 +2015,10 @@ def _run_attribution(
     if cross_cluster_debug_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "cross_cluster_debug requires compact_output=True and exact_chunked_decoder=True"
+        )
+    if capture_phase3_seed_bundle_enabled and not (compact_output and exact_chunked_decoder):
+        raise ValueError(
+            "capture_phase3_seed_bundle requires compact_output=True and exact_chunked_decoder=True"
         )
     if phase4_anomaly_debug_enabled:
         anomaly_debug_result = {
@@ -2074,6 +2116,7 @@ def _run_attribution(
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
     compact_output_result: dict[str, object] | None = None
+    phase3_seed_bundle_payload: dict[str, object] | None = None
 
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
@@ -2788,12 +2831,17 @@ def _run_attribution(
         if callable(reset_decoder_cache):
             reset_decoder_cache()
 
-        if cross_cluster_debug_summary is not None:
-            phase3_runtime_summary, phase3_runtime_stream = _build_cross_cluster_runtime_snapshot(
-                device=model.device,
-                ctx=ctx,
-                transcoder=model.transcoders,
-            )
+        if cross_cluster_debug_summary is not None or capture_phase3_seed_bundle_enabled:
+            phase3_runtime_summary: dict[str, object] = {}
+            phase3_runtime_stream: dict[str, object] = {}
+            if cross_cluster_debug_summary is not None:
+                phase3_runtime_summary, phase3_runtime_stream = (
+                    _build_cross_cluster_runtime_snapshot(
+                        device=model.device,
+                        ctx=ctx,
+                        transcoder=model.transcoders,
+                    )
+                )
             pre_phase4_st = int(n_logits)
             phase3_seed_summary: dict[str, object] = {
                 "stored_row_count_before_phase4": pre_phase4_st,
@@ -2806,6 +2854,8 @@ def _run_attribution(
                 **phase3_runtime_summary,
             }
             if actual_max_feature_nodes < total_active_feats:
+                normalization_input_stats: dict[str, object] | None = None
+                row_store_snapshot: dict[str, float | int | None] | None = None
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     seed_feature_influences = compute_partial_feature_influences_streaming(
@@ -2822,10 +2872,11 @@ def _run_attribution(
                         device=feature_row_store.row_abs_sums.device,
                         compute_dtype=planner_compute_dtype,
                     )
-                    normalization_input_stats = _build_phase4_normalization_stats(
-                        feature_row_store.row_abs_sums[:pre_phase4_st].detach().cpu(),
-                    )
-                    row_store_snapshot = feature_row_store.get_diagnostic_snapshot()
+                    if cross_cluster_debug_summary is not None:
+                        normalization_input_stats = _build_phase4_normalization_stats(
+                            feature_row_store.row_abs_sums[:pre_phase4_st].detach().cpu(),
+                        )
+                        row_store_snapshot = feature_row_store.get_diagnostic_snapshot()
                 else:
                     planner_influences = compute_partial_influences(
                         edge_matrix[:pre_phase4_st].to(dtype=planner_compute_dtype),
@@ -2834,10 +2885,14 @@ def _run_attribution(
                         device=torch.device("cpu"),
                     )
                     seed_feature_influences = planner_influences[:total_active_feats]
-                    normalization_input_stats = _build_phase4_normalization_stats(
-                        edge_matrix[:pre_phase4_st, :logit_offset].abs().sum(dim=1).detach().cpu(),
-                    )
-                    row_store_snapshot = None
+                    if cross_cluster_debug_summary is not None:
+                        normalization_input_stats = _build_phase4_normalization_stats(
+                            edge_matrix[:pre_phase4_st, :logit_offset]
+                            .abs()
+                            .sum(dim=1)
+                            .detach()
+                            .cpu(),
+                        )
 
                 unvisited_feature_rank = torch.argsort(
                     seed_feature_influences,
@@ -2857,103 +2912,130 @@ def _run_attribution(
                     exact_chunked_decoder=exact_chunked_decoder,
                     decoder_chunk_size=getattr(model.transcoders, "decoder_chunk_size", None),
                 )
-                deterministic_pending = _build_phase4_deterministic_shadow_pending(
-                    unvisited_feature_rank,
-                    seed_feature_influences.detach().cpu(),
-                    queue_size=queue_size,
-                    feat_layers=feat_layers,
-                    feat_positions=feat_pos,
-                    feat_ids=feat_ids,
-                    exact_chunked_decoder=exact_chunked_decoder,
-                    decoder_chunk_size=getattr(model.transcoders, "decoder_chunk_size", None),
-                )
-                seed_cutoff_debug = _build_phase4_cutoff_debug(
-                    candidate_scores,
-                    queue_size=queue_size,
-                )
-                seed_influence_topk = _build_phase3_seed_influence_topk(
-                    ranked_feature_indices=unvisited_feature_rank,
-                    seed_feature_influences=seed_feature_influences,
-                    feat_layers=feat_layers,
-                    feat_positions=feat_pos,
-                    feat_ids=feat_ids,
-                    top_k=8,
-                )
-
                 phase3_seed_summary.update(
                     {
                         "status": "captured",
                         "queue_size": int(queue_size),
-                        "feature_influence_stats": _build_vector_stats(
-                            seed_feature_influences.detach().cpu(),
-                            epsilon=1e-12,
-                            top_k=8,
-                        ),
-                        "feature_influence_hash": _hash_float_tensor(
-                            seed_feature_influences.detach().cpu(),
-                            dtype=torch.float64,
-                        ),
-                        "frontier_pre_locality_hash": _hash_index_tensor(pre_locality_pending),
-                        "frontier_post_locality_hash": _hash_index_tensor(post_locality_pending),
-                        "frontier_pre_locality_sample": [
-                            int(v) for v in pre_locality_pending[:16].tolist()
-                        ],
-                        "frontier_post_locality_sample": [
-                            int(v) for v in post_locality_pending[:16].tolist()
-                        ],
-                        "seed_influence_topk": seed_influence_topk,
-                        "seed_influence_topk_hash": _hash_json_payload(seed_influence_topk),
-                        "seed_cutoff": seed_cutoff_debug,
-                        "deterministic_shadow": _compare_phase4_frontiers(
-                            post_locality_pending,
-                            deterministic_pending,
-                        ),
-                        "normalization_input_stats": normalization_input_stats,
-                        "feature_row_store_summary": row_store_snapshot,
                     }
                 )
 
-                if shadow_debug_compute_dtype != planner_compute_dtype:
-                    if use_compact_feature_row_store:
-                        assert feature_row_store is not None
-                        shadow_feature_influences = compute_partial_feature_influences_streaming(
-                            lambda row_start, row_end: feature_row_store.read_feature_rows(
-                                row_start,
-                                row_end,
-                                phase="phase3_seed_ranking_shadow",
-                            ),
-                            feature_row_store.row_abs_sums[:pre_phase4_st],
-                            targets.logit_probabilities,
-                            row_to_node_index[:pre_phase4_st],
-                            n_feature_nodes=total_active_feats,
-                            n_logits=n_logits,
-                            device=torch.device("cpu"),
-                            compute_dtype=shadow_debug_compute_dtype,
-                        )
-                    else:
-                        shadow_influences = compute_partial_influences(
-                            edge_matrix[:pre_phase4_st].to(dtype=shadow_debug_compute_dtype),
-                            targets.logit_probabilities.to(dtype=shadow_debug_compute_dtype),
-                            row_to_node_index[:pre_phase4_st],
-                            device=torch.device("cpu"),
-                        )
-                        shadow_feature_influences = shadow_influences[:total_active_feats]
-                    shadow_rank = torch.argsort(
-                        shadow_feature_influences,
-                        descending=True,
-                    ).cpu()
-                    shadow_pending = _reorder_pending_for_phase4_locality(
-                        shadow_rank[:queue_size],
+                if capture_phase3_seed_bundle_enabled:
+                    phase3_seed_bundle_payload = _build_phase3_seed_bundle_payload(
+                        active_features=activation_matrix.indices().T,
+                        activation_values=activation_matrix.values(),
+                        seed_feature_influences=seed_feature_influences,
+                        frontier_pre_locality=pre_locality_pending,
+                        frontier_post_locality=post_locality_pending,
+                        queue_size=queue_size,
+                        actual_max_feature_nodes=int(actual_max_feature_nodes),
+                        total_active_features=int(total_active_feats),
+                        status="captured",
+                        planner_compute_dtype=planner_compute_dtype,
+                        influence_compute_dtype=influence_compute_dtype,
+                    )
+
+                if cross_cluster_debug_summary is not None:
+                    deterministic_pending = _build_phase4_deterministic_shadow_pending(
+                        unvisited_feature_rank,
+                        seed_feature_influences.detach().cpu(),
+                        queue_size=queue_size,
                         feat_layers=feat_layers,
                         feat_positions=feat_pos,
                         feat_ids=feat_ids,
                         exact_chunked_decoder=exact_chunked_decoder,
                         decoder_chunk_size=getattr(model.transcoders, "decoder_chunk_size", None),
                     )
-                    phase3_seed_summary["shadow_debug"] = _compare_phase4_frontiers(
-                        post_locality_pending,
-                        shadow_pending,
+                    seed_cutoff_debug = _build_phase4_cutoff_debug(
+                        candidate_scores,
+                        queue_size=queue_size,
                     )
+                    seed_influence_topk = _build_phase3_seed_influence_topk(
+                        ranked_feature_indices=unvisited_feature_rank,
+                        seed_feature_influences=seed_feature_influences,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        top_k=8,
+                    )
+
+                    phase3_seed_summary.update(
+                        {
+                            "feature_influence_stats": _build_vector_stats(
+                                seed_feature_influences.detach().cpu(),
+                                epsilon=1e-12,
+                                top_k=8,
+                            ),
+                            "feature_influence_hash": _hash_float_tensor(
+                                seed_feature_influences.detach().cpu(),
+                                dtype=torch.float64,
+                            ),
+                            "frontier_pre_locality_hash": _hash_index_tensor(pre_locality_pending),
+                            "frontier_post_locality_hash": _hash_index_tensor(
+                                post_locality_pending
+                            ),
+                            "frontier_pre_locality_sample": [
+                                int(v) for v in pre_locality_pending[:16].tolist()
+                            ],
+                            "frontier_post_locality_sample": [
+                                int(v) for v in post_locality_pending[:16].tolist()
+                            ],
+                            "seed_influence_topk": seed_influence_topk,
+                            "seed_influence_topk_hash": _hash_json_payload(seed_influence_topk),
+                            "seed_cutoff": seed_cutoff_debug,
+                            "deterministic_shadow": _compare_phase4_frontiers(
+                                post_locality_pending,
+                                deterministic_pending,
+                            ),
+                            "normalization_input_stats": normalization_input_stats,
+                            "feature_row_store_summary": row_store_snapshot,
+                        }
+                    )
+
+                    if shadow_debug_compute_dtype != planner_compute_dtype:
+                        if use_compact_feature_row_store:
+                            assert feature_row_store is not None
+                            shadow_feature_influences = (
+                                compute_partial_feature_influences_streaming(
+                                    lambda row_start, row_end: feature_row_store.read_feature_rows(
+                                        row_start,
+                                        row_end,
+                                        phase="phase3_seed_ranking_shadow",
+                                    ),
+                                    feature_row_store.row_abs_sums[:pre_phase4_st],
+                                    targets.logit_probabilities,
+                                    row_to_node_index[:pre_phase4_st],
+                                    n_feature_nodes=total_active_feats,
+                                    n_logits=n_logits,
+                                    device=torch.device("cpu"),
+                                    compute_dtype=shadow_debug_compute_dtype,
+                                )
+                            )
+                        else:
+                            shadow_influences = compute_partial_influences(
+                                edge_matrix[:pre_phase4_st].to(dtype=shadow_debug_compute_dtype),
+                                targets.logit_probabilities.to(dtype=shadow_debug_compute_dtype),
+                                row_to_node_index[:pre_phase4_st],
+                                device=torch.device("cpu"),
+                            )
+                            shadow_feature_influences = shadow_influences[:total_active_feats]
+                        shadow_rank = torch.argsort(
+                            shadow_feature_influences,
+                            descending=True,
+                        ).cpu()
+                        shadow_pending = _reorder_pending_for_phase4_locality(
+                            shadow_rank[:queue_size],
+                            feat_layers=feat_layers,
+                            feat_positions=feat_pos,
+                            feat_ids=feat_ids,
+                            exact_chunked_decoder=exact_chunked_decoder,
+                            decoder_chunk_size=getattr(
+                                model.transcoders, "decoder_chunk_size", None
+                            ),
+                        )
+                        phase3_seed_summary["shadow_debug"] = _compare_phase4_frontiers(
+                            post_locality_pending,
+                            shadow_pending,
+                        )
             else:
                 phase3_seed_summary.update(
                     {
@@ -2961,89 +3043,109 @@ def _run_attribution(
                         "queue_size": int(actual_max_feature_nodes),
                     }
                 )
-            deterministic_shadow = phase3_seed_summary.get("deterministic_shadow")
-            shadow_debug = phase3_seed_summary.get("shadow_debug")
-            normalization_input_stats = phase3_seed_summary.get("normalization_input_stats")
-            feature_influence_stats = phase3_seed_summary.get("feature_influence_stats")
-            phase3_stream_checkpoint = {
-                "status": phase3_seed_summary.get("status"),
-                "stored_row_count_before_phase4": int(pre_phase4_st),
-                "actual_max_feature_nodes": int(actual_max_feature_nodes),
-                "total_active_features": int(total_active_feats),
-                "update_interval": int(update_interval),
-                "feature_batch_size": int(effective_feature_batch_size),
-                "queue_size": phase3_seed_summary.get("queue_size"),
-                "feature_influence_hash": phase3_seed_summary.get("feature_influence_hash"),
-                "frontier_pre_locality_hash": phase3_seed_summary.get("frontier_pre_locality_hash"),
-                "frontier_post_locality_hash": phase3_seed_summary.get(
-                    "frontier_post_locality_hash"
-                ),
-                "deterministic_shadow_overlap_fraction": (
-                    _safe_float(deterministic_shadow.get("overlap_fraction"))
-                    if isinstance(deterministic_shadow, dict)
-                    else None
-                ),
-                "deterministic_shadow_jaccard": (
-                    _safe_float(deterministic_shadow.get("jaccard_similarity"))
-                    if isinstance(deterministic_shadow, dict)
-                    else None
-                ),
-                "deterministic_shadow_prefix_match_count": (
-                    int(deterministic_shadow.get("prefix_match_count", 0))
-                    if isinstance(deterministic_shadow, dict)
-                    else None
-                ),
-                "shadow_debug_overlap_fraction": (
-                    _safe_float(shadow_debug.get("overlap_fraction"))
-                    if isinstance(shadow_debug, dict)
-                    else None
-                ),
-                "seed_influence_topk_hash": phase3_seed_summary.get("seed_influence_topk_hash"),
-                "seed_cutoff_margin": (
-                    _safe_float(phase3_seed_summary.get("seed_cutoff", {}).get("cutoff_margin"))
-                    if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
-                    else None
-                ),
-                "seed_cutoff_near_tie_count": (
-                    int(phase3_seed_summary.get("seed_cutoff", {}).get("near_cutoff_count", 0))
-                    if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
-                    else None
-                ),
-                "seed_cutoff_exact_tie_count": (
-                    int(phase3_seed_summary.get("seed_cutoff", {}).get("exact_cutoff_count", 0))
-                    if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
-                    else None
-                ),
-                "feature_influence_nonfinite_count": (
-                    int(feature_influence_stats.get("nonfinite_count", 0))
-                    if isinstance(feature_influence_stats, dict)
-                    else None
-                ),
-                "feature_influence_abs_sum": (
-                    _safe_float(feature_influence_stats.get("abs_sum"))
-                    if isinstance(feature_influence_stats, dict)
-                    else None
-                ),
-                "normalization_clamped_row_count": (
-                    int(normalization_input_stats.get("clamped_row_count", 0))
-                    if isinstance(normalization_input_stats, dict)
-                    else None
-                ),
-                "normalization_clamped_row_fraction": (
-                    _safe_float(normalization_input_stats.get("clamped_row_fraction"))
-                    if isinstance(normalization_input_stats, dict)
-                    else None
-                ),
-                **phase3_runtime_stream,
-            }
-            _record_cross_cluster_checkpoint(
-                cross_cluster_debug_summary=cross_cluster_debug_summary,
-                cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
-                checkpoint_name="phase3_seed_ranking_pre_phase4",
-                phase="phase3",
-                summary_payload=phase3_seed_summary,
-                stream_payload=phase3_stream_checkpoint,
-            )
+                if capture_phase3_seed_bundle_enabled:
+                    phase3_seed_bundle_payload = _build_phase3_seed_bundle_payload(
+                        active_features=activation_matrix.indices().T,
+                        activation_values=activation_matrix.values(),
+                        seed_feature_influences=torch.empty(
+                            0,
+                            dtype=planner_compute_dtype,
+                        ),
+                        frontier_pre_locality=torch.empty(0, dtype=torch.long),
+                        frontier_post_locality=torch.empty(0, dtype=torch.long),
+                        queue_size=int(actual_max_feature_nodes),
+                        actual_max_feature_nodes=int(actual_max_feature_nodes),
+                        total_active_features=int(total_active_feats),
+                        status="skipped_all_features_included",
+                        planner_compute_dtype=planner_compute_dtype,
+                        influence_compute_dtype=influence_compute_dtype,
+                    )
+            if cross_cluster_debug_summary is not None:
+                deterministic_shadow = phase3_seed_summary.get("deterministic_shadow")
+                shadow_debug = phase3_seed_summary.get("shadow_debug")
+                normalization_input_stats = phase3_seed_summary.get("normalization_input_stats")
+                feature_influence_stats = phase3_seed_summary.get("feature_influence_stats")
+                phase3_stream_checkpoint = {
+                    "status": phase3_seed_summary.get("status"),
+                    "stored_row_count_before_phase4": int(pre_phase4_st),
+                    "actual_max_feature_nodes": int(actual_max_feature_nodes),
+                    "total_active_features": int(total_active_feats),
+                    "update_interval": int(update_interval),
+                    "feature_batch_size": int(effective_feature_batch_size),
+                    "queue_size": phase3_seed_summary.get("queue_size"),
+                    "feature_influence_hash": phase3_seed_summary.get("feature_influence_hash"),
+                    "frontier_pre_locality_hash": phase3_seed_summary.get(
+                        "frontier_pre_locality_hash"
+                    ),
+                    "frontier_post_locality_hash": phase3_seed_summary.get(
+                        "frontier_post_locality_hash"
+                    ),
+                    "deterministic_shadow_overlap_fraction": (
+                        _safe_float(deterministic_shadow.get("overlap_fraction"))
+                        if isinstance(deterministic_shadow, dict)
+                        else None
+                    ),
+                    "deterministic_shadow_jaccard": (
+                        _safe_float(deterministic_shadow.get("jaccard_similarity"))
+                        if isinstance(deterministic_shadow, dict)
+                        else None
+                    ),
+                    "deterministic_shadow_prefix_match_count": (
+                        int(deterministic_shadow.get("prefix_match_count", 0))
+                        if isinstance(deterministic_shadow, dict)
+                        else None
+                    ),
+                    "shadow_debug_overlap_fraction": (
+                        _safe_float(shadow_debug.get("overlap_fraction"))
+                        if isinstance(shadow_debug, dict)
+                        else None
+                    ),
+                    "seed_influence_topk_hash": phase3_seed_summary.get("seed_influence_topk_hash"),
+                    "seed_cutoff_margin": (
+                        _safe_float(phase3_seed_summary.get("seed_cutoff", {}).get("cutoff_margin"))
+                        if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
+                        else None
+                    ),
+                    "seed_cutoff_near_tie_count": (
+                        int(phase3_seed_summary.get("seed_cutoff", {}).get("near_cutoff_count", 0))
+                        if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
+                        else None
+                    ),
+                    "seed_cutoff_exact_tie_count": (
+                        int(phase3_seed_summary.get("seed_cutoff", {}).get("exact_cutoff_count", 0))
+                        if isinstance(phase3_seed_summary.get("seed_cutoff"), dict)
+                        else None
+                    ),
+                    "feature_influence_nonfinite_count": (
+                        int(feature_influence_stats.get("nonfinite_count", 0))
+                        if isinstance(feature_influence_stats, dict)
+                        else None
+                    ),
+                    "feature_influence_abs_sum": (
+                        _safe_float(feature_influence_stats.get("abs_sum"))
+                        if isinstance(feature_influence_stats, dict)
+                        else None
+                    ),
+                    "normalization_clamped_row_count": (
+                        int(normalization_input_stats.get("clamped_row_count", 0))
+                        if isinstance(normalization_input_stats, dict)
+                        else None
+                    ),
+                    "normalization_clamped_row_fraction": (
+                        _safe_float(normalization_input_stats.get("clamped_row_fraction"))
+                        if isinstance(normalization_input_stats, dict)
+                        else None
+                    ),
+                    **phase3_runtime_stream,
+                }
+                _record_cross_cluster_checkpoint(
+                    cross_cluster_debug_summary=cross_cluster_debug_summary,
+                    cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                    checkpoint_name="phase3_seed_ranking_pre_phase4",
+                    phase="phase3",
+                    summary_payload=phase3_seed_summary,
+                    stream_payload=phase3_stream_checkpoint,
+                )
 
         # Phase 4: feature attribution
         logger.info("Phase 4: Computing feature attributions")
@@ -4070,6 +4172,7 @@ def _run_attribution(
                 "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
                 "cross_cluster_debug_enabled": bool(cross_cluster_debug_enabled),
+                "capture_phase3_seed_bundle_enabled": bool(capture_phase3_seed_bundle_enabled),
                 "phase4_refresh_count": int(phase4_refresh_count),
                 "phase4_batch_count": int(phase4_batch_count),
                 "phase4_refresh_elapsed_seconds_total": round(
@@ -4084,6 +4187,8 @@ def _run_attribution(
                 "cfg": model.config,
                 "scan": model.scan,
             }
+            if capture_phase3_seed_bundle_enabled:
+                compact_output_result["phase3_seed_bundle"] = phase3_seed_bundle_payload
             if cross_cluster_debug_summary is not None:
                 cross_cluster_debug_summary["status"] = "captured"
                 phase4_runtime_summary, phase4_runtime_stream = (

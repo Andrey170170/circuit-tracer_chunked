@@ -13,6 +13,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
+    _build_phase3_seed_bundle_payload,
     _record_cross_cluster_batch_event,
     _record_cross_cluster_checkpoint,
     _compute_row_abs_sums,
@@ -782,6 +783,49 @@ def test_build_phase4_cutoff_debug_reports_margin_and_ties() -> None:
     assert result["cutoff_margin"] == pytest.approx(0.0)
     assert result["exact_cutoff_count"] == 2
     assert result["near_cutoff_count"] >= 2
+
+
+def test_build_phase3_seed_bundle_payload_canonicalizes_cpu_tensors() -> None:
+    payload = _build_phase3_seed_bundle_payload(
+        active_features=torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64),
+        activation_values=torch.tensor([0.25, -0.75], dtype=torch.float32),
+        seed_feature_influences=torch.tensor([0.4, 0.2, 0.1], dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([2, 0], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([0, 2], dtype=torch.int64),
+        queue_size=2,
+        actual_max_feature_nodes=3,
+        total_active_features=9,
+        status="captured",
+        planner_compute_dtype=torch.float64,
+        influence_compute_dtype=torch.float64,
+    )
+
+    assert payload["status"] == "captured"
+    assert payload["queue_size"] == 2
+    assert payload["actual_max_feature_nodes"] == 3
+    assert payload["total_active_features"] == 9
+    assert payload["planner_compute_dtype"] == "float64"
+    assert payload["influence_compute_dtype"] == "float64"
+    assert torch.equal(
+        payload["active_features"],
+        torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64),
+    )
+    assert torch.equal(
+        payload["activation_values"],
+        torch.tensor([0.25, -0.75], dtype=torch.float32),
+    )
+    assert torch.equal(
+        payload["seed_feature_influences"],
+        torch.tensor([0.4, 0.2, 0.1], dtype=torch.float64),
+    )
+    assert torch.equal(
+        payload["frontier_pre_locality"],
+        torch.tensor([2, 0], dtype=torch.int64),
+    )
+    assert torch.equal(
+        payload["frontier_post_locality"],
+        torch.tensor([0, 2], dtype=torch.int64),
+    )
 
 
 def test_build_vector_stats_reports_effective_zero_signal() -> None:
