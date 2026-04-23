@@ -159,7 +159,7 @@ def _exact_trace_internal_dtype_name(dtype: torch.dtype) -> str:
 
 
 class _FileBackedFeatureRowStore:
-    """Append-only dense feature-row store backed by a temporary memmap file."""
+    """Append-only dense feature-row store backed by a temporary binary file."""
 
     def __init__(
         self,
@@ -183,14 +183,25 @@ class _FileBackedFeatureRowStore:
 
         self._dtype = dtype
         self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
+        self._dtype_itemsize = int(np.dtype(self._np_dtype).itemsize)
+        self._row_nbytes = int(self.n_feature_columns * self._dtype_itemsize)
+        self._total_nbytes = int(self.n_rows * self._row_nbytes)
         self._tmpdir = tempfile.TemporaryDirectory(prefix="ct_feature_rows_")
-        self._path = f"{self._tmpdir.name}/feature_rows.memmap"
-        self._rows: np.memmap | None = np.memmap(
-            self._path,
-            mode="w+",
-            dtype=self._np_dtype,
-            shape=(n_rows, n_feature_columns),
-        )
+        self._path = os.path.join(self._tmpdir.name, "feature_rows.bin")
+        self._fd: int | None = None
+        try:
+            self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.ftruncate(self._fd, self._total_nbytes)
+        except Exception:
+            fd = self._fd
+            self._fd = None
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            self._tmpdir.cleanup()
+            raise
         self._read_chunk_cache_max_bytes = max(0, int(read_chunk_cache_bytes))
         self._read_chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
         self._read_chunk_cache_nbytes = 0
@@ -245,13 +256,75 @@ class _FileBackedFeatureRowStore:
 
     @property
     def nbytes(self) -> int:
-        rows = self._require_open_rows()
-        return int(rows.size * rows.dtype.itemsize)
+        self._require_open_fd()
+        return self._total_nbytes
 
-    def _require_open_rows(self) -> np.memmap:
-        if self._closed or self._rows is None:
+    def _require_open_fd(self) -> int:
+        if self._closed or self._fd is None:
             raise RuntimeError("feature row store has been cleaned up")
-        return self._rows
+        return self._fd
+
+    def _row_slice_offset_and_nbytes(self, row_start: int, row_end: int) -> tuple[int, int]:
+        row_count = int(row_end - row_start)
+        return (int(row_start * self._row_nbytes), int(row_count * self._row_nbytes))
+
+    def _write_all_at_offset(self, payload: bytes, *, byte_offset: int) -> None:
+        if not payload:
+            return
+
+        fd = self._require_open_fd()
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            chunk = view[written:]
+            if hasattr(os, "pwrite"):
+                n_written = os.pwrite(fd, chunk, byte_offset + written)
+            else:
+                os.lseek(fd, byte_offset + written, os.SEEK_SET)
+                n_written = os.write(fd, chunk)
+            if n_written <= 0:
+                raise OSError("failed to write complete feature row payload")
+            written += n_written
+
+    def _read_exact_at_offset(self, *, byte_offset: int, byte_count: int) -> bytes:
+        if byte_count == 0:
+            return b""
+
+        fd = self._require_open_fd()
+        chunks: list[bytes] = []
+        remaining = byte_count
+        cursor = byte_offset
+        while remaining > 0:
+            if hasattr(os, "pread"):
+                chunk = os.pread(fd, remaining, cursor)
+            else:
+                os.lseek(fd, cursor, os.SEEK_SET)
+                chunk = os.read(fd, remaining)
+            if not chunk:
+                raise OSError("failed to read complete feature row payload")
+            chunks.append(chunk)
+            read_nbytes = len(chunk)
+            remaining -= read_nbytes
+            cursor += read_nbytes
+
+        return b"".join(chunks)
+
+    def _read_rows_numpy(self, row_start: int, row_end: int) -> np.ndarray:
+        row_count = int(row_end - row_start)
+        if row_count == 0:
+            return np.empty((0, self.n_feature_columns), dtype=self._np_dtype)
+
+        byte_offset, byte_count = self._row_slice_offset_and_nbytes(row_start, row_end)
+        payload = self._read_exact_at_offset(byte_offset=byte_offset, byte_count=byte_count)
+        flat = np.frombuffer(payload, dtype=self._np_dtype)
+        expected_elements = row_count * self.n_feature_columns
+        if int(flat.size) != expected_elements:
+            raise RuntimeError(
+                "feature row payload size mismatch "
+                f"(expected {expected_elements}, got {int(flat.size)})"
+            )
+
+        return flat.reshape(row_count, self.n_feature_columns).copy()
 
     @staticmethod
     def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -358,6 +431,9 @@ class _FileBackedFeatureRowStore:
         if row_start < 0 or row_end > self.n_rows:
             raise ValueError("row range is out of bounds for file-backed store")
 
+        self._evict_overlapping_read_chunks(row_start, row_end)
+        self._sync_read_cache_snapshot()
+
         with self._telemetry_timer(
             name="feature_row_store.append_rows",
             phase=phase,
@@ -368,11 +444,20 @@ class _FileBackedFeatureRowStore:
                 "feature_columns": n_feature_cols,
             },
         ):
-            rows = self._require_open_rows()
             feature_rows_cpu = feature_rows.detach()
             if feature_rows_cpu.device.type != "cpu" or feature_rows_cpu.dtype != self._dtype:
                 feature_rows_cpu = feature_rows_cpu.to(device="cpu", dtype=self._dtype)
-            rows[row_start:row_end] = feature_rows_cpu.numpy()
+            if not feature_rows_cpu.is_contiguous():
+                feature_rows_cpu = feature_rows_cpu.contiguous()
+
+            byte_offset, expected_nbytes = self._row_slice_offset_and_nbytes(row_start, row_end)
+            payload = feature_rows_cpu.numpy().tobytes(order="C")
+            if len(payload) != expected_nbytes:
+                raise RuntimeError(
+                    "feature row payload size mismatch "
+                    f"(expected {expected_nbytes} bytes, got {len(payload)} bytes)"
+                )
+            self._write_all_at_offset(payload, byte_offset=byte_offset)
 
             row_abs_max_cpu = row_abs_max.detach()
             if (
@@ -402,7 +487,6 @@ class _FileBackedFeatureRowStore:
         self._diagnostic_stats["append_row_count"] = int(
             self._diagnostic_stats["append_row_count"] or 0
         ) + int(row_count)
-        self._evict_overlapping_read_chunks(row_start, row_end)
         self._sync_read_cache_snapshot()
 
     def read_feature_rows(
@@ -433,8 +517,7 @@ class _FileBackedFeatureRowStore:
                 self._read_chunk_cache.move_to_end(cache_key)
                 result = cached
             else:
-                rows = self._require_open_rows()
-                result = torch.from_numpy(np.asarray(rows[row_start:row_end], dtype=self._np_dtype))
+                result = torch.from_numpy(self._read_rows_numpy(row_start, row_end))
                 self._insert_read_chunk(cache_key, result)
 
         self._diagnostic_stats["read_call_count"] = (
@@ -500,23 +583,30 @@ class _FileBackedFeatureRowStore:
                 "col_chunk_size": col_chunk_size,
             },
         ):
-            rows = self._require_open_rows()
-            row_slice = rows[row_start:row_end]
-            dense_np = dense.numpy() if same_dtype_fast_path else None
-            for col_start in range(0, n_cols, col_chunk_size):
-                col_end = min(col_start + col_chunk_size, n_cols)
-                cols_np = selected_cols_np[col_start:col_end]
-                if same_dtype_fast_path:
-                    assert dense_np is not None
-                    np.take(
-                        row_slice,
-                        cols_np,
-                        axis=1,
-                        out=dense_np[:, col_start:col_end],
-                    )
-                else:
-                    chunk_np = np.asarray(row_slice[:, cols_np], dtype=self._np_dtype)
-                    dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
+            max_row_chunk_bytes = 32 * 1024 * 1024
+            row_chunk_rows = max(1, max_row_chunk_bytes // max(self._row_nbytes, 1))
+            for block_row_start in range(row_start, row_end, row_chunk_rows):
+                block_row_end = min(block_row_start + row_chunk_rows, row_end)
+                block_row_slice = self._read_rows_numpy(block_row_start, block_row_end)
+                out_row_start = block_row_start - row_start
+                out_row_end = out_row_start + block_row_slice.shape[0]
+                dense_block = dense[out_row_start:out_row_end]
+                dense_block_np = dense_block.numpy() if same_dtype_fast_path else None
+
+                for col_start in range(0, n_cols, col_chunk_size):
+                    col_end = min(col_start + col_chunk_size, n_cols)
+                    cols_np = selected_cols_np[col_start:col_end]
+                    if same_dtype_fast_path:
+                        assert dense_block_np is not None
+                        np.take(
+                            block_row_slice,
+                            cols_np,
+                            axis=1,
+                            out=dense_block_np[:, col_start:col_end],
+                        )
+                    else:
+                        chunk_np = np.asarray(block_row_slice[:, cols_np], dtype=self._np_dtype)
+                        dense_block[:, col_start:col_end] = torch.from_numpy(chunk_np)
 
         self._diagnostic_stats["materialize_call_count"] = (
             int(self._diagnostic_stats["materialize_call_count"] or 0) + 1
@@ -549,11 +639,11 @@ class _FileBackedFeatureRowStore:
             return
         self._closed = True
 
-        rows = self._rows
-        self._rows = None
-        if rows is not None:
+        fd = self._fd
+        self._fd = None
+        if fd is not None:
             try:
-                rows.flush()
+                os.close(fd)
             except Exception:
                 pass
 
@@ -2495,7 +2585,7 @@ def _run_attribution(
         if use_compact_feature_row_store:
             assert feature_row_store is not None
             phase2_extra.update(
-                feature_row_store="dense_memmap",
+                feature_row_store="dense_file_io",
                 feature_row_store_path=feature_row_store.path,
                 row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",

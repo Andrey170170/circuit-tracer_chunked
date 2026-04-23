@@ -127,6 +127,35 @@ def test_file_backed_feature_row_store_read_cache_too_large_is_reported() -> Non
     assert stats["read_cache_miss_count"] == 2
 
 
+def test_file_backed_feature_row_store_read_returns_owned_rows() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        read_chunk_cache_bytes=0,
+    )
+
+    try:
+        store.append_rows(
+            row_start=0,
+            feature_rows=torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32),
+            full_row_abs_sums=torch.tensor([6.0], dtype=torch.float32),
+        )
+        first_read = store.read_feature_rows(0, 1)
+
+        store.append_rows(
+            row_start=0,
+            feature_rows=torch.tensor([[9.0, 9.0, 9.0]], dtype=torch.float32),
+            full_row_abs_sums=torch.tensor([27.0], dtype=torch.float32),
+        )
+        second_read = store.read_feature_rows(0, 1)
+    finally:
+        store.cleanup()
+
+    assert torch.allclose(first_read, torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32))
+    assert torch.allclose(second_read, torch.tensor([[9.0, 9.0, 9.0]], dtype=torch.float32))
+
+
 def test_exact_trace_internal_dtype_resolution_supports_fp32_and_fp64() -> None:
     assert _resolve_exact_trace_internal_dtype("fp32") == torch.float32
     assert _resolve_exact_trace_internal_dtype("FP64") == torch.float64
