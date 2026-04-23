@@ -185,9 +185,14 @@ class _FileBackedFeatureRowStore:
         self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
         self._tmpdir = tempfile.TemporaryDirectory(prefix="ct_feature_rows_")
         self._path = f"{self._tmpdir.name}/feature_rows.memmap"
+        self._row_nbytes = int(np.dtype(self._np_dtype).itemsize * n_feature_columns)
+        total_nbytes = int(self._row_nbytes * n_rows)
+        with open(self._path, "wb") as handle:
+            handle.truncate(total_nbytes)
+        self._write_fd: int | None = os.open(self._path, os.O_RDWR)
         self._rows: np.memmap | None = np.memmap(
             self._path,
-            mode="w+",
+            mode="r+",
             dtype=self._np_dtype,
             shape=(n_rows, n_feature_columns),
         )
@@ -252,6 +257,11 @@ class _FileBackedFeatureRowStore:
         if self._closed or self._rows is None:
             raise RuntimeError("feature row store has been cleaned up")
         return self._rows
+
+    def _require_open_write_fd(self) -> int:
+        if self._closed or self._write_fd is None:
+            raise RuntimeError("feature row store has been cleaned up")
+        return self._write_fd
 
     @staticmethod
     def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -368,11 +378,29 @@ class _FileBackedFeatureRowStore:
                 "feature_columns": n_feature_cols,
             },
         ):
-            rows = self._require_open_rows()
+            write_fd = self._require_open_write_fd()
             feature_rows_cpu = feature_rows.detach()
             if feature_rows_cpu.device.type != "cpu" or feature_rows_cpu.dtype != self._dtype:
                 feature_rows_cpu = feature_rows_cpu.to(device="cpu", dtype=self._dtype)
-            rows[row_start:row_end] = feature_rows_cpu.numpy()
+
+            feature_rows_np = np.asarray(feature_rows_cpu.numpy(), dtype=self._np_dtype, order="C")
+            if not feature_rows_np.flags.c_contiguous:
+                feature_rows_np = np.ascontiguousarray(feature_rows_np, dtype=self._np_dtype)
+            payload = memoryview(feature_rows_np).cast("B")
+            expected_nbytes = int(row_count * self._row_nbytes)
+            if payload.nbytes != expected_nbytes:
+                raise RuntimeError(
+                    "feature row store append payload size mismatch: "
+                    f"expected {expected_nbytes} bytes, got {payload.nbytes}"
+                )
+
+            byte_offset = int(row_start * self._row_nbytes)
+            bytes_written = 0
+            while bytes_written < expected_nbytes:
+                wrote = os.pwrite(write_fd, payload[bytes_written:], byte_offset + bytes_written)
+                if wrote <= 0:
+                    raise OSError("feature row store append write failed")
+                bytes_written += wrote
 
             row_abs_max_cpu = row_abs_max.detach()
             if (
@@ -554,6 +582,14 @@ class _FileBackedFeatureRowStore:
         if rows is not None:
             try:
                 rows.flush()
+            except Exception:
+                pass
+
+        write_fd = self._write_fd
+        self._write_fd = None
+        if write_fd is not None:
+            try:
+                os.close(write_fd)
             except Exception:
                 pass
 

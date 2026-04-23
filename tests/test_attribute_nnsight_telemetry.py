@@ -335,6 +335,31 @@ def test_file_backed_feature_row_store_append_rows_accepts_strided_scaled_l1_tup
     assert torch.allclose(store.row_l1_scaled[:2], row_denominator[1])
 
 
+def test_file_backed_feature_row_store_append_rows_works_with_read_only_memmap_view() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+    )
+
+    try:
+        assert store._rows is not None
+        store._rows.flags.writeable = False
+
+        rows = torch.tensor([[1.0, 2.0, 3.0], [0.5, -0.5, 1.5]], dtype=torch.float32)
+        store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=_compute_row_denominator_scaled_l1(rows, dtype=torch.float32),
+        )
+        store._rows.flags.writeable = True
+        restored = store.read_feature_rows(0, 2)
+    finally:
+        store.cleanup()
+
+    assert torch.allclose(restored, rows)
+
+
 def test_file_backed_row_store_materialize_dtype_tracks_denominator_dtype() -> None:
     store = _FileBackedFeatureRowStore(
         n_rows=2,
