@@ -19,6 +19,8 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_vector_stats,
     _compare_phase4_frontiers,
     _compute_phase4_planned_feature_batch_size,
+    _compute_phase4_locality_shaped_batch_end,
+    _compute_phase4_locality_shaped_frontier_size,
     _reorder_pending_for_phase4_locality,
     _resolve_internal_dtype_map,
     _resolve_internal_precision_requested,
@@ -687,6 +689,80 @@ def test_reorder_pending_for_phase4_locality_groups_layer_then_chunk_then_positi
     assert torch.equal(reordered, torch.tensor([5, 1, 3, 2, 4, 0], dtype=torch.long))
 
 
+def test_phase4_locality_shaped_batch_end_prefers_layer_chunk_boundaries() -> None:
+    pending = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+    feat_layers = torch.zeros(6, dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+
+    end0 = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=0,
+        max_batch_size=3,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+    end1 = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=end0,
+        max_batch_size=3,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+    end2 = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=end1,
+        max_batch_size=3,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert end0 == 2
+    assert end1 == 4
+    assert end2 == 6
+
+
+def test_phase4_locality_shaped_batch_end_keeps_baseline_when_split_unavoidable() -> None:
+    pending = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    feat_layers = torch.zeros(4, dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+
+    end = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=0,
+        max_batch_size=2,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=8,
+    )
+
+    assert end == 2
+
+
+def test_phase4_locality_shaped_frontier_size_preserves_update_interval_batch_cadence() -> None:
+    pending = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+    feat_layers = torch.zeros(6, dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+
+    frontier_size = _compute_phase4_locality_shaped_frontier_size(
+        pending,
+        max_batch_size=3,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert frontier_size == 4
+
+
 def test_phase4_planner_batch_size_grows_and_respects_max_cap() -> None:
     assert (
         _compute_phase4_planned_feature_batch_size(
@@ -1023,6 +1099,137 @@ def test_chunked_feature_replay_windows_match_full_replay() -> None:
     )
 
     assert torch.allclose(windowed_ctx._batch_buffer, expected)
+
+
+def test_chunked_attr_fallback_handles_nonmonotonic_chunk_ids_within_layer() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 0], [0, 1, 2], [0, 2, 1]]),
+        values=torch.tensor([1.0, 1.0, 1.0]),
+        size=(2, 3, 3),
+        check_invariants=True,
+    ).coalesce()
+    provider = FakeDecoderProvider(
+        {
+            0: torch.tensor(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[0.0, 1.0], [1.0, 0.0]],
+                    [[1.0, 1.0], [2.0, 0.0]],
+                ]
+            )
+        },
+        chunk_size=2,
+        enable_cache=True,
+    )
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 3, 2),
+        token_vectors=torch.zeros(3, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+    ctx._batch_buffer = torch.zeros(ctx._row_size, 1)
+
+    grads_by_output_layer = [
+        torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]),
+        torch.tensor([[[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]]),
+    ]
+
+    expected = torch.zeros(activation_matrix._nnz(), 1)
+    positions = activation_matrix.indices()[1]
+    feature_ids = activation_matrix.indices()[2]
+    activations = activation_matrix.values()
+    decoder_block = provider.blocks[0]
+    for row_idx in range(activation_matrix._nnz()):
+        position = int(positions[row_idx].item())
+        feature_id = int(feature_ids[row_idx].item())
+        activation = activations[row_idx]
+        total = torch.zeros(1)
+        for output_layer, grads in enumerate(grads_by_output_layer):
+            decoder_vec = decoder_block[feature_id, output_layer]
+            total += torch.einsum("bd,d->b", grads[:, position], decoder_vec) * activation
+        expected[row_idx] = total
+
+    ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+
+    assert torch.allclose(ctx._batch_buffer[: activation_matrix._nnz()], expected)
+    assert provider.load_calls == [(0, 0), (0, 1)]
+
+
+def test_chunked_attr_monotonic_chunk_fast_path_matches_reference() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 0, 0], [0, 1, 2, 3], [0, 1, 2, 3]]),
+        values=torch.tensor([1.0, 1.5, 2.0, 0.5]),
+        size=(2, 4, 4),
+        check_invariants=True,
+    ).coalesce()
+    provider = FakeDecoderProvider(
+        {
+            0: torch.tensor(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[0.0, 1.0], [1.0, 0.0]],
+                    [[1.0, 1.0], [2.0, 0.0]],
+                    [[2.0, 1.0], [0.0, 2.0]],
+                ]
+            )
+        },
+        chunk_size=2,
+        enable_cache=True,
+    )
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 4, 2),
+        token_vectors=torch.zeros(4, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+    ctx._batch_buffer = torch.zeros(ctx._row_size, 1)
+
+    grads_by_output_layer = [
+        torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]),
+        torch.tensor([[[2.0, 1.0], [4.0, 3.0], [6.0, 5.0], [8.0, 7.0]]]),
+    ]
+
+    expected = torch.zeros(activation_matrix._nnz(), 1)
+    positions = activation_matrix.indices()[1]
+    feature_ids = activation_matrix.indices()[2]
+    activations = activation_matrix.values()
+    decoder_block = provider.blocks[0]
+    for row_idx in range(activation_matrix._nnz()):
+        position = int(positions[row_idx].item())
+        feature_id = int(feature_ids[row_idx].item())
+        activation = activations[row_idx]
+        total = torch.zeros(1)
+        for output_layer, grads in enumerate(grads_by_output_layer):
+            decoder_vec = decoder_block[feature_id, output_layer]
+            total += torch.einsum("bd,d->b", grads[:, position], decoder_vec) * activation
+        expected[row_idx] = total
+
+    ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+
+    assert torch.allclose(ctx._batch_buffer[: activation_matrix._nnz()], expected)
+    assert provider.load_calls == [(0, 0), (0, 1)]
 
 
 def test_decoder_cache_stays_enabled_on_churn() -> None:

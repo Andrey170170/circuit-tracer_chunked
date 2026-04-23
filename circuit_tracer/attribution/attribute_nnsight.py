@@ -82,14 +82,17 @@ def _log_batch_profile(
     logger,
     label: str,
     batch_idx: int,
-    total_batches: int,
+    total_batches: int | None,
     elapsed: float,
     ctx_before: dict[str, object] | None,
     ctx_after: dict[str, object] | None,
     transcoder_before: dict[str, object] | None,
     transcoder_after: dict[str, object] | None,
 ):
-    parts = [f"{label} batch {batch_idx}/{total_batches} in {elapsed:.2f}s"]
+    batch_progress = (
+        f"batch {batch_idx}/{total_batches}" if total_batches is not None else f"batch {batch_idx}"
+    )
+    parts = [f"{label} {batch_progress} in {elapsed:.2f}s"]
     ctx_delta = diff_numeric_metrics(ctx_before, ctx_after) if ctx_after is not None else {}
     transcoder_delta = (
         diff_numeric_metrics(transcoder_before, transcoder_after)
@@ -639,6 +642,103 @@ def _reorder_pending_for_phase4_locality(
         )
     )
     return torch.tensor(pending_list, dtype=pending.dtype, device=pending.device)
+
+
+def _compute_phase4_locality_shaped_batch_end(
+    pending: torch.Tensor,
+    *,
+    pending_offset: int,
+    max_batch_size: int,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> int:
+    """Pick a Phase-4 batch end that prefers layer/chunk run boundaries.
+
+    This keeps the frontier membership fixed and preserves ordering while avoiding
+    unnecessary splits of contiguous ``(source_layer, decoder_chunk)`` runs when
+    a boundary is available within the current max-size slice.
+    """
+
+    total_pending = int(pending.numel())
+    if pending_offset >= total_pending:
+        return total_pending
+
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be > 0")
+
+    if max_batch_size == 1:
+        return min(pending_offset + max_batch_size, total_pending)
+
+    baseline_end = min(pending_offset + max_batch_size, total_pending)
+    if baseline_end >= total_pending:
+        return baseline_end
+
+    use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
+    probe = pending[pending_offset : baseline_end + 1]
+    probe_layers = feat_layers[probe]
+    if use_chunk_key:
+        probe_chunks = torch.div(
+            feat_ids[probe],
+            int(decoder_chunk_size),
+            rounding_mode="floor",
+        )
+    else:
+        probe_chunks = torch.zeros_like(probe_layers)
+
+    split_index = max_batch_size - 1
+    if int(probe_layers[split_index].item()) != int(probe_layers[split_index + 1].item()):
+        return baseline_end
+    if int(probe_chunks[split_index].item()) != int(probe_chunks[split_index + 1].item()):
+        return baseline_end
+
+    prefix_layers = probe_layers[:max_batch_size]
+    prefix_chunks = probe_chunks[:max_batch_size]
+    boundaries = (prefix_layers[1:] != prefix_layers[:-1]) | (
+        prefix_chunks[1:] != prefix_chunks[:-1]
+    )
+    boundary_positions = torch.nonzero(boundaries, as_tuple=False)
+    if boundary_positions.numel() == 0:
+        return baseline_end
+
+    last_boundary = int(boundary_positions[-1].item())
+    return pending_offset + last_boundary + 1
+
+
+def _compute_phase4_locality_shaped_frontier_size(
+    pending: torch.Tensor,
+    *,
+    max_batch_size: int,
+    max_batches: int,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> int:
+    """Return the pending-prefix size covering at most ``max_batches`` shaped batches."""
+
+    if max_batches <= 0:
+        raise ValueError("max_batches must be > 0")
+
+    pending_offset = 0
+    pending_size = int(pending.numel())
+    for _ in range(max_batches):
+        if pending_offset >= pending_size:
+            break
+        batch_end = _compute_phase4_locality_shaped_batch_end(
+            pending,
+            pending_offset=pending_offset,
+            max_batch_size=max_batch_size,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        if batch_end <= pending_offset:
+            raise RuntimeError("Phase 4 locality shaping produced a non-advancing batch boundary")
+        pending_offset = batch_end
+    return pending_offset
 
 
 def _resolve_phase4_feature_batch_planner_enabled(
@@ -1452,11 +1552,16 @@ def _build_phase4_probe_pending_frontier(
 
     if feature_influences is None or actual_max_feature_nodes == total_active_feats:
         pending = torch.arange(total_active_feats)
-        max_probe_candidates = min(
-            int(pending.numel()),
-            initial_feature_batch_size * feature_batch_probe_batches,
+        probe_frontier_size = _compute_phase4_locality_shaped_frontier_size(
+            pending,
+            max_batch_size=initial_feature_batch_size,
+            max_batches=feature_batch_probe_batches,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
         )
-        return pending[:max_probe_candidates]
+        return pending[:probe_frontier_size]
 
     feature_rank = torch.argsort(feature_influences, descending=True).cpu()
     queue_size = min(update_interval * initial_feature_batch_size, actual_max_feature_nodes)
@@ -1471,11 +1576,16 @@ def _build_phase4_probe_pending_frontier(
         decoder_chunk_size=decoder_chunk_size,
     )
 
-    max_probe_candidates = min(
-        int(pending.numel()),
-        initial_feature_batch_size * feature_batch_probe_batches,
+    probe_frontier_size = _compute_phase4_locality_shaped_frontier_size(
+        pending,
+        max_batch_size=initial_feature_batch_size,
+        max_batches=feature_batch_probe_batches,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=exact_chunked_decoder,
+        decoder_chunk_size=decoder_chunk_size,
     )
-    return pending[:max_probe_candidates]
+    return pending[:probe_frontier_size]
 
 
 def _plan_phase4_feature_batch_size_preflight(
@@ -3162,11 +3272,11 @@ def _run_attribution(
                     if feature_row_store_snapshot_after is not None
                     else None
                 )
-                queue_size = min(
+                max_frontier_size = min(
                     update_interval * phase4_feature_batch_size,
                     actual_max_feature_nodes - n_visited,
                 )
-                pending = unvisited_feature_rank[:queue_size]
+                pending = unvisited_feature_rank[:max_frontier_size]
                 pending = _reorder_pending_for_phase4_locality(
                     pending,
                     feat_layers=feat_layers,
@@ -3175,6 +3285,16 @@ def _run_attribution(
                     exact_chunked_decoder=exact_chunked_decoder,
                     decoder_chunk_size=decoder_chunk_size,
                 )
+                queue_size = _compute_phase4_locality_shaped_frontier_size(
+                    pending,
+                    max_batch_size=phase4_feature_batch_size,
+                    max_batches=update_interval,
+                    feat_layers=feat_layers,
+                    feat_ids=feat_ids,
+                    exact_chunked_decoder=exact_chunked_decoder,
+                    decoder_chunk_size=decoder_chunk_size,
+                )
+                pending = pending[:queue_size]
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
                 phase4_refresh_elapsed_ms_total += refresh_elapsed_ms
@@ -3504,8 +3624,17 @@ def _run_attribution(
 
             pending_offset = 0
             while pending_offset < len(pending):
-                idx_batch = pending[pending_offset : pending_offset + phase4_feature_batch_size]
-                pending_offset += len(idx_batch)
+                batch_end = _compute_phase4_locality_shaped_batch_end(
+                    pending,
+                    pending_offset=pending_offset,
+                    max_batch_size=phase4_feature_batch_size,
+                    feat_layers=feat_layers,
+                    feat_ids=feat_ids,
+                    exact_chunked_decoder=exact_chunked_decoder,
+                    decoder_chunk_size=decoder_chunk_size,
+                )
+                idx_batch = pending[pending_offset:batch_end]
+                pending_offset = batch_end
                 n_visited += len(idx_batch)
                 phase4_batch_count += 1
 
@@ -3576,11 +3705,7 @@ def _run_attribution(
                             logger,
                             "Phase 4",
                             batch_number,
-                            max(
-                                (actual_max_feature_nodes + phase4_feature_batch_size - 1)
-                                // phase4_feature_batch_size,
-                                1,
-                            ),
+                            None,
                             batch_elapsed_ms / 1000.0,
                             ctx_before,
                             _snapshot_diagnostics(ctx),

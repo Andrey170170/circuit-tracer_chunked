@@ -592,15 +592,39 @@ class AttributionContext:
             layer_rows = torch.arange(layer_start, layer_end, device=feature_ids.device)
             layer_feature_ids = feature_ids[layer_start:layer_end]
             layer_chunk_ids = torch.div(layer_feature_ids, chunk_size, rounding_mode="floor")
-            unique_chunk_ids = torch.unique(layer_chunk_ids, sorted=True)
-            for chunk_position, chunk_id_tensor in enumerate(unique_chunk_ids, start=1):
+            monotonic_chunk_order = bool(
+                layer_chunk_ids.numel() <= 1
+                or torch.all(layer_chunk_ids[1:] >= layer_chunk_ids[:-1])
+            )
+            if monotonic_chunk_order:
+                ordered_chunk_ids, ordered_chunk_counts = torch.unique_consecutive(
+                    layer_chunk_ids,
+                    return_counts=True,
+                )
+            else:
+                ordered_chunk_ids = torch.unique(layer_chunk_ids, sorted=True)
+                ordered_chunk_counts = None
+
+            total_chunks = int(ordered_chunk_ids.numel())
+            chunk_offset = 0
+            for chunk_position, chunk_id_tensor in enumerate(ordered_chunk_ids, start=1):
                 chunk_id = int(chunk_id_tensor.item())
-                chunk_mask = layer_chunk_ids == chunk_id_tensor
-                chunk_rows = layer_rows[chunk_mask]
-                chunk_positions = positions[chunk_rows]
-                chunk_local_feat_ids = (
-                    layer_feature_ids[chunk_mask] - (chunk_id * chunk_size)
-                ).long()
+                if ordered_chunk_counts is not None:
+                    chunk_count = int(ordered_chunk_counts[chunk_position - 1].item())
+                    chunk_end = chunk_offset + chunk_count
+                    chunk_rows = layer_rows[chunk_offset:chunk_end]
+                    chunk_positions = positions[chunk_rows]
+                    chunk_local_feat_ids = (
+                        layer_feature_ids[chunk_offset:chunk_end] - (chunk_id * chunk_size)
+                    ).long()
+                    chunk_offset = chunk_end
+                else:
+                    chunk_mask = layer_chunk_ids == chunk_id_tensor
+                    chunk_rows = layer_rows[chunk_mask]
+                    chunk_positions = positions[chunk_rows]
+                    chunk_local_feat_ids = (
+                        layer_feature_ids[chunk_mask] - (chunk_id * chunk_size)
+                    ).long()
                 decoder_chunk = self.decoder_provider.get_decoder_chunk(
                     source_layer,
                     chunk_id,
@@ -663,8 +687,8 @@ class AttributionContext:
                                 source_layer=source_layer,
                                 chunk=chunk_counts[output_layer],
                                 decoder_chunk_id=chunk_id,
-                                processed_chunks=min(chunk_position, len(unique_chunk_ids)),
-                                total_chunks=len(unique_chunk_ids),
+                                processed_chunks=chunk_position,
+                                total_chunks=total_chunks,
                                 row_subchunk=row_subchunk_idx,
                                 total_row_subchunks=total_row_subchunks,
                             )
@@ -685,7 +709,7 @@ class AttributionContext:
                 elapsed_ms=(time.perf_counter() - source_layer_start) * 1000.0,
                 attrs={
                     "source_layer": source_layer,
-                    "active_decoder_chunks": int(len(unique_chunk_ids)),
+                    "active_decoder_chunks": total_chunks,
                     "relevant_output_layers": int(len(relevant_output_layers)),
                 },
             )
