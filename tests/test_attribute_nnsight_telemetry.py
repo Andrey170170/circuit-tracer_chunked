@@ -143,6 +143,27 @@ def test_exact_trace_internal_dtype_default_is_fp32_on_public_entrypoints() -> N
     )
 
 
+def test_phase4_scheduler_defaults_match_between_public_entrypoints() -> None:
+    entrypoint_sig = inspect.signature(attribute_entrypoint)
+    nnsight_sig = inspect.signature(nnsight_attribute)
+
+    assert (
+        entrypoint_sig.parameters["phase4_scheduler_mode"].default
+        == nnsight_sig.parameters["phase4_scheduler_mode"].default
+        == "locality"
+    )
+    assert (
+        entrypoint_sig.parameters["phase4_scheduler_debug"].default
+        == nnsight_sig.parameters["phase4_scheduler_debug"].default
+        is False
+    )
+    assert (
+        entrypoint_sig.parameters["phase4_scheduler_telemetry_detail"].default
+        == nnsight_sig.parameters["phase4_scheduler_telemetry_detail"].default
+        == "normal"
+    )
+
+
 def test_exact_trace_internal_dtype_resolution_rejects_unknown_value() -> None:
     with pytest.raises(ValueError, match="exact_trace_internal_dtype"):
         _resolve_exact_trace_internal_dtype("bf16")

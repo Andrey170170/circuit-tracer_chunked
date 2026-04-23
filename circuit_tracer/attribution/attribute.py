@@ -146,6 +146,9 @@ def attribute(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "legacy"] = "locality",
+    phase4_scheduler_debug: bool = False,
+    phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
@@ -183,6 +186,14 @@ def attribute(
         sparsification: Optional candidate-screening config. When provided, phase 0
             keeps only retained feature candidates before reconstruction, and later
             attribution phases reuse the same candidate set.
+        phase4_scheduler_mode: Phase-4 frontier scheduler mode for NNSight backend.
+            ``"locality"`` keeps default behavior. ``"planner_v1"`` enables the
+            membership-preserving planner path. ``"legacy"`` is accepted as an
+            alias by the NNSight entrypoint.
+        phase4_scheduler_debug: Emit additional planner scheduler diagnostics when
+            supported by the backend.
+        phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
+            Phase-4 planning/batching metadata.
         exact_trace_internal_dtype: Internal dtype used by compact exact-trace
             normalization/ranking internals ("fp32" or "fp64"). Defaults to
             ``"fp32"`` on the post-fix stable path.
@@ -197,6 +208,12 @@ def attribute(
             "Phase-4 feature batch planner is unsupported via circuit_tracer.attribution.attribute(). "
             "Use the NNSight entrypoint with compact_output=True on exact_chunked_decoder paths."
         )
+
+    scheduler_overrides_requested = (
+        phase4_scheduler_mode != "locality"
+        or bool(phase4_scheduler_debug)
+        or phase4_scheduler_telemetry_detail != "normal"
+    )
 
     if model.backend == "nnsight":
         from .attribute_nnsight import attribute as attribute_nnsight
@@ -229,9 +246,19 @@ def attribute(
             feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
             feature_batch_min_free_fraction=feature_batch_min_free_fraction,
             feature_batch_probe_batches=feature_batch_probe_batches,
+            phase4_scheduler_mode=phase4_scheduler_mode,
+            phase4_scheduler_debug=phase4_scheduler_debug,
+            phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
         )
     else:
+        if scheduler_overrides_requested:
+            raise ValueError(
+                "Phase-4 scheduler settings are only supported for the NNSight backend via "
+                "circuit_tracer.attribution.attribute(); received non-default scheduler "
+                f"arguments for backend={getattr(model, 'backend', '<unknown>')!r}."
+            )
+
         from .attribute_transformerlens import attribute as attribute_transformerlens
 
         return attribute_transformerlens(

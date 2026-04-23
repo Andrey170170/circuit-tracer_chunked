@@ -984,11 +984,19 @@ def _build_phase4_batch_locality_summary(
             .to(device="cpu", dtype=torch.long)
         )
         distinct_chunks = torch.unique(chunk_values)
-        monotonic_chunk_order = bool(
-            torch.all(chunk_values[1:] >= chunk_values[:-1]).item()
-            if chunk_values.numel() > 1
-            else True
-        )
+        if chunk_values.numel() > 1:
+            next_layers = layer_values[1:]
+            prev_layers = layer_values[:-1]
+            next_chunks = chunk_values[1:]
+            prev_chunks = chunk_values[:-1]
+            monotonic_chunk_order = bool(
+                torch.all(
+                    (next_layers > prev_layers)
+                    | ((next_layers == prev_layers) & (next_chunks >= prev_chunks))
+                ).item()
+            )
+        else:
+            monotonic_chunk_order = True
         distinct_chunk_count = int(distinct_chunks.numel())
         chunk_min = int(chunk_values.min().item())
         chunk_max = int(chunk_values.max().item())
@@ -3672,6 +3680,7 @@ def _run_attribution(
         phase4_batch_count = 0
         phase4_refresh_count = 0
         phase4_refresh_elapsed_ms_total = 0.0
+        phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
         previous_phase4_pending: torch.Tensor | None = None
         first_phase4_pending: torch.Tensor | None = None
         phase4_logit_probability_stats: dict[str, object] | None = None
@@ -3711,6 +3720,10 @@ def _run_attribution(
                         apply_locality_reorder=False,
                     )
                     pending = phase4_frontier_plan.selected_frontier
+                    phase4_no_refresh_plan_telemetry = _build_phase4_scheduler_plan_telemetry(
+                        phase4_frontier_plan=phase4_frontier_plan,
+                        telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                    )
                     if phase4_scheduler_config.debug:
                         logger.info(
                             "Phase 4 scheduler plan | "
@@ -4390,6 +4403,7 @@ def _run_attribution(
                 "phase4_refreshes": int(phase4_refresh_count),
                 "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
                 **phase4_scheduler_metadata,
+                **(phase4_no_refresh_plan_telemetry or {}),
             },
         )
         telemetry_recorder.record_wall_clock_duration(

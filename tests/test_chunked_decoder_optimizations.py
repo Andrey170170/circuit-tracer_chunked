@@ -14,6 +14,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
+    _build_phase4_scheduler_plan_telemetry,
     _record_cross_cluster_batch_event,
     _record_cross_cluster_checkpoint,
     _compute_row_abs_sums,
@@ -739,6 +740,21 @@ def test_phase4_batch_locality_summary_reports_layer_and_chunk_ranges() -> None:
     assert summary["scheduler_batch_monotonic_chunk_order"] is False
 
 
+def test_phase4_batch_locality_summary_treats_cross_layer_chunk_resets_as_monotonic() -> None:
+    summary = _build_phase4_batch_locality_summary(
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        feat_layers=torch.tensor([0, 0, 1, 1], dtype=torch.long),
+        feat_ids=torch.tensor([4, 6, 0, 2], dtype=torch.long),
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert summary["scheduler_batch_distinct_source_layer_count"] == 2
+    assert summary["scheduler_batch_decoder_chunk_min"] == 0
+    assert summary["scheduler_batch_decoder_chunk_max"] == 3
+    assert summary["scheduler_batch_monotonic_chunk_order"] is True
+
+
 def test_phase4_planner_v1_preserves_membership_and_boundaries() -> None:
     pending_candidates = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
     feat_layers = torch.zeros(6, dtype=torch.long)
@@ -794,6 +810,36 @@ def test_phase4_planner_v1_rejects_invalid_parameters_and_duplicates() -> None:
             exact_chunked_decoder=False,
             decoder_chunk_size=None,
         )
+
+
+def test_phase4_scheduler_plan_telemetry_reports_full_frontier_planner_metadata() -> None:
+    pending_candidates = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    feat_layers = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    feat_positions = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+
+    plan = _plan_phase4_frontier_membership_preserving_v1(
+        pending_candidates,
+        max_batch_size=2,
+        max_batches=None,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+        apply_locality_reorder=False,
+    )
+    telemetry = _build_phase4_scheduler_plan_telemetry(
+        phase4_frontier_plan=plan,
+        telemetry_detail="normal",
+    )
+
+    assert telemetry["scheduler_plan_frontier_size"] == 4
+    assert telemetry["scheduler_plan_membership_hash"] == plan.selected_membership_hash
+    assert telemetry["scheduler_plan_order_hash"] == plan.selected_order_hash
+    assert telemetry["scheduler_plan_batch_count"] == 2
+    assert telemetry["scheduler_plan_boundary_reason_counts"] == plan.boundary_reason_counts
+    assert telemetry["scheduler_plan_invariants"] == plan.invariant_summary
 
 
 def test_phase4_locality_shaped_batch_end_prefers_layer_chunk_boundaries() -> None:
@@ -1209,6 +1255,92 @@ def test_top_level_attribute_rejects_phase4_planner_flags() -> None:
             prompt="hello",
             model=cast(object, _DummyModel()),
             plan_feature_batch_size=True,
+        )
+
+
+def test_top_level_attribute_forwards_phase4_scheduler_args_to_nnsight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def _fake_attribute(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr("circuit_tracer.attribution.attribute_nnsight.attribute", _fake_attribute)
+
+    class _DummyModel:
+        backend = "nnsight"
+
+    result = attribute_top_level(
+        prompt="hello",
+        model=cast(object, _DummyModel()),
+        phase4_scheduler_mode="planner_v1",
+        phase4_scheduler_debug=True,
+        phase4_scheduler_telemetry_detail="debug",
+    )
+
+    assert result is sentinel
+    assert captured["phase4_scheduler_mode"] == "planner_v1"
+    assert captured["phase4_scheduler_debug"] is True
+    assert captured["phase4_scheduler_telemetry_detail"] == "debug"
+
+
+def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transformerlens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def _fake_attribute(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.attribute_transformerlens.attribute",
+        _fake_attribute,
+    )
+
+    class _DummyModel:
+        backend = "transformerlens"
+
+    result = attribute_top_level(
+        prompt="hello",
+        model=cast(object, _DummyModel()),
+        phase4_scheduler_mode="locality",
+        phase4_scheduler_debug=False,
+        phase4_scheduler_telemetry_detail="normal",
+    )
+
+    assert result is sentinel
+    assert "phase4_scheduler_mode" not in captured
+    assert "phase4_scheduler_debug" not in captured
+    assert "phase4_scheduler_telemetry_detail" not in captured
+
+
+@pytest.mark.parametrize(
+    "scheduler_kwargs",
+    [
+        {"phase4_scheduler_mode": "planner_v1"},
+        {"phase4_scheduler_debug": True},
+        {"phase4_scheduler_telemetry_detail": "summary"},
+    ],
+)
+def test_top_level_attribute_rejects_non_default_phase4_scheduler_args_on_transformerlens(
+    scheduler_kwargs: dict[str, object],
+) -> None:
+    class _DummyModel:
+        backend = "transformerlens"
+
+    with pytest.raises(
+        ValueError,
+        match=r"Phase-4 scheduler settings are only supported for the NNSight backend",
+    ):
+        attribute_top_level(
+            prompt="hello",
+            model=cast(object, _DummyModel()),
+            **scheduler_kwargs,
         )
 
 
