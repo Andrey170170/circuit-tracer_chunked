@@ -9,6 +9,7 @@ from circuit_tracer.attribution.attribute import attribute as attribute_top_leve
 from circuit_tracer.attribution.attribute_nnsight import (
     _build_cross_cluster_runtime_snapshot,
     _build_matrix_abs_stats,
+    _build_phase4_batch_locality_summary,
     _build_phase4_normalization_stats,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
@@ -28,6 +29,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
     _resolve_phase4_scheduler_mode,
+    _resolve_phase4_scheduler_telemetry_detail,
 )
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
@@ -700,6 +702,41 @@ def test_phase4_scheduler_mode_resolves_and_accepts_legacy_alias() -> None:
 def test_phase4_scheduler_mode_rejects_unknown_value() -> None:
     with pytest.raises(ValueError, match="phase4_scheduler_mode must be one of"):
         _resolve_phase4_scheduler_mode("unsupported")
+
+
+def test_phase4_scheduler_telemetry_detail_resolves_aliases() -> None:
+    assert _resolve_phase4_scheduler_telemetry_detail("summary") == "summary"
+    assert _resolve_phase4_scheduler_telemetry_detail("normal") == "normal"
+    assert _resolve_phase4_scheduler_telemetry_detail("debug") == "debug"
+    assert _resolve_phase4_scheduler_telemetry_detail("compact") == "summary"
+    assert _resolve_phase4_scheduler_telemetry_detail("full") == "debug"
+
+
+def test_phase4_scheduler_telemetry_detail_rejects_unknown_value() -> None:
+    with pytest.raises(
+        ValueError,
+        match="phase4_scheduler_telemetry_detail must be one of",
+    ):
+        _resolve_phase4_scheduler_telemetry_detail("verbose")
+
+
+def test_phase4_batch_locality_summary_reports_layer_and_chunk_ranges() -> None:
+    summary = _build_phase4_batch_locality_summary(
+        torch.tensor([3, 1, 2], dtype=torch.long),
+        feat_layers=torch.tensor([2, 1, 1, 3], dtype=torch.long),
+        feat_ids=torch.tensor([0, 4, 6, 7], dtype=torch.long),
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert summary["scheduler_batch_hash"] is not None
+    assert summary["scheduler_batch_distinct_source_layer_count"] == 2
+    assert summary["scheduler_batch_source_layer_min"] == 1
+    assert summary["scheduler_batch_source_layer_max"] == 3
+    assert summary["scheduler_batch_distinct_decoder_chunk_count"] == 2
+    assert summary["scheduler_batch_decoder_chunk_min"] == 2
+    assert summary["scheduler_batch_decoder_chunk_max"] == 3
+    assert summary["scheduler_batch_monotonic_chunk_order"] is False
 
 
 def test_phase4_planner_v1_preserves_membership_and_boundaries() -> None:

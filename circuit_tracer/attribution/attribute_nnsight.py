@@ -144,6 +144,11 @@ _PHASE4_SCHEDULER_MODE_ALIAS: dict[str, str] = {
     "legacy": "locality",
 }
 
+_PHASE4_SCHEDULER_TELEMETRY_DETAIL_ALIAS: dict[str, str] = {
+    "compact": "summary",
+    "full": "debug",
+}
+
 _PHASE4_SCHEDULER_VERSION_BY_MODE: dict[str, str] = {
     "locality": "locality_v1",
     "planner_v1": "planner_v1",
@@ -161,6 +166,7 @@ class _Phase4SchedulerConfig:
     version: str
     policy: str
     debug: bool
+    telemetry_detail: Literal["summary", "normal", "debug"]
 
 
 @dataclass(frozen=True)
@@ -827,10 +833,26 @@ def _resolve_phase4_scheduler_mode(
     return cast(Literal["locality", "planner_v1"], normalized)
 
 
+def _resolve_phase4_scheduler_telemetry_detail(
+    phase4_scheduler_telemetry_detail: str,
+) -> Literal["summary", "normal", "debug"]:
+    normalized = str(phase4_scheduler_telemetry_detail).strip().lower()
+    normalized = _PHASE4_SCHEDULER_TELEMETRY_DETAIL_ALIAS.get(normalized, normalized)
+    allowed_values = {"summary", "normal", "debug"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values | set(_PHASE4_SCHEDULER_TELEMETRY_DETAIL_ALIAS)))
+        raise ValueError(
+            "phase4_scheduler_telemetry_detail must be one of: "
+            f"{allowed} (got {phase4_scheduler_telemetry_detail!r})"
+        )
+    return cast(Literal["summary", "normal", "debug"], normalized)
+
+
 def _resolve_phase4_scheduler_config(
     *,
     phase4_scheduler_mode: str,
     phase4_scheduler_debug: bool,
+    phase4_scheduler_telemetry_detail: str,
 ) -> _Phase4SchedulerConfig:
     mode = _resolve_phase4_scheduler_mode(phase4_scheduler_mode)
     return _Phase4SchedulerConfig(
@@ -838,7 +860,154 @@ def _resolve_phase4_scheduler_config(
         version=_PHASE4_SCHEDULER_VERSION_BY_MODE[mode],
         policy=_PHASE4_SCHEDULER_POLICY_BY_MODE[mode],
         debug=bool(phase4_scheduler_debug),
+        telemetry_detail=_resolve_phase4_scheduler_telemetry_detail(
+            phase4_scheduler_telemetry_detail
+        ),
     )
+
+
+def _build_phase4_scheduler_metadata(
+    phase4_scheduler_config: _Phase4SchedulerConfig,
+) -> dict[str, object]:
+    return {
+        "scheduler_mode": phase4_scheduler_config.mode,
+        "scheduler_version": phase4_scheduler_config.version,
+        "scheduler_policy": phase4_scheduler_config.policy,
+        "scheduler_debug": bool(phase4_scheduler_config.debug),
+        "scheduler_telemetry_detail": phase4_scheduler_config.telemetry_detail,
+    }
+
+
+def _build_phase4_scheduler_plan_telemetry(
+    *,
+    phase4_frontier_plan: _Phase4FrontierPlan | None,
+    telemetry_detail: Literal["summary", "normal", "debug"],
+) -> dict[str, object]:
+    if phase4_frontier_plan is None:
+        return {
+            "scheduler_plan_frontier_size": None,
+            "scheduler_plan_membership_hash": None,
+            "scheduler_plan_order_hash": None,
+            "scheduler_plan_batch_count": None,
+            "scheduler_plan_boundary_reason_counts": None,
+            "scheduler_plan_invariants": None,
+            "scheduler_plan_layer_chunk_run_count": None,
+            "scheduler_plan_layer_chunk_transition_count": None,
+            "scheduler_plan_layer_chunk_fragmentation_ratio": None,
+            "scheduler_plan_batch_fragmentation_ratio": None,
+        }
+
+    locality_summary = phase4_frontier_plan.locality_fragmentation_summary
+    boundary_reason_counts = {
+        str(key): int(value) for key, value in phase4_frontier_plan.boundary_reason_counts.items()
+    }
+    invariant_summary = {
+        str(key): value for key, value in phase4_frontier_plan.invariant_summary.items()
+    }
+    if telemetry_detail == "summary":
+        invariant_summary = {
+            "membership_preserved": bool(invariant_summary.get("membership_preserved")),
+            "duplicate_count": int(invariant_summary.get("duplicate_count", 0)),
+            "missing_count": int(invariant_summary.get("missing_count", 0)),
+            "unexpected_count": int(invariant_summary.get("unexpected_count", 0)),
+            "non_advancing_boundary_count": int(
+                invariant_summary.get("non_advancing_boundary_count", 0)
+            ),
+        }
+
+    payload: dict[str, object] = {
+        "scheduler_plan_frontier_size": int(phase4_frontier_plan.selected_frontier.numel()),
+        "scheduler_plan_membership_hash": phase4_frontier_plan.selected_membership_hash,
+        "scheduler_plan_order_hash": phase4_frontier_plan.selected_order_hash,
+        "scheduler_plan_batch_count": int(len(phase4_frontier_plan.batch_boundaries)),
+        "scheduler_plan_boundary_reason_counts": boundary_reason_counts,
+        "scheduler_plan_invariants": invariant_summary,
+        "scheduler_plan_layer_chunk_run_count": int(
+            locality_summary.get("layer_chunk_run_count", 0)
+        ),
+        "scheduler_plan_layer_chunk_transition_count": int(
+            locality_summary.get("layer_chunk_transition_count", 0)
+        ),
+        "scheduler_plan_layer_chunk_fragmentation_ratio": _safe_float(
+            locality_summary.get("layer_chunk_fragmentation_ratio")
+        ),
+        "scheduler_plan_batch_fragmentation_ratio": _safe_float(
+            locality_summary.get("batch_fragmentation_ratio")
+        ),
+    }
+    if telemetry_detail in {"normal", "debug"}:
+        payload["scheduler_plan_locality_fragmentation"] = dict(locality_summary)
+    if telemetry_detail == "debug":
+        boundary_sample = phase4_frontier_plan.batch_boundaries[:8]
+        payload["scheduler_plan_batch_boundaries_sample"] = [
+            [int(start), int(end)] for start, end in boundary_sample
+        ]
+        payload["scheduler_plan_batch_boundaries_sample_count"] = int(len(boundary_sample))
+    return payload
+
+
+def _build_phase4_batch_locality_summary(
+    idx_batch: torch.Tensor,
+    *,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> dict[str, object]:
+    if idx_batch.numel() <= 0:
+        return {
+            "scheduler_batch_hash": None,
+            "scheduler_batch_distinct_source_layer_count": 0,
+            "scheduler_batch_source_layer_min": None,
+            "scheduler_batch_source_layer_max": None,
+            "scheduler_batch_distinct_decoder_chunk_count": None,
+            "scheduler_batch_decoder_chunk_min": None,
+            "scheduler_batch_decoder_chunk_max": None,
+            "scheduler_batch_monotonic_chunk_order": None,
+        }
+
+    layer_values = feat_layers[idx_batch].detach().to(device="cpu", dtype=torch.long)
+    distinct_layers = torch.unique(layer_values)
+    batch_hash = _hash_index_tensor(idx_batch)
+
+    use_decoder_chunks = bool(
+        exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0
+    )
+    if use_decoder_chunks:
+        chunk_values = (
+            torch.div(
+                feat_ids[idx_batch],
+                int(decoder_chunk_size),
+                rounding_mode="floor",
+            )
+            .detach()
+            .to(device="cpu", dtype=torch.long)
+        )
+        distinct_chunks = torch.unique(chunk_values)
+        monotonic_chunk_order = bool(
+            torch.all(chunk_values[1:] >= chunk_values[:-1]).item()
+            if chunk_values.numel() > 1
+            else True
+        )
+        distinct_chunk_count = int(distinct_chunks.numel())
+        chunk_min = int(chunk_values.min().item())
+        chunk_max = int(chunk_values.max().item())
+    else:
+        monotonic_chunk_order = None
+        distinct_chunk_count = None
+        chunk_min = None
+        chunk_max = None
+
+    return {
+        "scheduler_batch_hash": batch_hash,
+        "scheduler_batch_distinct_source_layer_count": int(distinct_layers.numel()),
+        "scheduler_batch_source_layer_min": int(layer_values.min().item()),
+        "scheduler_batch_source_layer_max": int(layer_values.max().item()),
+        "scheduler_batch_distinct_decoder_chunk_count": distinct_chunk_count,
+        "scheduler_batch_decoder_chunk_min": chunk_min,
+        "scheduler_batch_decoder_chunk_max": chunk_max,
+        "scheduler_batch_monotonic_chunk_order": monotonic_chunk_order,
+    }
 
 
 def _build_phase4_frontier_locality_fragmentation_summary(
@@ -2235,6 +2404,7 @@ def attribute(
     compact_output: bool = False,
     phase4_scheduler_mode: Literal["locality", "planner_v1", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
+    phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -2306,6 +2476,10 @@ def attribute(
             ``"legacy"`` is accepted as an alias for ``"locality"``.
         phase4_scheduler_debug: Emit additional planner-v1 scheduler diagnostics in
             Phase 4 logs.
+        phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
+            Phase-4 refresh/batch events. ``"summary"`` keeps compact planner
+            metadata, ``"normal"`` adds full plan aggregates, and ``"debug"``
+            additionally includes bounded samples.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
             normalization/influence ranking path. ``"fp32"`` uses float32
             internals and is the post-fix default; ``"fp64"`` uses float64
@@ -2365,6 +2539,7 @@ def attribute(
             compact_output=compact_output,
             phase4_scheduler_mode=phase4_scheduler_mode,
             phase4_scheduler_debug=phase4_scheduler_debug,
+            phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             logger=logger,
         )
@@ -2413,6 +2588,7 @@ def _run_attribution(
     compact_output: bool = False,
     phase4_scheduler_mode: Literal["locality", "planner_v1", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
+    phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ):
     start_time = time.time()
@@ -2459,7 +2635,9 @@ def _run_attribution(
     phase4_scheduler_config = _resolve_phase4_scheduler_config(
         phase4_scheduler_mode=phase4_scheduler_mode,
         phase4_scheduler_debug=phase4_scheduler_debug,
+        phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
     )
+    phase4_scheduler_metadata = _build_phase4_scheduler_metadata(phase4_scheduler_config)
     phase4_debug_summary_enabled = phase4_anomaly_debug_enabled or cross_cluster_debug_enabled
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
@@ -2486,10 +2664,7 @@ def _run_attribution(
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
-            "phase4_scheduler_mode": phase4_scheduler_config.mode,
-            "phase4_scheduler_version": phase4_scheduler_config.version,
-            "phase4_scheduler_policy": phase4_scheduler_config.policy,
-            "phase4_scheduler_debug": phase4_scheduler_config.debug,
+            **{f"phase4_{key}": value for key, value in phase4_scheduler_metadata.items()},
         },
     )
 
@@ -2549,6 +2724,7 @@ def _run_attribution(
             "mode": "early_phase_scalar_summary",
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
+            "phase4_scheduler": phase4_scheduler_metadata,
             "environment": _build_phase4_environment_fingerprint(),
             "checkpoints": {},
         }
@@ -3455,6 +3631,7 @@ def _run_attribution(
             f"version={phase4_scheduler_config.version} | "
             f"policy={phase4_scheduler_config.policy} | "
             f"debug={phase4_scheduler_config.debug} | "
+            f"telemetry_detail={phase4_scheduler_config.telemetry_detail} | "
             f"exact_chunked_decoder={exact_chunked_decoder} | "
             f"decoder_chunk_size={decoder_chunk_size}"
         )
@@ -3483,10 +3660,7 @@ def _run_attribution(
                     "planner_enabled": bool(planner_enabled),
                     "planner_status": planner_status,
                     "planner_skip_reason": planner_skip_reason,
-                    "scheduler_mode": phase4_scheduler_config.mode,
-                    "scheduler_version": phase4_scheduler_config.version,
-                    "scheduler_policy": phase4_scheduler_config.policy,
-                    "scheduler_debug": bool(phase4_scheduler_config.debug),
+                    **phase4_scheduler_metadata,
                     "actual_max_feature_nodes": int(actual_max_feature_nodes),
                     "total_active_features": int(total_active_feats),
                     "update_interval": int(update_interval),
@@ -3521,6 +3695,7 @@ def _run_attribution(
 
         while n_visited < actual_max_feature_nodes:
             phase4_frontier_plan: _Phase4FrontierPlan | None = None
+            pending_refresh_index: int | None = None
             if actual_max_feature_nodes == total_active_feats:
                 pending = torch.arange(total_active_feats)
                 if phase4_scheduler_config.mode == "planner_v1":
@@ -3544,6 +3719,8 @@ def _run_attribution(
                             f"boundary_reasons={phase4_frontier_plan.boundary_reason_counts}"
                         )
             else:
+                refresh_index = int(phase4_refresh_count)
+                pending_refresh_index = refresh_index
                 refresh_start = time.perf_counter()
                 refresh_memory_before = get_memory_snapshot(model.device)
                 feature_row_store_snapshot_before = (
@@ -3667,6 +3844,10 @@ def _run_attribution(
                         decoder_chunk_size=decoder_chunk_size,
                     )
                     pending = pending[:queue_size]
+                phase4_plan_telemetry = _build_phase4_scheduler_plan_telemetry(
+                    phase4_frontier_plan=phase4_frontier_plan,
+                    telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                )
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
                 phase4_refresh_elapsed_ms_total += refresh_elapsed_ms
@@ -3677,20 +3858,13 @@ def _run_attribution(
                     batch_index=phase4_refresh_count + 1,
                     elapsed_ms=refresh_elapsed_ms,
                     attrs={
-                        "refresh_index": int(phase4_refresh_count),
+                        "refresh_index": refresh_index,
                         "stored_rows": int(st),
                         "visited_features": int(n_visited),
                         "frontier_candidate_count": int(unvisited_feature_rank.numel()),
                         "queue_size": int(queue_size),
-                        "scheduler_mode": phase4_scheduler_config.mode,
-                        "scheduler_version": phase4_scheduler_config.version,
-                        "scheduler_policy": phase4_scheduler_config.policy,
-                        "scheduler_debug": bool(phase4_scheduler_config.debug),
-                        "scheduler_plan_batch_count": (
-                            int(len(phase4_frontier_plan.batch_boundaries))
-                            if phase4_frontier_plan is not None
-                            else None
-                        ),
+                        **phase4_scheduler_metadata,
+                        **phase4_plan_telemetry,
                         "rank_nonzero_count": (
                             int(rank_signal_stats["nonzero_count"])
                             if rank_signal_stats is not None
@@ -3818,7 +3992,7 @@ def _run_attribution(
                         phase="phase4",
                         event_index=phase4_refresh_count + 1,
                         payload={
-                            "refresh_index": int(phase4_refresh_count),
+                            "refresh_index": refresh_index,
                             "stored_rows": int(st),
                             "visited_features": int(n_visited),
                             "frontier_candidate_count": int(unvisited_feature_rank.numel()),
@@ -3827,10 +4001,8 @@ def _run_attribution(
                             "pending_hash": (
                                 _hash_index_tensor(pending) if pending.numel() > 0 else None
                             ),
-                            "scheduler_mode": phase4_scheduler_config.mode,
-                            "scheduler_version": phase4_scheduler_config.version,
-                            "scheduler_policy": phase4_scheduler_config.policy,
-                            "scheduler_debug": bool(phase4_scheduler_config.debug),
+                            **phase4_scheduler_metadata,
+                            **phase4_plan_telemetry,
                             "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
                             "rank_effective_nonzero_count": int(
                                 rank_signal_stats["effective_nonzero_count"]
@@ -3862,7 +4034,7 @@ def _run_attribution(
                     assert phase4_logit_probability_stats is not None
                     _record_phase4_refresh_debug(
                         anomaly_debug_result,
-                        refresh_index=phase4_refresh_count,
+                        refresh_index=refresh_index,
                         n_visited=n_visited,
                         queue_size=queue_size,
                         pending=pending,
@@ -4123,6 +4295,13 @@ def _run_attribution(
                         )
                 batch_number = phase4_batch_count
                 batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                batch_locality_summary = _build_phase4_batch_locality_summary(
+                    idx_batch,
+                    feat_layers=feat_layers,
+                    feat_ids=feat_ids,
+                    exact_chunked_decoder=exact_chunked_decoder,
+                    decoder_chunk_size=decoder_chunk_size,
+                )
                 telemetry_recorder.record_event(
                     scope="batch",
                     name="phase4.feature_batch",
@@ -4133,6 +4312,9 @@ def _run_attribution(
                         "batch_rows": int(row_count),
                         "visited_features": int(n_visited),
                         "target_feature_count": int(actual_max_feature_nodes),
+                        **phase4_scheduler_metadata,
+                        "scheduler_refresh_index": pending_refresh_index,
+                        **batch_locality_summary,
                     },
                 )
                 telemetry_recorder.record_wall_clock_duration(
@@ -4159,9 +4341,10 @@ def _run_attribution(
                             "batch_rows": int(row_count),
                             "visited_features": int(n_visited),
                             "target_feature_count": int(actual_max_feature_nodes),
-                            "idx_batch_hash": (
-                                _hash_index_tensor(idx_batch) if idx_batch.numel() > 0 else None
-                            ),
+                            **phase4_scheduler_metadata,
+                            "scheduler_refresh_index": pending_refresh_index,
+                            **batch_locality_summary,
+                            "idx_batch_hash": batch_locality_summary.get("scheduler_batch_hash"),
                             "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
                             "row_input_finite_max_abs": _safe_float(
                                 row_input_stats.get("finite_max_abs")
@@ -4206,10 +4389,7 @@ def _run_attribution(
                 "phase4_batches": int(phase4_batch_count),
                 "phase4_refreshes": int(phase4_refresh_count),
                 "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
-                "scheduler_mode": phase4_scheduler_config.mode,
-                "scheduler_version": phase4_scheduler_config.version,
-                "scheduler_policy": phase4_scheduler_config.policy,
-                "scheduler_debug": bool(phase4_scheduler_config.debug),
+                **phase4_scheduler_metadata,
             },
         )
         telemetry_recorder.record_wall_clock_duration(
@@ -4655,6 +4835,7 @@ def _run_attribution(
                 "phase4_scheduler_version": phase4_scheduler_config.version,
                 "phase4_scheduler_policy": phase4_scheduler_config.policy,
                 "phase4_scheduler_debug": bool(phase4_scheduler_config.debug),
+                "phase4_scheduler_telemetry_detail": phase4_scheduler_config.telemetry_detail,
                 "internal_precision_requested": internal_precision_requested,
                 "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
@@ -4682,6 +4863,7 @@ def _run_attribution(
                 phase4_entry_summary_checkpoint = {
                     "phase4_refresh_count": int(phase4_refresh_count),
                     "phase4_batch_count": int(phase4_batch_count),
+                    **phase4_scheduler_metadata,
                     **phase4_runtime_summary,
                 }
                 _record_cross_cluster_checkpoint(
@@ -4694,6 +4876,7 @@ def _run_attribution(
                         "checkpoint_stage": "post_phase4",
                         "phase4_refresh_count": int(phase4_refresh_count),
                         "phase4_batch_count": int(phase4_batch_count),
+                        **phase4_scheduler_metadata,
                         **phase4_runtime_stream,
                     },
                 )
@@ -4710,6 +4893,7 @@ def _run_attribution(
                         "phase4_batch_count": int(phase4_batch_count),
                         "phase4_elapsed_ms": float(phase4_elapsed_ms),
                         "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
+                        **phase4_scheduler_metadata,
                         **phase4_runtime_stream,
                     },
                 )
