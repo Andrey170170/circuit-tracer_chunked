@@ -364,7 +364,7 @@ def test_phase0_threshold_membership_diagnostics_are_emitted_when_enabled() -> N
         collect_diagnostics=True,
         sample_limit_per_layer=2,
     )
-    _ = clt.encode_sparse(inputs, zero_positions=slice(0, 0))
+    _ = clt.encode_sparse(inputs, zero_positions=torch.tensor([0]))
 
     diagnostics = clt.get_diagnostic_snapshot()
     assert diagnostics["phase0_activation_threshold_compare_mode"] == "fp64"
@@ -375,5 +375,28 @@ def test_phase0_threshold_membership_diagnostics_are_emitted_when_enabled() -> N
     assert membership["borderline_sample_count"] > 0
     assert "0" in membership["per_layer"]
     layer_zero = membership["per_layer"]["0"]
+    assert layer_zero["pre_activation_hash_fp32"]
+    assert layer_zero["compare_margin_hash_fp64"]
+    assert layer_zero["mask_membership_hash_canonical"]
+    assert layer_zero["post_activation_hash_fp32"]
+    assert layer_zero["post_activation_zero_positions_applied"] is True
+    assert layer_zero["pre_activation_stats"]["count"] == 6
+    assert layer_zero["compare_margin_stats"]["count"] == 6
+    assert layer_zero["post_activation_stats"]["count"] == 6
+    assert layer_zero["post_activation_stats"]["effective_zero_count"] >= 3
+    assert layer_zero["near_counts_by_epsilon"]["abs_lte_1e-06"] >= 0
     assert layer_zero["near_counts_by_epsilon"]["abs_lte_1e-04"] >= 0
     assert len(layer_zero["borderline_samples"]) <= 2
+
+    boundary = diagnostics["phase0_boundary_fingerprints"]
+    assert isinstance(boundary, dict)
+    constants = boundary["transcoder_constant_fingerprints"]
+    assert isinstance(constants, dict)
+    assert constants["global_hash"]
+    assert "0" in constants["per_layer"]
+    assert constants["per_layer"]["0"]["layer_constant_hash"]
+    assert boundary["global_hashes"]["pre_activation_hash_global"]
+    assert boundary["global_hashes"]["compare_margin_hash_global"]
+    assert boundary["global_hashes"]["mask_membership_hash_global"]
+    assert boundary["global_hashes"]["post_activation_hash_global"]
+    assert boundary["per_layer"]["0"]["post_activation_zero_positions_applied"] is True

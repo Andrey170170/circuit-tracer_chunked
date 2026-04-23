@@ -2225,6 +2225,30 @@ def _run_attribution(
             )
             if not isinstance(phase0_threshold_membership, dict):
                 phase0_threshold_membership = None
+            phase0_boundary_fingerprints = (
+                transcoder_snapshot.get("phase0_boundary_fingerprints")
+                if isinstance(transcoder_snapshot, dict)
+                else None
+            )
+            if not isinstance(phase0_boundary_fingerprints, dict):
+                phase0_boundary_fingerprints = None
+
+            setup_diagnostic_stats = getattr(ctx, "setup_diagnostic_stats", None)
+            phase0_pre_clt_input_fingerprints = (
+                setup_diagnostic_stats.get("phase0_pre_clt_input_fingerprints")
+                if isinstance(setup_diagnostic_stats, dict)
+                else None
+            )
+            if not isinstance(phase0_pre_clt_input_fingerprints, dict):
+                phase0_pre_clt_input_fingerprints = None
+
+            phase0_boundary_global_hashes = (
+                phase0_boundary_fingerprints.get("global_hashes")
+                if isinstance(phase0_boundary_fingerprints, dict)
+                else None
+            )
+            if not isinstance(phase0_boundary_global_hashes, dict):
+                phase0_boundary_global_hashes = None
             activation_value_stats = _build_vector_stats(
                 activation_values,
                 epsilon=1e-12,
@@ -2241,12 +2265,19 @@ def _run_attribution(
                     phase0_activation_threshold_compare_mode_resolved
                 ),
                 "phase0_threshold_membership": phase0_threshold_membership,
+                "phase0_boundary_fingerprints": phase0_boundary_fingerprints,
+                "phase0_pre_clt_input_fingerprints": phase0_pre_clt_input_fingerprints,
+                "phase0_pre_clt_input_global_hash": (
+                    phase0_pre_clt_input_fingerprints.get("global_hash")
+                    if isinstance(phase0_pre_clt_input_fingerprints, dict)
+                    else None
+                ),
                 "logit_retention": getattr(ctx, "logit_retention", None),
                 "staging_flags": {
                     "stage_encoder_vecs_on_cpu": bool(stage_encoder_vecs_on_cpu),
                     "stage_error_vectors_on_cpu": bool(stage_error_vectors_on_cpu),
                 },
-                "setup_diagnostic_stats": getattr(ctx, "setup_diagnostic_stats", None),
+                "setup_diagnostic_stats": setup_diagnostic_stats,
                 **phase0_runtime_summary,
             }
             phase0_stream_checkpoint = {
@@ -2287,6 +2318,46 @@ def _run_attribution(
                         )
                     )
                     if isinstance(phase0_threshold_membership, dict)
+                    else None
+                ),
+                "phase0_pre_clt_input_global_hash": (
+                    phase0_summary_checkpoint.get("phase0_pre_clt_input_global_hash")
+                ),
+                "phase0_pre_clt_input_layer_count": (
+                    int(phase0_pre_clt_input_fingerprints.get("layer_count", 0))
+                    if isinstance(phase0_pre_clt_input_fingerprints, dict)
+                    else None
+                ),
+                "phase0_boundary_layer_count": (
+                    int(len(phase0_boundary_fingerprints.get("per_layer", {})))
+                    if isinstance(phase0_boundary_fingerprints, dict)
+                    else None
+                ),
+                "phase0_boundary_transcoder_constants_global_hash": (
+                    phase0_boundary_fingerprints.get("transcoder_constant_fingerprints", {}).get(
+                        "global_hash"
+                    )
+                    if isinstance(phase0_boundary_fingerprints, dict)
+                    else None
+                ),
+                "phase0_boundary_preactivation_hash_global": (
+                    phase0_boundary_global_hashes.get("pre_activation_hash_global")
+                    if isinstance(phase0_boundary_global_hashes, dict)
+                    else None
+                ),
+                "phase0_boundary_margin_hash_global": (
+                    phase0_boundary_global_hashes.get("compare_margin_hash_global")
+                    if isinstance(phase0_boundary_global_hashes, dict)
+                    else None
+                ),
+                "phase0_boundary_mask_membership_hash_global": (
+                    phase0_boundary_global_hashes.get("mask_membership_hash_global")
+                    if isinstance(phase0_boundary_global_hashes, dict)
+                    else None
+                ),
+                "phase0_boundary_post_activation_hash_global": (
+                    phase0_boundary_global_hashes.get("post_activation_hash_global")
+                    if isinstance(phase0_boundary_global_hashes, dict)
                     else None
                 ),
                 "logit_retention": getattr(ctx, "logit_retention", None),

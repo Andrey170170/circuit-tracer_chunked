@@ -1,4 +1,5 @@
 import warnings
+import hashlib
 from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -26,6 +27,129 @@ from circuit_tracer.utils.tl_nnsight_mapping import (
 NNSIGHT_CONFIG.APP.PYMOUNT = False
 NNSIGHT_CONFIG.APP.CROSS_INVOKER = False
 NNSIGHT_CONFIG.APP.TRACE_CACHING = True
+
+
+def _hash_tensor_payload(values: torch.Tensor, *, dtype: torch.dtype = torch.float32) -> str:
+    values_cpu = values.detach().to(device="cpu", dtype=dtype).contiguous()
+    hasher = hashlib.blake2s(digest_size=8)
+    hasher.update(torch.tensor(list(values_cpu.shape), dtype=torch.int64).cpu().numpy().tobytes())
+    hasher.update(values_cpu.numpy().tobytes())
+    return hasher.hexdigest()
+
+
+def _build_compact_tensor_stats(
+    values: torch.Tensor,
+    *,
+    epsilon: float = 1e-12,
+) -> dict[str, object]:
+    flat = values.detach().to(device="cpu", dtype=torch.float64).flatten()
+    count = int(flat.numel())
+    if count == 0:
+        return {
+            "count": 0,
+            "finite_count": 0,
+            "nonfinite_count": 0,
+            "nan_count": 0,
+            "posinf_count": 0,
+            "neginf_count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "abs_sum": 0.0,
+            "abs_max": None,
+            "effective_nonzero_count": 0,
+            "effective_zero_count": 0,
+            "epsilon": float(epsilon),
+        }
+
+    finite_mask = torch.isfinite(flat)
+    finite_values = flat[finite_mask]
+    abs_flat = flat.abs()
+    effective_nonzero_count = int((abs_flat > epsilon).sum().item())
+    finite_count = int(finite_mask.sum().item())
+    return {
+        "count": count,
+        "finite_count": finite_count,
+        "nonfinite_count": int(count - finite_count),
+        "nan_count": int(torch.isnan(flat).sum().item()),
+        "posinf_count": int(torch.isposinf(flat).sum().item()),
+        "neginf_count": int(torch.isneginf(flat).sum().item()),
+        "min": float(finite_values.min().item()) if finite_values.numel() > 0 else None,
+        "max": float(finite_values.max().item()) if finite_values.numel() > 0 else None,
+        "mean": float(finite_values.mean().item()) if finite_values.numel() > 0 else None,
+        "abs_sum": float(abs_flat.sum().item()),
+        "abs_max": float(abs_flat.max().item()) if abs_flat.numel() > 0 else None,
+        "effective_nonzero_count": effective_nonzero_count,
+        "effective_zero_count": int(count - effective_nonzero_count),
+        "epsilon": float(epsilon),
+    }
+
+
+def _sample_flat_tensor(
+    values: torch.Tensor, *, sample_limit: int = 4096
+) -> tuple[torch.Tensor, int]:
+    flat = values.detach().flatten()
+    total_count = int(flat.numel())
+    if total_count == 0:
+        return flat, 1
+
+    sample_limit = max(1, int(sample_limit))
+    if total_count <= sample_limit:
+        return flat, 1
+
+    sample_count = min(total_count, sample_limit)
+    sample_indices = (
+        torch.linspace(
+            0,
+            total_count - 1,
+            steps=sample_count,
+            device=flat.device,
+        )
+        .round()
+        .to(dtype=torch.int64)
+    )
+    return flat.index_select(0, sample_indices), max(1, total_count // sample_count)
+
+
+def _build_phase0_pre_clt_input_fingerprints(mlp_in_cache: torch.Tensor) -> dict[str, object]:
+    if mlp_in_cache.ndim != 3:
+        return {
+            "schema_version": 1,
+            "layer_count": 0,
+            "global_hash": None,
+            "per_layer": {},
+        }
+
+    n_layers = int(mlp_in_cache.shape[0])
+    per_layer: dict[str, object] = {}
+    layer_hashes: list[str] = []
+    for layer_id in range(n_layers):
+        layer_input = mlp_in_cache[layer_id]
+        sampled_input, sample_stride = _sample_flat_tensor(layer_input, sample_limit=4096)
+        layer_hash = _hash_tensor_payload(sampled_input, dtype=torch.float32)
+        layer_hashes.append(layer_hash)
+        per_layer[str(layer_id)] = {
+            "layer": int(layer_id),
+            "shape": list(layer_input.shape),
+            "element_count": int(layer_input.numel()),
+            "sample_count": int(sampled_input.numel()),
+            "sample_stride": int(sample_stride),
+            "pre_clt_input_hash_fp32": layer_hash,
+            "pre_clt_input_stats": _build_compact_tensor_stats(sampled_input, epsilon=1e-12),
+        }
+
+    global_hasher = hashlib.blake2s(digest_size=8)
+    global_hasher.update(torch.tensor([n_layers], dtype=torch.int64).cpu().numpy().tobytes())
+    for layer_hash in layer_hashes:
+        global_hasher.update(layer_hash.encode("utf-8"))
+
+    return {
+        "schema_version": 1,
+        "layer_count": int(n_layers),
+        "global_hash": global_hasher.hexdigest(),
+        "per_layer": per_layer,
+    }
+
 
 # Type definition for an intervention tuple (layer, position, feature_idx, value)
 Intervention = tuple[
@@ -516,6 +640,9 @@ class NNSightReplacementModel(LanguageModel):
 
         transcoders = self.transcoders
         trace_event = getattr(transcoders, "emit_trace_event", None)
+        collect_phase0_pre_clt_input_fingerprints = bool(
+            getattr(transcoders, "_phase0_threshold_membership_debug_enabled", False)
+        )
         trace_start = time.perf_counter()
         if callable(trace_event):
             trace_event(
@@ -547,6 +674,12 @@ class NNSightReplacementModel(LanguageModel):
                 mlp_in_shape=tuple(mlp_in_cache.shape),
                 mlp_out_shape=tuple(mlp_out_cache.shape),
             )
+
+        phase0_pre_clt_input_fingerprints = (
+            _build_phase0_pre_clt_input_fingerprints(mlp_in_cache)
+            if collect_phase0_pre_clt_input_fingerprints
+            else None
+        )
 
         component_start = time.perf_counter()
         if callable(trace_event):
@@ -656,6 +789,7 @@ class NNSightReplacementModel(LanguageModel):
             "row_subchunk_size": row_subchunk_size,
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
+            "phase0_pre_clt_input_fingerprints": phase0_pre_clt_input_fingerprints,
         }
         ctx.sparsification_stats = cast(
             dict[str, object] | None, attribution_data.get("sparsification_stats")
