@@ -11,6 +11,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_matrix_abs_stats,
     _build_phase4_batch_locality_summary,
     _build_phase4_executor_substage_telemetry,
+    _build_phase4_executor_batch_telemetry,
     _build_phase4_normalization_stats,
     _build_phase4_planner_v2_candidate_window,
     _build_phase4_refresh_substage_telemetry,
@@ -40,6 +41,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_refresh_optimization_metadata,
     _resolve_phase4_row_executor_mode,
     _resolve_phase4_row_executor_config,
+    _resolve_phase4_streaming_v1_microbatch_size,
     _build_phase4_row_executor_metadata,
     _resolve_phase4_scheduler_mode,
     _resolve_phase4_scheduler_config,
@@ -808,15 +810,95 @@ def test_phase4_row_executor_mode_resolves_and_rejects_unknown() -> None:
 
 
 def test_phase4_row_executor_metadata_tracks_requested_and_effective_modes() -> None:
-    config = _resolve_phase4_row_executor_config("streaming_v1")
+    config = _resolve_phase4_row_executor_config(
+        "streaming_v1",
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
     metadata = _build_phase4_row_executor_metadata(config)
 
     assert metadata["row_executor_requested"] == "streaming_v1"
     assert metadata["row_executor_mode_requested"] == "streaming_v1"
     assert metadata["row_executor"] == "streaming_v1"
+    assert metadata["row_executor_effective"] == "streaming_v1"
+    assert metadata["row_executor_mode_effective"] == "streaming_v1"
+    assert metadata["row_executor_reference_execution"] is False
+
+
+def test_phase4_row_executor_falls_back_to_batched_when_streaming_path_unavailable() -> None:
+    config = _resolve_phase4_row_executor_config(
+        "streaming_v1",
+        compact_output=False,
+        exact_chunked_decoder=False,
+    )
+    metadata = _build_phase4_row_executor_metadata(config)
+
+    assert metadata["row_executor_requested"] == "streaming_v1"
     assert metadata["row_executor_effective"] == "batched"
     assert metadata["row_executor_mode_effective"] == "batched"
+    assert metadata["row_executor_effective_version"] == "batched_v1"
     assert metadata["row_executor_reference_execution"] is True
+    assert metadata["row_executor_effective_behavior"] == "batched_reference_execution"
+
+
+def test_phase4_streaming_v1_microbatch_size_is_capped() -> None:
+    assert _resolve_phase4_streaming_v1_microbatch_size(1) == 1
+    assert _resolve_phase4_streaming_v1_microbatch_size(64) == 64
+    assert _resolve_phase4_streaming_v1_microbatch_size(256) == 64
+
+
+def test_phase4_executor_batch_telemetry_separates_scheduler_and_microbatch_counts() -> None:
+    telemetry = _build_phase4_executor_batch_telemetry(
+        scheduler_reference_batch_index=2,
+        scheduler_reference_batch_count=4,
+        scheduler_reference_batch_rows=128,
+        executor_microbatch_index=9,
+        executor_microbatch_count=12,
+        executor_configured_reference_batch_size=128,
+        executor_microbatch_rows=32,
+        executor_microbatch_size=32,
+    )
+
+    assert telemetry["phase4_batch_count"] == 4
+    assert telemetry["phase4_batches"] == 4
+    assert telemetry["phase4_executor_microbatch_count"] == 12
+    assert telemetry["scheduler_reference_batch_index"] == 2
+    assert telemetry["scheduler_reference_batch_rows"] == 128
+    assert telemetry["executor_microbatch_index"] == 9
+    assert telemetry["executor_microbatch_rows"] == 32
+    assert telemetry["executor_configured_reference_batch_size"] == 128
+    assert telemetry["executor_reference_batch_size"] == 128
+    assert telemetry["executor_microbatch_size"] == 32
+
+
+def test_phase4_executor_batch_telemetry_keeps_reference_and_microbatch_indices_separate() -> None:
+    first = _build_phase4_executor_batch_telemetry(
+        scheduler_reference_batch_index=0,
+        scheduler_reference_batch_count=1,
+        scheduler_reference_batch_rows=64,
+        executor_microbatch_index=1,
+        executor_microbatch_count=1,
+        executor_configured_reference_batch_size=64,
+        executor_microbatch_rows=32,
+        executor_microbatch_size=32,
+    )
+    second = _build_phase4_executor_batch_telemetry(
+        scheduler_reference_batch_index=1,
+        scheduler_reference_batch_count=2,
+        scheduler_reference_batch_rows=64,
+        executor_microbatch_index=2,
+        executor_microbatch_count=2,
+        executor_configured_reference_batch_size=64,
+        executor_microbatch_rows=32,
+        executor_microbatch_size=32,
+    )
+
+    assert first["phase4_batch_count"] == 1
+    assert second["phase4_batch_count"] == 2
+    assert first["scheduler_reference_batch_index"] == 0
+    assert second["scheduler_reference_batch_index"] == 1
+    assert first["executor_microbatch_index"] == 1
+    assert second["executor_microbatch_index"] == 2
 
 
 def test_phase4_batch_locality_summary_reports_layer_and_chunk_ranges() -> None:

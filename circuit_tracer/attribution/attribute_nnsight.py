@@ -184,8 +184,10 @@ _PHASE4_ROW_EXECUTOR_VERSION_BY_MODE: dict[str, str] = {
 
 _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "batched": "batched",
-    "streaming_v1": "batched",
+    "streaming_v1": "streaming_v1",
 }
+
+_PHASE4_STREAMING_V1_MAX_MICROBATCH_SIZE = 64
 
 _PHASE4_PLANNER_V2_POLICY_VERSION = "planner_v2_bounded_membership_v1"
 _PHASE4_PLANNER_V2_CANDIDATE_WINDOW_MULTIPLIER = 2.0
@@ -1033,11 +1035,19 @@ def _resolve_phase4_row_executor_mode(
 
 def _resolve_phase4_row_executor_config(
     phase4_row_executor: str,
+    *,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
 ) -> _Phase4RowExecutorConfig:
     requested_mode = _resolve_phase4_row_executor_mode(phase4_row_executor)
+    streaming_executor_applicable = bool(compact_output and exact_chunked_decoder)
     effective_mode = cast(
         Literal["batched", "streaming_v1"],
-        _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE[requested_mode],
+        (
+            _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE[requested_mode]
+            if requested_mode == "batched" or streaming_executor_applicable
+            else "batched"
+        ),
     )
     effective_behavior: Literal["requested", "batched_reference_execution"] = (
         "batched_reference_execution" if requested_mode != effective_mode else "requested"
@@ -1049,6 +1059,12 @@ def _resolve_phase4_row_executor_config(
         effective_version=_PHASE4_ROW_EXECUTOR_VERSION_BY_MODE[effective_mode],
         effective_behavior=effective_behavior,
     )
+
+
+def _resolve_phase4_streaming_v1_microbatch_size(reference_batch_size: int) -> int:
+    if reference_batch_size <= 0:
+        raise ValueError("reference_batch_size must be > 0")
+    return min(reference_batch_size, _PHASE4_STREAMING_V1_MAX_MICROBATCH_SIZE)
 
 
 def _build_phase4_row_executor_metadata(
@@ -2633,6 +2649,32 @@ def _build_phase4_executor_substage_telemetry(
     return payload
 
 
+def _build_phase4_executor_batch_telemetry(
+    *,
+    scheduler_reference_batch_index: int,
+    scheduler_reference_batch_count: int,
+    scheduler_reference_batch_rows: int,
+    executor_microbatch_index: int,
+    executor_microbatch_count: int,
+    executor_configured_reference_batch_size: int,
+    executor_microbatch_rows: int,
+    executor_microbatch_size: int,
+) -> dict[str, object]:
+    return {
+        "phase4_batch_count": int(scheduler_reference_batch_count),
+        "phase4_batches": int(scheduler_reference_batch_count),
+        "phase4_executor_microbatch_count": int(executor_microbatch_count),
+        "phase4_executor_microbatches": int(executor_microbatch_count),
+        "scheduler_reference_batch_index": int(scheduler_reference_batch_index),
+        "scheduler_reference_batch_rows": int(scheduler_reference_batch_rows),
+        "executor_microbatch_index": int(executor_microbatch_index),
+        "executor_microbatch_rows": int(executor_microbatch_rows),
+        "executor_configured_reference_batch_size": int(executor_configured_reference_batch_size),
+        "executor_reference_batch_size": int(scheduler_reference_batch_rows),
+        "executor_microbatch_size": int(executor_microbatch_size),
+    }
+
+
 def _record_cross_cluster_checkpoint(
     *,
     cross_cluster_debug_summary: dict[str, object] | None,
@@ -3468,8 +3510,9 @@ def attribute(
             ``"off"`` keeps current behavior. ``"v1"`` enables the compact
             refresh row-range reader optimization while preserving exact math.
         phase4_row_executor: Requested Phase-4 row execution mode.
-            ``"batched"`` keeps current behavior. ``"streaming_v1"`` is accepted
-            for metadata round-trip but currently executes the ``"batched"`` behavior.
+            ``"batched"`` keeps current behavior. ``"streaming_v1"`` executes
+            compact exact-trace Phase-4 feature rows in smaller compute micro-batches
+            while preserving scheduler frontier membership/order semantics.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
             normalization/influence ranking path. ``"fp32"`` uses float32
             internals and is the post-fix default; ``"fp64"`` uses float64
@@ -3642,7 +3685,11 @@ def _run_attribution(
     phase4_refresh_optimization_metadata = _build_phase4_refresh_optimization_metadata(
         phase4_refresh_optimization_config
     )
-    phase4_row_executor_config = _resolve_phase4_row_executor_config(phase4_row_executor)
+    phase4_row_executor_config = _resolve_phase4_row_executor_config(
+        phase4_row_executor,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
+    )
     phase4_row_executor_metadata = _build_phase4_row_executor_metadata(phase4_row_executor_config)
     phase4_execution_metadata: dict[str, object] = {
         **phase4_scheduler_metadata,
@@ -4633,6 +4680,22 @@ def _run_attribution(
         _log_memory_boundary(logger, "Phase 4 start", model.device)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
         phase4_feature_batch_size = effective_feature_batch_size
+        phase4_row_executor_effective_mode = phase4_row_executor_config.effective_mode
+        phase4_executor_reference_batch_size = int(phase4_feature_batch_size)
+        phase4_executor_microbatch_size = phase4_executor_reference_batch_size
+        if phase4_row_executor_effective_mode == "streaming_v1":
+            phase4_executor_microbatch_size = _resolve_phase4_streaming_v1_microbatch_size(
+                phase4_executor_reference_batch_size
+            )
+        phase4_execution_metadata.update(
+            {
+                "executor_configured_reference_batch_size": int(
+                    phase4_executor_reference_batch_size
+                ),
+                "executor_reference_batch_size": int(phase4_executor_reference_batch_size),
+                "executor_microbatch_size": int(phase4_executor_microbatch_size),
+            }
+        )
         logger.info(
             "Phase 4 frontier scheduler | "
             f"mode={phase4_scheduler_config.requested_mode} | "
@@ -4666,7 +4729,9 @@ def _run_attribution(
             f"behavior={phase4_refresh_optimization_config.effective_behavior}) | "
             f"row_executor={phase4_row_executor_config.requested_mode}"
             f" (effective={phase4_row_executor_config.effective_mode}, "
-            f"behavior={phase4_row_executor_config.effective_behavior})"
+            f"behavior={phase4_row_executor_config.effective_behavior}) | "
+            f"executor_reference_batch_size={phase4_executor_reference_batch_size} | "
+            f"executor_microbatch_size={phase4_executor_microbatch_size}"
         )
         scheduler_uses_reference_planner = phase4_scheduler_config.effective_mode in {
             "planner_v1",
@@ -4694,7 +4759,8 @@ def _run_attribution(
         st = n_logits
         visited = torch.zeros(total_active_feats, dtype=torch.bool)
         n_visited = 0
-        phase4_batch_count = 0
+        phase4_scheduler_reference_batch_count = 0
+        phase4_executor_microbatch_count = 0
         phase4_refresh_count = 0
         phase4_refresh_elapsed_ms_total = 0.0
         phase4_feature_batch_elapsed_ms_total = 0.0
@@ -5402,178 +5468,246 @@ def _run_attribution(
                         "Phase 4 scheduling produced a non-advancing batch boundary "
                         f"(offset={pending_offset}, batch_end={batch_end})"
                     )
-                idx_batch = pending[pending_offset:batch_end]
+                reference_pending_start = pending_offset
+                reference_pending_end = batch_end
+                reference_idx_batch = pending[reference_pending_start:reference_pending_end]
                 pending_offset = batch_end
-                n_visited += len(idx_batch)
-                phase4_batch_count += 1
+                scheduler_reference_batch_index = int(phase4_scheduler_reference_batch_count)
+                phase4_scheduler_reference_batch_count += 1
 
-                ctx_before = _snapshot_diagnostics(ctx) if profile else None
-                transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
-                batch_start = time.perf_counter()
-                compute_batch_start = time.perf_counter()
-                rows = ctx.compute_batch(
-                    layers=feat_layers[idx_batch],
-                    positions=feat_pos[idx_batch],
-                    inject_values=ctx.materialize_encoder_vectors(idx_batch),
-                    retain_graph=n_visited < actual_max_feature_nodes,
-                    phase_label="phase4_features",
-                )
-                executor_compute_batch_elapsed_ms = (
-                    time.perf_counter() - compute_batch_start
-                ) * 1000.0
-
-                row_count = rows.shape[0]
-                end = st + row_count
-                cpu_staging_start = time.perf_counter()
-                rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
-                    rows,
-                    staging_buffer=rows_cpu_staging,
-                )
-                executor_cpu_staging_elapsed_ms = (time.perf_counter() - cpu_staging_start) * 1000.0
-                row_input_slice = rows_cpu[:, :logit_offset]
-                feature_row_slice = rows_cpu[:, :total_active_feats]
-                denominator_start = time.perf_counter()
-                row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
-                    row_input_slice,
-                    dtype=exact_trace_internal_dtype_resolved,
-                )
-                executor_denominator_elapsed_ms = (time.perf_counter() - denominator_start) * 1000.0
-                if anomaly_debug_result is not None and phase4_batch_count <= 2:
-                    feature_row_batches = anomaly_debug_result.setdefault(
-                        "phase4_feature_row_batches",
-                        [],
-                    )
-                    assert isinstance(feature_row_batches, list)
-                    feature_row_batches.append(
-                        {
-                            "batch_index": int(phase4_batch_count),
-                            "batch_row_count": int(row_count),
-                            "row_input_stats": _build_matrix_abs_stats(
-                                row_input_slice,
-                                epsilon=1e-12,
-                                top_k=8,
-                            ),
-                            "row_abs_sum_stats": _build_phase4_normalization_stats(
-                                (row_abs_max_cpu, row_l1_scaled_cpu),
-                                clamp_epsilon=1e-8,
-                            ),
-                        }
-                    )
-                if use_compact_feature_row_store:
-                    assert feature_row_store is not None
-                    row_store_write_start = time.perf_counter()
-                    feature_row_store.append_rows(
-                        row_start=st,
-                        feature_rows=feature_row_slice,
-                        row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
-                        phase="phase4",
-                    )
-                    executor_row_store_write_elapsed_ms = (
-                        time.perf_counter() - row_store_write_start
-                    ) * 1000.0
-                else:
-                    row_store_write_start = time.perf_counter()
-                    edge_matrix[st:end, :logit_offset] = rows_cpu
-                    executor_row_store_write_elapsed_ms = (
-                        time.perf_counter() - row_store_write_start
-                    ) * 1000.0
-                row_to_node_index[st:end] = idx_batch
-                visited[idx_batch] = True
-                st = end
-                pbar.update(len(idx_batch))
-
-                if profile:
-                    batch_number = phase4_batch_count
-                    if batch_number % profile_log_interval == 0:
-                        batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
-                        _log_batch_profile(
-                            logger,
-                            "Phase 4",
-                            batch_number,
-                            None,
-                            batch_elapsed_ms / 1000.0,
-                            ctx_before,
-                            _snapshot_diagnostics(ctx),
-                            transcoder_before,
-                            _snapshot_diagnostics(model.transcoders),
+                if phase4_row_executor_effective_mode == "streaming_v1":
+                    executor_batches: list[torch.Tensor] = []
+                    streaming_pending_offset = 0
+                    while streaming_pending_offset < int(reference_idx_batch.numel()):
+                        streaming_end = min(
+                            streaming_pending_offset + phase4_executor_microbatch_size,
+                            int(reference_idx_batch.numel()),
                         )
-                batch_number = phase4_batch_count
-                batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
-                phase4_feature_batch_elapsed_ms_total += batch_elapsed_ms
-                executor_substage_telemetry = _build_phase4_executor_substage_telemetry(
-                    telemetry_detail=phase4_scheduler_config.telemetry_detail,
-                    compute_batch_elapsed_ms=executor_compute_batch_elapsed_ms,
-                    cpu_staging_elapsed_ms=executor_cpu_staging_elapsed_ms,
-                    denominator_elapsed_ms=executor_denominator_elapsed_ms,
-                    row_store_write_elapsed_ms=executor_row_store_write_elapsed_ms,
-                    batch_elapsed_ms=batch_elapsed_ms,
-                )
-                batch_locality_summary = _build_phase4_batch_locality_summary(
-                    idx_batch,
-                    feat_layers=feat_layers,
-                    feat_ids=feat_ids,
-                    exact_chunked_decoder=exact_chunked_decoder,
-                    decoder_chunk_size=decoder_chunk_size,
-                )
-                telemetry_recorder.record_event(
-                    scope="batch",
-                    name="phase4.feature_batch",
-                    phase="phase4",
-                    batch_index=batch_number,
-                    elapsed_ms=batch_elapsed_ms,
-                    attrs={
-                        "batch_rows": int(row_count),
-                        "visited_features": int(n_visited),
-                        "target_feature_count": int(actual_max_feature_nodes),
-                        **phase4_execution_metadata,
-                        "scheduler_refresh_index": pending_refresh_index,
-                        **batch_locality_summary,
-                        **executor_substage_telemetry,
-                    },
-                )
-                telemetry_recorder.record_wall_clock_duration(
-                    scope="batch",
-                    name="phase4.feature_batch",
-                    elapsed_ms=batch_elapsed_ms,
-                )
-                if cross_cluster_debug_batches is not None:
-                    row_input_stats = _build_matrix_abs_stats(
+                        executor_batches.append(
+                            reference_idx_batch[streaming_pending_offset:streaming_end]
+                        )
+                        streaming_pending_offset = streaming_end
+                else:
+                    executor_batches = [reference_idx_batch]
+
+                streaming_chunk_count = int(len(executor_batches))
+                chunk_pending_start = reference_pending_start
+                for streaming_chunk_index, idx_batch in enumerate(executor_batches, start=1):
+                    chunk_pending_end = chunk_pending_start + int(idx_batch.numel())
+                    n_visited += len(idx_batch)
+                    phase4_executor_microbatch_count += 1
+                    executor_microbatch_index = int(phase4_executor_microbatch_count)
+
+                    ctx_before = _snapshot_diagnostics(ctx) if profile else None
+                    transcoder_before = (
+                        _snapshot_diagnostics(model.transcoders) if profile else None
+                    )
+                    batch_start = time.perf_counter()
+                    compute_batch_start = time.perf_counter()
+                    rows = ctx.compute_batch(
+                        layers=feat_layers[idx_batch],
+                        positions=feat_pos[idx_batch],
+                        inject_values=ctx.materialize_encoder_vectors(idx_batch),
+                        retain_graph=n_visited < actual_max_feature_nodes,
+                        phase_label="phase4_features",
+                    )
+                    executor_compute_batch_elapsed_ms = (
+                        time.perf_counter() - compute_batch_start
+                    ) * 1000.0
+
+                    row_count = rows.shape[0]
+                    end = st + row_count
+                    cpu_staging_start = time.perf_counter()
+                    rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                        rows,
+                        staging_buffer=rows_cpu_staging,
+                    )
+                    executor_cpu_staging_elapsed_ms = (
+                        time.perf_counter() - cpu_staging_start
+                    ) * 1000.0
+                    row_input_slice = rows_cpu[:, :logit_offset]
+                    feature_row_slice = rows_cpu[:, :total_active_feats]
+                    denominator_start = time.perf_counter()
+                    row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                         row_input_slice,
-                        epsilon=1e-12,
-                        top_k=0,
+                        dtype=exact_trace_internal_dtype_resolved,
                     )
-                    row_abs_sum_stats = _build_phase4_normalization_stats(
-                        (row_abs_max_cpu, row_l1_scaled_cpu),
-                        clamp_epsilon=1e-8,
+                    executor_denominator_elapsed_ms = (
+                        time.perf_counter() - denominator_start
+                    ) * 1000.0
+                    if anomaly_debug_result is not None and phase4_executor_microbatch_count <= 2:
+                        feature_row_batches = anomaly_debug_result.setdefault(
+                            "phase4_feature_row_batches",
+                            [],
+                        )
+                        assert isinstance(feature_row_batches, list)
+                        feature_row_batches.append(
+                            {
+                                "batch_index": int(executor_microbatch_index),
+                                "batch_row_count": int(row_count),
+                                "row_input_stats": _build_matrix_abs_stats(
+                                    row_input_slice,
+                                    epsilon=1e-12,
+                                    top_k=8,
+                                ),
+                                "row_abs_sum_stats": _build_phase4_normalization_stats(
+                                    (row_abs_max_cpu, row_l1_scaled_cpu),
+                                    clamp_epsilon=1e-8,
+                                ),
+                            }
+                        )
+                    if use_compact_feature_row_store:
+                        assert feature_row_store is not None
+                        row_store_write_start = time.perf_counter()
+                        feature_row_store.append_rows(
+                            row_start=st,
+                            feature_rows=feature_row_slice,
+                            row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
+                            phase="phase4",
+                        )
+                        executor_row_store_write_elapsed_ms = (
+                            time.perf_counter() - row_store_write_start
+                        ) * 1000.0
+                    else:
+                        row_store_write_start = time.perf_counter()
+                        edge_matrix[st:end, :logit_offset] = rows_cpu
+                        executor_row_store_write_elapsed_ms = (
+                            time.perf_counter() - row_store_write_start
+                        ) * 1000.0
+                    row_to_node_index[st:end] = idx_batch
+                    visited[idx_batch] = True
+                    st = end
+                    pbar.update(len(idx_batch))
+
+                    if profile:
+                        batch_number = executor_microbatch_index
+                        if batch_number % profile_log_interval == 0:
+                            batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                            _log_batch_profile(
+                                logger,
+                                "Phase 4",
+                                batch_number,
+                                None,
+                                batch_elapsed_ms / 1000.0,
+                                ctx_before,
+                                _snapshot_diagnostics(ctx),
+                                transcoder_before,
+                                _snapshot_diagnostics(model.transcoders),
+                            )
+                    batch_number = executor_microbatch_index
+                    batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                    phase4_feature_batch_elapsed_ms_total += batch_elapsed_ms
+                    executor_batch_telemetry = _build_phase4_executor_batch_telemetry(
+                        scheduler_reference_batch_index=scheduler_reference_batch_index,
+                        scheduler_reference_batch_count=phase4_scheduler_reference_batch_count,
+                        scheduler_reference_batch_rows=int(reference_idx_batch.numel()),
+                        executor_microbatch_index=executor_microbatch_index,
+                        executor_microbatch_count=phase4_executor_microbatch_count,
+                        executor_configured_reference_batch_size=phase4_executor_reference_batch_size,
+                        executor_microbatch_rows=int(idx_batch.numel()),
+                        executor_microbatch_size=phase4_executor_microbatch_size,
                     )
-                    _record_cross_cluster_batch_event(
-                        cross_cluster_debug_batches=cross_cluster_debug_batches,
-                        event_name="phase4.feature_batch",
+                    executor_substage_telemetry = _build_phase4_executor_substage_telemetry(
+                        telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                        compute_batch_elapsed_ms=executor_compute_batch_elapsed_ms,
+                        cpu_staging_elapsed_ms=executor_cpu_staging_elapsed_ms,
+                        denominator_elapsed_ms=executor_denominator_elapsed_ms,
+                        row_store_write_elapsed_ms=executor_row_store_write_elapsed_ms,
+                        batch_elapsed_ms=batch_elapsed_ms,
+                    )
+                    executor_streaming_telemetry = {
+                        "executor_reference_batch_size": int(reference_idx_batch.numel()),
+                        "executor_microbatch_size": int(phase4_executor_microbatch_size),
+                        "executor_streaming_chunk_index": (
+                            int(streaming_chunk_index)
+                            if phase4_row_executor_effective_mode == "streaming_v1"
+                            else None
+                        ),
+                        "executor_streaming_chunk_count": (
+                            int(streaming_chunk_count)
+                            if phase4_row_executor_effective_mode == "streaming_v1"
+                            else None
+                        ),
+                        "scheduler_pending_start_index": int(chunk_pending_start),
+                        "scheduler_pending_end_index": int(chunk_pending_end),
+                        "scheduler_reference_pending_start_index": int(reference_pending_start),
+                        "scheduler_reference_pending_end_index": int(reference_pending_end),
+                    }
+                    batch_locality_summary = _build_phase4_batch_locality_summary(
+                        idx_batch,
+                        feat_layers=feat_layers,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                    telemetry_recorder.record_event(
+                        scope="batch",
+                        name="phase4.feature_batch",
                         phase="phase4",
-                        event_index=batch_number,
-                        payload={
+                        batch_index=batch_number,
+                        elapsed_ms=batch_elapsed_ms,
+                        attrs={
                             "batch_rows": int(row_count),
                             "visited_features": int(n_visited),
                             "target_feature_count": int(actual_max_feature_nodes),
                             **phase4_execution_metadata,
+                            **executor_batch_telemetry,
                             "scheduler_refresh_index": pending_refresh_index,
+                            **executor_streaming_telemetry,
                             **batch_locality_summary,
                             **executor_substage_telemetry,
-                            "idx_batch_hash": batch_locality_summary.get("scheduler_batch_hash"),
-                            "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
-                            "row_input_finite_max_abs": _safe_float(
-                                row_input_stats.get("finite_max_abs")
-                            ),
-                            "row_l1_abs_sum": _safe_float(row_abs_sum_stats.get("abs_sum")),
-                            "row_l1_max": _safe_float(row_abs_sum_stats.get("max")),
-                            "row_l1_nonfinite_count": int(row_abs_sum_stats["nonfinite_count"]),
-                            "row_l1_effectively_all_zero": bool(
-                                row_abs_sum_stats["effectively_all_zero"]
-                            ),
-                            "batch_elapsed_ms": float(batch_elapsed_ms),
-                            **get_memory_snapshot(model.device),
                         },
                     )
+                    telemetry_recorder.record_wall_clock_duration(
+                        scope="batch",
+                        name="phase4.feature_batch",
+                        elapsed_ms=batch_elapsed_ms,
+                    )
+                    if cross_cluster_debug_batches is not None:
+                        row_input_stats = _build_matrix_abs_stats(
+                            row_input_slice,
+                            epsilon=1e-12,
+                            top_k=0,
+                        )
+                        row_abs_sum_stats = _build_phase4_normalization_stats(
+                            (row_abs_max_cpu, row_l1_scaled_cpu),
+                            clamp_epsilon=1e-8,
+                        )
+                        _record_cross_cluster_batch_event(
+                            cross_cluster_debug_batches=cross_cluster_debug_batches,
+                            event_name="phase4.feature_batch",
+                            phase="phase4",
+                            event_index=batch_number,
+                            payload={
+                                "batch_rows": int(row_count),
+                                "visited_features": int(n_visited),
+                                "target_feature_count": int(actual_max_feature_nodes),
+                                **phase4_execution_metadata,
+                                **executor_batch_telemetry,
+                                "scheduler_refresh_index": pending_refresh_index,
+                                **executor_streaming_telemetry,
+                                **batch_locality_summary,
+                                **executor_substage_telemetry,
+                                "idx_batch_hash": batch_locality_summary.get(
+                                    "scheduler_batch_hash"
+                                ),
+                                "row_input_nonfinite_count": int(
+                                    row_input_stats["nonfinite_count"]
+                                ),
+                                "row_input_finite_max_abs": _safe_float(
+                                    row_input_stats.get("finite_max_abs")
+                                ),
+                                "row_l1_abs_sum": _safe_float(row_abs_sum_stats.get("abs_sum")),
+                                "row_l1_max": _safe_float(row_abs_sum_stats.get("max")),
+                                "row_l1_nonfinite_count": int(row_abs_sum_stats["nonfinite_count"]),
+                                "row_l1_effectively_all_zero": bool(
+                                    row_abs_sum_stats["effectively_all_zero"]
+                                ),
+                                "batch_elapsed_ms": float(batch_elapsed_ms),
+                                **get_memory_snapshot(model.device),
+                            },
+                        )
+                    chunk_pending_start = chunk_pending_end
             if planned_boundaries is not None and planned_boundary_offset != len(
                 planned_boundaries
             ):
@@ -5590,7 +5724,8 @@ def _run_attribution(
             model.device,
             selected_features=int(visited.sum().item()),
             final_feature_batch_size=phase4_feature_batch_size,
-            phase4_batches=phase4_batch_count,
+            phase4_batches=phase4_scheduler_reference_batch_count,
+            phase4_executor_microbatch_count=phase4_executor_microbatch_count,
         )
         phase4_elapsed_ms = (time.perf_counter() - phase4_start) * 1000.0
         telemetry_recorder.record_event(
@@ -5601,7 +5736,8 @@ def _run_attribution(
             attrs={
                 "selected_features": int(visited.sum().item()),
                 "feature_batch_size": int(phase4_feature_batch_size),
-                "phase4_batches": int(phase4_batch_count),
+                "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
                 "phase4_refreshes": int(phase4_refresh_count),
                 "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
                 "phase4_feature_batch_elapsed_ms_total": float(
@@ -6115,12 +6251,19 @@ def _run_attribution(
                     phase4_row_executor_config.requested_mode
                     != phase4_row_executor_config.effective_mode
                 ),
+                "phase4_executor_configured_reference_batch_size": int(
+                    phase4_executor_reference_batch_size
+                ),
+                "phase4_executor_reference_batch_size": int(phase4_executor_reference_batch_size),
+                "phase4_executor_microbatch_size": int(phase4_executor_microbatch_size),
                 "internal_precision_requested": internal_precision_requested,
                 "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
                 "cross_cluster_debug_enabled": bool(cross_cluster_debug_enabled),
                 "phase4_refresh_count": int(phase4_refresh_count),
-                "phase4_batch_count": int(phase4_batch_count),
+                "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
+                "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
                 "phase4_refresh_elapsed_seconds_total": round(
                     phase4_refresh_elapsed_ms_total / 1000.0,
                     6,
@@ -6161,7 +6304,9 @@ def _run_attribution(
                 )
                 phase4_entry_summary_checkpoint = {
                     "phase4_refresh_count": int(phase4_refresh_count),
-                    "phase4_batch_count": int(phase4_batch_count),
+                    "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
+                    "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                    "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
                     **phase4_execution_metadata,
                     **phase4_runtime_summary,
                 }
@@ -6174,7 +6319,9 @@ def _run_attribution(
                     stream_payload={
                         "checkpoint_stage": "post_phase4",
                         "phase4_refresh_count": int(phase4_refresh_count),
-                        "phase4_batch_count": int(phase4_batch_count),
+                        "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
+                        "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                        "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
                         **phase4_execution_metadata,
                         **phase4_runtime_stream,
                     },
@@ -6189,7 +6336,9 @@ def _run_attribution(
                         "selected_feature_count": int(visited.sum().item()),
                         "phase4_feature_batch_size": int(phase4_feature_batch_size),
                         "phase4_refresh_count": int(phase4_refresh_count),
-                        "phase4_batch_count": int(phase4_batch_count),
+                        "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
+                        "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                        "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
                         "phase4_elapsed_ms": float(phase4_elapsed_ms),
                         "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
                         "phase4_feature_batch_elapsed_ms_total": float(
