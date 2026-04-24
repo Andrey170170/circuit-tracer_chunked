@@ -167,6 +167,12 @@ _PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "planner_v2": "planner_v1",
 }
 
+_PHASE4_PLANNER_V2_POLICY_VERSION = "planner_v2_candidate_window_v1"
+_PHASE4_PLANNER_V2_CANDIDATE_WINDOW_MULTIPLIER = 2.0
+_PHASE4_PLANNER_V2_LOCKED_PREFIX_FRACTION = 0.5
+_PHASE4_PLANNER_V2_MAX_REPLACEMENT_FRACTION = 0.25
+_PHASE4_PLANNER_V2_MIN_SCORE_RATIO = 0.995
+
 
 @dataclass(frozen=True)
 class _Phase4SchedulerConfig:
@@ -975,6 +981,155 @@ def _build_phase4_scheduler_plan_telemetry(
         ]
         payload["scheduler_plan_batch_boundaries_sample_count"] = int(len(boundary_sample))
     return payload
+
+
+def _build_phase4_planner_v2_refresh_telemetry_disabled() -> dict[str, object]:
+    return {
+        "scheduler_planner_v2_enabled": False,
+        "scheduler_planner_v2_policy_version": None,
+        "scheduler_planner_v2_reference_frontier_size": None,
+        "scheduler_planner_v2_candidate_window_size": None,
+        "scheduler_planner_v2_candidate_window_multiplier": None,
+        "scheduler_planner_v2_locked_prefix_fraction": None,
+        "scheduler_planner_v2_locked_prefix_size": None,
+        "scheduler_planner_v2_max_replacement_fraction": None,
+        "scheduler_planner_v2_max_replacement_count": None,
+        "scheduler_planner_v2_min_score_ratio": None,
+        "scheduler_planner_v2_score_cutoff": None,
+        "scheduler_planner_v2_score_threshold": None,
+        "scheduler_planner_v2_score_threshold_applied": None,
+        "scheduler_planner_v2_candidate_window_order_hash": None,
+        "scheduler_planner_v2_candidate_window_membership_hash": None,
+        "scheduler_planner_v2_candidate_window_includes_reference": None,
+    }
+
+
+def _build_phase4_planner_v2_candidate_window(
+    unvisited_feature_rank: torch.Tensor,
+    *,
+    reference_frontier: torch.Tensor,
+    reference_frontier_size: int,
+    candidate_scores: torch.Tensor,
+    window_multiplier: float = _PHASE4_PLANNER_V2_CANDIDATE_WINDOW_MULTIPLIER,
+    locked_prefix_fraction: float = _PHASE4_PLANNER_V2_LOCKED_PREFIX_FRACTION,
+    max_replacement_fraction: float = _PHASE4_PLANNER_V2_MAX_REPLACEMENT_FRACTION,
+    min_score_ratio: float = _PHASE4_PLANNER_V2_MIN_SCORE_RATIO,
+    max_window_size: int | None = None,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    if reference_frontier_size < 0:
+        raise ValueError("reference_frontier_size must be >= 0")
+
+    ranked = unvisited_feature_rank.detach().to(device="cpu", dtype=torch.long)
+    reference = reference_frontier.detach().to(device="cpu", dtype=torch.long)
+    scores = candidate_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+
+    available_count = int(ranked.numel())
+    reference_size = min(
+        int(reference_frontier_size),
+        int(reference.numel()),
+        available_count,
+    )
+
+    multiplier = max(1.0, float(window_multiplier))
+    locked_fraction = min(max(0.0, float(locked_prefix_fraction)), 1.0)
+    replacement_fraction = max(0.0, float(max_replacement_fraction))
+    score_ratio = min(max(0.0, float(min_score_ratio)), 1.0)
+
+    locked_prefix_size = min(reference_size, int(math.floor(reference_size * locked_fraction)))
+    max_replacement_count = int(math.ceil(reference_size * replacement_fraction))
+
+    multiplier_target_size = (
+        max(reference_size, int(math.ceil(reference_size * multiplier)))
+        if reference_size > 0
+        else 0
+    )
+    replacement_target_size = reference_size + max_replacement_count
+    bounded_target_size = max(
+        reference_size,
+        min(multiplier_target_size, replacement_target_size),
+    )
+    if max_window_size is not None:
+        bounded_target_size = min(bounded_target_size, int(max_window_size))
+    bounded_target_size = min(bounded_target_size, available_count)
+
+    score_cutoff = None
+    score_threshold = None
+    score_threshold_applied = False
+    if (
+        reference_size > 0
+        and scores.numel() >= reference_size
+        and scores.numel() >= available_count
+    ):
+        score_cutoff_value = float(scores[reference_size - 1].item())
+        score_cutoff = score_cutoff_value
+        if math.isfinite(score_cutoff_value) and score_cutoff_value > 0.0:
+            score_threshold = float(score_cutoff_value * score_ratio)
+            score_threshold_applied = True
+            ratio_eligible_size = int((scores[:available_count] >= score_threshold).sum().item())
+            bounded_target_size = min(
+                bounded_target_size,
+                max(reference_size, ratio_eligible_size),
+            )
+
+    window_size = bounded_target_size
+
+    missing_reference_nodes: set[int] = set()
+    if reference_size > 0:
+        reference_nodes = reference[:reference_size]
+        if window_size > 0:
+            in_window = torch.isin(reference_nodes, ranked[:window_size])
+        else:
+            in_window = torch.zeros(reference_nodes.shape, dtype=torch.bool)
+        missing_reference_nodes = {int(value) for value in reference_nodes[~in_window].tolist()}
+        if missing_reference_nodes:
+            max_reference_rank = window_size - 1
+            for rank_idx, node_idx in enumerate(ranked.tolist()):
+                if int(node_idx) in missing_reference_nodes:
+                    max_reference_rank = max(max_reference_rank, rank_idx)
+                    missing_reference_nodes.remove(int(node_idx))
+                    if not missing_reference_nodes:
+                        break
+            if missing_reference_nodes:
+                raise RuntimeError(
+                    "Planner v2 candidate window missing reference frontier nodes "
+                    "outside unvisited rank ordering"
+                )
+            window_size = max(window_size, max_reference_rank + 1)
+
+    candidate_window = ranked[:window_size]
+    candidate_window_sorted = (
+        torch.sort(candidate_window).values if candidate_window.numel() > 0 else candidate_window
+    )
+
+    includes_reference = True
+    if reference_size > 0:
+        includes_reference = bool(
+            torch.isin(reference[:reference_size], candidate_window).all().item()
+        )
+
+    telemetry: dict[str, object] = {
+        "scheduler_planner_v2_enabled": True,
+        "scheduler_planner_v2_policy_version": _PHASE4_PLANNER_V2_POLICY_VERSION,
+        "scheduler_planner_v2_reference_frontier_size": int(reference_size),
+        "scheduler_planner_v2_candidate_window_size": int(candidate_window.numel()),
+        "scheduler_planner_v2_candidate_window_multiplier": float(multiplier),
+        "scheduler_planner_v2_locked_prefix_fraction": float(locked_fraction),
+        "scheduler_planner_v2_locked_prefix_size": int(locked_prefix_size),
+        "scheduler_planner_v2_max_replacement_fraction": float(replacement_fraction),
+        "scheduler_planner_v2_max_replacement_count": int(max_replacement_count),
+        "scheduler_planner_v2_min_score_ratio": float(score_ratio),
+        "scheduler_planner_v2_score_cutoff": score_cutoff,
+        "scheduler_planner_v2_score_threshold": score_threshold,
+        "scheduler_planner_v2_score_threshold_applied": bool(score_threshold_applied),
+        "scheduler_planner_v2_candidate_window_order_hash": (
+            _hash_index_tensor(candidate_window) if candidate_window.numel() > 0 else None
+        ),
+        "scheduler_planner_v2_candidate_window_membership_hash": (
+            _hash_index_tensor(candidate_window_sorted) if candidate_window.numel() > 0 else None
+        ),
+        "scheduler_planner_v2_candidate_window_includes_reference": bool(includes_reference),
+    }
+    return candidate_window, telemetry
 
 
 def _build_phase4_batch_locality_summary(
@@ -3895,6 +4050,27 @@ def _run_attribution(
                         decoder_chunk_size=decoder_chunk_size,
                     )
                     pending = pending[:queue_size]
+
+                planner_v2_candidate_window = torch.empty(0, dtype=torch.long)
+                planner_v2_refresh_telemetry = _build_phase4_planner_v2_refresh_telemetry_disabled()
+                if phase4_scheduler_config.requested_mode == "planner_v2":
+                    planner_v2_candidate_scores = feature_influences[unvisited_feature_rank]
+                    planner_v2_candidate_window, planner_v2_refresh_telemetry = (
+                        _build_phase4_planner_v2_candidate_window(
+                            unvisited_feature_rank,
+                            reference_frontier=pending,
+                            reference_frontier_size=queue_size,
+                            candidate_scores=planner_v2_candidate_scores,
+                        )
+                    )
+                    if phase4_scheduler_config.debug:
+                        logger.info(
+                            "Phase 4 planner_v2 candidate window | "
+                            f"reference_frontier_size={planner_v2_refresh_telemetry.get('scheduler_planner_v2_reference_frontier_size')} | "
+                            f"candidate_window_size={planner_v2_refresh_telemetry.get('scheduler_planner_v2_candidate_window_size')} | "
+                            "candidate_window_order_hash="
+                            f"{planner_v2_refresh_telemetry.get('scheduler_planner_v2_candidate_window_order_hash')}"
+                        )
                 phase4_plan_telemetry = _build_phase4_scheduler_plan_telemetry(
                     phase4_frontier_plan=phase4_frontier_plan,
                     telemetry_detail=phase4_scheduler_config.telemetry_detail,
@@ -3914,7 +4090,12 @@ def _run_attribution(
                         "visited_features": int(n_visited),
                         "frontier_candidate_count": int(unvisited_feature_rank.numel()),
                         "queue_size": int(queue_size),
+                        "pending_count": int(pending.numel()),
+                        "pending_hash": _hash_index_tensor(pending)
+                        if pending.numel() > 0
+                        else None,
                         **phase4_scheduler_metadata,
+                        **planner_v2_refresh_telemetry,
                         **phase4_plan_telemetry,
                         "rank_nonzero_count": (
                             int(rank_signal_stats["nonzero_count"])
@@ -4052,7 +4233,16 @@ def _run_attribution(
                             "pending_hash": (
                                 _hash_index_tensor(pending) if pending.numel() > 0 else None
                             ),
+                            "planner_v2_candidate_window_size": int(
+                                planner_v2_candidate_window.numel()
+                            ),
+                            "planner_v2_candidate_window_hash": (
+                                _hash_index_tensor(planner_v2_candidate_window)
+                                if planner_v2_candidate_window.numel() > 0
+                                else None
+                            ),
                             **phase4_scheduler_metadata,
+                            **planner_v2_refresh_telemetry,
                             **phase4_plan_telemetry,
                             "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
                             "rank_effective_nonzero_count": int(

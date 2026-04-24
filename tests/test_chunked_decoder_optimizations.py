@@ -11,6 +11,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_matrix_abs_stats,
     _build_phase4_batch_locality_summary,
     _build_phase4_normalization_stats,
+    _build_phase4_planner_v2_candidate_window,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
@@ -832,6 +833,59 @@ def test_phase4_planner_v1_rejects_invalid_parameters_and_duplicates() -> None:
             exact_chunked_decoder=False,
             decoder_chunk_size=None,
         )
+
+
+def test_phase4_planner_v2_candidate_window_includes_reference_frontier() -> None:
+    unvisited_feature_rank = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.long)
+    candidate_scores = torch.tensor([1.0, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92])
+    reference_frontier = torch.tensor([0, 4, 7], dtype=torch.long)
+
+    candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+        unvisited_feature_rank,
+        reference_frontier=reference_frontier,
+        reference_frontier_size=3,
+        candidate_scores=candidate_scores,
+    )
+
+    assert torch.equal(candidate_window, torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.long))
+    assert telemetry["scheduler_planner_v2_enabled"] is True
+    assert telemetry["scheduler_planner_v2_reference_frontier_size"] == 3
+    assert telemetry["scheduler_planner_v2_candidate_window_size"] == 8
+    assert telemetry["scheduler_planner_v2_candidate_window_includes_reference"] is True
+    assert telemetry["scheduler_planner_v2_candidate_window_order_hash"] is not None
+
+
+def test_phase4_planner_v2_candidate_window_respects_min_score_ratio_near_cutoff() -> None:
+    unvisited_feature_rank = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    candidate_scores = torch.tensor([1.0, 0.99, 0.80, 0.79])
+    reference_frontier = torch.tensor([0, 1], dtype=torch.long)
+
+    candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+        unvisited_feature_rank,
+        reference_frontier=reference_frontier,
+        reference_frontier_size=2,
+        candidate_scores=candidate_scores,
+    )
+
+    assert torch.equal(candidate_window, torch.tensor([0, 1], dtype=torch.long))
+    assert telemetry["scheduler_planner_v2_candidate_window_size"] == 2
+    assert telemetry["scheduler_planner_v2_score_threshold_applied"] is True
+    assert telemetry["scheduler_planner_v2_score_threshold"] == pytest.approx(0.99 * 0.995)
+
+
+def test_phase4_planner_v2_candidate_window_handles_empty_reference_and_short_unvisited() -> None:
+    candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+        torch.tensor([9], dtype=torch.long),
+        reference_frontier=torch.tensor([], dtype=torch.long),
+        reference_frontier_size=0,
+        candidate_scores=torch.tensor([0.5]),
+    )
+
+    assert candidate_window.numel() == 0
+    assert telemetry["scheduler_planner_v2_reference_frontier_size"] == 0
+    assert telemetry["scheduler_planner_v2_candidate_window_size"] == 0
+    assert telemetry["scheduler_planner_v2_candidate_window_order_hash"] is None
+    assert telemetry["scheduler_planner_v2_candidate_window_includes_reference"] is True
 
 
 def test_phase4_scheduler_plan_telemetry_reports_full_frontier_planner_metadata() -> None:
