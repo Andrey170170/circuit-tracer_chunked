@@ -715,14 +715,20 @@ def test_phase4_scheduler_config_planner_v2_tracks_requested_and_effective_polic
     metadata = _build_phase4_scheduler_metadata(config)
 
     assert metadata["scheduler_requested_mode"] == "planner_v2"
+    assert metadata["scheduler_mode_requested"] == "planner_v2"
     assert metadata["scheduler_mode"] == "planner_v2"
     assert metadata["scheduler_version"] == "planner_v2"
-    assert metadata["scheduler_policy"] == "bounded_membership_identity"
-    assert metadata["scheduler_effective_mode"] == "planner_v1"
-    assert metadata["scheduler_effective_version"] == "planner_v1"
-    assert metadata["scheduler_effective_policy"] == "membership_preserving_locality"
-    assert metadata["scheduler_effective_behavior"] == "planner_v1_reference_execution"
-    assert metadata["scheduler_reference_execution"] is True
+    assert metadata["scheduler_version_requested"] == "planner_v2"
+    assert metadata["scheduler_policy"] == "bounded_membership_selection"
+    assert metadata["scheduler_policy_requested"] == "bounded_membership_selection"
+    assert metadata["scheduler_effective_mode"] == "planner_v2"
+    assert metadata["scheduler_mode_effective"] == "planner_v2"
+    assert metadata["scheduler_effective_version"] == "planner_v2"
+    assert metadata["scheduler_version_effective"] == "planner_v2"
+    assert metadata["scheduler_effective_policy"] == "bounded_membership_selection"
+    assert metadata["scheduler_policy_effective"] == "bounded_membership_selection"
+    assert metadata["scheduler_effective_behavior"] == "requested"
+    assert metadata["scheduler_reference_execution"] is False
 
 
 def test_phase4_scheduler_mode_rejects_unknown_value() -> None:
@@ -1018,6 +1024,56 @@ def test_phase4_planner_v2_refresh_can_change_membership_for_better_grouping() -
     assert int(telemetry["scheduler_planner_v2_group_count_delta"]) >= 1
     assert selected_plan.selected_membership_hash != reference_plan.selected_membership_hash
     assert selected_plan.invariant_summary["planner_v2_changed_membership"] is True
+
+
+def test_phase4_planner_v2_refresh_fails_closed_when_candidate_window_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feat_layers = torch.tensor([0, 0, 1, 0], dtype=torch.long)
+    feat_positions = torch.arange(4, dtype=torch.long)
+    feat_ids = torch.zeros(4, dtype=torch.long)
+    reference_plan = _plan_phase4_frontier_membership_preserving_v1(
+        torch.tensor([0, 1], dtype=torch.long),
+        max_batch_size=2,
+        max_batches=1,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+        apply_locality_reorder=False,
+    )
+
+    def _raise_candidate_window(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.attribute_nnsight._build_phase4_planner_v2_candidate_window",
+        _raise_candidate_window,
+    )
+
+    selected_plan, candidate_window, telemetry = _apply_phase4_planner_v2_refresh_plan(
+        reference_plan=reference_plan,
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        candidate_scores=torch.tensor([1.0, 0.9, 0.8, 0.7], dtype=torch.float64),
+        visited=torch.zeros(4, dtype=torch.bool),
+        max_batch_size=2,
+        max_batches=1,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert candidate_window.numel() == 0
+    assert torch.equal(selected_plan.selected_frontier, reference_plan.selected_frontier)
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is True
+    assert telemetry["scheduler_planner_v2_selection_applied"] is False
+    assert (
+        telemetry["scheduler_planner_v2_fallback_reason"]
+        == "planner_v2_selection_error:RuntimeError"
+    )
 
 
 def test_phase4_scheduler_plan_telemetry_reports_full_frontier_planner_metadata() -> None:

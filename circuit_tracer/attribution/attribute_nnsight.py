@@ -158,13 +158,13 @@ _PHASE4_SCHEDULER_VERSION_BY_MODE: dict[str, str] = {
 _PHASE4_SCHEDULER_POLICY_BY_MODE: dict[str, str] = {
     "locality": "fixed_frontier_locality",
     "planner_v1": "membership_preserving_locality",
-    "planner_v2": "bounded_membership_identity",
+    "planner_v2": "bounded_membership_selection",
 }
 
 _PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "locality": "locality",
     "planner_v1": "planner_v1",
-    "planner_v2": "planner_v1",
+    "planner_v2": "planner_v2",
 }
 
 _PHASE4_PLANNER_V2_POLICY_VERSION = "planner_v2_bounded_membership_v1"
@@ -177,7 +177,7 @@ _PHASE4_PLANNER_V2_MIN_SCORE_RATIO = 0.995
 @dataclass(frozen=True)
 class _Phase4SchedulerConfig:
     requested_mode: Literal["locality", "planner_v1", "planner_v2"]
-    effective_mode: Literal["locality", "planner_v1"]
+    effective_mode: Literal["locality", "planner_v1", "planner_v2"]
     version: str
     policy: str
     effective_version: str
@@ -874,7 +874,7 @@ def _resolve_phase4_scheduler_config(
 ) -> _Phase4SchedulerConfig:
     requested_mode = _resolve_phase4_scheduler_mode(phase4_scheduler_mode)
     effective_mode = cast(
-        Literal["locality", "planner_v1"],
+        Literal["locality", "planner_v1", "planner_v2"],
         _PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE[requested_mode],
     )
     effective_behavior: Literal["requested", "planner_v1_reference_execution"] = (
@@ -900,12 +900,18 @@ def _build_phase4_scheduler_metadata(
 ) -> dict[str, object]:
     return {
         "scheduler_requested_mode": phase4_scheduler_config.requested_mode,
+        "scheduler_mode_requested": phase4_scheduler_config.requested_mode,
         "scheduler_mode": phase4_scheduler_config.requested_mode,
         "scheduler_version": phase4_scheduler_config.version,
+        "scheduler_version_requested": phase4_scheduler_config.version,
         "scheduler_policy": phase4_scheduler_config.policy,
+        "scheduler_policy_requested": phase4_scheduler_config.policy,
         "scheduler_effective_mode": phase4_scheduler_config.effective_mode,
+        "scheduler_mode_effective": phase4_scheduler_config.effective_mode,
         "scheduler_effective_version": phase4_scheduler_config.effective_version,
+        "scheduler_version_effective": phase4_scheduler_config.effective_version,
         "scheduler_effective_policy": phase4_scheduler_config.effective_policy,
+        "scheduler_policy_effective": phase4_scheduler_config.effective_policy,
         "scheduler_effective_behavior": phase4_scheduler_config.effective_behavior,
         "scheduler_reference_execution": bool(
             phase4_scheduler_config.requested_mode != phase4_scheduler_config.effective_mode
@@ -1517,25 +1523,60 @@ def _apply_phase4_planner_v2_refresh_plan(
     reference_frontier = reference_plan.selected_frontier
     reference_size = int(reference_frontier.numel())
 
-    candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
-        unvisited_feature_rank,
-        reference_frontier=reference_frontier,
-        reference_frontier_size=reference_size,
-        candidate_scores=candidate_scores,
-    )
-    selected_membership, selection_telemetry = _select_phase4_planner_v2_membership(
-        unvisited_feature_rank=unvisited_feature_rank,
-        reference_frontier=reference_frontier,
-        reference_frontier_size=reference_size,
-        candidate_window=candidate_window,
-        candidate_scores=candidate_scores,
-        visited=visited,
-        feat_layers=feat_layers,
-        feat_ids=feat_ids,
-        exact_chunked_decoder=exact_chunked_decoder,
-        decoder_chunk_size=decoder_chunk_size,
-    )
-    telemetry.update(selection_telemetry)
+    candidate_window = torch.empty(0, dtype=torch.long)
+    telemetry = _build_phase4_planner_v2_refresh_telemetry_disabled()
+    selected_membership = reference_frontier.detach().to(device="cpu", dtype=torch.long)
+    try:
+        candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+            unvisited_feature_rank,
+            reference_frontier=reference_frontier,
+            reference_frontier_size=reference_size,
+            candidate_scores=candidate_scores,
+        )
+        selected_membership, selection_telemetry = _select_phase4_planner_v2_membership(
+            unvisited_feature_rank=unvisited_feature_rank,
+            reference_frontier=reference_frontier,
+            reference_frontier_size=reference_size,
+            candidate_window=candidate_window,
+            candidate_scores=candidate_scores,
+            visited=visited,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        telemetry.update(selection_telemetry)
+    except Exception as exc:  # pragma: no cover - defensive fail-closed path
+        reference_sorted = (
+            torch.sort(selected_membership).values
+            if selected_membership.numel() > 0
+            else selected_membership
+        )
+        telemetry.update(
+            {
+                "scheduler_planner_v2_enabled": True,
+                "scheduler_planner_v2_policy_version": _PHASE4_PLANNER_V2_POLICY_VERSION,
+                "scheduler_planner_v2_reference_frontier_size": int(reference_size),
+                "scheduler_planner_v2_selection_attempted": False,
+                "scheduler_planner_v2_selection_applied": False,
+                "scheduler_planner_v2_selection_changed_membership": False,
+                "scheduler_planner_v2_fallback_to_reference": True,
+                "scheduler_planner_v2_fallback_reason": (
+                    f"planner_v2_selection_error:{type(exc).__name__}"
+                ),
+                "scheduler_planner_v2_reference_membership_hash": (
+                    _hash_index_tensor(reference_sorted) if reference_sorted.numel() > 0 else None
+                ),
+                "scheduler_planner_v2_selected_membership_hash": (
+                    _hash_index_tensor(reference_sorted) if reference_sorted.numel() > 0 else None
+                ),
+                "scheduler_planner_v2_replacement_count": 0,
+                "scheduler_planner_v2_replacement_fraction_realized": 0.0,
+                "scheduler_planner_v2_selected_score_ratio": 1.0,
+                "scheduler_planner_v2_group_count_delta": 0,
+                "scheduler_planner_v2_rank_displacement_sum": 0,
+            }
+        )
 
     fallback_to_reference = bool(telemetry.get("scheduler_planner_v2_fallback_to_reference", False))
     fallback_reason = cast(str | None, telemetry.get("scheduler_planner_v2_fallback_reason"))
@@ -3165,10 +3206,9 @@ def attribute(
         phase4_scheduler_mode: Phase-4 frontier scheduler mode. ``"locality"``
             keeps current behavior. ``"planner_v1"`` routes frontier selection and
             intra-frontier batching through the membership-preserving planner core.
-            ``"planner_v2"`` is currently a feature-gated identity mode that
-            records v2 scheduler identity/policy telemetry while executing the
-            planner-v1 reference plan path. ``"legacy"`` is accepted as an alias
-            for ``"locality"``.
+            ``"planner_v2"`` enables bounded-membership selection (with explicit
+            per-refresh fallback telemetry when the planner-v1 reference plan is
+            reused). ``"legacy"`` is accepted as an alias for ``"locality"``.
         phase4_scheduler_debug: Emit additional planner-v1 scheduler diagnostics in
             Phase 4 logs.
         phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
@@ -4346,6 +4386,10 @@ def _run_attribution(
                 else ""
             )
         )
+        scheduler_uses_reference_planner = phase4_scheduler_config.effective_mode in {
+            "planner_v1",
+            "planner_v2",
+        }
         if cross_cluster_debug_summary is not None:
             _record_cross_cluster_checkpoint(
                 cross_cluster_debug_summary=cross_cluster_debug_summary,
@@ -4398,7 +4442,7 @@ def _run_attribution(
             pending_refresh_index: int | None = None
             if actual_max_feature_nodes == total_active_feats:
                 pending = torch.arange(total_active_feats)
-                if phase4_scheduler_config.effective_mode == "planner_v1":
+                if scheduler_uses_reference_planner:
                     phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
                         pending,
                         max_batch_size=phase4_feature_batch_size,
@@ -4506,7 +4550,7 @@ def _run_attribution(
                     actual_max_feature_nodes - n_visited,
                 )
                 pending_candidates = unvisited_feature_rank[:max_frontier_size]
-                if phase4_scheduler_config.effective_mode == "planner_v1":
+                if scheduler_uses_reference_planner:
                     phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
                         pending_candidates,
                         max_batch_size=phase4_feature_batch_size,
@@ -4936,8 +4980,7 @@ def _run_attribution(
             pending_offset = 0
             planned_boundaries = (
                 phase4_frontier_plan.batch_boundaries
-                if phase4_scheduler_config.effective_mode == "planner_v1"
-                and phase4_frontier_plan is not None
+                if scheduler_uses_reference_planner and phase4_frontier_plan is not None
                 else None
             )
             planned_boundary_offset = 0
@@ -5589,11 +5632,17 @@ def _run_attribution(
                 "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
                 "phase4_scheduler_requested_mode": phase4_scheduler_config.requested_mode,
                 "phase4_scheduler_mode": phase4_scheduler_config.requested_mode,
+                "phase4_scheduler_mode_requested": phase4_scheduler_config.requested_mode,
                 "phase4_scheduler_version": phase4_scheduler_config.version,
+                "phase4_scheduler_version_requested": phase4_scheduler_config.version,
                 "phase4_scheduler_policy": phase4_scheduler_config.policy,
+                "phase4_scheduler_policy_requested": phase4_scheduler_config.policy,
                 "phase4_scheduler_effective_mode": phase4_scheduler_config.effective_mode,
+                "phase4_scheduler_mode_effective": phase4_scheduler_config.effective_mode,
                 "phase4_scheduler_effective_version": phase4_scheduler_config.effective_version,
+                "phase4_scheduler_version_effective": phase4_scheduler_config.effective_version,
                 "phase4_scheduler_effective_policy": phase4_scheduler_config.effective_policy,
+                "phase4_scheduler_policy_effective": phase4_scheduler_config.effective_policy,
                 "phase4_scheduler_effective_behavior": phase4_scheduler_config.effective_behavior,
                 "phase4_scheduler_reference_execution": bool(
                     phase4_scheduler_config.requested_mode != phase4_scheduler_config.effective_mode
