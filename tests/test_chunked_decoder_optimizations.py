@@ -14,6 +14,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
+    _build_phase4_scheduler_metadata,
     _build_phase4_scheduler_plan_telemetry,
     _record_cross_cluster_batch_event,
     _record_cross_cluster_checkpoint,
@@ -30,6 +31,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
     _resolve_phase4_scheduler_mode,
+    _resolve_phase4_scheduler_config,
     _resolve_phase4_scheduler_telemetry_detail,
 )
 from circuit_tracer.attribution.context_nnsight import (
@@ -697,7 +699,27 @@ def test_reorder_pending_for_phase4_locality_groups_layer_then_chunk_then_positi
 def test_phase4_scheduler_mode_resolves_and_accepts_legacy_alias() -> None:
     assert _resolve_phase4_scheduler_mode("locality") == "locality"
     assert _resolve_phase4_scheduler_mode("planner_v1") == "planner_v1"
+    assert _resolve_phase4_scheduler_mode("planner_v2") == "planner_v2"
     assert _resolve_phase4_scheduler_mode("legacy") == "locality"
+
+
+def test_phase4_scheduler_config_planner_v2_tracks_requested_and_effective_policy() -> None:
+    config = _resolve_phase4_scheduler_config(
+        phase4_scheduler_mode="planner_v2",
+        phase4_scheduler_debug=False,
+        phase4_scheduler_telemetry_detail="normal",
+    )
+    metadata = _build_phase4_scheduler_metadata(config)
+
+    assert metadata["scheduler_requested_mode"] == "planner_v2"
+    assert metadata["scheduler_mode"] == "planner_v2"
+    assert metadata["scheduler_version"] == "planner_v2"
+    assert metadata["scheduler_policy"] == "bounded_membership_identity"
+    assert metadata["scheduler_effective_mode"] == "planner_v1"
+    assert metadata["scheduler_effective_version"] == "planner_v1"
+    assert metadata["scheduler_effective_policy"] == "membership_preserving_locality"
+    assert metadata["scheduler_effective_behavior"] == "planner_v1_reference_execution"
+    assert metadata["scheduler_reference_execution"] is True
 
 
 def test_phase4_scheduler_mode_rejects_unknown_value() -> None:
@@ -1323,6 +1345,7 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
     "scheduler_kwargs",
     [
         {"phase4_scheduler_mode": "planner_v1"},
+        {"phase4_scheduler_mode": "planner_v2"},
         {"phase4_scheduler_debug": True},
         {"phase4_scheduler_telemetry_detail": "summary"},
     ],

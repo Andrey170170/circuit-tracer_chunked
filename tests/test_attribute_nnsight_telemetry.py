@@ -1,4 +1,5 @@
 import inspect
+from typing import get_args
 
 import pytest
 import torch
@@ -162,6 +163,20 @@ def test_phase4_scheduler_defaults_match_between_public_entrypoints() -> None:
         == nnsight_sig.parameters["phase4_scheduler_telemetry_detail"].default
         == "normal"
     )
+
+
+def test_phase4_scheduler_mode_type_hints_include_planner_v2() -> None:
+    entrypoint_mode_annotation = (
+        inspect.signature(attribute_entrypoint).parameters["phase4_scheduler_mode"].annotation
+    )
+    nnsight_mode_annotation = (
+        inspect.signature(nnsight_attribute).parameters["phase4_scheduler_mode"].annotation
+    )
+
+    entrypoint_modes = set(get_args(entrypoint_mode_annotation))
+    nnsight_modes = set(get_args(nnsight_mode_annotation))
+    assert "planner_v2" in entrypoint_modes
+    assert "planner_v2" in nnsight_modes
 
 
 def test_exact_trace_internal_dtype_resolution_rejects_unknown_value() -> None:

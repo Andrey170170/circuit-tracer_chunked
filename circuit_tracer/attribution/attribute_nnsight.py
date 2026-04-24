@@ -152,19 +152,31 @@ _PHASE4_SCHEDULER_TELEMETRY_DETAIL_ALIAS: dict[str, str] = {
 _PHASE4_SCHEDULER_VERSION_BY_MODE: dict[str, str] = {
     "locality": "locality_v1",
     "planner_v1": "planner_v1",
+    "planner_v2": "planner_v2",
 }
 
 _PHASE4_SCHEDULER_POLICY_BY_MODE: dict[str, str] = {
     "locality": "fixed_frontier_locality",
     "planner_v1": "membership_preserving_locality",
+    "planner_v2": "bounded_membership_identity",
+}
+
+_PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "locality": "locality",
+    "planner_v1": "planner_v1",
+    "planner_v2": "planner_v1",
 }
 
 
 @dataclass(frozen=True)
 class _Phase4SchedulerConfig:
-    mode: Literal["locality", "planner_v1"]
+    requested_mode: Literal["locality", "planner_v1", "planner_v2"]
+    effective_mode: Literal["locality", "planner_v1"]
     version: str
     policy: str
+    effective_version: str
+    effective_policy: str
+    effective_behavior: Literal["requested", "planner_v1_reference_execution"]
     debug: bool
     telemetry_detail: Literal["summary", "normal", "debug"]
 
@@ -820,7 +832,7 @@ def _compute_phase4_locality_shaped_frontier_size(
 
 def _resolve_phase4_scheduler_mode(
     phase4_scheduler_mode: str,
-) -> Literal["locality", "planner_v1"]:
+) -> Literal["locality", "planner_v1", "planner_v2"]:
     normalized = str(phase4_scheduler_mode).strip().lower()
     normalized = _PHASE4_SCHEDULER_MODE_ALIAS.get(normalized, normalized)
     if normalized not in _PHASE4_SCHEDULER_POLICY_BY_MODE:
@@ -830,7 +842,7 @@ def _resolve_phase4_scheduler_mode(
         raise ValueError(
             f"phase4_scheduler_mode must be one of: {allowed} (got {phase4_scheduler_mode!r})"
         )
-    return cast(Literal["locality", "planner_v1"], normalized)
+    return cast(Literal["locality", "planner_v1", "planner_v2"], normalized)
 
 
 def _resolve_phase4_scheduler_telemetry_detail(
@@ -854,11 +866,22 @@ def _resolve_phase4_scheduler_config(
     phase4_scheduler_debug: bool,
     phase4_scheduler_telemetry_detail: str,
 ) -> _Phase4SchedulerConfig:
-    mode = _resolve_phase4_scheduler_mode(phase4_scheduler_mode)
+    requested_mode = _resolve_phase4_scheduler_mode(phase4_scheduler_mode)
+    effective_mode = cast(
+        Literal["locality", "planner_v1"],
+        _PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE[requested_mode],
+    )
+    effective_behavior: Literal["requested", "planner_v1_reference_execution"] = (
+        "planner_v1_reference_execution" if requested_mode != effective_mode else "requested"
+    )
     return _Phase4SchedulerConfig(
-        mode=mode,
-        version=_PHASE4_SCHEDULER_VERSION_BY_MODE[mode],
-        policy=_PHASE4_SCHEDULER_POLICY_BY_MODE[mode],
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        version=_PHASE4_SCHEDULER_VERSION_BY_MODE[requested_mode],
+        policy=_PHASE4_SCHEDULER_POLICY_BY_MODE[requested_mode],
+        effective_version=_PHASE4_SCHEDULER_VERSION_BY_MODE[effective_mode],
+        effective_policy=_PHASE4_SCHEDULER_POLICY_BY_MODE[effective_mode],
+        effective_behavior=effective_behavior,
         debug=bool(phase4_scheduler_debug),
         telemetry_detail=_resolve_phase4_scheduler_telemetry_detail(
             phase4_scheduler_telemetry_detail
@@ -870,9 +893,17 @@ def _build_phase4_scheduler_metadata(
     phase4_scheduler_config: _Phase4SchedulerConfig,
 ) -> dict[str, object]:
     return {
-        "scheduler_mode": phase4_scheduler_config.mode,
+        "scheduler_requested_mode": phase4_scheduler_config.requested_mode,
+        "scheduler_mode": phase4_scheduler_config.requested_mode,
         "scheduler_version": phase4_scheduler_config.version,
         "scheduler_policy": phase4_scheduler_config.policy,
+        "scheduler_effective_mode": phase4_scheduler_config.effective_mode,
+        "scheduler_effective_version": phase4_scheduler_config.effective_version,
+        "scheduler_effective_policy": phase4_scheduler_config.effective_policy,
+        "scheduler_effective_behavior": phase4_scheduler_config.effective_behavior,
+        "scheduler_reference_execution": bool(
+            phase4_scheduler_config.requested_mode != phase4_scheduler_config.effective_mode
+        ),
         "scheduler_debug": bool(phase4_scheduler_config.debug),
         "scheduler_telemetry_detail": phase4_scheduler_config.telemetry_detail,
     }
@@ -2410,7 +2441,7 @@ def attribute(
     cross_cluster_debug: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
-    phase4_scheduler_mode: Literal["locality", "planner_v1", "legacy"] = "locality",
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
@@ -2481,7 +2512,10 @@ def attribute(
         phase4_scheduler_mode: Phase-4 frontier scheduler mode. ``"locality"``
             keeps current behavior. ``"planner_v1"`` routes frontier selection and
             intra-frontier batching through the membership-preserving planner core.
-            ``"legacy"`` is accepted as an alias for ``"locality"``.
+            ``"planner_v2"`` is currently a feature-gated identity mode that
+            records v2 scheduler identity/policy telemetry while executing the
+            planner-v1 reference plan path. ``"legacy"`` is accepted as an alias
+            for ``"locality"``.
         phase4_scheduler_debug: Emit additional planner-v1 scheduler diagnostics in
             Phase 4 logs.
         phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
@@ -2594,7 +2628,7 @@ def _run_attribution(
     cross_cluster_debug: bool = False,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
-    phase4_scheduler_mode: Literal["locality", "planner_v1", "legacy"] = "locality",
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
@@ -3635,9 +3669,13 @@ def _run_attribution(
         phase4_feature_batch_size = effective_feature_batch_size
         logger.info(
             "Phase 4 frontier scheduler | "
-            f"mode={phase4_scheduler_config.mode} | "
+            f"mode={phase4_scheduler_config.requested_mode} | "
             f"version={phase4_scheduler_config.version} | "
             f"policy={phase4_scheduler_config.policy} | "
+            f"effective_mode={phase4_scheduler_config.effective_mode} | "
+            f"effective_version={phase4_scheduler_config.effective_version} | "
+            f"effective_policy={phase4_scheduler_config.effective_policy} | "
+            f"effective_behavior={phase4_scheduler_config.effective_behavior} | "
             f"debug={phase4_scheduler_config.debug} | "
             f"telemetry_detail={phase4_scheduler_config.telemetry_detail} | "
             f"exact_chunked_decoder={exact_chunked_decoder} | "
@@ -3707,7 +3745,7 @@ def _run_attribution(
             pending_refresh_index: int | None = None
             if actual_max_feature_nodes == total_active_feats:
                 pending = torch.arange(total_active_feats)
-                if phase4_scheduler_config.mode == "planner_v1":
+                if phase4_scheduler_config.effective_mode == "planner_v1":
                     phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
                         pending,
                         max_batch_size=phase4_feature_batch_size,
@@ -3815,7 +3853,7 @@ def _run_attribution(
                     actual_max_feature_nodes - n_visited,
                 )
                 pending_candidates = unvisited_feature_rank[:max_frontier_size]
-                if phase4_scheduler_config.mode == "planner_v1":
+                if phase4_scheduler_config.effective_mode == "planner_v1":
                     phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
                         pending_candidates,
                         max_batch_size=phase4_feature_batch_size,
@@ -4195,7 +4233,8 @@ def _run_attribution(
             pending_offset = 0
             planned_boundaries = (
                 phase4_frontier_plan.batch_boundaries
-                if phase4_scheduler_config.mode == "planner_v1" and phase4_frontier_plan is not None
+                if phase4_scheduler_config.effective_mode == "planner_v1"
+                and phase4_frontier_plan is not None
                 else None
             )
             planned_boundary_offset = 0
@@ -4845,9 +4884,17 @@ def _run_attribution(
                 "phase4_feature_batch_planner_enabled": bool(planner_enabled),
                 "phase4_feature_batch_planner_status": planner_status,
                 "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
-                "phase4_scheduler_mode": phase4_scheduler_config.mode,
+                "phase4_scheduler_requested_mode": phase4_scheduler_config.requested_mode,
+                "phase4_scheduler_mode": phase4_scheduler_config.requested_mode,
                 "phase4_scheduler_version": phase4_scheduler_config.version,
                 "phase4_scheduler_policy": phase4_scheduler_config.policy,
+                "phase4_scheduler_effective_mode": phase4_scheduler_config.effective_mode,
+                "phase4_scheduler_effective_version": phase4_scheduler_config.effective_version,
+                "phase4_scheduler_effective_policy": phase4_scheduler_config.effective_policy,
+                "phase4_scheduler_effective_behavior": phase4_scheduler_config.effective_behavior,
+                "phase4_scheduler_reference_execution": bool(
+                    phase4_scheduler_config.requested_mode != phase4_scheduler_config.effective_mode
+                ),
                 "phase4_scheduler_debug": bool(phase4_scheduler_config.debug),
                 "phase4_scheduler_telemetry_detail": phase4_scheduler_config.telemetry_detail,
                 "internal_precision_requested": internal_precision_requested,

@@ -146,7 +146,7 @@ def attribute(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
-    phase4_scheduler_mode: Literal["locality", "planner_v1", "legacy"] = "locality",
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
@@ -188,8 +188,10 @@ def attribute(
             attribution phases reuse the same candidate set.
         phase4_scheduler_mode: Phase-4 frontier scheduler mode for NNSight backend.
             ``"locality"`` keeps default behavior. ``"planner_v1"`` enables the
-            membership-preserving planner path. ``"legacy"`` is accepted as an
-            alias by the NNSight entrypoint.
+            membership-preserving planner path. ``"planner_v2"`` records distinct
+            v2 scheduler identity/policy telemetry while currently executing the
+            planner-v1 reference behavior. ``"legacy"`` is accepted as an alias
+            by the NNSight entrypoint.
         phase4_scheduler_debug: Emit additional planner scheduler diagnostics when
             supported by the backend.
         phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
