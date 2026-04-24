@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from circuit_tracer.replacement_model.replacement_model_nnsight import (
         NNSightReplacementModel,
     )
+    from circuit_tracer.transcoder.cross_layer_transcoder import DecoderChunkCache
 
 
 class AttributionContext:
@@ -59,6 +60,7 @@ class AttributionContext:
         stage_error_vectors_on_cpu: bool | None = None,
         error_vector_prefetch_lookahead: int = 2,
         chunked_feature_replay_window: int = 4,
+        external_decoder_chunk_cache: "DecoderChunkCache | None" = None,
     ) -> None:
         n_layers, n_pos, _ = activation_matrix.shape
 
@@ -131,7 +133,16 @@ class AttributionContext:
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
         self._refresh_chunked_layer_spans()
-        self.decoder_chunk_cache = self._create_decoder_cache()
+        # Strategy D: if the caller passed in an externally-owned decoder
+        # chunk cache (e.g. from a session-scoped PrefixActivationCache
+        # companion) we reuse it across attribute() calls and skip the
+        # per-step init/teardown.  Decoder chunks are a function of frozen
+        # model weights so sharing them across steps is safe by construction.
+        self._owns_decoder_chunk_cache = external_decoder_chunk_cache is None
+        if external_decoder_chunk_cache is not None:
+            self.decoder_chunk_cache = external_decoder_chunk_cache
+        else:
+            self.decoder_chunk_cache = self._create_decoder_cache()
 
     @staticmethod
     def _stage_tensor_on_cpu(tensor: torch.Tensor) -> torch.Tensor:
@@ -353,6 +364,12 @@ class AttributionContext:
         return init_decoder_cache()
 
     def clear_decoder_cache(self) -> None:
+        # When the cache was supplied externally (Strategy D), we only
+        # detach our reference.  The caller owns the cache's lifetime and
+        # will reuse it on the next attribute() call.
+        if not self._owns_decoder_chunk_cache:
+            self.decoder_chunk_cache = None
+            return
         clear_decoder_cache = getattr(self.decoder_provider, "clear_decoder_block_cache", None)
         if callable(clear_decoder_cache):
             clear_decoder_cache(self.decoder_chunk_cache)
@@ -361,6 +378,7 @@ class AttributionContext:
     def reset_decoder_cache(self) -> None:
         self.clear_decoder_cache()
         self.decoder_chunk_cache = self._create_decoder_cache()
+        self._owns_decoder_chunk_cache = True
 
     def apply_diagnostic_feature_cap(self, max_features: int) -> tuple[int, int]:
         total_active_feats = self.activation_matrix._nnz()

@@ -17,6 +17,7 @@ from circuit_tracer.attribution.sparsification import SparsificationConfig
 
 if TYPE_CHECKING:
     from circuit_tracer.attribution.prefix_cache import PrefixActivationCache
+    from circuit_tracer.transcoder.cross_layer_transcoder import DecoderChunkCache
 from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 from circuit_tracer.utils import get_default_device
@@ -490,6 +491,7 @@ class NNSightReplacementModel(LanguageModel):
         sparsification: SparsificationConfig | None = None,
         retain_full_logits: bool = False,
         prefix_cache: "PrefixActivationCache | None" = None,
+        decoder_chunk_cache: "DecoderChunkCache | None" = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
@@ -658,6 +660,7 @@ class NNSightReplacementModel(LanguageModel):
             decoder_locations=decoder_locations,
             decoder_provider=transcoders if exact_chunked_decoder else None,
             chunked_decoder_state=chunked_decoder_state,
+            external_decoder_chunk_cache=decoder_chunk_cache,
         )
         del reconstruction
         del attribution_data["reconstruction"]

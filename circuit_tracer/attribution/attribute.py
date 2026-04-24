@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from circuit_tracer.replacement_model.replacement_model_transformerlens import (
         TransformerLensReplacementModel,
     )
+    from circuit_tracer.transcoder.cross_layer_transcoder import DecoderChunkCache
 
 
 def _count_active_features_by_axis(activation_matrix: torch.Tensor, axis: int) -> list[int]:
@@ -137,6 +138,7 @@ def attribute(
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
     prefix_cache: "PrefixActivationCache | None" = None,
+    decoder_chunk_cache: "DecoderChunkCache | None" = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -199,12 +201,21 @@ def attribute(
             diagnostic_feature_cap=diagnostic_feature_cap,
             sparsification=sparsification,
             prefix_cache=prefix_cache,
+            decoder_chunk_cache=decoder_chunk_cache,
         )
     else:
         if prefix_cache is not None:
             import warnings
             warnings.warn(
                 "prefix_cache is only supported for the nnsight backend; "
+                "ignoring it for the transformerlens backend.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if decoder_chunk_cache is not None:
+            import warnings
+            warnings.warn(
+                "decoder_chunk_cache is only supported for the nnsight backend; "
                 "ignoring it for the transformerlens backend.",
                 RuntimeWarning,
                 stacklevel=2,

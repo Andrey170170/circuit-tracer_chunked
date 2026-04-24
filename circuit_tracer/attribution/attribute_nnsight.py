@@ -37,6 +37,7 @@ from circuit_tracer.attribution.sparsification import SparsificationConfig
 
 if TYPE_CHECKING:
     from circuit_tracer.attribution.prefix_cache import PrefixActivationCache
+    from circuit_tracer.transcoder.cross_layer_transcoder import DecoderChunkCache
 from circuit_tracer.graph import Graph, compute_partial_influences
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 from circuit_tracer.utils.disk_offload import offload_modules
@@ -122,6 +123,7 @@ def attribute(
     sparsification: SparsificationConfig | None = None,
     compact_output: bool = False,
     prefix_cache: "PrefixActivationCache | None" = None,
+    decoder_chunk_cache: "DecoderChunkCache | None" = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -195,6 +197,7 @@ def attribute(
             compact_output=compact_output,
             logger=logger,
             prefix_cache=prefix_cache,
+            decoder_chunk_cache=decoder_chunk_cache,
         )
     finally:
         for reload_handle in offload_handles:
@@ -225,6 +228,7 @@ def _run_attribution(
     sparsification: SparsificationConfig | None = None,
     compact_output: bool = False,
     prefix_cache: "PrefixActivationCache | None" = None,
+    decoder_chunk_cache: "DecoderChunkCache | None" = None,
 ):
     start_time = time.time()
     if batch_size <= 0:
@@ -270,6 +274,7 @@ def _run_attribution(
         sparsification=sparsification,
         retain_full_logits=False,
         prefix_cache=prefix_cache,
+        decoder_chunk_cache=decoder_chunk_cache,
     )
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
