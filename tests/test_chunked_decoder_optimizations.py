@@ -768,15 +768,36 @@ def test_phase4_refresh_optimization_mode_resolves_and_rejects_unknown() -> None
 
 
 def test_phase4_refresh_optimization_metadata_tracks_requested_and_effective_modes() -> None:
-    config = _resolve_phase4_refresh_optimization_config("v1")
+    config = _resolve_phase4_refresh_optimization_config(
+        "v1",
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
     metadata = _build_phase4_refresh_optimization_metadata(config)
 
     assert metadata["refresh_optimization_requested"] == "v1"
     assert metadata["refresh_optimization_mode_requested"] == "v1"
     assert metadata["refresh_optimization"] == "v1"
+    assert metadata["refresh_optimization_effective"] == "v1"
+    assert metadata["refresh_optimization_mode_effective"] == "v1"
+    assert metadata["refresh_optimization_reference_execution"] is False
+
+
+def test_phase4_refresh_optimization_falls_back_off_when_compact_refresh_unavailable() -> None:
+    config = _resolve_phase4_refresh_optimization_config(
+        "v1",
+        compact_output=False,
+        exact_chunked_decoder=False,
+    )
+    metadata = _build_phase4_refresh_optimization_metadata(config)
+
+    assert metadata["refresh_optimization_requested"] == "v1"
+    assert metadata["refresh_optimization"] == "v1"
     assert metadata["refresh_optimization_effective"] == "off"
     assert metadata["refresh_optimization_mode_effective"] == "off"
+    assert metadata["refresh_optimization_effective_version"] == "off_v1"
     assert metadata["refresh_optimization_reference_execution"] is True
+    assert metadata["refresh_optimization_effective_behavior"] == "off_reference_execution"
 
 
 def test_phase4_row_executor_mode_resolves_and_rejects_unknown() -> None:
@@ -1458,6 +1479,11 @@ def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
         active_row_chunk_count=6,
         row_reader_row_count=2048,
         solver_iteration_count=4,
+        row_chunk_strategy="active_row_contiguous_chunks",
+        row_weight_nonzero_row_count=768,
+        row_weight_zero_row_count=1280,
+        row_reader_overread_zero_row_count=0,
+        active_row_range_count=6,
     )
 
     assert telemetry["refresh_row_store_read_elapsed_ms"] == pytest.approx(4.0)
@@ -1467,6 +1493,11 @@ def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
     assert telemetry["refresh_active_row_chunk_count"] == 6
     assert telemetry["refresh_rows_touched"] == 2048
     assert telemetry["refresh_solver_iteration_count"] == 4
+    assert telemetry["refresh_row_chunk_strategy"] == "active_row_contiguous_chunks"
+    assert telemetry["refresh_row_weight_nonzero_rows"] == 768
+    assert telemetry["refresh_row_weight_zero_rows"] == 1280
+    assert telemetry["refresh_row_reader_overread_zero_rows"] == 0
+    assert telemetry["refresh_active_row_range_count"] == 6
 
 
 def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:

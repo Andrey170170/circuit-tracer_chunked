@@ -702,8 +702,9 @@ def compute_partial_feature_influences_streaming(
     device=None,
     row_chunk_size: int = 4096,
     chunk_cache_max_bytes: int = 0,
-    chunk_reuse_stats: dict[str, int | float] | None = None,
+    chunk_reuse_stats: dict[str, int | float | str] | None = None,
     compute_dtype: torch.dtype | None = None,
+    active_row_only_chunks: bool = False,
 ) -> torch.Tensor:
     """Compute feature-only partial influences from streamed dense row chunks.
 
@@ -731,6 +732,9 @@ def compute_partial_feature_influences_streaming(
         compute_dtype: Optional explicit compute dtype for influence math. When
             omitted, defaults to the primary denominator dtype for backward
             compatibility.
+        active_row_only_chunks: When ``True``, preserve fixed row-chunk windows but
+            read only contiguous non-zero subranges inside each active chunk.
+            Default ``False`` preserves legacy fixed-chunk behavior.
 
     Returns:
         Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
@@ -766,6 +770,8 @@ def compute_partial_feature_influences_streaming(
 
     if compute_dtype is not None and compute_dtype not in (torch.float32, torch.float64):
         raise ValueError("compute_dtype must be float32 or float64 when provided")
+    if not isinstance(active_row_only_chunks, bool):
+        raise ValueError("active_row_only_chunks must be a bool")
 
     if isinstance(row_abs_sums, torch.Tensor):
         row_denominator_device = row_abs_sums.device
@@ -796,7 +802,10 @@ def compute_partial_feature_influences_streaming(
     row_weights = torch.zeros(n_rows, device=device, dtype=dtype)
     row_weights[:n_logits] = working_logit_p.to(dtype=dtype)
     chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
-    cache_enabled = bool(chunk_cache_max_bytes > 0)
+    # Active-row chunks are iteration-specific because the stored fixed-shape chunk
+    # contains zero-filled inactive rows that may differ on later iterations.
+    # Never reuse those chunks from the solver-local cache.
+    cache_enabled = bool(chunk_cache_max_bytes > 0) and not active_row_only_chunks
     chunk_cache_nbytes = 0
     chunk_request_count = 0
     chunk_cache_hit_count = 0
@@ -806,12 +815,48 @@ def compute_partial_feature_influences_streaming(
     chunk_cache_store_skip_disabled_count = 0
     chunk_cache_store_skip_too_large_count = 0
     active_row_chunk_count = 0
+    active_row_range_count = 0
     row_reader_row_count = 0
+    row_reader_call_count = 0
+    row_weight_nonzero_row_count = 0
+    row_weight_zero_row_count = 0
     row_reader_elapsed_ms_total = 0.0
     normalization_elapsed_ms_total = 0.0
     matmul_elapsed_ms_total = 0.0
     iteration_count = 0
     solver_start = time.perf_counter()
+    row_chunk_strategy = (
+        "active_row_contiguous_chunks" if active_row_only_chunks else "fixed_row_chunks"
+    )
+
+    def _iter_active_row_subranges(
+        chunk_start: int,
+        chunk_end: int,
+        current_row_weights: torch.Tensor,
+    ):
+        active_rows = (
+            torch.nonzero(
+                current_row_weights[chunk_start:chunk_end] != 0,
+                as_tuple=False,
+            )
+            .flatten()
+            .tolist()
+        )
+        if not active_rows:
+            return
+
+        run_start = active_rows[0]
+        run_end = run_start + 1
+        for row_offset in active_rows[1:]:
+            if row_offset == run_end:
+                run_end += 1
+                continue
+
+            yield chunk_start + run_start, chunk_start + run_end
+            run_start = row_offset
+            run_end = row_offset + 1
+
+        yield chunk_start + run_start, chunk_start + run_end
 
     def _tensor_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
@@ -826,65 +871,147 @@ def compute_partial_feature_influences_streaming(
     for _ in range(max_iter):
         iteration_count += 1
         next_feature_prod = torch.zeros_like(influences)
-        for start in range(0, n_rows, row_chunk_size):
-            end = min(start + row_chunk_size, n_rows)
-            chunk_row_weights = row_weights[start:end]
-            if not bool(chunk_row_weights.any()):
-                continue
+        iteration_nonzero_rows = int(torch.count_nonzero(row_weights).item())
+        row_weight_nonzero_row_count += iteration_nonzero_rows
+        row_weight_zero_row_count += int(max(0, n_rows - iteration_nonzero_rows))
 
-            active_row_chunk_count += 1
-            chunk_request_count += 1
-            cache_key = (start, end)
-            cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
-            if cached_chunk is None:
-                row_reader_start = time.perf_counter()
-                chunk = row_reader(start, end)
-                row_reader_elapsed_ms_total += (time.perf_counter() - row_reader_start) * 1000.0
-                row_reader_row_count += int(end - start)
-                if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
-                    raise ValueError(
-                        "row_reader must return shape "
-                        f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
-                    )
-                if chunk.device != device:
-                    chunk = chunk.to(device)
-                chunk = chunk.to(dtype=dtype).abs()
-                if not cache_enabled:
-                    chunk_cache_store_skip_disabled_count += 1
-                else:
-                    chunk_nbytes = _tensor_nbytes(chunk)
-                    if chunk_nbytes > chunk_cache_max_bytes:
-                        chunk_cache_store_skip_too_large_count += 1
+        if not active_row_only_chunks:
+            for start in range(0, n_rows, row_chunk_size):
+                end = min(start + row_chunk_size, n_rows)
+                chunk_row_weights = row_weights[start:end]
+                if not bool(chunk_row_weights.any()):
+                    continue
+
+                active_row_chunk_count += 1
+                chunk_request_count += 1
+                cache_key = (start, end)
+                cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
+                if cached_chunk is None:
+                    row_reader_start = time.perf_counter()
+                    chunk = row_reader(start, end)
+                    row_reader_elapsed_ms_total += (time.perf_counter() - row_reader_start) * 1000.0
+                    row_reader_call_count += 1
+                    row_reader_row_count += int(end - start)
+                    if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
+                        raise ValueError(
+                            "row_reader must return shape "
+                            f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
+                        )
+                    if chunk.device != device:
+                        chunk = chunk.to(device)
+                    chunk = chunk.to(dtype=dtype).abs()
+                    if not cache_enabled:
+                        chunk_cache_store_skip_disabled_count += 1
                     else:
-                        while (
-                            chunk_cache
-                            and chunk_cache_nbytes + chunk_nbytes > chunk_cache_max_bytes
+                        chunk_nbytes = _tensor_nbytes(chunk)
+                        if chunk_nbytes > chunk_cache_max_bytes:
+                            chunk_cache_store_skip_too_large_count += 1
+                        else:
+                            while (
+                                chunk_cache
+                                and chunk_cache_nbytes + chunk_nbytes > chunk_cache_max_bytes
+                            ):
+                                _drop_oldest_chunk()
+                            chunk_cache[cache_key] = chunk
+                            chunk_cache.move_to_end(cache_key)
+                            chunk_cache_nbytes += chunk_nbytes
+                            chunk_cache_store_success_count += 1
+                    chunk_cache_miss_count += 1
+                else:
+                    chunk = cached_chunk
+                    chunk_cache.move_to_end(cache_key)
+                    chunk_cache_hit_count += 1
+
+                normalization_start = time.perf_counter()
+                normalized_row_weights = _normalize_row_weights_from_denominator(
+                    chunk_row_weights,
+                    denom_mode=denom_mode,
+                    denom_primary=denom_primary[start:end],
+                    denom_secondary=(
+                        denom_secondary[start:end] if denom_secondary is not None else None
+                    ),
+                )
+                normalization_elapsed_ms_total += (
+                    time.perf_counter() - normalization_start
+                ) * 1000.0
+
+                matmul_start = time.perf_counter()
+                next_feature_prod += normalized_row_weights @ chunk
+                matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
+        else:
+            for start in range(0, n_rows, row_chunk_size):
+                end = min(start + row_chunk_size, n_rows)
+                chunk_row_weights = row_weights[start:end]
+                active_row_subranges = list(_iter_active_row_subranges(start, end, row_weights))
+                if not active_row_subranges:
+                    continue
+
+                active_row_chunk_count += 1
+                active_row_range_count += len(active_row_subranges)
+                chunk_request_count += 1
+                cache_key = (start, end)
+                cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
+                if cached_chunk is None:
+                    chunk = torch.zeros((end - start, n_feature_nodes), device=device, dtype=dtype)
+                    for sub_start, sub_end in active_row_subranges:
+                        row_reader_start = time.perf_counter()
+                        subchunk = row_reader(sub_start, sub_end)
+                        row_reader_elapsed_ms_total += (
+                            time.perf_counter() - row_reader_start
+                        ) * 1000.0
+                        row_reader_call_count += 1
+                        row_reader_row_count += int(sub_end - sub_start)
+                        if subchunk.ndim != 2 or subchunk.shape != (
+                            sub_end - sub_start,
+                            n_feature_nodes,
                         ):
-                            _drop_oldest_chunk()
-                        chunk_cache[cache_key] = chunk
-                        chunk_cache.move_to_end(cache_key)
-                        chunk_cache_nbytes += chunk_nbytes
-                        chunk_cache_store_success_count += 1
-                chunk_cache_miss_count += 1
-            else:
-                chunk = cached_chunk
-                chunk_cache.move_to_end(cache_key)
-                chunk_cache_hit_count += 1
+                            raise ValueError(
+                                "row_reader must return shape "
+                                f"({sub_end - sub_start}, {n_feature_nodes}) for rows "
+                                f"[{sub_start}, {sub_end})"
+                            )
+                        if subchunk.device != device:
+                            subchunk = subchunk.to(device)
+                        subchunk = subchunk.to(dtype=dtype).abs()
+                        chunk[sub_start - start : sub_end - start] = subchunk
+                    if not cache_enabled:
+                        chunk_cache_store_skip_disabled_count += 1
+                    else:
+                        chunk_nbytes = _tensor_nbytes(chunk)
+                        if chunk_nbytes > chunk_cache_max_bytes:
+                            chunk_cache_store_skip_too_large_count += 1
+                        else:
+                            while (
+                                chunk_cache
+                                and chunk_cache_nbytes + chunk_nbytes > chunk_cache_max_bytes
+                            ):
+                                _drop_oldest_chunk()
+                            chunk_cache[cache_key] = chunk
+                            chunk_cache.move_to_end(cache_key)
+                            chunk_cache_nbytes += chunk_nbytes
+                            chunk_cache_store_success_count += 1
+                    chunk_cache_miss_count += 1
+                else:
+                    chunk = cached_chunk
+                    chunk_cache.move_to_end(cache_key)
+                    chunk_cache_hit_count += 1
 
-            normalization_start = time.perf_counter()
-            normalized_row_weights = _normalize_row_weights_from_denominator(
-                chunk_row_weights,
-                denom_mode=denom_mode,
-                denom_primary=denom_primary[start:end],
-                denom_secondary=(
-                    denom_secondary[start:end] if denom_secondary is not None else None
-                ),
-            )
-            normalization_elapsed_ms_total += (time.perf_counter() - normalization_start) * 1000.0
+                normalization_start = time.perf_counter()
+                normalized_row_weights = _normalize_row_weights_from_denominator(
+                    chunk_row_weights,
+                    denom_mode=denom_mode,
+                    denom_primary=denom_primary[start:end],
+                    denom_secondary=(
+                        denom_secondary[start:end] if denom_secondary is not None else None
+                    ),
+                )
+                normalization_elapsed_ms_total += (
+                    time.perf_counter() - normalization_start
+                ) * 1000.0
 
-            matmul_start = time.perf_counter()
-            next_feature_prod += normalized_row_weights @ chunk
-            matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
+                matmul_start = time.perf_counter()
+                next_feature_prod += normalized_row_weights @ chunk
+                matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
 
         if not bool(next_feature_prod.any()):
             break
@@ -906,7 +1033,7 @@ def compute_partial_feature_influences_streaming(
                 "chunk_cache_max_bytes": int(chunk_cache_max_bytes),
                 "chunk_cache_hit_count": int(chunk_cache_hit_count),
                 "chunk_cache_miss_count": int(chunk_cache_miss_count),
-                "row_reader_call_count": int(chunk_cache_miss_count),
+                "row_reader_call_count": int(row_reader_call_count),
                 "chunk_cache_eviction_count": int(chunk_cache_eviction_count),
                 "chunk_cache_store_success_count": int(chunk_cache_store_success_count),
                 "chunk_cache_store_skip_disabled_count": int(chunk_cache_store_skip_disabled_count),
@@ -915,7 +1042,15 @@ def compute_partial_feature_influences_streaming(
                 ),
                 "chunk_cache_unique_entries": int(len(chunk_cache)),
                 "chunk_cache_nbytes": int(chunk_cache_nbytes),
+                "row_chunk_strategy": row_chunk_strategy,
+                "active_row_only_chunks": int(active_row_only_chunks),
                 "active_row_chunk_count": int(active_row_chunk_count),
+                "active_row_range_count": int(active_row_range_count),
+                "row_weight_nonzero_row_count": int(row_weight_nonzero_row_count),
+                "row_weight_zero_row_count": int(row_weight_zero_row_count),
+                "row_reader_overread_zero_row_count": int(
+                    max(0, row_reader_row_count - row_weight_nonzero_row_count)
+                ),
                 "row_reader_row_count": int(row_reader_row_count),
                 "iteration_count": int(iteration_count),
                 "solver_elapsed_ms_total": float(solver_elapsed_ms_total),

@@ -630,6 +630,73 @@ def test_compute_partial_feature_influences_streaming_reuses_row_chunks_within_c
     assert chunk_reuse_stats["matmul_elapsed_ms_total"] >= 0.0
 
 
+def test_streaming_active_row_chunks_match_default_and_reduce_row_reads() -> None:
+    n_features = 4
+    n_logits = 1
+    # row_chunk_size=4 => active mode must preserve the [0:4) fixed chunk boundary
+    # while reading only the contiguous active subranges [1:2) and [3:4) on the
+    # second iteration.
+    feature_rows = torch.tensor(
+        [
+            [0.0, 2.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    row_abs_sums = torch.ones(feature_rows.shape[0], dtype=torch.float32)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([3, 1, 2, 3], dtype=torch.int32)
+
+    default_stats: dict[str, int | float | str] = {}
+    default_result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(feature_rows),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=4,
+        chunk_cache_max_bytes=1024,
+        chunk_reuse_stats=default_stats,
+    )
+
+    active_stats: dict[str, int | float | str] = {}
+    active_result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(feature_rows),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=n_features,
+        n_logits=n_logits,
+        row_chunk_size=4,
+        chunk_cache_max_bytes=1024,
+        chunk_reuse_stats=active_stats,
+        active_row_only_chunks=True,
+    )
+
+    assert torch.equal(active_result, default_result)
+    assert torch.equal(
+        torch.argsort(active_result, descending=True),
+        torch.argsort(default_result, descending=True),
+    )
+    assert default_stats["row_chunk_strategy"] == "fixed_row_chunks"
+    assert active_stats["row_chunk_strategy"] == "active_row_contiguous_chunks"
+    assert active_stats["active_row_range_count"] == 3
+    assert active_stats["row_reader_row_count"] < default_stats["row_reader_row_count"]
+    assert active_stats["row_reader_call_count"] == 3
+    assert active_stats["chunk_cache_enabled"] == 0
+    assert active_stats["chunk_cache_hit_count"] == 0
+    assert active_stats["chunk_cache_store_success_count"] == 0
+    assert (
+        active_stats["chunk_cache_store_skip_disabled_count"]
+        == active_stats["chunk_cache_miss_count"]
+    )
+    assert active_stats["row_reader_overread_zero_row_count"] == 0
+    assert default_stats["row_reader_overread_zero_row_count"] > 0
+
+
 def test_compute_partial_feature_influences_streaming_solver_cache_disabled_is_explicit():
     n_features = 3
     n_logits = 1

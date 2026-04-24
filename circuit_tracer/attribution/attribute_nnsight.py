@@ -174,7 +174,7 @@ _PHASE4_REFRESH_OPTIMIZATION_VERSION_BY_MODE: dict[str, str] = {
 
 _PHASE4_REFRESH_OPTIMIZATION_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "off": "off",
-    "v1": "off",
+    "v1": "v1",
 }
 
 _PHASE4_ROW_EXECUTOR_VERSION_BY_MODE: dict[str, str] = {
@@ -975,11 +975,15 @@ def _resolve_phase4_refresh_optimization_mode(
 
 def _resolve_phase4_refresh_optimization_config(
     phase4_refresh_optimization: str,
+    *,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
 ) -> _Phase4RefreshOptimizationConfig:
     requested_mode = _resolve_phase4_refresh_optimization_mode(phase4_refresh_optimization)
+    refresh_optimization_applicable = bool(compact_output and exact_chunked_decoder)
     effective_mode = cast(
         Literal["off", "v1"],
-        _PHASE4_REFRESH_OPTIMIZATION_EFFECTIVE_MODE_BY_MODE[requested_mode],
+        requested_mode if requested_mode == "off" or refresh_optimization_applicable else "off",
     )
     effective_behavior: Literal["requested", "off_reference_execution"] = (
         "off_reference_execution" if requested_mode != effective_mode else "requested"
@@ -2563,6 +2567,11 @@ def _build_phase4_refresh_substage_telemetry(
     active_row_chunk_count: int | None,
     row_reader_row_count: int | None,
     solver_iteration_count: int | None,
+    row_chunk_strategy: str | None = None,
+    row_weight_nonzero_row_count: int | None = None,
+    row_weight_zero_row_count: int | None = None,
+    row_reader_overread_zero_row_count: int | None = None,
+    active_row_range_count: int | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "refresh_partial_influence_elapsed_ms": float(partial_influence_elapsed_ms),
@@ -2581,6 +2590,13 @@ def _build_phase4_refresh_substage_telemetry(
                 "refresh_active_row_chunk_count": _safe_int(active_row_chunk_count),
                 "refresh_rows_touched": _safe_int(row_reader_row_count),
                 "refresh_solver_iteration_count": _safe_int(solver_iteration_count),
+                "refresh_row_chunk_strategy": row_chunk_strategy,
+                "refresh_row_weight_nonzero_rows": _safe_int(row_weight_nonzero_row_count),
+                "refresh_row_weight_zero_rows": _safe_int(row_weight_zero_row_count),
+                "refresh_row_reader_overread_zero_rows": _safe_int(
+                    row_reader_overread_zero_row_count
+                ),
+                "refresh_active_row_range_count": _safe_int(active_row_range_count),
             }
         )
     return payload
@@ -3449,8 +3465,8 @@ def attribute(
             metadata, ``"normal"`` adds full plan aggregates, and ``"debug"``
             additionally includes bounded samples.
         phase4_refresh_optimization: Requested Phase-4 refresh optimization mode.
-            ``"off"`` keeps current behavior. ``"v1"`` is accepted for metadata
-            round-trip but currently executes the ``"off"`` behavior.
+            ``"off"`` keeps current behavior. ``"v1"`` enables the compact
+            refresh row-range reader optimization while preserving exact math.
         phase4_row_executor: Requested Phase-4 row execution mode.
             ``"batched"`` keeps current behavior. ``"streaming_v1"`` is accepted
             for metadata round-trip but currently executes the ``"batched"`` behavior.
@@ -3604,6 +3620,8 @@ def _run_attribution(
         internal_precision_requested=internal_precision_requested,
         phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,
     )
+    exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+    use_compact_feature_row_store = compact_output and exact_chunked_decoder
     feature_row_storage_dtype = _dtype_from_name(resolved_dtype_map["feature_row_storage_dtype"])
     row_abs_sum_dtype = _dtype_from_name(resolved_dtype_map["row_abs_sum_dtype"])
     influence_compute_dtype = _dtype_from_name(resolved_dtype_map["influence_compute_dtype"])
@@ -3617,7 +3635,9 @@ def _run_attribution(
     )
     phase4_scheduler_metadata = _build_phase4_scheduler_metadata(phase4_scheduler_config)
     phase4_refresh_optimization_config = _resolve_phase4_refresh_optimization_config(
-        phase4_refresh_optimization
+        phase4_refresh_optimization,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
     )
     phase4_refresh_optimization_metadata = _build_phase4_refresh_optimization_metadata(
         phase4_refresh_optimization_config
@@ -3633,7 +3653,7 @@ def _run_attribution(
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
         compact_output=compact_output,
-        exact_chunked_decoder=bool(getattr(model.transcoders, "exact_chunked_decoder", False)),
+        exact_chunked_decoder=exact_chunked_decoder,
         profile=profile,
         phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,
     )
@@ -4095,14 +4115,11 @@ def _run_attribution(
             f"Will include {actual_max_feature_nodes} of {total_active_feats} feature nodes"
         )
 
-        use_compact_feature_row_store = compact_output and bool(
-            getattr(model.transcoders, "exact_chunked_decoder", False)
-        )
         if use_compact_feature_row_store:
             # Benchmark-critical path only: exact chunked decoder + compact output.
             # Keep dense full-row behavior unchanged for non-compact Graph outputs.
             assert compact_output
-            assert bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+            assert exact_chunked_decoder
             feature_row_store = _FileBackedFeatureRowStore(
                 n_rows=actual_max_feature_nodes + n_logits,
                 n_feature_columns=total_active_feats,
@@ -4748,7 +4765,7 @@ def _run_attribution(
                     if use_compact_feature_row_store and feature_row_store is not None
                     else None
                 )
-                streaming_chunk_reuse_stats: dict[str, int | float] | None = None
+                streaming_chunk_reuse_stats: dict[str, int | float | str] | None = None
                 refresh_row_store_read_elapsed_ms: float | None = None
                 refresh_influence_normalization_elapsed_ms: float | None = None
                 refresh_influence_matmul_elapsed_ms: float | None = None
@@ -4756,10 +4773,18 @@ def _run_attribution(
                 refresh_active_row_chunk_count: int | None = None
                 refresh_rows_touched: int | None = None
                 refresh_solver_iteration_count: int | None = None
+                refresh_row_chunk_strategy: str | None = None
+                refresh_row_weight_nonzero_rows: int | None = None
+                refresh_row_weight_zero_rows: int | None = None
+                refresh_row_reader_overread_zero_rows: int | None = None
+                refresh_active_row_range_count: int | None = None
                 partial_influence_start = time.perf_counter()
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     streaming_chunk_reuse_stats = {}
+                    refresh_active_row_only_chunks = (
+                        phase4_refresh_optimization_config.effective_mode == "v1"
+                    )
                     row_denominator_prefix = (
                         feature_row_store.row_abs_max[:st],
                         feature_row_store.row_l1_scaled[:st],
@@ -4778,6 +4803,7 @@ def _run_attribution(
                         device=feature_row_store.row_abs_max.device,
                         chunk_reuse_stats=streaming_chunk_reuse_stats,
                         compute_dtype=influence_compute_dtype,
+                        active_row_only_chunks=refresh_active_row_only_chunks,
                     )
                     refresh_row_store_read_elapsed_ms = _safe_float(
                         streaming_chunk_reuse_stats.get("row_reader_elapsed_ms_total")
@@ -4799,6 +4825,21 @@ def _run_attribution(
                     )
                     refresh_solver_iteration_count = _safe_int(
                         streaming_chunk_reuse_stats.get("iteration_count")
+                    )
+                    row_chunk_strategy_value = streaming_chunk_reuse_stats.get("row_chunk_strategy")
+                    if isinstance(row_chunk_strategy_value, str):
+                        refresh_row_chunk_strategy = row_chunk_strategy_value
+                    refresh_row_weight_nonzero_rows = _safe_int(
+                        streaming_chunk_reuse_stats.get("row_weight_nonzero_row_count")
+                    )
+                    refresh_row_weight_zero_rows = _safe_int(
+                        streaming_chunk_reuse_stats.get("row_weight_zero_row_count")
+                    )
+                    refresh_row_reader_overread_zero_rows = _safe_int(
+                        streaming_chunk_reuse_stats.get("row_reader_overread_zero_row_count")
+                    )
+                    refresh_active_row_range_count = _safe_int(
+                        streaming_chunk_reuse_stats.get("active_row_range_count")
                     )
                 else:
                     influences = compute_partial_influences(
@@ -4973,6 +5014,11 @@ def _run_attribution(
                     active_row_chunk_count=refresh_active_row_chunk_count,
                     row_reader_row_count=refresh_rows_touched,
                     solver_iteration_count=refresh_solver_iteration_count,
+                    row_chunk_strategy=refresh_row_chunk_strategy,
+                    row_weight_nonzero_row_count=refresh_row_weight_nonzero_rows,
+                    row_weight_zero_row_count=refresh_row_weight_zero_rows,
+                    row_reader_overread_zero_row_count=refresh_row_reader_overread_zero_rows,
+                    active_row_range_count=refresh_active_row_range_count,
                 )
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
