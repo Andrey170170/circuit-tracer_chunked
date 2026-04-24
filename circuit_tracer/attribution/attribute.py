@@ -149,6 +149,8 @@ def attribute(
     phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
+    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
@@ -196,6 +198,10 @@ def attribute(
             supported by the backend.
         phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
             Phase-4 planning/batching metadata.
+        phase4_refresh_optimization: Requested Phase-4 refresh optimization mode
+            (``"off"`` or ``"v1"``).
+        phase4_row_executor: Requested Phase-4 row execution mode
+            (``"batched"`` or ``"streaming_v1"``).
         exact_trace_internal_dtype: Internal dtype used by compact exact-trace
             normalization/ranking internals ("fp32" or "fp64"). Defaults to
             ``"fp32"`` on the post-fix stable path.
@@ -211,10 +217,12 @@ def attribute(
             "Use the NNSight entrypoint with compact_output=True on exact_chunked_decoder paths."
         )
 
-    scheduler_overrides_requested = (
+    phase4_overrides_requested = (
         phase4_scheduler_mode != "locality"
         or bool(phase4_scheduler_debug)
         or phase4_scheduler_telemetry_detail != "normal"
+        or phase4_refresh_optimization != "off"
+        or phase4_row_executor != "batched"
     )
 
     if model.backend == "nnsight":
@@ -251,13 +259,15 @@ def attribute(
             phase4_scheduler_mode=phase4_scheduler_mode,
             phase4_scheduler_debug=phase4_scheduler_debug,
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
+            phase4_refresh_optimization=phase4_refresh_optimization,
+            phase4_row_executor=phase4_row_executor,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
         )
     else:
-        if scheduler_overrides_requested:
+        if phase4_overrides_requested:
             raise ValueError(
-                "Phase-4 scheduler settings are only supported for the NNSight backend via "
-                "circuit_tracer.attribution.attribute(); received non-default scheduler "
+                "Phase-4 execution settings are only supported for the NNSight backend via "
+                "circuit_tracer.attribution.attribute(); received non-default Phase-4 "
                 f"arguments for backend={getattr(model, 'backend', '<unknown>')!r}."
             )
 

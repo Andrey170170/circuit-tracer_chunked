@@ -33,6 +33,12 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_internal_precision_requested,
     _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
+    _resolve_phase4_refresh_optimization_mode,
+    _resolve_phase4_refresh_optimization_config,
+    _build_phase4_refresh_optimization_metadata,
+    _resolve_phase4_row_executor_mode,
+    _resolve_phase4_row_executor_config,
+    _build_phase4_row_executor_metadata,
     _resolve_phase4_scheduler_mode,
     _resolve_phase4_scheduler_config,
     _resolve_phase4_scheduler_telemetry_detail,
@@ -750,6 +756,44 @@ def test_phase4_scheduler_telemetry_detail_rejects_unknown_value() -> None:
         match="phase4_scheduler_telemetry_detail must be one of",
     ):
         _resolve_phase4_scheduler_telemetry_detail("verbose")
+
+
+def test_phase4_refresh_optimization_mode_resolves_and_rejects_unknown() -> None:
+    assert _resolve_phase4_refresh_optimization_mode("off") == "off"
+    assert _resolve_phase4_refresh_optimization_mode("v1") == "v1"
+    with pytest.raises(ValueError, match="phase4_refresh_optimization must be one of"):
+        _resolve_phase4_refresh_optimization_mode("v2")
+
+
+def test_phase4_refresh_optimization_metadata_tracks_requested_and_effective_modes() -> None:
+    config = _resolve_phase4_refresh_optimization_config("v1")
+    metadata = _build_phase4_refresh_optimization_metadata(config)
+
+    assert metadata["refresh_optimization_requested"] == "v1"
+    assert metadata["refresh_optimization_mode_requested"] == "v1"
+    assert metadata["refresh_optimization"] == "v1"
+    assert metadata["refresh_optimization_effective"] == "off"
+    assert metadata["refresh_optimization_mode_effective"] == "off"
+    assert metadata["refresh_optimization_reference_execution"] is True
+
+
+def test_phase4_row_executor_mode_resolves_and_rejects_unknown() -> None:
+    assert _resolve_phase4_row_executor_mode("batched") == "batched"
+    assert _resolve_phase4_row_executor_mode("streaming_v1") == "streaming_v1"
+    with pytest.raises(ValueError, match="phase4_row_executor must be one of"):
+        _resolve_phase4_row_executor_mode("streaming_v2")
+
+
+def test_phase4_row_executor_metadata_tracks_requested_and_effective_modes() -> None:
+    config = _resolve_phase4_row_executor_config("streaming_v1")
+    metadata = _build_phase4_row_executor_metadata(config)
+
+    assert metadata["row_executor_requested"] == "streaming_v1"
+    assert metadata["row_executor_mode_requested"] == "streaming_v1"
+    assert metadata["row_executor"] == "streaming_v1"
+    assert metadata["row_executor_effective"] == "batched"
+    assert metadata["row_executor_mode_effective"] == "batched"
+    assert metadata["row_executor_reference_execution"] is True
 
 
 def test_phase4_batch_locality_summary_reports_layer_and_chunk_ranges() -> None:
@@ -1543,12 +1587,16 @@ def test_top_level_attribute_forwards_phase4_scheduler_args_to_nnsight(
         phase4_scheduler_mode="planner_v1",
         phase4_scheduler_debug=True,
         phase4_scheduler_telemetry_detail="debug",
+        phase4_refresh_optimization="v1",
+        phase4_row_executor="streaming_v1",
     )
 
     assert result is sentinel
     assert captured["phase4_scheduler_mode"] == "planner_v1"
     assert captured["phase4_scheduler_debug"] is True
     assert captured["phase4_scheduler_telemetry_detail"] == "debug"
+    assert captured["phase4_refresh_optimization"] == "v1"
+    assert captured["phase4_row_executor"] == "streaming_v1"
 
 
 def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transformerlens(
@@ -1575,12 +1623,16 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
         phase4_scheduler_mode="locality",
         phase4_scheduler_debug=False,
         phase4_scheduler_telemetry_detail="normal",
+        phase4_refresh_optimization="off",
+        phase4_row_executor="batched",
     )
 
     assert result is sentinel
     assert "phase4_scheduler_mode" not in captured
     assert "phase4_scheduler_debug" not in captured
     assert "phase4_scheduler_telemetry_detail" not in captured
+    assert "phase4_refresh_optimization" not in captured
+    assert "phase4_row_executor" not in captured
 
 
 @pytest.mark.parametrize(
@@ -1590,6 +1642,8 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
         {"phase4_scheduler_mode": "planner_v2"},
         {"phase4_scheduler_debug": True},
         {"phase4_scheduler_telemetry_detail": "summary"},
+        {"phase4_refresh_optimization": "v1"},
+        {"phase4_row_executor": "streaming_v1"},
     ],
 )
 def test_top_level_attribute_rejects_non_default_phase4_scheduler_args_on_transformerlens(
@@ -1600,7 +1654,7 @@ def test_top_level_attribute_rejects_non_default_phase4_scheduler_args_on_transf
 
     with pytest.raises(
         ValueError,
-        match=r"Phase-4 scheduler settings are only supported for the NNSight backend",
+        match=r"Phase-4 execution settings are only supported for the NNSight backend",
     ):
         attribute_top_level(
             prompt="hello",

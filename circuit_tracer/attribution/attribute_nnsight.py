@@ -167,6 +167,26 @@ _PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "planner_v2": "planner_v2",
 }
 
+_PHASE4_REFRESH_OPTIMIZATION_VERSION_BY_MODE: dict[str, str] = {
+    "off": "off_v1",
+    "v1": "v1",
+}
+
+_PHASE4_REFRESH_OPTIMIZATION_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "off": "off",
+    "v1": "off",
+}
+
+_PHASE4_ROW_EXECUTOR_VERSION_BY_MODE: dict[str, str] = {
+    "batched": "batched_v1",
+    "streaming_v1": "streaming_v1",
+}
+
+_PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "batched": "batched",
+    "streaming_v1": "batched",
+}
+
 _PHASE4_PLANNER_V2_POLICY_VERSION = "planner_v2_bounded_membership_v1"
 _PHASE4_PLANNER_V2_CANDIDATE_WINDOW_MULTIPLIER = 2.0
 _PHASE4_PLANNER_V2_LOCKED_PREFIX_FRACTION = 0.5
@@ -185,6 +205,24 @@ class _Phase4SchedulerConfig:
     effective_behavior: Literal["requested", "planner_v1_reference_execution"]
     debug: bool
     telemetry_detail: Literal["summary", "normal", "debug"]
+
+
+@dataclass(frozen=True)
+class _Phase4RefreshOptimizationConfig:
+    requested_mode: Literal["off", "v1"]
+    effective_mode: Literal["off", "v1"]
+    version: str
+    effective_version: str
+    effective_behavior: Literal["requested", "off_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _Phase4RowExecutorConfig:
+    requested_mode: Literal["batched", "streaming_v1"]
+    effective_mode: Literal["batched", "streaming_v1"]
+    version: str
+    effective_version: str
+    effective_behavior: Literal["requested", "batched_reference_execution"]
 
 
 @dataclass(frozen=True)
@@ -918,6 +956,114 @@ def _build_phase4_scheduler_metadata(
         ),
         "scheduler_debug": bool(phase4_scheduler_config.debug),
         "scheduler_telemetry_detail": phase4_scheduler_config.telemetry_detail,
+    }
+
+
+def _resolve_phase4_refresh_optimization_mode(
+    phase4_refresh_optimization: str,
+) -> Literal["off", "v1"]:
+    normalized = str(phase4_refresh_optimization).strip().lower()
+    allowed_values = {"off", "v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            "phase4_refresh_optimization must be one of: "
+            f"{allowed} (got {phase4_refresh_optimization!r})"
+        )
+    return cast(Literal["off", "v1"], normalized)
+
+
+def _resolve_phase4_refresh_optimization_config(
+    phase4_refresh_optimization: str,
+) -> _Phase4RefreshOptimizationConfig:
+    requested_mode = _resolve_phase4_refresh_optimization_mode(phase4_refresh_optimization)
+    effective_mode = cast(
+        Literal["off", "v1"],
+        _PHASE4_REFRESH_OPTIMIZATION_EFFECTIVE_MODE_BY_MODE[requested_mode],
+    )
+    effective_behavior: Literal["requested", "off_reference_execution"] = (
+        "off_reference_execution" if requested_mode != effective_mode else "requested"
+    )
+    return _Phase4RefreshOptimizationConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        version=_PHASE4_REFRESH_OPTIMIZATION_VERSION_BY_MODE[requested_mode],
+        effective_version=_PHASE4_REFRESH_OPTIMIZATION_VERSION_BY_MODE[effective_mode],
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase4_refresh_optimization_metadata(
+    phase4_refresh_optimization_config: _Phase4RefreshOptimizationConfig,
+) -> dict[str, object]:
+    return {
+        "refresh_optimization_requested": phase4_refresh_optimization_config.requested_mode,
+        "refresh_optimization_mode_requested": phase4_refresh_optimization_config.requested_mode,
+        "refresh_optimization": phase4_refresh_optimization_config.requested_mode,
+        "refresh_optimization_version": phase4_refresh_optimization_config.version,
+        "refresh_optimization_version_requested": phase4_refresh_optimization_config.version,
+        "refresh_optimization_effective": phase4_refresh_optimization_config.effective_mode,
+        "refresh_optimization_mode_effective": phase4_refresh_optimization_config.effective_mode,
+        "refresh_optimization_effective_version": phase4_refresh_optimization_config.effective_version,
+        "refresh_optimization_version_effective": phase4_refresh_optimization_config.effective_version,
+        "refresh_optimization_effective_behavior": phase4_refresh_optimization_config.effective_behavior,
+        "refresh_optimization_reference_execution": bool(
+            phase4_refresh_optimization_config.requested_mode
+            != phase4_refresh_optimization_config.effective_mode
+        ),
+    }
+
+
+def _resolve_phase4_row_executor_mode(
+    phase4_row_executor: str,
+) -> Literal["batched", "streaming_v1"]:
+    normalized = str(phase4_row_executor).strip().lower()
+    allowed_values = {"batched", "streaming_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"phase4_row_executor must be one of: {allowed} (got {phase4_row_executor!r})"
+        )
+    return cast(Literal["batched", "streaming_v1"], normalized)
+
+
+def _resolve_phase4_row_executor_config(
+    phase4_row_executor: str,
+) -> _Phase4RowExecutorConfig:
+    requested_mode = _resolve_phase4_row_executor_mode(phase4_row_executor)
+    effective_mode = cast(
+        Literal["batched", "streaming_v1"],
+        _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE[requested_mode],
+    )
+    effective_behavior: Literal["requested", "batched_reference_execution"] = (
+        "batched_reference_execution" if requested_mode != effective_mode else "requested"
+    )
+    return _Phase4RowExecutorConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        version=_PHASE4_ROW_EXECUTOR_VERSION_BY_MODE[requested_mode],
+        effective_version=_PHASE4_ROW_EXECUTOR_VERSION_BY_MODE[effective_mode],
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase4_row_executor_metadata(
+    phase4_row_executor_config: _Phase4RowExecutorConfig,
+) -> dict[str, object]:
+    return {
+        "row_executor_requested": phase4_row_executor_config.requested_mode,
+        "row_executor_mode_requested": phase4_row_executor_config.requested_mode,
+        "row_executor": phase4_row_executor_config.requested_mode,
+        "row_executor_version": phase4_row_executor_config.version,
+        "row_executor_version_requested": phase4_row_executor_config.version,
+        "row_executor_effective": phase4_row_executor_config.effective_mode,
+        "row_executor_mode_effective": phase4_row_executor_config.effective_mode,
+        "row_executor_effective_version": phase4_row_executor_config.effective_version,
+        "row_executor_version_effective": phase4_row_executor_config.effective_version,
+        "row_executor_effective_behavior": phase4_row_executor_config.effective_behavior,
+        "row_executor_reference_execution": bool(
+            phase4_row_executor_config.requested_mode != phase4_row_executor_config.effective_mode
+        ),
     }
 
 
@@ -3138,6 +3284,8 @@ def attribute(
     phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
+    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -3215,6 +3363,12 @@ def attribute(
             Phase-4 refresh/batch events. ``"summary"`` keeps compact planner
             metadata, ``"normal"`` adds full plan aggregates, and ``"debug"``
             additionally includes bounded samples.
+        phase4_refresh_optimization: Requested Phase-4 refresh optimization mode.
+            ``"off"`` keeps current behavior. ``"v1"`` is accepted for metadata
+            round-trip but currently executes the ``"off"`` behavior.
+        phase4_row_executor: Requested Phase-4 row execution mode.
+            ``"batched"`` keeps current behavior. ``"streaming_v1"`` is accepted
+            for metadata round-trip but currently executes the ``"batched"`` behavior.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
             normalization/influence ranking path. ``"fp32"`` uses float32
             internals and is the post-fix default; ``"fp64"`` uses float64
@@ -3275,6 +3429,8 @@ def attribute(
             phase4_scheduler_mode=phase4_scheduler_mode,
             phase4_scheduler_debug=phase4_scheduler_debug,
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
+            phase4_refresh_optimization=phase4_refresh_optimization,
+            phase4_row_executor=phase4_row_executor,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             logger=logger,
         )
@@ -3324,6 +3480,8 @@ def _run_attribution(
     phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
+    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ):
     start_time = time.time()
@@ -3373,6 +3531,19 @@ def _run_attribution(
         phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
     )
     phase4_scheduler_metadata = _build_phase4_scheduler_metadata(phase4_scheduler_config)
+    phase4_refresh_optimization_config = _resolve_phase4_refresh_optimization_config(
+        phase4_refresh_optimization
+    )
+    phase4_refresh_optimization_metadata = _build_phase4_refresh_optimization_metadata(
+        phase4_refresh_optimization_config
+    )
+    phase4_row_executor_config = _resolve_phase4_row_executor_config(phase4_row_executor)
+    phase4_row_executor_metadata = _build_phase4_row_executor_metadata(phase4_row_executor_config)
+    phase4_execution_metadata: dict[str, object] = {
+        **phase4_scheduler_metadata,
+        **phase4_refresh_optimization_metadata,
+        **phase4_row_executor_metadata,
+    }
     phase4_debug_summary_enabled = phase4_anomaly_debug_enabled or cross_cluster_debug_enabled
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
@@ -3399,7 +3570,7 @@ def _run_attribution(
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
-            **{f"phase4_{key}": value for key, value in phase4_scheduler_metadata.items()},
+            **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
         },
     )
 
@@ -4386,6 +4557,15 @@ def _run_attribution(
                 else ""
             )
         )
+        logger.info(
+            "Phase 4 execution flags | "
+            f"refresh_optimization={phase4_refresh_optimization_config.requested_mode}"
+            f" (effective={phase4_refresh_optimization_config.effective_mode}, "
+            f"behavior={phase4_refresh_optimization_config.effective_behavior}) | "
+            f"row_executor={phase4_row_executor_config.requested_mode}"
+            f" (effective={phase4_row_executor_config.effective_mode}, "
+            f"behavior={phase4_row_executor_config.effective_behavior})"
+        )
         scheduler_uses_reference_planner = phase4_scheduler_config.effective_mode in {
             "planner_v1",
             "planner_v2",
@@ -4403,7 +4583,7 @@ def _run_attribution(
                     "planner_enabled": bool(planner_enabled),
                     "planner_status": planner_status,
                     "planner_skip_reason": planner_skip_reason,
-                    **phase4_scheduler_metadata,
+                    **phase4_execution_metadata,
                     "actual_max_feature_nodes": int(actual_max_feature_nodes),
                     "total_active_features": int(total_active_feats),
                     "update_interval": int(update_interval),
@@ -4651,7 +4831,7 @@ def _run_attribution(
                         "pending_hash": _hash_index_tensor(pending)
                         if pending.numel() > 0
                         else None,
-                        **phase4_scheduler_metadata,
+                        **phase4_execution_metadata,
                         **planner_v2_refresh_telemetry,
                         **phase4_plan_telemetry,
                         "rank_nonzero_count": (
@@ -4798,7 +4978,7 @@ def _run_attribution(
                                 if planner_v2_candidate_window.numel() > 0
                                 else None
                             ),
-                            **phase4_scheduler_metadata,
+                            **phase4_execution_metadata,
                             **planner_v2_refresh_telemetry,
                             **phase4_plan_telemetry,
                             "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
@@ -5110,7 +5290,7 @@ def _run_attribution(
                         "batch_rows": int(row_count),
                         "visited_features": int(n_visited),
                         "target_feature_count": int(actual_max_feature_nodes),
-                        **phase4_scheduler_metadata,
+                        **phase4_execution_metadata,
                         "scheduler_refresh_index": pending_refresh_index,
                         **batch_locality_summary,
                     },
@@ -5139,7 +5319,7 @@ def _run_attribution(
                             "batch_rows": int(row_count),
                             "visited_features": int(n_visited),
                             "target_feature_count": int(actual_max_feature_nodes),
-                            **phase4_scheduler_metadata,
+                            **phase4_execution_metadata,
                             "scheduler_refresh_index": pending_refresh_index,
                             **batch_locality_summary,
                             "idx_batch_hash": batch_locality_summary.get("scheduler_batch_hash"),
@@ -5187,7 +5367,7 @@ def _run_attribution(
                 "phase4_batches": int(phase4_batch_count),
                 "phase4_refreshes": int(phase4_refresh_count),
                 "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
-                **phase4_scheduler_metadata,
+                **phase4_execution_metadata,
                 **(phase4_no_refresh_plan_telemetry or {}),
             },
         )
@@ -5649,6 +5829,34 @@ def _run_attribution(
                 ),
                 "phase4_scheduler_debug": bool(phase4_scheduler_config.debug),
                 "phase4_scheduler_telemetry_detail": phase4_scheduler_config.telemetry_detail,
+                "phase4_refresh_optimization_requested": phase4_refresh_optimization_config.requested_mode,
+                "phase4_refresh_optimization": phase4_refresh_optimization_config.requested_mode,
+                "phase4_refresh_optimization_mode_requested": phase4_refresh_optimization_config.requested_mode,
+                "phase4_refresh_optimization_effective": phase4_refresh_optimization_config.effective_mode,
+                "phase4_refresh_optimization_mode_effective": phase4_refresh_optimization_config.effective_mode,
+                "phase4_refresh_optimization_version": phase4_refresh_optimization_config.version,
+                "phase4_refresh_optimization_version_requested": phase4_refresh_optimization_config.version,
+                "phase4_refresh_optimization_effective_version": phase4_refresh_optimization_config.effective_version,
+                "phase4_refresh_optimization_version_effective": phase4_refresh_optimization_config.effective_version,
+                "phase4_refresh_optimization_effective_behavior": phase4_refresh_optimization_config.effective_behavior,
+                "phase4_refresh_optimization_reference_execution": bool(
+                    phase4_refresh_optimization_config.requested_mode
+                    != phase4_refresh_optimization_config.effective_mode
+                ),
+                "phase4_row_executor_requested": phase4_row_executor_config.requested_mode,
+                "phase4_row_executor": phase4_row_executor_config.requested_mode,
+                "phase4_row_executor_mode_requested": phase4_row_executor_config.requested_mode,
+                "phase4_row_executor_effective": phase4_row_executor_config.effective_mode,
+                "phase4_row_executor_mode_effective": phase4_row_executor_config.effective_mode,
+                "phase4_row_executor_version": phase4_row_executor_config.version,
+                "phase4_row_executor_version_requested": phase4_row_executor_config.version,
+                "phase4_row_executor_effective_version": phase4_row_executor_config.effective_version,
+                "phase4_row_executor_version_effective": phase4_row_executor_config.effective_version,
+                "phase4_row_executor_effective_behavior": phase4_row_executor_config.effective_behavior,
+                "phase4_row_executor_reference_execution": bool(
+                    phase4_row_executor_config.requested_mode
+                    != phase4_row_executor_config.effective_mode
+                ),
                 "internal_precision_requested": internal_precision_requested,
                 "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
@@ -5676,7 +5884,7 @@ def _run_attribution(
                 phase4_entry_summary_checkpoint = {
                     "phase4_refresh_count": int(phase4_refresh_count),
                     "phase4_batch_count": int(phase4_batch_count),
-                    **phase4_scheduler_metadata,
+                    **phase4_execution_metadata,
                     **phase4_runtime_summary,
                 }
                 _record_cross_cluster_checkpoint(
@@ -5689,7 +5897,7 @@ def _run_attribution(
                         "checkpoint_stage": "post_phase4",
                         "phase4_refresh_count": int(phase4_refresh_count),
                         "phase4_batch_count": int(phase4_batch_count),
-                        **phase4_scheduler_metadata,
+                        **phase4_execution_metadata,
                         **phase4_runtime_stream,
                     },
                 )
@@ -5706,7 +5914,7 @@ def _run_attribution(
                         "phase4_batch_count": int(phase4_batch_count),
                         "phase4_elapsed_ms": float(phase4_elapsed_ms),
                         "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
-                        **phase4_scheduler_metadata,
+                        **phase4_execution_metadata,
                         **phase4_runtime_stream,
                     },
                 )

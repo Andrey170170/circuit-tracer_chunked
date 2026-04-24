@@ -163,6 +163,16 @@ def test_phase4_scheduler_defaults_match_between_public_entrypoints() -> None:
         == nnsight_sig.parameters["phase4_scheduler_telemetry_detail"].default
         == "normal"
     )
+    assert (
+        entrypoint_sig.parameters["phase4_refresh_optimization"].default
+        == nnsight_sig.parameters["phase4_refresh_optimization"].default
+        == "off"
+    )
+    assert (
+        entrypoint_sig.parameters["phase4_row_executor"].default
+        == nnsight_sig.parameters["phase4_row_executor"].default
+        == "batched"
+    )
 
 
 def test_phase4_scheduler_mode_type_hints_include_planner_v2() -> None:
@@ -177,6 +187,25 @@ def test_phase4_scheduler_mode_type_hints_include_planner_v2() -> None:
     nnsight_modes = set(get_args(nnsight_mode_annotation))
     assert "planner_v2" in entrypoint_modes
     assert "planner_v2" in nnsight_modes
+
+
+def test_phase4_execution_flag_type_hints_include_new_modes() -> None:
+    entrypoint_sig = inspect.signature(attribute_entrypoint)
+    nnsight_sig = inspect.signature(nnsight_attribute)
+
+    entry_refresh_modes = set(
+        get_args(entrypoint_sig.parameters["phase4_refresh_optimization"].annotation)
+    )
+    nnsight_refresh_modes = set(
+        get_args(nnsight_sig.parameters["phase4_refresh_optimization"].annotation)
+    )
+    assert "v1" in entry_refresh_modes
+    assert "v1" in nnsight_refresh_modes
+
+    entry_row_modes = set(get_args(entrypoint_sig.parameters["phase4_row_executor"].annotation))
+    nnsight_row_modes = set(get_args(nnsight_sig.parameters["phase4_row_executor"].annotation))
+    assert "streaming_v1" in entry_row_modes
+    assert "streaming_v1" in nnsight_row_modes
 
 
 def test_exact_trace_internal_dtype_resolution_rejects_unknown_value() -> None:
