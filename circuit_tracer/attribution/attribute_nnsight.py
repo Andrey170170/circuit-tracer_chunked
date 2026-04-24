@@ -2532,6 +2532,91 @@ def _safe_float(value: torch.Tensor | float | int | None) -> float | None:
     return float(value)
 
 
+def _safe_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return int(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return _safe_int(value.item())
+    return None
+
+
+def _build_phase4_refresh_substage_telemetry(
+    *,
+    telemetry_detail: Literal["summary", "normal", "debug"],
+    partial_influence_elapsed_ms: float,
+    rank_topk_elapsed_ms: float,
+    frontier_plan_elapsed_ms: float,
+    row_store_read_elapsed_ms: float | None,
+    influence_normalization_elapsed_ms: float | None,
+    influence_matmul_elapsed_ms: float | None,
+    chunk_request_count: int | None,
+    active_row_chunk_count: int | None,
+    row_reader_row_count: int | None,
+    solver_iteration_count: int | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "refresh_partial_influence_elapsed_ms": float(partial_influence_elapsed_ms),
+        "refresh_rank_topk_elapsed_ms": float(rank_topk_elapsed_ms),
+        "refresh_frontier_plan_elapsed_ms": float(frontier_plan_elapsed_ms),
+    }
+    if telemetry_detail in {"normal", "debug"}:
+        payload.update(
+            {
+                "refresh_row_store_read_elapsed_ms": _safe_float(row_store_read_elapsed_ms),
+                "refresh_influence_normalization_elapsed_ms": _safe_float(
+                    influence_normalization_elapsed_ms
+                ),
+                "refresh_influence_matmul_elapsed_ms": _safe_float(influence_matmul_elapsed_ms),
+                "refresh_chunk_request_count": _safe_int(chunk_request_count),
+                "refresh_active_row_chunk_count": _safe_int(active_row_chunk_count),
+                "refresh_rows_touched": _safe_int(row_reader_row_count),
+                "refresh_solver_iteration_count": _safe_int(solver_iteration_count),
+            }
+        )
+    return payload
+
+
+def _build_phase4_executor_substage_telemetry(
+    *,
+    telemetry_detail: Literal["summary", "normal", "debug"],
+    compute_batch_elapsed_ms: float,
+    cpu_staging_elapsed_ms: float,
+    denominator_elapsed_ms: float,
+    row_store_write_elapsed_ms: float,
+    batch_elapsed_ms: float,
+) -> dict[str, object]:
+    accounted_elapsed_ms = (
+        compute_batch_elapsed_ms
+        + cpu_staging_elapsed_ms
+        + denominator_elapsed_ms
+        + row_store_write_elapsed_ms
+    )
+    payload: dict[str, object] = {
+        "executor_compute_batch_elapsed_ms": float(compute_batch_elapsed_ms),
+        "executor_accounted_elapsed_ms": float(accounted_elapsed_ms),
+        "executor_overhead_elapsed_ms": float(max(0.0, batch_elapsed_ms - accounted_elapsed_ms)),
+    }
+    if telemetry_detail in {"normal", "debug"}:
+        payload.update(
+            {
+                "executor_cpu_staging_elapsed_ms": float(cpu_staging_elapsed_ms),
+                "executor_denominator_elapsed_ms": float(denominator_elapsed_ms),
+                "executor_row_store_write_elapsed_ms": float(row_store_write_elapsed_ms),
+            }
+        )
+    return payload
+
+
 def _record_cross_cluster_checkpoint(
     *,
     cross_cluster_debug_summary: dict[str, object] | None,
@@ -4595,6 +4680,13 @@ def _run_attribution(
         phase4_batch_count = 0
         phase4_refresh_count = 0
         phase4_refresh_elapsed_ms_total = 0.0
+        phase4_feature_batch_elapsed_ms_total = 0.0
+        phase4_refresh_partial_influence_elapsed_ms_total = 0.0
+        phase4_refresh_row_store_read_elapsed_ms_total = 0.0
+        phase4_refresh_rank_topk_elapsed_ms_total = 0.0
+        phase4_refresh_frontier_plan_elapsed_ms_total = 0.0
+        phase4_refresh_influence_normalization_elapsed_ms_total = 0.0
+        phase4_refresh_influence_matmul_elapsed_ms_total = 0.0
         phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
         previous_phase4_pending: torch.Tensor | None = None
         first_phase4_pending: torch.Tensor | None = None
@@ -4656,7 +4748,15 @@ def _run_attribution(
                     if use_compact_feature_row_store and feature_row_store is not None
                     else None
                 )
-                streaming_chunk_reuse_stats: dict[str, int] | None = None
+                streaming_chunk_reuse_stats: dict[str, int | float] | None = None
+                refresh_row_store_read_elapsed_ms: float | None = None
+                refresh_influence_normalization_elapsed_ms: float | None = None
+                refresh_influence_matmul_elapsed_ms: float | None = None
+                refresh_chunk_request_count: int | None = None
+                refresh_active_row_chunk_count: int | None = None
+                refresh_rows_touched: int | None = None
+                refresh_solver_iteration_count: int | None = None
+                partial_influence_start = time.perf_counter()
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     streaming_chunk_reuse_stats = {}
@@ -4679,6 +4779,27 @@ def _run_attribution(
                         chunk_reuse_stats=streaming_chunk_reuse_stats,
                         compute_dtype=influence_compute_dtype,
                     )
+                    refresh_row_store_read_elapsed_ms = _safe_float(
+                        streaming_chunk_reuse_stats.get("row_reader_elapsed_ms_total")
+                    )
+                    refresh_influence_normalization_elapsed_ms = _safe_float(
+                        streaming_chunk_reuse_stats.get("normalization_elapsed_ms_total")
+                    )
+                    refresh_influence_matmul_elapsed_ms = _safe_float(
+                        streaming_chunk_reuse_stats.get("matmul_elapsed_ms_total")
+                    )
+                    refresh_chunk_request_count = _safe_int(
+                        streaming_chunk_reuse_stats.get("chunk_request_count")
+                    )
+                    refresh_active_row_chunk_count = _safe_int(
+                        streaming_chunk_reuse_stats.get("active_row_chunk_count")
+                    )
+                    refresh_rows_touched = _safe_int(
+                        streaming_chunk_reuse_stats.get("row_reader_row_count")
+                    )
+                    refresh_solver_iteration_count = _safe_int(
+                        streaming_chunk_reuse_stats.get("iteration_count")
+                    )
                 else:
                     influences = compute_partial_influences(
                         edge_matrix[:st],
@@ -4688,6 +4809,26 @@ def _run_attribution(
                     )
                     feature_influences = influences[:total_active_feats]
 
+                refresh_partial_influence_elapsed_ms = (
+                    time.perf_counter() - partial_influence_start
+                ) * 1000.0
+                phase4_refresh_partial_influence_elapsed_ms_total += (
+                    refresh_partial_influence_elapsed_ms
+                )
+                if refresh_row_store_read_elapsed_ms is not None:
+                    phase4_refresh_row_store_read_elapsed_ms_total += (
+                        refresh_row_store_read_elapsed_ms
+                    )
+                if refresh_influence_normalization_elapsed_ms is not None:
+                    phase4_refresh_influence_normalization_elapsed_ms_total += (
+                        refresh_influence_normalization_elapsed_ms
+                    )
+                if refresh_influence_matmul_elapsed_ms is not None:
+                    phase4_refresh_influence_matmul_elapsed_ms_total += (
+                        refresh_influence_matmul_elapsed_ms
+                    )
+
+                rank_topk_start = time.perf_counter()
                 feature_rank = torch.argsort(feature_influences, descending=True).cpu()
                 unvisited_feature_rank = feature_rank[~visited[feature_rank]]
                 candidate_scores: torch.Tensor | None = None
@@ -4730,6 +4871,10 @@ def _run_attribution(
                     actual_max_feature_nodes - n_visited,
                 )
                 pending_candidates = unvisited_feature_rank[:max_frontier_size]
+                refresh_rank_topk_elapsed_ms = (time.perf_counter() - rank_topk_start) * 1000.0
+                phase4_refresh_rank_topk_elapsed_ms_total += refresh_rank_topk_elapsed_ms
+
+                frontier_plan_start = time.perf_counter()
                 if scheduler_uses_reference_planner:
                     phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
                         pending_candidates,
@@ -4812,6 +4957,23 @@ def _run_attribution(
                     phase4_frontier_plan=phase4_frontier_plan,
                     telemetry_detail=phase4_scheduler_config.telemetry_detail,
                 )
+                refresh_frontier_plan_elapsed_ms = (
+                    time.perf_counter() - frontier_plan_start
+                ) * 1000.0
+                phase4_refresh_frontier_plan_elapsed_ms_total += refresh_frontier_plan_elapsed_ms
+                refresh_substage_telemetry = _build_phase4_refresh_substage_telemetry(
+                    telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                    partial_influence_elapsed_ms=refresh_partial_influence_elapsed_ms,
+                    rank_topk_elapsed_ms=refresh_rank_topk_elapsed_ms,
+                    frontier_plan_elapsed_ms=refresh_frontier_plan_elapsed_ms,
+                    row_store_read_elapsed_ms=refresh_row_store_read_elapsed_ms,
+                    influence_normalization_elapsed_ms=refresh_influence_normalization_elapsed_ms,
+                    influence_matmul_elapsed_ms=refresh_influence_matmul_elapsed_ms,
+                    chunk_request_count=refresh_chunk_request_count,
+                    active_row_chunk_count=refresh_active_row_chunk_count,
+                    row_reader_row_count=refresh_rows_touched,
+                    solver_iteration_count=refresh_solver_iteration_count,
+                )
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
                 phase4_refresh_elapsed_ms_total += refresh_elapsed_ms
@@ -4834,6 +4996,7 @@ def _run_attribution(
                         **phase4_execution_metadata,
                         **planner_v2_refresh_telemetry,
                         **phase4_plan_telemetry,
+                        **refresh_substage_telemetry,
                         "rank_nonzero_count": (
                             int(rank_signal_stats["nonzero_count"])
                             if rank_signal_stats is not None
@@ -4981,6 +5144,7 @@ def _run_attribution(
                             **phase4_execution_metadata,
                             **planner_v2_refresh_telemetry,
                             **phase4_plan_telemetry,
+                            **refresh_substage_telemetry,
                             "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
                             "rank_effective_nonzero_count": int(
                                 rank_signal_stats["effective_nonzero_count"]
@@ -5200,6 +5364,7 @@ def _run_attribution(
                 ctx_before = _snapshot_diagnostics(ctx) if profile else None
                 transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
                 batch_start = time.perf_counter()
+                compute_batch_start = time.perf_counter()
                 rows = ctx.compute_batch(
                     layers=feat_layers[idx_batch],
                     positions=feat_pos[idx_batch],
@@ -5207,19 +5372,26 @@ def _run_attribution(
                     retain_graph=n_visited < actual_max_feature_nodes,
                     phase_label="phase4_features",
                 )
+                executor_compute_batch_elapsed_ms = (
+                    time.perf_counter() - compute_batch_start
+                ) * 1000.0
 
                 row_count = rows.shape[0]
                 end = st + row_count
+                cpu_staging_start = time.perf_counter()
                 rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
                     rows,
                     staging_buffer=rows_cpu_staging,
                 )
+                executor_cpu_staging_elapsed_ms = (time.perf_counter() - cpu_staging_start) * 1000.0
                 row_input_slice = rows_cpu[:, :logit_offset]
                 feature_row_slice = rows_cpu[:, :total_active_feats]
+                denominator_start = time.perf_counter()
                 row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                     row_input_slice,
                     dtype=exact_trace_internal_dtype_resolved,
                 )
+                executor_denominator_elapsed_ms = (time.perf_counter() - denominator_start) * 1000.0
                 if anomaly_debug_result is not None and phase4_batch_count <= 2:
                     feature_row_batches = anomaly_debug_result.setdefault(
                         "phase4_feature_row_batches",
@@ -5243,14 +5415,22 @@ def _run_attribution(
                     )
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
+                    row_store_write_start = time.perf_counter()
                     feature_row_store.append_rows(
                         row_start=st,
                         feature_rows=feature_row_slice,
                         row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                         phase="phase4",
                     )
+                    executor_row_store_write_elapsed_ms = (
+                        time.perf_counter() - row_store_write_start
+                    ) * 1000.0
                 else:
+                    row_store_write_start = time.perf_counter()
                     edge_matrix[st:end, :logit_offset] = rows_cpu
+                    executor_row_store_write_elapsed_ms = (
+                        time.perf_counter() - row_store_write_start
+                    ) * 1000.0
                 row_to_node_index[st:end] = idx_batch
                 visited[idx_batch] = True
                 st = end
@@ -5273,6 +5453,15 @@ def _run_attribution(
                         )
                 batch_number = phase4_batch_count
                 batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                phase4_feature_batch_elapsed_ms_total += batch_elapsed_ms
+                executor_substage_telemetry = _build_phase4_executor_substage_telemetry(
+                    telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                    compute_batch_elapsed_ms=executor_compute_batch_elapsed_ms,
+                    cpu_staging_elapsed_ms=executor_cpu_staging_elapsed_ms,
+                    denominator_elapsed_ms=executor_denominator_elapsed_ms,
+                    row_store_write_elapsed_ms=executor_row_store_write_elapsed_ms,
+                    batch_elapsed_ms=batch_elapsed_ms,
+                )
                 batch_locality_summary = _build_phase4_batch_locality_summary(
                     idx_batch,
                     feat_layers=feat_layers,
@@ -5293,6 +5482,7 @@ def _run_attribution(
                         **phase4_execution_metadata,
                         "scheduler_refresh_index": pending_refresh_index,
                         **batch_locality_summary,
+                        **executor_substage_telemetry,
                     },
                 )
                 telemetry_recorder.record_wall_clock_duration(
@@ -5322,6 +5512,7 @@ def _run_attribution(
                             **phase4_execution_metadata,
                             "scheduler_refresh_index": pending_refresh_index,
                             **batch_locality_summary,
+                            **executor_substage_telemetry,
                             "idx_batch_hash": batch_locality_summary.get("scheduler_batch_hash"),
                             "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
                             "row_input_finite_max_abs": _safe_float(
@@ -5367,6 +5558,27 @@ def _run_attribution(
                 "phase4_batches": int(phase4_batch_count),
                 "phase4_refreshes": int(phase4_refresh_count),
                 "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
+                "phase4_feature_batch_elapsed_ms_total": float(
+                    phase4_feature_batch_elapsed_ms_total
+                ),
+                "phase4_refresh_partial_influence_elapsed_ms_total": float(
+                    phase4_refresh_partial_influence_elapsed_ms_total
+                ),
+                "phase4_refresh_rank_topk_elapsed_ms_total": float(
+                    phase4_refresh_rank_topk_elapsed_ms_total
+                ),
+                "phase4_refresh_frontier_plan_elapsed_ms_total": float(
+                    phase4_refresh_frontier_plan_elapsed_ms_total
+                ),
+                "phase4_refresh_row_store_read_elapsed_ms_total": float(
+                    phase4_refresh_row_store_read_elapsed_ms_total
+                ),
+                "phase4_refresh_influence_normalization_elapsed_ms_total": float(
+                    phase4_refresh_influence_normalization_elapsed_ms_total
+                ),
+                "phase4_refresh_influence_matmul_elapsed_ms_total": float(
+                    phase4_refresh_influence_matmul_elapsed_ms_total
+                ),
                 **phase4_execution_metadata,
                 **(phase4_no_refresh_plan_telemetry or {}),
             },
@@ -5867,6 +6079,26 @@ def _run_attribution(
                     phase4_refresh_elapsed_ms_total / 1000.0,
                     6,
                 ),
+                "phase4_feature_batch_elapsed_seconds_total": round(
+                    phase4_feature_batch_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_refresh_partial_influence_elapsed_seconds_total": round(
+                    phase4_refresh_partial_influence_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_refresh_rank_topk_elapsed_seconds_total": round(
+                    phase4_refresh_rank_topk_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_refresh_frontier_plan_elapsed_seconds_total": round(
+                    phase4_refresh_frontier_plan_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_refresh_row_store_read_elapsed_seconds_total": round(
+                    phase4_refresh_row_store_read_elapsed_ms_total / 1000.0,
+                    6,
+                ),
                 "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
                 "telemetry_max_events": int(telemetry_max_events_resolved),
                 "cfg": model.config,
@@ -5914,6 +6146,18 @@ def _run_attribution(
                         "phase4_batch_count": int(phase4_batch_count),
                         "phase4_elapsed_ms": float(phase4_elapsed_ms),
                         "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
+                        "phase4_feature_batch_elapsed_ms_total": float(
+                            phase4_feature_batch_elapsed_ms_total
+                        ),
+                        "phase4_refresh_partial_influence_elapsed_ms_total": float(
+                            phase4_refresh_partial_influence_elapsed_ms_total
+                        ),
+                        "phase4_refresh_rank_topk_elapsed_ms_total": float(
+                            phase4_refresh_rank_topk_elapsed_ms_total
+                        ),
+                        "phase4_refresh_frontier_plan_elapsed_ms_total": float(
+                            phase4_refresh_frontier_plan_elapsed_ms_total
+                        ),
                         **phase4_execution_metadata,
                         **phase4_runtime_stream,
                     },

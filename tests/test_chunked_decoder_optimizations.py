@@ -10,8 +10,10 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_cross_cluster_runtime_snapshot,
     _build_matrix_abs_stats,
     _build_phase4_batch_locality_summary,
+    _build_phase4_executor_substage_telemetry,
     _build_phase4_normalization_stats,
     _build_phase4_planner_v2_candidate_window,
+    _build_phase4_refresh_substage_telemetry,
     _select_phase4_planner_v2_membership,
     _apply_phase4_planner_v2_refresh_plan,
     _build_phase4_deterministic_shadow_pending,
@@ -1419,6 +1421,80 @@ def test_phase4_normalization_stats_reports_clamped_rows() -> None:
 
     assert stats["clamped_row_count"] == 2
     assert stats["clamped_row_fraction"] == pytest.approx(2 / 3)
+
+
+def test_phase4_refresh_substage_telemetry_is_compact_in_summary_mode() -> None:
+    telemetry = _build_phase4_refresh_substage_telemetry(
+        telemetry_detail="summary",
+        partial_influence_elapsed_ms=12.5,
+        rank_topk_elapsed_ms=3.25,
+        frontier_plan_elapsed_ms=1.75,
+        row_store_read_elapsed_ms=6.0,
+        influence_normalization_elapsed_ms=2.0,
+        influence_matmul_elapsed_ms=1.5,
+        chunk_request_count=7,
+        active_row_chunk_count=5,
+        row_reader_row_count=1024,
+        solver_iteration_count=3,
+    )
+
+    assert telemetry == {
+        "refresh_partial_influence_elapsed_ms": pytest.approx(12.5),
+        "refresh_rank_topk_elapsed_ms": pytest.approx(3.25),
+        "refresh_frontier_plan_elapsed_ms": pytest.approx(1.75),
+    }
+
+
+def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
+    telemetry = _build_phase4_refresh_substage_telemetry(
+        telemetry_detail="normal",
+        partial_influence_elapsed_ms=10.0,
+        rank_topk_elapsed_ms=2.0,
+        frontier_plan_elapsed_ms=1.0,
+        row_store_read_elapsed_ms=4.0,
+        influence_normalization_elapsed_ms=0.75,
+        influence_matmul_elapsed_ms=0.5,
+        chunk_request_count=9,
+        active_row_chunk_count=6,
+        row_reader_row_count=2048,
+        solver_iteration_count=4,
+    )
+
+    assert telemetry["refresh_row_store_read_elapsed_ms"] == pytest.approx(4.0)
+    assert telemetry["refresh_influence_normalization_elapsed_ms"] == pytest.approx(0.75)
+    assert telemetry["refresh_influence_matmul_elapsed_ms"] == pytest.approx(0.5)
+    assert telemetry["refresh_chunk_request_count"] == 9
+    assert telemetry["refresh_active_row_chunk_count"] == 6
+    assert telemetry["refresh_rows_touched"] == 2048
+    assert telemetry["refresh_solver_iteration_count"] == 4
+
+
+def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
+    summary = _build_phase4_executor_substage_telemetry(
+        telemetry_detail="summary",
+        compute_batch_elapsed_ms=5.0,
+        cpu_staging_elapsed_ms=1.0,
+        denominator_elapsed_ms=0.5,
+        row_store_write_elapsed_ms=0.75,
+        batch_elapsed_ms=8.0,
+    )
+    normal = _build_phase4_executor_substage_telemetry(
+        telemetry_detail="normal",
+        compute_batch_elapsed_ms=5.0,
+        cpu_staging_elapsed_ms=1.0,
+        denominator_elapsed_ms=0.5,
+        row_store_write_elapsed_ms=0.75,
+        batch_elapsed_ms=8.0,
+    )
+
+    assert summary["executor_compute_batch_elapsed_ms"] == pytest.approx(5.0)
+    assert summary["executor_accounted_elapsed_ms"] == pytest.approx(7.25)
+    assert summary["executor_overhead_elapsed_ms"] == pytest.approx(0.75)
+    assert "executor_cpu_staging_elapsed_ms" not in summary
+
+    assert normal["executor_cpu_staging_elapsed_ms"] == pytest.approx(1.0)
+    assert normal["executor_denominator_elapsed_ms"] == pytest.approx(0.5)
+    assert normal["executor_row_store_write_elapsed_ms"] == pytest.approx(0.75)
 
 
 def test_record_cross_cluster_checkpoint_updates_summary_and_stream() -> None:

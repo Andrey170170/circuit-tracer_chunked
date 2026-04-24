@@ -621,6 +621,13 @@ def test_compute_partial_feature_influences_streaming_reuses_row_chunks_within_c
         chunk_reuse_stats["chunk_cache_hit_count"] + chunk_reuse_stats["chunk_cache_miss_count"]
         == chunk_reuse_stats["chunk_request_count"]
     )
+    assert chunk_reuse_stats["active_row_chunk_count"] >= 1
+    assert chunk_reuse_stats["row_reader_row_count"] >= 1
+    assert chunk_reuse_stats["iteration_count"] >= 1
+    assert chunk_reuse_stats["solver_elapsed_ms_total"] >= 0.0
+    assert chunk_reuse_stats["row_reader_elapsed_ms_total"] >= 0.0
+    assert chunk_reuse_stats["normalization_elapsed_ms_total"] >= 0.0
+    assert chunk_reuse_stats["matmul_elapsed_ms_total"] >= 0.0
 
 
 def test_compute_partial_feature_influences_streaming_solver_cache_disabled_is_explicit():

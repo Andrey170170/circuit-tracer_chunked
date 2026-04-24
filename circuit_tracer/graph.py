@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import NamedTuple
+import time
 import warnings
 
 import torch
@@ -701,7 +702,7 @@ def compute_partial_feature_influences_streaming(
     device=None,
     row_chunk_size: int = 4096,
     chunk_cache_max_bytes: int = 0,
-    chunk_reuse_stats: dict[str, int] | None = None,
+    chunk_reuse_stats: dict[str, int | float] | None = None,
     compute_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Compute feature-only partial influences from streamed dense row chunks.
@@ -726,7 +727,7 @@ def compute_partial_feature_influences_streaming(
         chunk_cache_max_bytes: Strict byte budget for optional solver-local
             row-chunk reuse cache. ``0`` disables solver-local caching.
         chunk_reuse_stats: Optional output dictionary populated with lightweight
-            chunk reuse counters for diagnostics.
+            chunk reuse counters and elapsed timings for diagnostics.
         compute_dtype: Optional explicit compute dtype for influence math. When
             omitted, defaults to the primary denominator dtype for backward
             compatibility.
@@ -804,6 +805,13 @@ def compute_partial_feature_influences_streaming(
     chunk_cache_store_success_count = 0
     chunk_cache_store_skip_disabled_count = 0
     chunk_cache_store_skip_too_large_count = 0
+    active_row_chunk_count = 0
+    row_reader_row_count = 0
+    row_reader_elapsed_ms_total = 0.0
+    normalization_elapsed_ms_total = 0.0
+    matmul_elapsed_ms_total = 0.0
+    iteration_count = 0
+    solver_start = time.perf_counter()
 
     def _tensor_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
@@ -816,6 +824,7 @@ def compute_partial_feature_influences_streaming(
         chunk_cache_eviction_count += 1
 
     for _ in range(max_iter):
+        iteration_count += 1
         next_feature_prod = torch.zeros_like(influences)
         for start in range(0, n_rows, row_chunk_size):
             end = min(start + row_chunk_size, n_rows)
@@ -823,11 +832,15 @@ def compute_partial_feature_influences_streaming(
             if not bool(chunk_row_weights.any()):
                 continue
 
+            active_row_chunk_count += 1
             chunk_request_count += 1
             cache_key = (start, end)
             cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
             if cached_chunk is None:
+                row_reader_start = time.perf_counter()
                 chunk = row_reader(start, end)
+                row_reader_elapsed_ms_total += (time.perf_counter() - row_reader_start) * 1000.0
+                row_reader_row_count += int(end - start)
                 if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
                     raise ValueError(
                         "row_reader must return shape "
@@ -858,6 +871,7 @@ def compute_partial_feature_influences_streaming(
                 chunk_cache.move_to_end(cache_key)
                 chunk_cache_hit_count += 1
 
+            normalization_start = time.perf_counter()
             normalized_row_weights = _normalize_row_weights_from_denominator(
                 chunk_row_weights,
                 denom_mode=denom_mode,
@@ -866,8 +880,11 @@ def compute_partial_feature_influences_streaming(
                     denom_secondary[start:end] if denom_secondary is not None else None
                 ),
             )
+            normalization_elapsed_ms_total += (time.perf_counter() - normalization_start) * 1000.0
 
+            matmul_start = time.perf_counter()
             next_feature_prod += normalized_row_weights @ chunk
+            matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
 
         if not bool(next_feature_prod.any()):
             break
@@ -881,6 +898,7 @@ def compute_partial_feature_influences_streaming(
 
     if chunk_reuse_stats is not None:
         chunk_reuse_stats.clear()
+        solver_elapsed_ms_total = (time.perf_counter() - solver_start) * 1000.0
         chunk_reuse_stats.update(
             {
                 "chunk_request_count": int(chunk_request_count),
@@ -897,6 +915,13 @@ def compute_partial_feature_influences_streaming(
                 ),
                 "chunk_cache_unique_entries": int(len(chunk_cache)),
                 "chunk_cache_nbytes": int(chunk_cache_nbytes),
+                "active_row_chunk_count": int(active_row_chunk_count),
+                "row_reader_row_count": int(row_reader_row_count),
+                "iteration_count": int(iteration_count),
+                "solver_elapsed_ms_total": float(solver_elapsed_ms_total),
+                "row_reader_elapsed_ms_total": float(row_reader_elapsed_ms_total),
+                "normalization_elapsed_ms_total": float(normalization_elapsed_ms_total),
+                "matmul_elapsed_ms_total": float(matmul_elapsed_ms_total),
             }
         )
 
