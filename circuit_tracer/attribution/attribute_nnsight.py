@@ -167,7 +167,7 @@ _PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "planner_v2": "planner_v1",
 }
 
-_PHASE4_PLANNER_V2_POLICY_VERSION = "planner_v2_candidate_window_v1"
+_PHASE4_PLANNER_V2_POLICY_VERSION = "planner_v2_bounded_membership_v1"
 _PHASE4_PLANNER_V2_CANDIDATE_WINDOW_MULTIPLIER = 2.0
 _PHASE4_PLANNER_V2_LOCKED_PREFIX_FRACTION = 0.5
 _PHASE4_PLANNER_V2_MAX_REPLACEMENT_FRACTION = 0.25
@@ -1001,6 +1001,23 @@ def _build_phase4_planner_v2_refresh_telemetry_disabled() -> dict[str, object]:
         "scheduler_planner_v2_candidate_window_order_hash": None,
         "scheduler_planner_v2_candidate_window_membership_hash": None,
         "scheduler_planner_v2_candidate_window_includes_reference": None,
+        "scheduler_planner_v2_selection_attempted": None,
+        "scheduler_planner_v2_selection_applied": None,
+        "scheduler_planner_v2_selection_changed_membership": None,
+        "scheduler_planner_v2_fallback_to_reference": None,
+        "scheduler_planner_v2_fallback_reason": None,
+        "scheduler_planner_v2_reference_membership_hash": None,
+        "scheduler_planner_v2_selected_membership_hash": None,
+        "scheduler_planner_v2_locked_prefix_membership_hash": None,
+        "scheduler_planner_v2_replacement_count": None,
+        "scheduler_planner_v2_replacement_fraction_realized": None,
+        "scheduler_planner_v2_reference_score_sum": None,
+        "scheduler_planner_v2_selected_score_sum": None,
+        "scheduler_planner_v2_selected_score_ratio": None,
+        "scheduler_planner_v2_reference_group_count": None,
+        "scheduler_planner_v2_selected_group_count": None,
+        "scheduler_planner_v2_group_count_delta": None,
+        "scheduler_planner_v2_rank_displacement_sum": None,
     }
 
 
@@ -1130,6 +1147,487 @@ def _build_phase4_planner_v2_candidate_window(
         "scheduler_planner_v2_candidate_window_includes_reference": bool(includes_reference),
     }
     return candidate_window, telemetry
+
+
+def _phase4_planner_v2_group_key(
+    feature_idx: int,
+    *,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> tuple[int, int]:
+    layer_value = int(feat_layers[feature_idx].item())
+    use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
+    if use_chunk_key:
+        chunk_value = int(feat_ids[feature_idx].item()) // int(decoder_chunk_size)
+    else:
+        chunk_value = -1
+    return layer_value, chunk_value
+
+
+def _select_phase4_planner_v2_membership(
+    *,
+    unvisited_feature_rank: torch.Tensor,
+    reference_frontier: torch.Tensor,
+    reference_frontier_size: int,
+    candidate_window: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    visited: torch.Tensor,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+    locked_prefix_fraction: float = _PHASE4_PLANNER_V2_LOCKED_PREFIX_FRACTION,
+    max_replacement_fraction: float = _PHASE4_PLANNER_V2_MAX_REPLACEMENT_FRACTION,
+    min_score_ratio: float = _PHASE4_PLANNER_V2_MIN_SCORE_RATIO,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    ranked = unvisited_feature_rank.detach().to(device="cpu", dtype=torch.long)
+    reference = reference_frontier.detach().to(device="cpu", dtype=torch.long)
+    window = candidate_window.detach().to(device="cpu", dtype=torch.long)
+    scores = candidate_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+    visited_cpu = visited.detach().to(device="cpu", dtype=torch.bool).flatten()
+
+    available_count = int(ranked.numel())
+    reference_size = min(
+        int(reference_frontier_size),
+        int(reference.numel()),
+        available_count,
+    )
+    locked_fraction = min(max(0.0, float(locked_prefix_fraction)), 1.0)
+    replacement_fraction = max(0.0, float(max_replacement_fraction))
+    required_score_ratio = min(max(0.0, float(min_score_ratio)), 1.0)
+    locked_prefix_size = min(reference_size, int(math.floor(reference_size * locked_fraction)))
+    max_replacement_count = int(math.ceil(reference_size * replacement_fraction))
+
+    telemetry: dict[str, object] = {
+        "scheduler_planner_v2_selection_attempted": True,
+        "scheduler_planner_v2_selection_applied": True,
+        "scheduler_planner_v2_selection_changed_membership": False,
+        "scheduler_planner_v2_fallback_to_reference": False,
+        "scheduler_planner_v2_fallback_reason": None,
+        "scheduler_planner_v2_reference_membership_hash": None,
+        "scheduler_planner_v2_selected_membership_hash": None,
+        "scheduler_planner_v2_locked_prefix_membership_hash": None,
+        "scheduler_planner_v2_replacement_count": 0,
+        "scheduler_planner_v2_replacement_fraction_realized": 0.0,
+        "scheduler_planner_v2_reference_score_sum": None,
+        "scheduler_planner_v2_selected_score_sum": None,
+        "scheduler_planner_v2_selected_score_ratio": None,
+        "scheduler_planner_v2_reference_group_count": 0,
+        "scheduler_planner_v2_selected_group_count": 0,
+        "scheduler_planner_v2_group_count_delta": 0,
+        "scheduler_planner_v2_rank_displacement_sum": 0,
+    }
+
+    def _fallback(reason: str) -> tuple[torch.Tensor, dict[str, object]]:
+        telemetry["scheduler_planner_v2_selection_applied"] = False
+        telemetry["scheduler_planner_v2_selection_changed_membership"] = False
+        telemetry["scheduler_planner_v2_fallback_to_reference"] = True
+        telemetry["scheduler_planner_v2_fallback_reason"] = reason
+        telemetry["scheduler_planner_v2_replacement_count"] = 0
+        telemetry["scheduler_planner_v2_replacement_fraction_realized"] = 0.0
+        reference_ranked = reference[:reference_size]
+        reference_ranked_sorted = (
+            torch.sort(reference_ranked).values
+            if reference_ranked.numel() > 0
+            else reference_ranked
+        )
+        telemetry["scheduler_planner_v2_selected_membership_hash"] = (
+            _hash_index_tensor(reference_ranked_sorted)
+            if reference_ranked_sorted.numel() > 0
+            else None
+        )
+        return reference_ranked, telemetry
+
+    if reference_size <= 0:
+        return torch.empty(0, dtype=torch.long), telemetry
+
+    if scores.numel() < available_count:
+        return _fallback("score_metrics_unavailable")
+
+    rank_lookup: dict[int, int] = {}
+    score_lookup: dict[int, float] = {}
+    for rank_idx, node_idx in enumerate(ranked.tolist()):
+        node_int = int(node_idx)
+        rank_lookup[node_int] = int(rank_idx)
+        score_value = float(scores[rank_idx].item())
+        if math.isfinite(score_value):
+            score_lookup[node_int] = score_value
+
+    reference_nodes = [int(value) for value in reference[:reference_size].tolist()]
+    if len(reference_nodes) != len(set(reference_nodes)):
+        return _fallback("reference_contains_duplicates")
+
+    for node_idx in reference_nodes:
+        if node_idx >= int(visited_cpu.numel()):
+            return _fallback("reference_index_out_of_range")
+        if bool(visited_cpu[node_idx].item()):
+            return _fallback("reference_contains_visited_feature")
+        if node_idx not in rank_lookup or node_idx not in score_lookup:
+            return _fallback("score_metrics_unavailable")
+
+    reference_ranked_nodes = sorted(reference_nodes, key=lambda node: (rank_lookup[node], node))
+    locked_nodes = reference_ranked_nodes[:locked_prefix_size]
+    locked_node_set = set(locked_nodes)
+    unlocked_reference_nodes = [
+        node for node in reference_ranked_nodes if node not in locked_node_set
+    ]
+    reference_set = set(reference_ranked_nodes)
+
+    reference_score_sum = float(sum(score_lookup[node] for node in reference_ranked_nodes))
+    if not math.isfinite(reference_score_sum) or reference_score_sum <= 0.0:
+        return _fallback("score_metrics_unavailable")
+
+    telemetry["scheduler_planner_v2_reference_score_sum"] = reference_score_sum
+    telemetry["scheduler_planner_v2_reference_membership_hash"] = _hash_index_tensor(
+        torch.sort(torch.tensor(reference_ranked_nodes, dtype=torch.long)).values
+    )
+    telemetry["scheduler_planner_v2_locked_prefix_membership_hash"] = (
+        _hash_index_tensor(torch.sort(torch.tensor(locked_nodes, dtype=torch.long)).values)
+        if locked_nodes
+        else None
+    )
+
+    reference_group_counts: dict[tuple[int, int], int] = {}
+    for node in reference_ranked_nodes:
+        group_key = _phase4_planner_v2_group_key(
+            node,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        reference_group_counts[group_key] = reference_group_counts.get(group_key, 0) + 1
+
+    telemetry["scheduler_planner_v2_reference_group_count"] = int(len(reference_group_counts))
+    locked_group_set = {
+        _phase4_planner_v2_group_key(
+            node,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        for node in locked_nodes
+    }
+
+    outsider_entries: list[dict[str, object]] = []
+    seen_outsiders: set[int] = set()
+    for node_idx in window.tolist():
+        node = int(node_idx)
+        if node in reference_set or node in seen_outsiders:
+            continue
+        seen_outsiders.add(node)
+        if node >= int(visited_cpu.numel()):
+            return _fallback("candidate_window_index_out_of_range")
+        if bool(visited_cpu[node].item()):
+            return _fallback("candidate_window_contains_visited_feature")
+        rank_value = rank_lookup.get(node)
+        score_value = score_lookup.get(node)
+        if rank_value is None or score_value is None:
+            continue
+        group_key = _phase4_planner_v2_group_key(
+            node,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        outsider_entries.append(
+            {
+                "node": node,
+                "rank": rank_value,
+                "score": score_value,
+                "group": group_key,
+                "locked_group": int(group_key in locked_group_set),
+                "reference_group_count": int(reference_group_counts.get(group_key, 0)),
+            }
+        )
+
+    outsider_entries.sort(
+        key=lambda item: (
+            int(item["locked_group"]),
+            int((item["reference_group_count"] or 0) > 0),
+            int(item["reference_group_count"]),
+            float(item["score"]),
+            -int(item["rank"]),
+            -int(item["node"]),
+        ),
+        reverse=True,
+    )
+
+    removable_entries: list[dict[str, object]] = []
+    for node in unlocked_reference_nodes:
+        group_key = _phase4_planner_v2_group_key(
+            node,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        removable_entries.append(
+            {
+                "node": node,
+                "rank": int(rank_lookup[node]),
+                "score": float(score_lookup[node]),
+                "group": group_key,
+                "reference_group_count": int(reference_group_counts.get(group_key, 0)),
+            }
+        )
+
+    removable_entries.sort(
+        key=lambda item: (
+            int(item["reference_group_count"]),
+            float(item["score"]),
+            -int(item["rank"]),
+            int(item["node"]),
+        )
+    )
+
+    max_k = min(max_replacement_count, len(outsider_entries), len(removable_entries))
+    score_ratio_rejected = False
+    best_candidate: dict[str, object] | None = None
+    reference_rank_sum = int(sum(rank_lookup[node] for node in reference_ranked_nodes))
+
+    for replacement_count in range(1, max_k + 1):
+        dropped_nodes = {int(item["node"]) for item in removable_entries[:replacement_count]}
+        added_nodes = [int(item["node"]) for item in outsider_entries[:replacement_count]]
+        candidate_nodes = [
+            node for node in reference_ranked_nodes if node not in dropped_nodes
+        ] + added_nodes
+
+        if len(candidate_nodes) != reference_size:
+            continue
+        if len(set(candidate_nodes)) != reference_size:
+            continue
+
+        candidate_ranked_nodes = sorted(candidate_nodes, key=lambda node: (rank_lookup[node], node))
+        candidate_score_sum = float(sum(score_lookup[node] for node in candidate_ranked_nodes))
+        score_ratio = candidate_score_sum / reference_score_sum
+        if (not math.isfinite(score_ratio)) or score_ratio < required_score_ratio:
+            score_ratio_rejected = True
+            continue
+
+        candidate_group_count = len(
+            {
+                _phase4_planner_v2_group_key(
+                    node,
+                    feat_layers=feat_layers,
+                    feat_ids=feat_ids,
+                    exact_chunked_decoder=exact_chunked_decoder,
+                    decoder_chunk_size=decoder_chunk_size,
+                )
+                for node in candidate_ranked_nodes
+            }
+        )
+        group_delta = int(len(reference_group_counts) - candidate_group_count)
+        if group_delta <= 0:
+            continue
+
+        candidate_rank_sum = int(sum(rank_lookup[node] for node in candidate_ranked_nodes))
+        rank_displacement_sum = int(candidate_rank_sum - reference_rank_sum)
+        objective = (
+            int(group_delta),
+            int(-rank_displacement_sum),
+            float(score_ratio),
+            int(replacement_count),
+        )
+        if best_candidate is None or objective > cast(
+            tuple[int, int, float, int], best_candidate["objective"]
+        ):
+            best_candidate = {
+                "nodes": candidate_ranked_nodes,
+                "score_sum": candidate_score_sum,
+                "score_ratio": float(score_ratio),
+                "group_count": int(candidate_group_count),
+                "group_delta": int(group_delta),
+                "replacement_count": int(replacement_count),
+                "rank_displacement_sum": int(rank_displacement_sum),
+                "objective": objective,
+            }
+
+    if best_candidate is None:
+        reference_ranked_tensor = torch.tensor(reference_ranked_nodes, dtype=torch.long)
+        reference_sorted_tensor = torch.sort(reference_ranked_tensor).values
+        telemetry["scheduler_planner_v2_selected_membership_hash"] = _hash_index_tensor(
+            reference_sorted_tensor
+        )
+        telemetry["scheduler_planner_v2_selected_score_sum"] = reference_score_sum
+        telemetry["scheduler_planner_v2_selected_score_ratio"] = 1.0
+        telemetry["scheduler_planner_v2_selected_group_count"] = int(len(reference_group_counts))
+        telemetry["scheduler_planner_v2_group_count_delta"] = 0
+        telemetry["scheduler_planner_v2_rank_displacement_sum"] = 0
+        if max_k > 0 and score_ratio_rejected:
+            return _fallback("score_ratio_below_threshold")
+        return reference_ranked_tensor, telemetry
+
+    selected_nodes = cast(list[int], best_candidate["nodes"])
+    selected_tensor = torch.tensor(selected_nodes, dtype=torch.long)
+    selected_sorted = torch.sort(selected_tensor).values
+
+    if selected_tensor.numel() != reference_size:
+        return _fallback("selected_count_mismatch")
+    if int(torch.unique(selected_tensor).numel()) != reference_size:
+        return _fallback("selected_membership_not_unique")
+    if not set(locked_nodes).issubset(set(selected_nodes)):
+        return _fallback("locked_prefix_not_preserved")
+    if bool(visited_cpu[selected_tensor].any().item()):
+        return _fallback("selected_membership_contains_visited_feature")
+
+    selected_score_ratio = float(best_candidate["score_ratio"])
+    if (not math.isfinite(selected_score_ratio)) or selected_score_ratio < required_score_ratio:
+        return _fallback("score_ratio_below_threshold")
+
+    replacement_count = int(best_candidate["replacement_count"])
+    if replacement_count > max_replacement_count:
+        return _fallback("replacement_fraction_exceeded")
+
+    telemetry["scheduler_planner_v2_selection_changed_membership"] = True
+    telemetry["scheduler_planner_v2_selected_membership_hash"] = _hash_index_tensor(selected_sorted)
+    telemetry["scheduler_planner_v2_replacement_count"] = replacement_count
+    telemetry["scheduler_planner_v2_replacement_fraction_realized"] = (
+        float(replacement_count / reference_size) if reference_size > 0 else 0.0
+    )
+    telemetry["scheduler_planner_v2_selected_score_sum"] = float(best_candidate["score_sum"])
+    telemetry["scheduler_planner_v2_selected_score_ratio"] = selected_score_ratio
+    telemetry["scheduler_planner_v2_selected_group_count"] = int(best_candidate["group_count"])
+    telemetry["scheduler_planner_v2_group_count_delta"] = int(best_candidate["group_delta"])
+    telemetry["scheduler_planner_v2_rank_displacement_sum"] = int(
+        best_candidate["rank_displacement_sum"]
+    )
+
+    return selected_tensor, telemetry
+
+
+def _apply_phase4_planner_v2_refresh_plan(
+    *,
+    reference_plan: _Phase4FrontierPlan,
+    unvisited_feature_rank: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    visited: torch.Tensor,
+    max_batch_size: int,
+    max_batches: int | None,
+    feat_layers: torch.Tensor,
+    feat_positions: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> tuple[_Phase4FrontierPlan, torch.Tensor, dict[str, object]]:
+    reference_frontier = reference_plan.selected_frontier
+    reference_size = int(reference_frontier.numel())
+
+    candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+        unvisited_feature_rank,
+        reference_frontier=reference_frontier,
+        reference_frontier_size=reference_size,
+        candidate_scores=candidate_scores,
+    )
+    selected_membership, selection_telemetry = _select_phase4_planner_v2_membership(
+        unvisited_feature_rank=unvisited_feature_rank,
+        reference_frontier=reference_frontier,
+        reference_frontier_size=reference_size,
+        candidate_window=candidate_window,
+        candidate_scores=candidate_scores,
+        visited=visited,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=exact_chunked_decoder,
+        decoder_chunk_size=decoder_chunk_size,
+    )
+    telemetry.update(selection_telemetry)
+
+    fallback_to_reference = bool(telemetry.get("scheduler_planner_v2_fallback_to_reference", False))
+    fallback_reason = cast(str | None, telemetry.get("scheduler_planner_v2_fallback_reason"))
+    changed_membership = bool(
+        telemetry.get("scheduler_planner_v2_selection_changed_membership", False)
+    )
+
+    selected_plan = reference_plan
+    if (not fallback_to_reference) and changed_membership:
+        try:
+            candidate_plan = _plan_phase4_frontier_membership_preserving_v1(
+                selected_membership,
+                max_batch_size=max_batch_size,
+                max_batches=max_batches,
+                feat_layers=feat_layers,
+                feat_positions=feat_positions,
+                feat_ids=feat_ids,
+                exact_chunked_decoder=exact_chunked_decoder,
+                decoder_chunk_size=decoder_chunk_size,
+                apply_locality_reorder=True,
+            )
+            candidate_sorted = torch.sort(
+                candidate_plan.selected_frontier.detach().to(device="cpu", dtype=torch.long)
+            ).values
+            expected_sorted = torch.sort(
+                selected_membership.detach().to(device="cpu", dtype=torch.long)
+            ).values
+            if (
+                candidate_plan.selected_frontier.numel() != reference_size
+                or candidate_sorted.numel() != expected_sorted.numel()
+                or not torch.equal(candidate_sorted, expected_sorted)
+            ):
+                fallback_to_reference = True
+                fallback_reason = "planner_v1_execution_membership_mismatch"
+            elif bool(
+                visited.detach()
+                .to(device="cpu", dtype=torch.bool)
+                .flatten()[
+                    candidate_plan.selected_frontier.detach().to(device="cpu", dtype=torch.long)
+                ]
+                .any()
+                .item()
+            ):
+                fallback_to_reference = True
+                fallback_reason = "planner_v1_execution_contains_visited_feature"
+            else:
+                selected_plan = candidate_plan
+        except Exception as exc:  # pragma: no cover - defensive fail-closed path
+            fallback_to_reference = True
+            fallback_reason = f"planner_v1_execution_error:{type(exc).__name__}"
+
+    if fallback_to_reference:
+        selected_plan = reference_plan
+        telemetry["scheduler_planner_v2_selection_applied"] = False
+        telemetry["scheduler_planner_v2_selection_changed_membership"] = False
+        telemetry["scheduler_planner_v2_fallback_to_reference"] = True
+        telemetry["scheduler_planner_v2_fallback_reason"] = fallback_reason
+
+    planner_v2_invariants: dict[str, object] = {
+        "planner_v2_attempted": True,
+        "planner_v2_selection_applied": bool(
+            telemetry.get("scheduler_planner_v2_selection_applied", False)
+        ),
+        "planner_v2_changed_membership": bool(
+            telemetry.get("scheduler_planner_v2_selection_changed_membership", False)
+        ),
+        "planner_v2_fallback_to_reference": bool(
+            telemetry.get("scheduler_planner_v2_fallback_to_reference", False)
+        ),
+        "planner_v2_fallback_reason": telemetry.get("scheduler_planner_v2_fallback_reason"),
+        "planner_v2_replacement_count": int(
+            telemetry.get("scheduler_planner_v2_replacement_count", 0)
+        ),
+        "planner_v2_selected_score_ratio": _safe_float(
+            telemetry.get("scheduler_planner_v2_selected_score_ratio")
+        ),
+        "planner_v2_group_count_delta": int(
+            telemetry.get("scheduler_planner_v2_group_count_delta", 0)
+        ),
+    }
+
+    selected_plan = _Phase4FrontierPlan(
+        selected_frontier=selected_plan.selected_frontier,
+        batch_boundaries=selected_plan.batch_boundaries,
+        selected_membership_hash=selected_plan.selected_membership_hash,
+        selected_order_hash=selected_plan.selected_order_hash,
+        locality_fragmentation_summary=selected_plan.locality_fragmentation_summary,
+        boundary_reason_counts=selected_plan.boundary_reason_counts,
+        invariant_summary={**selected_plan.invariant_summary, **planner_v2_invariants},
+    )
+
+    return selected_plan, candidate_window, telemetry
 
 
 def _build_phase4_batch_locality_summary(
@@ -4053,23 +4551,38 @@ def _run_attribution(
 
                 planner_v2_candidate_window = torch.empty(0, dtype=torch.long)
                 planner_v2_refresh_telemetry = _build_phase4_planner_v2_refresh_telemetry_disabled()
-                if phase4_scheduler_config.requested_mode == "planner_v2":
+                if (
+                    phase4_scheduler_config.requested_mode == "planner_v2"
+                    and phase4_frontier_plan is not None
+                ):
                     planner_v2_candidate_scores = feature_influences[unvisited_feature_rank]
-                    planner_v2_candidate_window, planner_v2_refresh_telemetry = (
-                        _build_phase4_planner_v2_candidate_window(
-                            unvisited_feature_rank,
-                            reference_frontier=pending,
-                            reference_frontier_size=queue_size,
-                            candidate_scores=planner_v2_candidate_scores,
-                        )
+                    (
+                        phase4_frontier_plan,
+                        planner_v2_candidate_window,
+                        planner_v2_refresh_telemetry,
+                    ) = _apply_phase4_planner_v2_refresh_plan(
+                        reference_plan=phase4_frontier_plan,
+                        unvisited_feature_rank=unvisited_feature_rank,
+                        candidate_scores=planner_v2_candidate_scores,
+                        visited=visited,
+                        max_batch_size=phase4_feature_batch_size,
+                        max_batches=update_interval,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
                     )
+                    pending = phase4_frontier_plan.selected_frontier
+                    queue_size = int(pending.numel())
                     if phase4_scheduler_config.debug:
                         logger.info(
-                            "Phase 4 planner_v2 candidate window | "
+                            "Phase 4 planner_v2 refresh | "
                             f"reference_frontier_size={planner_v2_refresh_telemetry.get('scheduler_planner_v2_reference_frontier_size')} | "
                             f"candidate_window_size={planner_v2_refresh_telemetry.get('scheduler_planner_v2_candidate_window_size')} | "
-                            "candidate_window_order_hash="
-                            f"{planner_v2_refresh_telemetry.get('scheduler_planner_v2_candidate_window_order_hash')}"
+                            f"changed_membership={planner_v2_refresh_telemetry.get('scheduler_planner_v2_selection_changed_membership')} | "
+                            f"fallback={planner_v2_refresh_telemetry.get('scheduler_planner_v2_fallback_to_reference')} | "
+                            f"fallback_reason={planner_v2_refresh_telemetry.get('scheduler_planner_v2_fallback_reason')}"
                         )
                 phase4_plan_telemetry = _build_phase4_scheduler_plan_telemetry(
                     phase4_frontier_plan=phase4_frontier_plan,

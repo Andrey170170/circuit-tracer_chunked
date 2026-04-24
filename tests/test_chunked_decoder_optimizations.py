@@ -12,6 +12,8 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_batch_locality_summary,
     _build_phase4_normalization_stats,
     _build_phase4_planner_v2_candidate_window,
+    _select_phase4_planner_v2_membership,
+    _apply_phase4_planner_v2_refresh_plan,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
@@ -886,6 +888,136 @@ def test_phase4_planner_v2_candidate_window_handles_empty_reference_and_short_un
     assert telemetry["scheduler_planner_v2_candidate_window_size"] == 0
     assert telemetry["scheduler_planner_v2_candidate_window_order_hash"] is None
     assert telemetry["scheduler_planner_v2_candidate_window_includes_reference"] is True
+
+
+def test_phase4_planner_v2_selection_preserves_locked_prefix_and_bounds() -> None:
+    selected_membership, telemetry = _select_phase4_planner_v2_membership(
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.long),
+        reference_frontier=torch.tensor([0, 4, 5, 6], dtype=torch.long),
+        reference_frontier_size=4,
+        candidate_window=torch.tensor([0, 1, 2, 3, 4, 5, 6], dtype=torch.long),
+        candidate_scores=torch.tensor(
+            [1.0, 0.9995, 0.999, 0.9985, 0.998, 0.9975, 0.997, 0.9965],
+            dtype=torch.float64,
+        ),
+        visited=torch.zeros(8, dtype=torch.bool),
+        feat_layers=torch.tensor([0, 0, 1, 0, 1, 2, 3, 1], dtype=torch.long),
+        feat_ids=torch.zeros(8, dtype=torch.long),
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert telemetry["scheduler_planner_v2_selection_applied"] is True
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is False
+    assert selected_membership.numel() == 4
+    assert torch.unique(selected_membership).numel() == 4
+    assert {0, 4}.issubset(set(selected_membership.tolist()))
+    assert int(telemetry["scheduler_planner_v2_replacement_count"]) <= 1
+    assert float(telemetry["scheduler_planner_v2_selected_score_ratio"]) >= 0.995
+
+
+def test_phase4_planner_v2_selection_falls_back_when_score_ratio_fails() -> None:
+    selected_membership, telemetry = _select_phase4_planner_v2_membership(
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long),
+        reference_frontier=torch.tensor([0, 3, 4, 5], dtype=torch.long),
+        reference_frontier_size=4,
+        candidate_window=torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long),
+        candidate_scores=torch.tensor([1.0, 0.5, 0.49, 0.99, 0.98, 0.97], dtype=torch.float64),
+        visited=torch.zeros(6, dtype=torch.bool),
+        feat_layers=torch.tensor([0, 0, 0, 1, 2, 3], dtype=torch.long),
+        feat_ids=torch.zeros(6, dtype=torch.long),
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert telemetry["scheduler_planner_v2_selection_applied"] is False
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is True
+    assert telemetry["scheduler_planner_v2_fallback_reason"] == "score_ratio_below_threshold"
+    assert torch.equal(selected_membership, torch.tensor([0, 3, 4, 5], dtype=torch.long))
+
+
+def test_phase4_planner_v2_refresh_fallback_reuses_reference_plan_when_invalid() -> None:
+    feat_layers = torch.tensor([0, 0, 1, 0, 1, 2, 3, 1], dtype=torch.long)
+    feat_positions = torch.arange(8, dtype=torch.long)
+    feat_ids = torch.zeros(8, dtype=torch.long)
+    reference_plan = _plan_phase4_frontier_membership_preserving_v1(
+        torch.tensor([0, 4, 5, 6], dtype=torch.long),
+        max_batch_size=2,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+        apply_locality_reorder=False,
+    )
+    visited = torch.zeros(8, dtype=torch.bool)
+    visited[4] = True
+
+    selected_plan, _candidate_window, telemetry = _apply_phase4_planner_v2_refresh_plan(
+        reference_plan=reference_plan,
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.long),
+        candidate_scores=torch.tensor(
+            [1.0, 0.9995, 0.999, 0.9985, 0.998, 0.9975, 0.997, 0.9965],
+            dtype=torch.float64,
+        ),
+        visited=visited,
+        max_batch_size=2,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is True
+    assert telemetry["scheduler_planner_v2_fallback_reason"] == "reference_contains_visited_feature"
+    assert torch.equal(selected_plan.selected_frontier, reference_plan.selected_frontier)
+    assert selected_plan.batch_boundaries == reference_plan.batch_boundaries
+    assert selected_plan.invariant_summary["planner_v2_fallback_to_reference"] is True
+
+
+def test_phase4_planner_v2_refresh_can_change_membership_for_better_grouping() -> None:
+    feat_layers = torch.tensor([0, 0, 1, 0, 1, 2, 3, 1], dtype=torch.long)
+    feat_positions = torch.arange(8, dtype=torch.long)
+    feat_ids = torch.zeros(8, dtype=torch.long)
+    reference_plan = _plan_phase4_frontier_membership_preserving_v1(
+        torch.tensor([0, 4, 5, 6], dtype=torch.long),
+        max_batch_size=2,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+        apply_locality_reorder=False,
+    )
+
+    selected_plan, _candidate_window, telemetry = _apply_phase4_planner_v2_refresh_plan(
+        reference_plan=reference_plan,
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.long),
+        candidate_scores=torch.tensor(
+            [1.0, 0.9995, 0.999, 0.9985, 0.998, 0.9975, 0.997, 0.9965],
+            dtype=torch.float64,
+        ),
+        visited=torch.zeros(8, dtype=torch.bool),
+        max_batch_size=2,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert telemetry["scheduler_planner_v2_selection_applied"] is True
+    assert telemetry["scheduler_planner_v2_selection_changed_membership"] is True
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is False
+    assert int(telemetry["scheduler_planner_v2_replacement_count"]) == 1
+    assert int(telemetry["scheduler_planner_v2_group_count_delta"]) >= 1
+    assert selected_plan.selected_membership_hash != reference_plan.selected_membership_hash
+    assert selected_plan.invariant_summary["planner_v2_changed_membership"] is True
 
 
 def test_phase4_scheduler_plan_telemetry_reports_full_frontier_planner_metadata() -> None:
