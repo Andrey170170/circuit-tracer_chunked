@@ -53,6 +53,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_phase4_ranker,
     _resolve_phase4_ranker_config,
     _build_phase4_ranker_metadata,
+    _select_phase4_frontier_rank_selection,
     _resolve_row_store_cache_control,
     _resolve_row_store_cache_control_config,
     _build_row_store_cache_control_metadata,
@@ -1022,7 +1023,7 @@ def test_phase4_refresh_queue_window_size_scales_with_multiplier_and_reduces_ref
     assert deferred_refreshes < standard_refreshes
 
 
-def test_phase4_ranker_config_validates_and_falls_back_to_argsort() -> None:
+def test_phase4_ranker_config_validates_and_tracks_effective_mode() -> None:
     assert _resolve_phase4_ranker("argsort") == "argsort"
     assert _resolve_phase4_ranker("topk_v1") == "topk_v1"
     with pytest.raises(ValueError, match="phase4_ranker must be one of"):
@@ -1031,9 +1032,58 @@ def test_phase4_ranker_config_validates_and_falls_back_to_argsort() -> None:
     config = _resolve_phase4_ranker_config("topk_v1")
     metadata = _build_phase4_ranker_metadata(config)
     assert metadata["ranker_requested"] == "topk_v1"
-    assert metadata["ranker_effective"] == "argsort"
+    assert metadata["ranker_effective"] == "topk_v1"
     assert metadata["ranker_default"] == "argsort"
-    assert metadata["ranker_reference_execution"] is True
+    assert metadata["ranker_reference_execution"] is False
+
+
+def test_phase4_ranker_topk_matches_argsort_frontier_without_ties() -> None:
+    feature_influences = torch.tensor([0.9, 0.2, 0.8, 0.7, 0.1, 0.6], dtype=torch.float64)
+    visited = torch.tensor([False, True, False, False, False, False], dtype=torch.bool)
+
+    argsort_selection = _select_phase4_frontier_rank_selection(
+        feature_influences=feature_influences,
+        visited=visited,
+        frontier_size=3,
+        ranker_mode="argsort",
+    )
+    topk_selection = _select_phase4_frontier_rank_selection(
+        feature_influences=feature_influences,
+        visited=visited,
+        frontier_size=3,
+        ranker_mode="topk_v1",
+    )
+
+    assert torch.equal(topk_selection.selected_frontier, argsort_selection.selected_frontier)
+    assert topk_selection.selected_order_hash == argsort_selection.selected_order_hash
+    assert topk_selection.tie_at_cutoff is False
+
+
+def test_phase4_ranker_topk_tie_metadata_documents_cutoff_membership_behavior() -> None:
+    feature_influences = torch.tensor([1.0, 0.5, 0.5, 0.1], dtype=torch.float64)
+    visited = torch.zeros(4, dtype=torch.bool)
+
+    argsort_selection = _select_phase4_frontier_rank_selection(
+        feature_influences=feature_influences,
+        visited=visited,
+        frontier_size=2,
+        ranker_mode="argsort",
+    )
+    topk_selection = _select_phase4_frontier_rank_selection(
+        feature_influences=feature_influences,
+        visited=visited,
+        frontier_size=2,
+        ranker_mode="topk_v1",
+    )
+
+    topk_set = set(topk_selection.selected_frontier.tolist())
+    assert topk_selection.selected_count == 2
+    assert 0 in topk_set
+    assert topk_set.issubset({0, 1, 2})
+    assert topk_selection.tie_count_at_cutoff >= 2
+    assert topk_selection.tie_at_cutoff is True
+    assert "ties at the cutoff" in topk_selection.tie_behavior
+    assert "argsort" in argsort_selection.tie_behavior
 
 
 def test_row_store_cache_control_config_validates_and_falls_back_to_off() -> None:

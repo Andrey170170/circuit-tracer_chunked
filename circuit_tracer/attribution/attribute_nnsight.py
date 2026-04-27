@@ -204,7 +204,19 @@ _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
 _PHASE4_RANKER_DEFAULT: Literal["argsort"] = "argsort"
 _PHASE4_RANKER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "argsort": "argsort",
-    "topk_v1": "argsort",
+    "topk_v1": "topk_v1",
+}
+
+_PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE: dict[str, str] = {
+    "argsort": (
+        "argsort preserves the current behavior; equal-score ordering follows torch.argsort "
+        "backend semantics."
+    ),
+    "topk_v1": (
+        "topk_v1 uses torch.topk for frontier membership; ties at the cutoff can select a "
+        "different equal-score member than argsort. Selected members are then ordered by "
+        "descending score (deterministic index tie-break for telemetry/debug stability)."
+    ),
 }
 
 _ROW_STORE_CACHE_CONTROL_DEFAULT: Literal["off"] = "off"
@@ -342,6 +354,20 @@ class _Phase4FrontierPlan:
     locality_fragmentation_summary: dict[str, object]
     boundary_reason_counts: dict[str, int]
     invariant_summary: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _Phase4FrontierRankSelection:
+    selected_frontier: torch.Tensor
+    selected_scores: torch.Tensor
+    candidate_count: int
+    selected_count: int
+    selected_order_hash: str | None
+    selected_membership_hash: str | None
+    cutoff_score: float | None
+    tie_count_at_cutoff: int
+    tie_at_cutoff: bool
+    tie_behavior: str
 
 
 def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype:
@@ -1606,6 +1632,169 @@ def _build_phase4_ranker_metadata(
             phase4_ranker_config.requested_mode != phase4_ranker_config.effective_mode
         ),
     }
+
+
+def _rank_phase4_unvisited_features_argsort(
+    feature_influences: torch.Tensor,
+    visited: torch.Tensor,
+) -> torch.Tensor:
+    feature_rank = (
+        torch.argsort(feature_influences, descending=True)
+        .detach()
+        .to(
+            device="cpu",
+            dtype=torch.long,
+        )
+    )
+    visited_cpu = visited.detach().to(device="cpu", dtype=torch.bool).flatten()
+    if visited_cpu.numel() != feature_rank.numel():
+        raise ValueError(
+            "feature_influences and visited must have matching flattened lengths "
+            f"(got {feature_rank.numel()} and {visited_cpu.numel()})"
+        )
+    return feature_rank[~visited_cpu[feature_rank]]
+
+
+def _compute_phase4_rank_selection_cutoff_metadata(
+    *,
+    unvisited_scores: torch.Tensor,
+    selected_scores: torch.Tensor,
+    selected_count: int,
+    candidate_count: int,
+) -> tuple[float | None, int, bool]:
+    if selected_count <= 0 or candidate_count <= 0 or unvisited_scores.numel() <= 0:
+        return None, 0, False
+
+    scores_cpu = unvisited_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+    selected_scores_cpu = selected_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+    if scores_cpu.numel() < candidate_count:
+        candidate_count = int(scores_cpu.numel())
+        selected_count = min(selected_count, candidate_count)
+    if selected_scores_cpu.numel() < selected_count:
+        selected_count = int(selected_scores_cpu.numel())
+
+    if selected_count <= 0:
+        return None, 0, False
+
+    cutoff_score = float(selected_scores_cpu[selected_count - 1].item())
+    tie_count_at_cutoff = int((scores_cpu[:candidate_count] == cutoff_score).sum().item())
+    strictly_greater_count = int((scores_cpu[:candidate_count] > cutoff_score).sum().item())
+    tie_at_cutoff = bool(
+        selected_count < candidate_count
+        and tie_count_at_cutoff > 1
+        and strictly_greater_count < selected_count
+    )
+    return cutoff_score, tie_count_at_cutoff, tie_at_cutoff
+
+
+def _select_phase4_frontier_rank_selection(
+    *,
+    feature_influences: torch.Tensor,
+    visited: torch.Tensor,
+    frontier_size: int,
+    ranker_mode: Literal["argsort", "topk_v1"],
+) -> _Phase4FrontierRankSelection:
+    if frontier_size < 0:
+        raise ValueError("frontier_size must be >= 0")
+
+    visited_cpu = visited.detach().to(device="cpu", dtype=torch.bool).flatten()
+    if feature_influences.numel() != visited_cpu.numel():
+        raise ValueError(
+            "feature_influences and visited must have matching flattened lengths "
+            f"(got {feature_influences.numel()} and {visited_cpu.numel()})"
+        )
+
+    candidate_count = int((~visited_cpu).sum().item())
+    selected_count = min(int(frontier_size), candidate_count)
+    if selected_count <= 0:
+        return _Phase4FrontierRankSelection(
+            selected_frontier=torch.empty(0, dtype=torch.long),
+            selected_scores=torch.empty(0, dtype=torch.float64),
+            candidate_count=candidate_count,
+            selected_count=0,
+            selected_order_hash=None,
+            selected_membership_hash=None,
+            cutoff_score=None,
+            tie_count_at_cutoff=0,
+            tie_at_cutoff=False,
+            tie_behavior=_PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE[ranker_mode],
+        )
+
+    if ranker_mode == "argsort":
+        unvisited_rank = _rank_phase4_unvisited_features_argsort(feature_influences, visited_cpu)
+        unvisited_scores = (
+            feature_influences[unvisited_rank.to(feature_influences.device)]
+            .detach()
+            .to(device="cpu", dtype=torch.float64)
+        )
+        selected_frontier = unvisited_rank[:selected_count]
+        selected_scores = unvisited_scores[:selected_count]
+    else:
+        unvisited_indices = (
+            torch.nonzero(~visited_cpu, as_tuple=False).flatten().to(dtype=torch.long)
+        )
+        if unvisited_indices.numel() != candidate_count:
+            raise RuntimeError(
+                "Phase-4 topk_v1 candidate_count mismatch against unvisited index selection "
+                f"(count={candidate_count}, selected={int(unvisited_indices.numel())})"
+            )
+        unvisited_scores_device = feature_influences[
+            unvisited_indices.to(feature_influences.device)
+        ]
+        top_scores, top_positions = torch.topk(
+            unvisited_scores_device,
+            k=selected_count,
+            largest=True,
+            sorted=False,
+        )
+        top_scores_cpu = top_scores.detach().to(device="cpu", dtype=torch.float64)
+        top_indices_cpu = unvisited_indices[
+            top_positions.detach().to(device="cpu", dtype=torch.long)
+        ]
+
+        selected_entries = sorted(
+            zip(top_indices_cpu.tolist(), top_scores_cpu.tolist(), strict=False),
+            key=lambda item: (-float(item[1]), int(item[0])),
+        )
+        selected_frontier = torch.tensor(
+            [int(index) for index, _ in selected_entries],
+            dtype=torch.long,
+        )
+        selected_scores = torch.tensor(
+            [float(score) for _, score in selected_entries],
+            dtype=torch.float64,
+        )
+        unvisited_scores = unvisited_scores_device.detach().to(device="cpu", dtype=torch.float64)
+
+    cutoff_score, tie_count_at_cutoff, tie_at_cutoff = (
+        _compute_phase4_rank_selection_cutoff_metadata(
+            unvisited_scores=unvisited_scores,
+            selected_scores=selected_scores,
+            selected_count=selected_count,
+            candidate_count=candidate_count,
+        )
+    )
+
+    selected_membership_hash = (
+        _hash_index_tensor(torch.sort(selected_frontier).values)
+        if selected_frontier.numel() > 0
+        else None
+    )
+    selected_order_hash = (
+        _hash_index_tensor(selected_frontier) if selected_frontier.numel() > 0 else None
+    )
+    return _Phase4FrontierRankSelection(
+        selected_frontier=selected_frontier,
+        selected_scores=selected_scores,
+        candidate_count=candidate_count,
+        selected_count=selected_count,
+        selected_order_hash=selected_order_hash,
+        selected_membership_hash=selected_membership_hash,
+        cutoff_score=cutoff_score,
+        tie_count_at_cutoff=tie_count_at_cutoff,
+        tie_at_cutoff=tie_at_cutoff,
+        tie_behavior=_PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE[ranker_mode],
+    )
 
 
 def _resolve_row_store_cache_control(
@@ -4158,8 +4347,10 @@ def attribute(
             used by ``"deferred_v1"`` to scale the Phase-4 pending/frontier
             queue window while keeping executor microbatch sizing unchanged.
         phase4_ranker: Requested Phase-4 ranking implementation.
-            ``"argsort"`` keeps current behavior; ``"topk_v1"`` is currently
-            validated/plumbed only and falls back to argsort execution.
+            ``"argsort"`` keeps current behavior; ``"topk_v1"`` uses
+            ``torch.topk`` for Phase-4 frontier membership selection (next-K
+            pending window), then orders selected entries by descending score.
+            For equal scores at the cutoff, membership may differ from argsort.
         row_store_cache_control: Requested compact row-store cache control mode.
             ``"off"`` keeps current behavior;
             ``"fadvise_dontneed_after_append_v1"`` is currently validated/
@@ -5741,14 +5932,54 @@ def _run_attribution(
                         refresh_influence_matmul_elapsed_ms
                     )
 
+                max_frontier_size = min(
+                    _compute_phase4_refresh_queue_window_size(
+                        update_interval=update_interval,
+                        phase4_feature_batch_size=phase4_feature_batch_size,
+                        queue_multiplier=phase4_refresh_queue_multiplier,
+                    ),
+                    int(actual_max_feature_nodes - n_visited),
+                )
+
                 rank_topk_start = time.perf_counter()
-                feature_rank = torch.argsort(feature_influences, descending=True).cpu()
-                unvisited_feature_rank = feature_rank[~visited[feature_rank]]
+                rank_selection = _select_phase4_frontier_rank_selection(
+                    feature_influences=feature_influences,
+                    visited=visited,
+                    frontier_size=max_frontier_size,
+                    ranker_mode=phase4_ranker_config.effective_mode,
+                )
+                pending_candidates = rank_selection.selected_frontier
+                unvisited_feature_rank: torch.Tensor | None = None
+                if (
+                    phase4_scheduler_config.requested_mode == "planner_v2"
+                    or phase4_debug_summary_enabled
+                ):
+                    unvisited_feature_rank = _rank_phase4_unvisited_features_argsort(
+                        feature_influences,
+                        visited,
+                    )
+
+                ranker_refresh_telemetry = {
+                    "ranker_frontier_candidate_count": int(rank_selection.candidate_count),
+                    "ranker_frontier_selected_count": int(rank_selection.selected_count),
+                    "ranker_frontier_selected_hash": rank_selection.selected_order_hash,
+                    "ranker_frontier_selected_order_hash": rank_selection.selected_order_hash,
+                    "ranker_frontier_selected_membership_hash": (
+                        rank_selection.selected_membership_hash
+                    ),
+                    "ranker_frontier_cutoff_score": rank_selection.cutoff_score,
+                    "ranker_frontier_tie_count_at_cutoff": int(rank_selection.tie_count_at_cutoff),
+                    "ranker_frontier_tie_at_cutoff": bool(rank_selection.tie_at_cutoff),
+                    "ranker_frontier_tie_behavior": rank_selection.tie_behavior,
+                }
                 candidate_scores: torch.Tensor | None = None
                 rank_signal_stats: dict[str, object] | None = None
                 normalization_input_stats: dict[str, object] | None = None
                 if phase4_debug_summary_enabled:
-                    candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
+                    if unvisited_feature_rank is not None:
+                        candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
+                    else:
+                        candidate_scores = rank_selection.selected_scores
                     rank_signal_stats = _build_vector_stats(
                         candidate_scores,
                         epsilon=1e-12,
@@ -5779,15 +6010,6 @@ def _run_attribution(
                     if feature_row_store_snapshot_after is not None
                     else None
                 )
-                max_frontier_size = min(
-                    _compute_phase4_refresh_queue_window_size(
-                        update_interval=update_interval,
-                        phase4_feature_batch_size=phase4_feature_batch_size,
-                        queue_multiplier=phase4_refresh_queue_multiplier,
-                    ),
-                    int(actual_max_feature_nodes - n_visited),
-                )
-                pending_candidates = unvisited_feature_rank[:max_frontier_size]
                 refresh_rank_topk_elapsed_ms = (time.perf_counter() - rank_topk_start) * 1000.0
                 phase4_refresh_rank_topk_elapsed_ms_total += refresh_rank_topk_elapsed_ms
 
@@ -5841,6 +6063,7 @@ def _run_attribution(
                     phase4_scheduler_config.requested_mode == "planner_v2"
                     and phase4_frontier_plan is not None
                 ):
+                    assert unvisited_feature_rank is not None
                     planner_v2_candidate_scores = feature_influences[unvisited_feature_rank]
                     (
                         phase4_frontier_plan,
@@ -5909,13 +6132,14 @@ def _run_attribution(
                         "refresh_index": refresh_index,
                         "stored_rows": int(st),
                         "visited_features": int(n_visited),
-                        "frontier_candidate_count": int(unvisited_feature_rank.numel()),
+                        "frontier_candidate_count": int(rank_selection.candidate_count),
                         "queue_size": int(queue_size),
                         "pending_count": int(pending.numel()),
                         "pending_hash": _hash_index_tensor(pending)
                         if pending.numel() > 0
                         else None,
                         **phase4_execution_metadata,
+                        **ranker_refresh_telemetry,
                         **planner_v2_refresh_telemetry,
                         **phase4_plan_telemetry,
                         **refresh_substage_telemetry,
@@ -6049,7 +6273,7 @@ def _run_attribution(
                             "refresh_index": refresh_index,
                             "stored_rows": int(st),
                             "visited_features": int(n_visited),
-                            "frontier_candidate_count": int(unvisited_feature_rank.numel()),
+                            "frontier_candidate_count": int(rank_selection.candidate_count),
                             "queue_size": int(queue_size),
                             "pending_count": int(pending.numel()),
                             "pending_hash": (
@@ -6064,6 +6288,7 @@ def _run_attribution(
                                 else None
                             ),
                             **phase4_execution_metadata,
+                            **ranker_refresh_telemetry,
                             **planner_v2_refresh_telemetry,
                             **phase4_plan_telemetry,
                             **refresh_substage_telemetry,
@@ -6116,6 +6341,7 @@ def _run_attribution(
                     assert isinstance(debug_records, list) and debug_records
                     current_debug_record = debug_records[-1]
                     assert isinstance(current_debug_record, dict)
+                    assert unvisited_feature_rank is not None
                     deterministic_pending = _build_phase4_deterministic_shadow_pending(
                         unvisited_feature_rank,
                         feature_influences.detach().cpu(),
