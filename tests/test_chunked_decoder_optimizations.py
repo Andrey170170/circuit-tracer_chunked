@@ -11,6 +11,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_cross_cluster_runtime_snapshot,
     _build_matrix_abs_stats,
     _build_feature_semantic_descriptors_payload,
+    _build_phase0_donor_bundle_payload,
     _build_phase4_normalization_stats,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
@@ -827,6 +828,59 @@ def test_build_phase3_seed_bundle_payload_canonicalizes_cpu_tensors() -> None:
     assert torch.equal(
         payload["frontier_post_locality"],
         torch.tensor([0, 2], dtype=torch.int64),
+    )
+
+
+def test_build_phase0_donor_bundle_payload_captures_hashes_and_metadata() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[1, 0], [0, 1], [3, 2]], dtype=torch.int64),
+        values=torch.tensor([0.25, -0.5], dtype=torch.bfloat16),
+        size=(3, 2, 8),
+        check_invariants=True,
+    ).coalesce()
+
+    payload = _build_phase0_donor_bundle_payload(
+        activation_matrix=activation_matrix,
+        input_tokens=torch.tensor([11, 22, 33], dtype=torch.int64),
+        target_token_ids=torch.tensor([2, 4], dtype=torch.int64),
+        target_probabilities=torch.tensor([0.7, 0.2], dtype=torch.float32),
+        target_logits=torch.tensor([3.5, -1.0], dtype=torch.float32),
+        transcoder_diagnostic_snapshot={
+            "phase0_boundary_fingerprints": {
+                "transcoder_constant_fingerprints": {"global_hash": "clt1234"}
+            }
+        },
+        status="captured",
+    )
+
+    assert payload["schema_version"] == 1
+    assert payload["replay_kind"] == "phase0_active_features_v1"
+    assert payload["status"] == "captured"
+    assert payload["activation_values_dtype"] == "bfloat16"
+    assert payload["activation_matrix_shape"] == [3, 2, 8]
+    assert payload["active_feature_count"] == 2
+    assert payload["input_token_count"] == 3
+    assert payload["target_count"] == 2
+    assert payload["clt_constants_hash"] == "clt1234"
+    assert isinstance(payload["active_feature_membership_hash_raw_order"], str)
+    assert isinstance(payload["active_feature_membership_hash_canonical"], str)
+    assert isinstance(payload["active_feature_values_hash"], str)
+    assert isinstance(payload["input_tokens_hash"], str)
+    assert isinstance(payload["target_token_ids_hash"], str)
+    assert isinstance(payload["target_probability_hash"], str)
+    assert isinstance(payload["target_logit_hash"], str)
+
+    assert torch.equal(
+        cast(torch.Tensor, payload["active_features"]),
+        activation_matrix.indices().T.to(dtype=torch.int64),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, payload["activation_values"]),
+        activation_matrix.values().to(dtype=torch.bfloat16),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, payload["active_feature_layer_counts"]),
+        torch.tensor([1, 1, 0], dtype=torch.int64),
     )
 
 

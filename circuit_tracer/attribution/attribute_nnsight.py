@@ -711,6 +711,54 @@ def _hash_float_tensor(values: torch.Tensor, *, dtype: torch.dtype = torch.float
     return hashlib.blake2s(values_cpu.numpy().tobytes(), digest_size=8).hexdigest()
 
 
+def _hash_tensor_raw_bytes(values: torch.Tensor) -> str:
+    values_cpu = values.detach().to(device="cpu").contiguous()
+    raw_byte_view = values_cpu.view(torch.uint8)
+    return hashlib.blake2s(raw_byte_view.numpy().tobytes(), digest_size=8).hexdigest()
+
+
+def _extract_clt_constants_hash_from_snapshot(
+    transcoder_diagnostic_snapshot: dict[str, object] | None,
+) -> str | None:
+    if not isinstance(transcoder_diagnostic_snapshot, dict):
+        return None
+
+    def _extract_from_boundary_fingerprints(payload: object) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        constants = payload.get("transcoder_constant_fingerprints")
+        if isinstance(constants, dict):
+            global_hash = constants.get("global_hash")
+            if isinstance(global_hash, str) and global_hash:
+                return global_hash
+        global_hashes = payload.get("global_hashes")
+        if isinstance(global_hashes, dict):
+            constants_hash = global_hashes.get("transcoder_constants_global_hash")
+            if isinstance(constants_hash, str) and constants_hash:
+                return constants_hash
+        return None
+
+    boundary_hash = _extract_from_boundary_fingerprints(
+        transcoder_diagnostic_snapshot.get("phase0_boundary_fingerprints")
+    )
+    if boundary_hash:
+        return boundary_hash
+
+    threshold_membership = transcoder_diagnostic_snapshot.get("phase0_threshold_membership")
+    if isinstance(threshold_membership, dict):
+        constants = threshold_membership.get("transcoder_constant_fingerprints")
+        if isinstance(constants, dict):
+            global_hash = constants.get("global_hash")
+            if isinstance(global_hash, str) and global_hash:
+                return global_hash
+        global_hashes = threshold_membership.get("global_hashes")
+        if isinstance(global_hashes, dict):
+            constants_hash = global_hashes.get("transcoder_constants_global_hash")
+            if isinstance(constants_hash, str) and constants_hash:
+                return constants_hash
+    return None
+
+
 def _build_vector_stats(
     vector: torch.Tensor,
     *,
@@ -1033,6 +1081,105 @@ def _build_phase4_cutoff_debug(
         "exact_cutoff_count": exact_cutoff_count,
         "window_scores": window_scores,
     }
+
+
+def _build_phase0_donor_bundle_payload(
+    *,
+    activation_matrix: torch.Tensor,
+    input_tokens: torch.Tensor,
+    target_token_ids: torch.Tensor,
+    target_probabilities: torch.Tensor | None,
+    target_logits: torch.Tensor | None,
+    transcoder_diagnostic_snapshot: dict[str, object] | None,
+    status: str,
+) -> dict[str, object]:
+    activation_matrix_coalesced = activation_matrix.coalesce()
+    activation_indices = (
+        activation_matrix_coalesced.indices().detach().to(device="cpu", dtype=torch.int64)
+    )
+    activation_values = activation_matrix_coalesced.values().detach().to(device="cpu").contiguous()
+    active_features = activation_indices.T.contiguous()
+    activation_shape = [int(dim) for dim in activation_matrix_coalesced.shape]
+
+    n_layers = int(activation_shape[0]) if activation_shape else 0
+    layer_counts = (
+        torch.bincount(active_features[:, 0], minlength=n_layers)
+        if active_features.numel() > 0
+        else torch.zeros((n_layers,), dtype=torch.int64)
+    )
+
+    input_tokens_cpu = input_tokens.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    target_token_ids_cpu = (
+        target_token_ids.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    )
+    target_probabilities_cpu = (
+        target_probabilities.detach().to(device="cpu").contiguous()
+        if isinstance(target_probabilities, torch.Tensor)
+        else None
+    )
+    target_logits_cpu = (
+        target_logits.detach().to(device="cpu").contiguous()
+        if isinstance(target_logits, torch.Tensor)
+        else None
+    )
+
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "replay_kind": "phase0_active_features_v1",
+        "status": str(status),
+        "active_features": active_features,
+        "activation_values": activation_values,
+        "activation_values_dtype": str(activation_values.dtype).replace("torch.", ""),
+        "activation_matrix_shape": activation_shape,
+        "active_feature_count": int(activation_values.numel()),
+        "active_feature_membership_hash_raw_order": _hash_sparse_membership_indices(
+            activation_indices,
+            shape=activation_shape,
+            canonicalize=False,
+        ),
+        "active_feature_membership_hash_canonical": _hash_sparse_membership_indices(
+            activation_indices,
+            shape=activation_shape,
+            canonicalize=True,
+        ),
+        "active_feature_values_hash": _hash_tensor_raw_bytes(activation_values),
+        "active_feature_layer_counts": layer_counts,
+        "input_tokens": input_tokens_cpu,
+        "input_token_count": int(input_tokens_cpu.numel()),
+        "input_tokens_hash": _hash_index_tensor(input_tokens_cpu),
+        "target_token_ids": target_token_ids_cpu,
+        "target_count": int(target_token_ids_cpu.numel()),
+        "target_token_ids_hash": (
+            _hash_index_tensor(target_token_ids_cpu) if target_token_ids_cpu.numel() > 0 else None
+        ),
+        "provenance": {
+            "transcoder_diagnostic_snapshot_hash": (
+                _hash_json_payload(transcoder_diagnostic_snapshot)
+                if isinstance(transcoder_diagnostic_snapshot, dict)
+                else None
+            ),
+        },
+    }
+
+    if target_probabilities_cpu is not None:
+        payload["target_probabilities"] = target_probabilities_cpu
+        payload["target_probability_hash"] = _hash_float_tensor(
+            target_probabilities_cpu,
+            dtype=torch.float64,
+        )
+
+    if target_logits_cpu is not None:
+        payload["target_logits"] = target_logits_cpu
+        payload["target_logit_hash"] = _hash_float_tensor(
+            target_logits_cpu,
+            dtype=torch.float64,
+        )
+
+    clt_constants_hash = _extract_clt_constants_hash_from_snapshot(transcoder_diagnostic_snapshot)
+    if clt_constants_hash is not None:
+        payload["clt_constants_hash"] = clt_constants_hash
+
+    return payload
 
 
 def _build_phase3_seed_influence_topk(
@@ -1994,6 +2141,7 @@ def attribute(
     internal_precision: Literal["float32", "float64"] = "float64",
     phase4_anomaly_debug: bool = False,
     cross_cluster_debug: bool = False,
+    capture_phase0_donor_bundle: bool = False,
     capture_phase3_seed_bundle: bool = False,
     capture_feature_semantic_descriptors: bool = False,
     semantic_descriptor_top_k: int = 2048,
@@ -2066,6 +2214,8 @@ def attribute(
             Can also be activated via ``PHASE4_ANOMALY_DEBUG=1``.
         cross_cluster_debug: Enable broad scalar-only cross-cluster debug summary
             scaffolding (Phase 0 through pre-Phase-4 checkpoints).
+        capture_phase0_donor_bundle: Enable opt-in Phase-0 donor bundle payload
+            capture for compact exact-chunked runs.
         capture_phase3_seed_bundle: Enable opt-in Phase-3 seed-bundle payload
             capture for compact exact-chunked runs.
         capture_feature_semantic_descriptors: Enable opt-in bounded semantic
@@ -2133,6 +2283,7 @@ def attribute(
             internal_precision=internal_precision,
             phase4_anomaly_debug=phase4_anomaly_debug,
             cross_cluster_debug=cross_cluster_debug,
+            capture_phase0_donor_bundle=capture_phase0_donor_bundle,
             capture_phase3_seed_bundle=capture_phase3_seed_bundle,
             capture_feature_semantic_descriptors=capture_feature_semantic_descriptors,
             semantic_descriptor_top_k=semantic_descriptor_top_k,
@@ -2184,6 +2335,7 @@ def _run_attribution(
     internal_precision: Literal["float32", "float64"] = "float64",
     phase4_anomaly_debug: bool = False,
     cross_cluster_debug: bool = False,
+    capture_phase0_donor_bundle: bool = False,
     capture_phase3_seed_bundle: bool = False,
     capture_feature_semantic_descriptors: bool = False,
     semantic_descriptor_top_k: int = 2048,
@@ -2239,6 +2391,7 @@ def _run_attribution(
     planner_compute_dtype = _dtype_from_name(resolved_dtype_map["planner_compute_dtype"])
     shadow_debug_compute_dtype = _dtype_from_name(resolved_dtype_map["shadow_debug_compute_dtype"])
     cross_cluster_debug_enabled = bool(cross_cluster_debug)
+    capture_phase0_donor_bundle_enabled = bool(capture_phase0_donor_bundle)
     capture_phase3_seed_bundle_enabled = bool(capture_phase3_seed_bundle)
     capture_feature_semantic_descriptors_enabled = bool(capture_feature_semantic_descriptors)
     semantic_descriptor_top_k = int(semantic_descriptor_top_k)
@@ -2275,10 +2428,13 @@ def _run_attribution(
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
+            "capture_phase0_donor_bundle_enabled": capture_phase0_donor_bundle_enabled,
             "capture_phase3_seed_bundle_enabled": capture_phase3_seed_bundle_enabled,
             "capture_feature_semantic_descriptors_enabled": (
                 capture_feature_semantic_descriptors_enabled
             ),
+            "phase0_donor_bundle_schema_version": 1,
+            "phase0_donor_bundle_replay_kind": "phase0_active_features_v1",
             "semantic_descriptor_top_k": semantic_descriptor_top_k,
             "semantic_descriptor_dim": semantic_descriptor_dim,
         },
@@ -2319,6 +2475,11 @@ def _run_attribution(
     if cross_cluster_debug_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "cross_cluster_debug requires compact_output=True and exact_chunked_decoder=True"
+        )
+    if capture_phase0_donor_bundle_enabled and not (compact_output and exact_chunked_decoder):
+        raise ValueError(
+            "capture_phase0_donor_bundle requires compact_output=True and "
+            "exact_chunked_decoder=True"
         )
     if capture_phase3_seed_bundle_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
@@ -2427,6 +2588,7 @@ def _run_attribution(
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
     compact_output_result: dict[str, object] | None = None
+    phase0_donor_bundle_payload: dict[str, object] | None = None
     phase3_seed_bundle_payload: dict[str, object] | None = None
     feature_semantic_descriptors_payload: dict[str, object] | None = None
 
@@ -2786,9 +2948,10 @@ def _run_attribution(
         total_active_feats = activation_matrix._nnz()
 
         # Create AttributionTargets using NNSight's unembed_weight accessor
+        last_token_logits = ctx.get_last_token_logits()[0]
         targets = AttributionTargets(
             attribution_targets=attribution_targets,
-            logits=ctx.get_last_token_logits()[0],
+            logits=last_token_logits,
             unembed_proj=cast(torch.Tensor, model.unembed_weight),  # NNSight uses unembed_weight
             tokenizer=model.tokenizer,
             max_n_logits=max_n_logits,
@@ -2796,6 +2959,30 @@ def _run_attribution(
         )
 
         log_attribution_target_info(targets, attribution_targets, logger)
+        if capture_phase0_donor_bundle_enabled:
+            target_token_ids = torch.tensor(
+                [int(target.vocab_idx) for target in targets.logit_targets],
+                dtype=torch.int64,
+                device=last_token_logits.device,
+            )
+            valid_target_mask = (target_token_ids >= 0) & (
+                target_token_ids < int(last_token_logits.shape[0])
+            )
+            target_logits = (
+                last_token_logits[target_token_ids[valid_target_mask]]
+                if bool(valid_target_mask.any().item())
+                else None
+            )
+            phase0_donor_bundle_payload = _build_phase0_donor_bundle_payload(
+                activation_matrix=activation_matrix,
+                input_tokens=input_ids,
+                target_token_ids=target_token_ids,
+                target_probabilities=targets.logit_probabilities,
+                target_logits=target_logits,
+                transcoder_diagnostic_snapshot=_snapshot_diagnostics(model.transcoders),
+                status="captured",
+            )
+
         if cross_cluster_debug_summary is not None:
             phase1_runtime_summary, phase1_runtime_stream = _build_cross_cluster_runtime_snapshot(
                 device=model.device,
@@ -4523,9 +4710,25 @@ def _run_attribution(
                 "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
                 "cross_cluster_debug_enabled": bool(cross_cluster_debug_enabled),
+                "capture_phase0_donor_bundle_enabled": bool(capture_phase0_donor_bundle_enabled),
                 "capture_phase3_seed_bundle_enabled": bool(capture_phase3_seed_bundle_enabled),
                 "capture_feature_semantic_descriptors_enabled": bool(
                     capture_feature_semantic_descriptors_enabled
+                ),
+                "phase0_donor_bundle_schema_version": (
+                    int(phase0_donor_bundle_payload.get("schema_version", 1))
+                    if isinstance(phase0_donor_bundle_payload, dict)
+                    else 1
+                ),
+                "phase0_donor_bundle_replay_kind": (
+                    str(phase0_donor_bundle_payload.get("replay_kind", "phase0_active_features_v1"))
+                    if isinstance(phase0_donor_bundle_payload, dict)
+                    else "phase0_active_features_v1"
+                ),
+                "phase0_donor_bundle_status": (
+                    str(phase0_donor_bundle_payload.get("status", "captured"))
+                    if isinstance(phase0_donor_bundle_payload, dict)
+                    else None
                 ),
                 "semantic_descriptor_top_k": int(semantic_descriptor_top_k),
                 "semantic_descriptor_dim": int(semantic_descriptor_dim),
@@ -4543,6 +4746,8 @@ def _run_attribution(
                 "cfg": model.config,
                 "scan": model.scan,
             }
+            if capture_phase0_donor_bundle_enabled:
+                compact_output_result["phase0_donor_bundle"] = phase0_donor_bundle_payload
             if capture_phase3_seed_bundle_enabled:
                 compact_output_result["phase3_seed_bundle"] = phase3_seed_bundle_payload
             if capture_feature_semantic_descriptors_enabled:
