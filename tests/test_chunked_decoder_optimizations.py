@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -17,6 +18,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
     _build_phase3_seed_bundle_payload,
+    _load_phase0_donor_bundle_npz,
     _record_cross_cluster_batch_event,
     _record_cross_cluster_checkpoint,
     _compute_row_abs_sums,
@@ -882,6 +884,153 @@ def test_build_phase0_donor_bundle_payload_captures_hashes_and_metadata() -> Non
         cast(torch.Tensor, payload["active_feature_layer_counts"]),
         torch.tensor([1, 1, 0], dtype=torch.int64),
     )
+
+
+def _write_phase0_donor_bundle_npz_for_test(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    include_raw_uint16: bool,
+) -> None:
+    activation_values = cast(torch.Tensor, payload["activation_values"]).detach().cpu().contiguous()
+    activation_values_dtype = str(payload.get("activation_values_dtype", "")).replace("torch.", "")
+    if not activation_values_dtype:
+        activation_values_dtype = str(activation_values.dtype).replace("torch.", "")
+
+    activation_values_np = activation_values.to(dtype=torch.float32).numpy()
+    activation_values_raw_uint16 = (
+        activation_values.view(torch.uint16).numpy()
+        if include_raw_uint16 and activation_values.dtype == torch.bfloat16
+        else np.empty((0,), dtype=np.uint16)
+    )
+
+    np.savez_compressed(
+        path,
+        active_features=cast(torch.Tensor, payload["active_features"]).detach().cpu().numpy(),
+        activation_values=activation_values_np,
+        activation_values_dtype=np.array(activation_values_dtype),
+        activation_values_raw_uint16=activation_values_raw_uint16,
+        activation_matrix_shape=np.asarray(
+            payload.get("activation_matrix_shape", []), dtype=np.int64
+        ),
+        active_feature_count=np.array(int(payload.get("active_feature_count", 0)), dtype=np.int64),
+        active_feature_membership_hash_raw_order=np.array(
+            str(payload.get("active_feature_membership_hash_raw_order", ""))
+        ),
+        active_feature_membership_hash_canonical=np.array(
+            str(payload.get("active_feature_membership_hash_canonical", ""))
+        ),
+        active_feature_values_hash=np.array(str(payload.get("active_feature_values_hash", ""))),
+        input_tokens=cast(torch.Tensor, payload["input_tokens"]).detach().cpu().numpy(),
+        input_token_count=np.array(int(payload.get("input_token_count", 0)), dtype=np.int64),
+        input_tokens_hash=np.array(str(payload.get("input_tokens_hash", ""))),
+        target_token_ids=cast(torch.Tensor, payload["target_token_ids"]).detach().cpu().numpy(),
+        target_count=np.array(int(payload.get("target_count", 0)), dtype=np.int64),
+        target_token_ids_hash=np.array(str(payload.get("target_token_ids_hash", ""))),
+        clt_constants_hash=np.array(str(payload.get("clt_constants_hash", ""))),
+        schema_version=np.array(int(payload.get("schema_version", 0)), dtype=np.int64),
+        replay_kind=np.array(str(payload.get("replay_kind", ""))),
+        status=np.array(str(payload.get("status", ""))),
+    )
+
+
+def _build_phase0_payload_fixture() -> dict[str, object]:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[1, 0], [0, 1], [3, 2]], dtype=torch.int64),
+        values=torch.tensor([0.25, -0.5], dtype=torch.bfloat16),
+        size=(3, 2, 8),
+        check_invariants=True,
+    ).coalesce()
+    return _build_phase0_donor_bundle_payload(
+        activation_matrix=activation_matrix,
+        input_tokens=torch.tensor([11, 22, 33], dtype=torch.int64),
+        target_token_ids=torch.tensor([2, 4], dtype=torch.int64),
+        target_probabilities=torch.tensor([0.7, 0.2], dtype=torch.float32),
+        target_logits=torch.tensor([3.5, -1.0], dtype=torch.float32),
+        transcoder_diagnostic_snapshot={
+            "phase0_boundary_fingerprints": {
+                "transcoder_constant_fingerprints": {"global_hash": "clt1234"}
+            }
+        },
+        status="captured",
+    )
+
+
+def test_load_phase0_donor_bundle_npz_reconstructs_bf16_from_raw_sidecar(
+    tmp_path: Path,
+) -> None:
+    payload = _build_phase0_payload_fixture()
+    bundle_path = tmp_path / "step_000_phase0_donor_bundle.npz"
+    _write_phase0_donor_bundle_npz_for_test(bundle_path, payload, include_raw_uint16=True)
+
+    loaded = _load_phase0_donor_bundle_npz(bundle_path, context_policy="strict")
+
+    assert cast(torch.Tensor, loaded["activation_values"]).dtype == torch.bfloat16
+    assert torch.equal(
+        cast(torch.Tensor, loaded["activation_values"]),
+        cast(torch.Tensor, payload["activation_values"]),
+    )
+
+    dtype_metadata = cast(dict[str, object], loaded["dtype_metadata"])
+    validation_metadata = cast(dict[str, object], loaded["validation_metadata"])
+    assert dtype_metadata["exact_bfloat16_reconstruction"] is True
+    assert dtype_metadata["dtype_roundtrip_loss"] is False
+    assert validation_metadata["validated"] is True
+    assert validation_metadata["warnings"] == []
+
+
+def test_load_phase0_donor_bundle_npz_without_raw_sidecar_tracks_roundtrip_loss(
+    tmp_path: Path,
+) -> None:
+    payload = _build_phase0_payload_fixture()
+    bundle_path = tmp_path / "step_000_phase0_donor_bundle_no_raw.npz"
+    _write_phase0_donor_bundle_npz_for_test(bundle_path, payload, include_raw_uint16=False)
+
+    loaded = _load_phase0_donor_bundle_npz(bundle_path, context_policy="strict")
+    dtype_metadata = cast(dict[str, object], loaded["dtype_metadata"])
+
+    assert cast(torch.Tensor, loaded["activation_values"]).dtype == torch.float32
+    assert dtype_metadata["exact_bfloat16_reconstruction"] is False
+    assert dtype_metadata["dtype_roundtrip_loss"] is True
+
+
+def test_load_phase0_donor_bundle_npz_strict_fails_on_context_mismatch(tmp_path: Path) -> None:
+    payload = _build_phase0_payload_fixture()
+    bundle_path = tmp_path / "step_000_phase0_donor_bundle_strict_mismatch.npz"
+    _write_phase0_donor_bundle_npz_for_test(bundle_path, payload, include_raw_uint16=True)
+
+    with pytest.raises(ValueError, match="validation_context"):
+        _load_phase0_donor_bundle_npz(
+            bundle_path,
+            context_policy="strict",
+            validation_context={
+                "input_tokens_hash": "deadbeef",
+                "target_token_ids": torch.tensor([999, 1000], dtype=torch.int64),
+                "active_feature_membership_hash_canonical": "badc0de",
+            },
+        )
+
+
+def test_load_phase0_donor_bundle_npz_warn_policy_returns_warnings(tmp_path: Path) -> None:
+    payload = _build_phase0_payload_fixture()
+    bundle_path = tmp_path / "step_000_phase0_donor_bundle_warn_mismatch.npz"
+    _write_phase0_donor_bundle_npz_for_test(bundle_path, payload, include_raw_uint16=True)
+
+    loaded = _load_phase0_donor_bundle_npz(
+        bundle_path,
+        context_policy="warn",
+        validation_context={
+            "input_tokens_hash": "deadbeef",
+            "target_token_ids_hash": "beaded",
+        },
+    )
+
+    validation_metadata = cast(dict[str, object], loaded["validation_metadata"])
+    warnings = cast(list[str], validation_metadata["warnings"])
+
+    assert len(warnings) >= 1
+    assert any("validation_context" in warning for warning in warnings)
+    assert cast(torch.Tensor, loaded["active_features"]).shape == (2, 3)
 
 
 def test_build_feature_semantic_descriptors_payload_is_bounded_and_deterministic() -> None:

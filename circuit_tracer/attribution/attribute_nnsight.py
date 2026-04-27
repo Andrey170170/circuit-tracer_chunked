@@ -1182,6 +1182,375 @@ def _build_phase0_donor_bundle_payload(
     return payload
 
 
+def _phase0_npz_scalar(value: object) -> object:
+    if isinstance(value, np.ndarray) and value.shape == ():
+        return value.item()
+    return value
+
+
+def _phase0_npz_optional_str(value: object) -> str | None:
+    scalar = _phase0_npz_scalar(value)
+    if scalar is None:
+        return None
+    text = str(scalar).replace("torch.", "").strip()
+    return text if text else None
+
+
+def _phase0_npz_int(value: object, *, default: int = 0) -> int:
+    scalar = _phase0_npz_scalar(value)
+    if scalar is None:
+        return int(default)
+    try:
+        return int(scalar)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _phase0_to_int64_tensor(value: object) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    array = np.asarray(value)
+    if array.size == 0:
+        return torch.empty((0,), dtype=torch.int64)
+    return torch.from_numpy(np.ascontiguousarray(array)).to(dtype=torch.int64)
+
+
+def _load_phase0_donor_bundle_npz(
+    donor_bundle_path: str | os.PathLike[str],
+    *,
+    context_policy: Literal["strict", "warn"] = "strict",
+    validation_context: dict[str, object] | None = None,
+) -> dict[str, object]:
+    policy = str(context_policy).strip().lower()
+    if policy not in {"strict", "warn"}:
+        raise ValueError("context_policy must be one of {'strict', 'warn'}")
+
+    with np.load(donor_bundle_path, allow_pickle=False) as donor_npz:
+        donor_payload = {key: donor_npz[key] for key in donor_npz.files}
+
+    schema_version = _phase0_npz_int(donor_payload.get("schema_version"), default=0)
+    replay_kind = _phase0_npz_optional_str(donor_payload.get("replay_kind")) or ""
+    status = _phase0_npz_optional_str(donor_payload.get("status")) or ""
+
+    activation_values_dtype_recorded = (
+        _phase0_npz_optional_str(donor_payload.get("activation_values_dtype")) or ""
+    ).lower()
+    if activation_values_dtype_recorded == "torch.bfloat16":
+        activation_values_dtype_recorded = "bfloat16"
+
+    active_features_array = np.ascontiguousarray(
+        np.asarray(donor_payload.get("active_features", np.empty((0, 3), dtype=np.int64)))
+    )
+    if active_features_array.ndim == 1 and active_features_array.size == 0:
+        active_features_array = np.empty((0, 3), dtype=np.int64)
+    active_features = torch.from_numpy(active_features_array).to(dtype=torch.int64)
+
+    activation_values_array = np.ascontiguousarray(
+        np.asarray(donor_payload.get("activation_values", np.empty((0,), dtype=np.float32)))
+    ).reshape(-1)
+    activation_values = torch.from_numpy(activation_values_array)
+
+    raw_uint16_array = np.ascontiguousarray(
+        np.asarray(
+            donor_payload.get("activation_values_raw_uint16", np.empty((0,), dtype=np.uint16)),
+            dtype=np.uint16,
+        )
+    ).reshape(-1)
+
+    exact_bfloat16_reconstructed = False
+    dtype_roundtrip_loss = False
+    if activation_values_dtype_recorded == "bfloat16":
+        if raw_uint16_array.size == activation_values_array.size and raw_uint16_array.size > 0:
+            activation_values = torch.from_numpy(raw_uint16_array).view(torch.bfloat16).clone()
+            exact_bfloat16_reconstructed = True
+        else:
+            dtype_roundtrip_loss = True
+
+    activation_matrix_shape = tuple(
+        int(v)
+        for v in np.asarray(
+            donor_payload.get("activation_matrix_shape", np.empty((0,), dtype=np.int64))
+        )
+        .astype(np.int64, copy=False)
+        .reshape(-1)
+        .tolist()
+    )
+    active_feature_count = _phase0_npz_int(
+        donor_payload.get("active_feature_count"),
+        default=int(active_features.shape[0]) if active_features.ndim == 2 else 0,
+    )
+
+    input_tokens = _phase0_to_int64_tensor(
+        donor_payload.get("input_tokens", np.empty((0,), dtype=np.int64))
+    )
+    target_token_ids = _phase0_to_int64_tensor(
+        donor_payload.get("target_token_ids", np.empty((0,), dtype=np.int64))
+    )
+
+    input_token_count = _phase0_npz_int(donor_payload.get("input_token_count"), default=0)
+    target_count = _phase0_npz_int(donor_payload.get("target_count"), default=0)
+
+    stored_membership_hash_raw = _phase0_npz_optional_str(
+        donor_payload.get("active_feature_membership_hash_raw_order")
+    )
+    stored_membership_hash_canonical = _phase0_npz_optional_str(
+        donor_payload.get("active_feature_membership_hash_canonical")
+    )
+    stored_values_hash = _phase0_npz_optional_str(donor_payload.get("active_feature_values_hash"))
+    stored_input_tokens_hash = _phase0_npz_optional_str(donor_payload.get("input_tokens_hash"))
+    stored_target_token_ids_hash = _phase0_npz_optional_str(
+        donor_payload.get("target_token_ids_hash")
+    )
+    stored_clt_constants_hash = _phase0_npz_optional_str(donor_payload.get("clt_constants_hash"))
+
+    computed_input_tokens_hash = _hash_index_tensor(input_tokens)
+    computed_target_token_ids_hash = (
+        _hash_index_tensor(target_token_ids) if target_token_ids.numel() > 0 else None
+    )
+
+    computed_membership_hash_raw: str | None = None
+    computed_membership_hash_canonical: str | None = None
+    if (
+        active_features.ndim == 2
+        and active_features.shape[1] == 3
+        and len(activation_matrix_shape) == 3
+    ):
+        activation_indices = active_features.T.contiguous()
+        computed_membership_hash_raw = _hash_sparse_membership_indices(
+            activation_indices,
+            shape=activation_matrix_shape,
+            canonicalize=False,
+        )
+        computed_membership_hash_canonical = _hash_sparse_membership_indices(
+            activation_indices,
+            shape=activation_matrix_shape,
+            canonicalize=True,
+        )
+
+    computed_values_hash: str | None = None
+    if exact_bfloat16_reconstructed:
+        computed_values_hash = _hash_tensor_raw_bytes(activation_values)
+
+    validation_issues: list[str] = []
+
+    if schema_version != 1:
+        validation_issues.append(f"schema_version mismatch (expected 1, got {schema_version})")
+    if replay_kind != "phase0_active_features_v1":
+        validation_issues.append(
+            f"replay_kind mismatch (expected 'phase0_active_features_v1', got {replay_kind!r})"
+        )
+
+    if active_features.ndim != 2 or active_features.shape[1] != 3:
+        validation_issues.append(
+            f"active_features must have shape [N, 3] (got {tuple(active_features.shape)})"
+        )
+
+    if len(activation_matrix_shape) != 3:
+        validation_issues.append(
+            f"activation_matrix_shape must have length 3 (got {activation_matrix_shape})"
+        )
+
+    row_count = int(active_features.shape[0]) if active_features.ndim == 2 else 0
+    value_count = int(activation_values.numel())
+    if value_count != row_count:
+        validation_issues.append(
+            f"activation_values length mismatch (values={value_count}, active_features={row_count})"
+        )
+    if active_feature_count != row_count:
+        validation_issues.append(
+            "active_feature_count mismatch "
+            f"(declared={active_feature_count}, active_features={row_count})"
+        )
+    if active_feature_count != value_count:
+        validation_issues.append(
+            "active_feature_count mismatch "
+            f"(declared={active_feature_count}, activation_values={value_count})"
+        )
+
+    if computed_membership_hash_raw is None:
+        validation_issues.append(
+            "unable to compute active_feature_membership_hash_raw_order "
+            "because active_features/activation_matrix_shape are invalid"
+        )
+    else:
+        if not stored_membership_hash_raw:
+            validation_issues.append("missing active_feature_membership_hash_raw_order")
+        elif stored_membership_hash_raw != computed_membership_hash_raw:
+            validation_issues.append(
+                "active_feature_membership_hash_raw_order mismatch "
+                f"(stored={stored_membership_hash_raw}, computed={computed_membership_hash_raw})"
+            )
+
+    if computed_membership_hash_canonical is None:
+        validation_issues.append(
+            "unable to compute active_feature_membership_hash_canonical "
+            "because active_features/activation_matrix_shape are invalid"
+        )
+    else:
+        if not stored_membership_hash_canonical:
+            validation_issues.append("missing active_feature_membership_hash_canonical")
+        elif stored_membership_hash_canonical != computed_membership_hash_canonical:
+            validation_issues.append(
+                "active_feature_membership_hash_canonical mismatch "
+                "(stored="
+                f"{stored_membership_hash_canonical}, computed={computed_membership_hash_canonical})"
+            )
+
+    if exact_bfloat16_reconstructed:
+        if not stored_values_hash:
+            validation_issues.append("missing active_feature_values_hash")
+        elif computed_values_hash != stored_values_hash:
+            validation_issues.append(
+                "active_feature_values_hash mismatch "
+                f"(stored={stored_values_hash}, computed={computed_values_hash})"
+            )
+
+    if input_token_count != int(input_tokens.numel()):
+        validation_issues.append(
+            f"input_token_count mismatch (declared={input_token_count}, actual={int(input_tokens.numel())})"
+        )
+    if not stored_input_tokens_hash:
+        validation_issues.append("missing input_tokens_hash")
+    elif stored_input_tokens_hash != computed_input_tokens_hash:
+        validation_issues.append(
+            "input_tokens_hash mismatch "
+            f"(stored={stored_input_tokens_hash}, computed={computed_input_tokens_hash})"
+        )
+
+    if target_count != int(target_token_ids.numel()):
+        validation_issues.append(
+            f"target_count mismatch (declared={target_count}, actual={int(target_token_ids.numel())})"
+        )
+    if target_token_ids.numel() > 0:
+        if not stored_target_token_ids_hash:
+            validation_issues.append("missing target_token_ids_hash")
+        elif stored_target_token_ids_hash != computed_target_token_ids_hash:
+            validation_issues.append(
+                "target_token_ids_hash mismatch "
+                "(stored="
+                f"{stored_target_token_ids_hash}, computed={computed_target_token_ids_hash})"
+            )
+
+    if isinstance(validation_context, dict):
+        expected_input_tokens = validation_context.get("input_tokens")
+        if expected_input_tokens is not None:
+            expected_input_tokens_tensor = _phase0_to_int64_tensor(expected_input_tokens).reshape(
+                -1
+            )
+            if not torch.equal(expected_input_tokens_tensor, input_tokens.reshape(-1)):
+                validation_issues.append("input_tokens mismatch with validation_context")
+
+        expected_input_hash = _phase0_npz_optional_str(validation_context.get("input_tokens_hash"))
+        if expected_input_hash is not None and expected_input_hash != computed_input_tokens_hash:
+            validation_issues.append(
+                "input_tokens_hash mismatch with validation_context "
+                f"(expected={expected_input_hash}, computed={computed_input_tokens_hash})"
+            )
+
+        expected_target_ids = validation_context.get("target_token_ids")
+        if expected_target_ids is not None:
+            expected_target_tensor = _phase0_to_int64_tensor(expected_target_ids).reshape(-1)
+            if not torch.equal(expected_target_tensor, target_token_ids.reshape(-1)):
+                validation_issues.append("target_token_ids mismatch with validation_context")
+
+        expected_target_hash = _phase0_npz_optional_str(
+            validation_context.get("target_token_ids_hash")
+        )
+        if (
+            expected_target_hash is not None
+            and expected_target_hash != computed_target_token_ids_hash
+        ):
+            validation_issues.append(
+                "target_token_ids_hash mismatch with validation_context "
+                f"(expected={expected_target_hash}, computed={computed_target_token_ids_hash})"
+            )
+
+        expected_raw_hash = _phase0_npz_optional_str(
+            validation_context.get("active_feature_membership_hash_raw_order")
+        )
+        if (
+            expected_raw_hash is not None
+            and computed_membership_hash_raw is not None
+            and expected_raw_hash != computed_membership_hash_raw
+        ):
+            validation_issues.append(
+                "active_feature_membership_hash_raw_order mismatch with validation_context "
+                f"(expected={expected_raw_hash}, computed={computed_membership_hash_raw})"
+            )
+
+        expected_canonical_hash = _phase0_npz_optional_str(
+            validation_context.get("active_feature_membership_hash_canonical")
+        )
+        if (
+            expected_canonical_hash is not None
+            and computed_membership_hash_canonical is not None
+            and expected_canonical_hash != computed_membership_hash_canonical
+        ):
+            validation_issues.append(
+                "active_feature_membership_hash_canonical mismatch with validation_context "
+                "(expected="
+                f"{expected_canonical_hash}, computed={computed_membership_hash_canonical})"
+            )
+
+        expected_clt_hash = _phase0_npz_optional_str(validation_context.get("clt_constants_hash"))
+        if (
+            expected_clt_hash is not None
+            and stored_clt_constants_hash is not None
+            and expected_clt_hash != stored_clt_constants_hash
+        ):
+            validation_issues.append(
+                "clt_constants_hash mismatch with validation_context "
+                f"(expected={expected_clt_hash}, bundle={stored_clt_constants_hash})"
+            )
+
+    if validation_issues and policy == "strict":
+        raise ValueError("Phase-0 donor bundle validation failed: " + "; ".join(validation_issues))
+
+    dtype_metadata = {
+        "activation_values_dtype_recorded": activation_values_dtype_recorded,
+        "activation_values_dtype_loaded": str(activation_values.dtype).replace("torch.", ""),
+        "activation_values_raw_uint16_present": bool(raw_uint16_array.size > 0),
+        "exact_bfloat16_reconstruction": bool(exact_bfloat16_reconstructed),
+        "dtype_roundtrip_loss": bool(dtype_roundtrip_loss),
+    }
+
+    validation_metadata = {
+        "context_policy": policy,
+        "warnings": list(validation_issues) if policy == "warn" else [],
+        "validation_failure_count": int(len(validation_issues)),
+        "validated": bool(len(validation_issues) == 0),
+        "computed_hashes": {
+            "active_feature_membership_hash_raw_order": computed_membership_hash_raw,
+            "active_feature_membership_hash_canonical": computed_membership_hash_canonical,
+            "active_feature_values_hash": computed_values_hash,
+            "input_tokens_hash": computed_input_tokens_hash,
+            "target_token_ids_hash": computed_target_token_ids_hash,
+        },
+        "stored_hashes": {
+            "active_feature_membership_hash_raw_order": stored_membership_hash_raw,
+            "active_feature_membership_hash_canonical": stored_membership_hash_canonical,
+            "active_feature_values_hash": stored_values_hash,
+            "input_tokens_hash": stored_input_tokens_hash,
+            "target_token_ids_hash": stored_target_token_ids_hash,
+            "clt_constants_hash": stored_clt_constants_hash,
+        },
+    }
+
+    return {
+        "schema_version": schema_version,
+        "replay_kind": replay_kind,
+        "status": status,
+        "active_features": active_features,
+        "activation_values": activation_values,
+        "activation_matrix_shape": activation_matrix_shape,
+        "active_feature_count": active_feature_count,
+        "input_tokens": input_tokens,
+        "target_token_ids": target_token_ids,
+        "dtype_metadata": dtype_metadata,
+        "validation_metadata": validation_metadata,
+    }
+
+
 def _build_phase3_seed_influence_topk(
     *,
     ranked_feature_indices: torch.Tensor,
