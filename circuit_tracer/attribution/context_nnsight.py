@@ -4,7 +4,7 @@ Attribution context for managing hooks during attribution computation.
 
 import time
 import weakref
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 import torch
@@ -79,6 +79,8 @@ class AttributionContext:
         error_vector_prefetch_lookahead: int = 2,
         chunked_feature_replay_window: int = 4,
         row_subchunk_size: int | None = None,
+        exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
+        materialized_encoder_vecs_during_phase0: bool = False,
         internal_precision_requested: str | None = None,
         resolved_dtype_map: dict[str, str] | None = None,
     ) -> None:
@@ -91,8 +93,23 @@ class AttributionContext:
         self.n_layers: int = n_layers
 
         exact_chunked_mode = chunked_decoder_state is not None
+        requested_encoder_residency = self._normalize_exact_encoder_residency(
+            exact_encoder_residency
+        )
+        encoder_residency_applicable = bool(exact_chunked_mode)
+        encoder_residency_fallback_reason: str | None = None
+        effective_encoder_residency = requested_encoder_residency
+        if requested_encoder_residency != "lazy" and not encoder_residency_applicable:
+            effective_encoder_residency = "lazy"
+            encoder_residency_fallback_reason = (
+                "active encoder residency requires exact chunked decoder state; "
+                "falling back to lazy execution"
+            )
+
         if stage_encoder_vecs_on_cpu is None:
             stage_encoder_vecs_on_cpu = exact_chunked_mode and encoder_vecs.numel() > 0
+        if effective_encoder_residency != "lazy":
+            stage_encoder_vecs_on_cpu = True
         if stage_error_vectors_on_cpu is None:
             stage_error_vectors_on_cpu = exact_chunked_mode and error_vectors.numel() > 0
 
@@ -106,6 +123,20 @@ class AttributionContext:
         )
         self._materialized_error_vector_layers: dict[int, torch.Tensor] = {}
         self._cleanup_complete = False
+        self.exact_encoder_residency_requested = requested_encoder_residency
+        self.exact_encoder_residency_effective = effective_encoder_residency
+        self.exact_encoder_residency_applicable = encoder_residency_applicable
+        self.exact_encoder_residency_fallback_reason = encoder_residency_fallback_reason
+        self.exact_encoder_materialized_during_phase0 = bool(
+            materialized_encoder_vecs_during_phase0
+        )
+        self.exact_encoder_pinned_requested = bool(
+            effective_encoder_residency == "active_pinned_cpu"
+        )
+        self.exact_encoder_pinned_effective = False
+        self.exact_encoder_pinning_success: bool | None = None
+        self.exact_encoder_pinning_failure_reason: str | None = None
+        self.exact_encoder_staging_destination = "none"
 
         self.logits = logits
         self.full_logits = full_logits
@@ -123,9 +154,22 @@ class AttributionContext:
         self.token_vectors = token_vectors
         self.decoder_vecs = decoder_vecs
         if self._stage_encoder_vecs_on_cpu:
-            self.encoder_vecs = self._stage_tensor_on_cpu(encoder_vecs)
+            self.encoder_vecs, pinning_success, pinning_failure_reason = self._stage_encoder_tensor(
+                encoder_vecs,
+                pin_memory=self.exact_encoder_pinned_requested,
+            )
+            self.exact_encoder_pinning_success = pinning_success
+            self.exact_encoder_pinning_failure_reason = pinning_failure_reason
+            self.exact_encoder_pinned_effective = bool(
+                self.exact_encoder_pinned_requested and self.encoder_vecs.is_pinned()
+            )
         else:
             self.encoder_vecs = encoder_vecs
+        self.exact_encoder_staging_destination = self._resolve_encoder_staging_destination(
+            self.encoder_vecs,
+            exact_chunked_mode=exact_chunked_mode,
+            encoder_residency=self.exact_encoder_residency_effective,
+        )
 
         self.encoder_to_decoder_map = encoder_to_decoder_map
         self.decoder_locations = decoder_locations
@@ -170,6 +214,52 @@ class AttributionContext:
         else:
             staged = staged.clone()
         return staged
+
+    @staticmethod
+    def _stage_encoder_tensor(
+        tensor: torch.Tensor,
+        *,
+        pin_memory: bool,
+    ) -> tuple[torch.Tensor, bool | None, str | None]:
+        staged = AttributionContext._stage_tensor_on_cpu(tensor)
+        if not pin_memory:
+            return staged, None, None
+        try:
+            pinned = staged.pin_memory()
+        except Exception as exc:  # pragma: no cover - platform dependent
+            return staged, False, f"{type(exc).__name__}: {exc}"
+        if not pinned.is_pinned():
+            return pinned, False, "pin_memory returned a non-pinned tensor"
+        return pinned, True, None
+
+    @staticmethod
+    def _normalize_exact_encoder_residency(
+        exact_encoder_residency: str,
+    ) -> Literal["lazy", "active_cpu", "active_pinned_cpu"]:
+        normalized = str(exact_encoder_residency).strip().lower()
+        allowed_values = {"lazy", "active_cpu", "active_pinned_cpu"}
+        if normalized not in allowed_values:
+            allowed = ", ".join(sorted(allowed_values))
+            raise ValueError(
+                "exact_encoder_residency must be one of: "
+                f"{allowed} (got {exact_encoder_residency!r})"
+            )
+        return cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], normalized)
+
+    @staticmethod
+    def _resolve_encoder_staging_destination(
+        encoder_vecs: torch.Tensor,
+        *,
+        exact_chunked_mode: bool,
+        encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"],
+    ) -> str:
+        if encoder_residency == "lazy":
+            if exact_chunked_mode and encoder_vecs.numel() == 0:
+                return "lazy_chunk_materialization"
+            return "none"
+        if encoder_vecs.device.type != "cpu":
+            return str(encoder_vecs.device)
+        return "pinned_cpu" if encoder_vecs.is_pinned() else "cpu"
 
     def _materialize_tensor(
         self,
@@ -420,6 +510,26 @@ class AttributionContext:
         if self.chunked_decoder_state is not None:
             snapshot["row_subchunk_size"] = float(self._effective_row_subchunk_size())
         snapshot["logit_retention"] = self.logit_retention
+        snapshot["exact_encoder_residency_requested"] = self.exact_encoder_residency_requested
+        snapshot["exact_encoder_residency_effective"] = self.exact_encoder_residency_effective
+        snapshot["exact_encoder_residency_applicable"] = bool(
+            self.exact_encoder_residency_applicable
+        )
+        snapshot["exact_encoder_residency_fallback_reason"] = (
+            self.exact_encoder_residency_fallback_reason
+        )
+        snapshot["exact_encoder_staging_destination"] = self.exact_encoder_staging_destination
+        snapshot["exact_encoder_materialized_during_phase0"] = bool(
+            self.exact_encoder_materialized_during_phase0
+        )
+        snapshot["active_encoder_shape"] = tuple(self.encoder_vecs.shape)
+        snapshot["active_encoder_bytes"] = float(
+            int(self.encoder_vecs.numel() * self.encoder_vecs.element_size())
+        )
+        snapshot["exact_encoder_pinned_requested"] = bool(self.exact_encoder_pinned_requested)
+        snapshot["exact_encoder_pinned_effective"] = bool(self.exact_encoder_pinned_effective)
+        snapshot["exact_encoder_pinning_success"] = self.exact_encoder_pinning_success
+        snapshot["exact_encoder_pinning_failure_reason"] = self.exact_encoder_pinning_failure_reason
         snapshot["internal_precision_requested"] = self.internal_precision_requested
         snapshot["resolved_dtype_map"] = self.resolved_dtype_map
         return snapshot
@@ -514,6 +624,14 @@ class AttributionContext:
         ).coalesce()
         if self.encoder_vecs.numel() > 0:
             self.encoder_vecs = self.encoder_vecs[selected.to(device=self.encoder_vecs.device)]
+            self.exact_encoder_pinned_effective = bool(
+                self.exact_encoder_pinned_requested and self.encoder_vecs.is_pinned()
+            )
+            self.exact_encoder_staging_destination = self._resolve_encoder_staging_destination(
+                self.encoder_vecs,
+                exact_chunked_mode=self.chunked_decoder_state is not None,
+                encoder_residency=self.exact_encoder_residency_effective,
+            )
 
         if self.chunked_decoder_state is not None:
             for key in self.chunked_decoder_state:

@@ -231,8 +231,8 @@ _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
 _EXACT_ENCODER_RESIDENCY_DEFAULT: Literal["lazy"] = "lazy"
 _EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "lazy": "lazy",
-    "active_cpu": "lazy",
-    "active_pinned_cpu": "lazy",
+    "active_cpu": "active_cpu",
+    "active_pinned_cpu": "active_pinned_cpu",
 }
 
 _PHASE4_STREAMING_V1_MAX_MICROBATCH_SIZE = 64
@@ -347,7 +347,9 @@ class _ExactEncoderResidencyConfig:
     requested_mode: Literal["lazy", "active_cpu", "active_pinned_cpu"]
     effective_mode: Literal["lazy", "active_cpu", "active_pinned_cpu"]
     default_mode: Literal["lazy"]
+    mode_applicable: bool
     effective_behavior: Literal["requested", "lazy_reference_execution"]
+    fallback_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -1958,12 +1960,23 @@ def _resolve_exact_encoder_residency(
 
 def _resolve_exact_encoder_residency_config(
     exact_encoder_residency: str,
+    *,
+    exact_chunked_decoder: bool,
 ) -> _ExactEncoderResidencyConfig:
     requested_mode = _resolve_exact_encoder_residency(exact_encoder_residency)
-    effective_mode = cast(
-        Literal["lazy", "active_cpu", "active_pinned_cpu"],
-        _EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE[requested_mode],
-    )
+    mode_applicable = bool(exact_chunked_decoder)
+    fallback_reason: str | None = None
+    if requested_mode != "lazy" and not mode_applicable:
+        effective_mode = cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], "lazy")
+        fallback_reason = (
+            "active encoder residency requires exact_chunked_decoder=True; "
+            "falling back to lazy execution"
+        )
+    else:
+        effective_mode = cast(
+            Literal["lazy", "active_cpu", "active_pinned_cpu"],
+            _EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE[requested_mode],
+        )
     effective_behavior: Literal["requested", "lazy_reference_execution"] = (
         "requested" if requested_mode == effective_mode else "lazy_reference_execution"
     )
@@ -1971,21 +1984,39 @@ def _resolve_exact_encoder_residency_config(
         requested_mode=requested_mode,
         effective_mode=effective_mode,
         default_mode=_EXACT_ENCODER_RESIDENCY_DEFAULT,
+        mode_applicable=mode_applicable,
         effective_behavior=effective_behavior,
+        fallback_reason=fallback_reason,
     )
 
 
 def _build_exact_encoder_residency_metadata(
     exact_encoder_residency_config: _ExactEncoderResidencyConfig,
 ) -> dict[str, object]:
+    effective_mode = exact_encoder_residency_config.effective_mode
     return {
         "exact_encoder_residency_requested": exact_encoder_residency_config.requested_mode,
         "exact_encoder_residency": exact_encoder_residency_config.requested_mode,
         "exact_encoder_residency_default": exact_encoder_residency_config.default_mode,
         "exact_encoder_residency_effective": exact_encoder_residency_config.effective_mode,
+        "exact_encoder_residency_applicable": bool(exact_encoder_residency_config.mode_applicable),
         "exact_encoder_residency_effective_behavior": (
             exact_encoder_residency_config.effective_behavior
         ),
+        "exact_encoder_residency_fallback_reason": exact_encoder_residency_config.fallback_reason,
+        "exact_encoder_materialize_phase0": bool(effective_mode != "lazy"),
+        "exact_encoder_staging_destination_planned": (
+            "none"
+            if effective_mode == "lazy"
+            else ("pinned_cpu" if effective_mode == "active_pinned_cpu" else "cpu")
+        ),
+        "exact_encoder_pinned_requested": bool(
+            exact_encoder_residency_config.requested_mode == "active_pinned_cpu"
+        ),
+        "exact_encoder_pinned_planned": bool(effective_mode == "active_pinned_cpu"),
+        "exact_encoder_pinned_effective": None,
+        "exact_encoder_pinning_success": None,
+        "exact_encoder_pinning_failure_reason": None,
         "exact_encoder_residency_reference_execution": bool(
             exact_encoder_residency_config.requested_mode
             != exact_encoder_residency_config.effective_mode
@@ -4006,6 +4037,7 @@ def _plan_phase4_feature_batch_size_preflight(
     stage_encoder_vecs_on_cpu: bool | None = None,
     stage_error_vectors_on_cpu: bool | None = None,
     row_subchunk_size: int | None = None,
+    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     diagnostic_feature_cap: int | None = None,
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
@@ -4082,6 +4114,7 @@ def _plan_phase4_feature_batch_size_preflight(
             stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
+            exact_encoder_residency=exact_encoder_residency,
             internal_precision_requested=internal_precision_requested,
             resolved_dtype_map=resolved_dtype_map,
         )
@@ -4452,8 +4485,11 @@ def attribute(
             ``"fadvise_dontneed_after_append_v1"`` is currently validated/
             plumbed only and falls back to ``"off"`` execution.
         exact_encoder_residency: Requested exact encoder residency mode.
-            ``"lazy"`` keeps current behavior; active residency modes are
-            currently validated/plumbed only and fall back to ``"lazy"``.
+            ``"lazy"`` keeps current behavior. ``"active_cpu"`` and
+            ``"active_pinned_cpu"`` materialize active encoder rows during
+            Phase 0 and stage them on CPU for exact chunked decoder runs.
+            Outside exact chunked decoder execution, active modes fall back to
+            ``"lazy"`` with explicit metadata.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
             normalization/influence ranking path. ``"fp32"`` uses float32
             internals and is the post-fix default; ``"fp64"`` uses float64
@@ -4687,7 +4723,8 @@ def _run_attribution(
         row_store_cache_control_config
     )
     exact_encoder_residency_config = _resolve_exact_encoder_residency_config(
-        exact_encoder_residency
+        exact_encoder_residency,
+        exact_chunked_decoder=exact_chunked_decoder,
     )
     exact_encoder_residency_metadata = _build_exact_encoder_residency_metadata(
         exact_encoder_residency_config
@@ -4838,6 +4875,7 @@ def _run_attribution(
                 stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
                 stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
                 row_subchunk_size=row_subchunk_size,
+                exact_encoder_residency=exact_encoder_residency_config.requested_mode,
                 diagnostic_feature_cap=diagnostic_feature_cap,
                 feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
                 feature_batch_min_free_fraction=feature_batch_min_free_fraction,
@@ -4928,9 +4966,31 @@ def _run_attribution(
         stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
         stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
         row_subchunk_size=row_subchunk_size,
+        exact_encoder_residency=exact_encoder_residency_config.requested_mode,
         internal_precision_requested=internal_precision_requested,
         resolved_dtype_map=resolved_dtype_map,
     )
+    exact_encoder_runtime_metadata = {
+        "exact_encoder_staging_destination": getattr(
+            ctx, "exact_encoder_staging_destination", "none"
+        ),
+        "exact_encoder_materialized_during_phase0": bool(
+            getattr(ctx, "exact_encoder_materialized_during_phase0", False)
+        ),
+        "active_encoder_shape": tuple(getattr(ctx, "encoder_vecs").shape),
+        "active_encoder_bytes": int(
+            getattr(ctx, "encoder_vecs").numel() * getattr(ctx, "encoder_vecs").element_size()
+        ),
+        "exact_encoder_pinned_effective": bool(
+            getattr(ctx, "exact_encoder_pinned_effective", False)
+        ),
+        "exact_encoder_pinning_success": getattr(ctx, "exact_encoder_pinning_success", None),
+        "exact_encoder_pinning_failure_reason": getattr(
+            ctx, "exact_encoder_pinning_failure_reason", None
+        ),
+    }
+    exact_encoder_residency_metadata.update(exact_encoder_runtime_metadata)
+    phase4_execution_metadata.update(exact_encoder_runtime_metadata)
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
     configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
