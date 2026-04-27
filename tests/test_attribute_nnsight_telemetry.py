@@ -1,3 +1,4 @@
+import os
 import inspect
 from typing import get_args
 
@@ -126,6 +127,78 @@ def test_file_backed_feature_row_store_read_cache_too_large_is_reported() -> Non
     assert stats["read_cache_store_skip_too_large_count"] == 2
     assert stats["read_cache_hit_count"] == 0
     assert stats["read_cache_miss_count"] == 2
+
+
+def test_file_backed_feature_row_store_cache_control_fadvise_tracks_append_byte_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int, int, int]] = []
+
+    def _fake_posix_fadvise(fd: int, offset: int, length: int, advice: int) -> int:
+        calls.append((fd, offset, length, advice))
+        return 0
+
+    monkeypatch.setattr(os, "posix_fadvise", _fake_posix_fadvise, raising=False)
+    monkeypatch.setattr(os, "POSIX_FADV_DONTNEED", 7, raising=False)
+
+    store = _FileBackedFeatureRowStore(
+        n_rows=4,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        row_store_cache_control_mode="fadvise_dontneed_after_append_v1",
+    )
+
+    try:
+        store.append_rows(
+            row_start=1,
+            feature_rows=torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32),
+            full_row_abs_sums=torch.tensor([6.0, 15.0], dtype=torch.float32),
+        )
+    finally:
+        store.cleanup()
+
+    assert len(calls) == 1
+    _, offset, length, advice = calls[0]
+    assert offset == 12
+    assert length == 24
+    assert advice == 7
+
+    stats = store.get_diagnostic_snapshot()
+    assert stats["row_store_cache_control_effective_mode"] == "fadvise_dontneed_after_append_v1"
+    assert stats["row_store_cache_control_advisory_call_count"] == 1
+    assert stats["row_store_cache_control_advisory_bytes"] == 24
+    assert stats["row_store_cache_control_advisory_failure_count"] == 0
+    assert stats["row_store_cache_control_advisory_unavailable_count"] == 0
+
+
+def test_file_backed_feature_row_store_cache_control_unavailable_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(os, "posix_fadvise", raising=False)
+    monkeypatch.delattr(os, "POSIX_FADV_DONTNEED", raising=False)
+
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=2,
+        dtype=torch.float32,
+        row_store_cache_control_mode="fadvise_dontneed_after_append_v1",
+    )
+
+    try:
+        store.append_rows(
+            row_start=0,
+            feature_rows=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+            full_row_abs_sums=torch.tensor([3.0], dtype=torch.float32),
+        )
+    finally:
+        store.cleanup()
+
+    stats = store.get_diagnostic_snapshot()
+    assert stats["row_store_cache_control_effective_mode"] == "fadvise_dontneed_after_append_v1"
+    assert stats["row_store_cache_control_advisory_call_count"] == 0
+    assert stats["row_store_cache_control_advisory_bytes"] == 0
+    assert stats["row_store_cache_control_advisory_unavailable_count"] == 1
+    assert stats["row_store_cache_control_advisory_failure_count"] == 0
 
 
 def test_exact_trace_internal_dtype_resolution_supports_fp32_and_fp64() -> None:

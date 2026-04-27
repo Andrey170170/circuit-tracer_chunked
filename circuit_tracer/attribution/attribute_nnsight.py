@@ -220,9 +220,12 @@ _PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE: dict[str, str] = {
 }
 
 _ROW_STORE_CACHE_CONTROL_DEFAULT: Literal["off"] = "off"
+_ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1: Literal[
+    "fadvise_dontneed_after_append_v1"
+] = "fadvise_dontneed_after_append_v1"
 _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "off": "off",
-    "fadvise_dontneed_after_append_v1": "off",
+    "fadvise_dontneed_after_append_v1": "fadvise_dontneed_after_append_v1",
 }
 
 _EXACT_ENCODER_RESIDENCY_DEFAULT: Literal["lazy"] = "lazy"
@@ -334,7 +337,9 @@ class _RowStoreCacheControlConfig:
     requested_mode: Literal["off", "fadvise_dontneed_after_append_v1"]
     effective_mode: Literal["off", "fadvise_dontneed_after_append_v1"]
     default_mode: Literal["off"]
+    mode_applicable: bool
     effective_behavior: Literal["requested", "off_reference_execution"]
+    fallback_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -402,12 +407,19 @@ class _FileBackedFeatureRowStore:
         dtype: torch.dtype,
         row_abs_sum_dtype: torch.dtype = torch.float32,
         read_chunk_cache_bytes: int = 0,
+        row_store_cache_control_mode: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
         telemetry_recorder: TelemetryRecorder | None = None,
     ) -> None:
         if dtype not in (torch.float32, torch.float64):
             raise ValueError(f"Unsupported feature row store dtype: {dtype}")
         if row_abs_sum_dtype not in (torch.float32, torch.float64):
             raise ValueError(f"Unsupported row_abs_sum_dtype: {row_abs_sum_dtype}")
+        if row_store_cache_control_mode not in _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE:
+            allowed = ", ".join(sorted(_ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE))
+            raise ValueError(
+                "Unsupported row_store_cache_control_mode: "
+                f"{row_store_cache_control_mode!r}; expected one of: {allowed}"
+            )
 
         self.n_rows = n_rows
         self.n_feature_columns = n_feature_columns
@@ -423,6 +435,13 @@ class _FileBackedFeatureRowStore:
         with open(self._path, "wb") as handle:
             handle.truncate(total_nbytes)
         self._write_fd: int | None = os.open(self._path, os.O_RDWR)
+        self._row_store_cache_control_effective_mode = row_store_cache_control_mode
+        self._fadvise_dontneed_after_append_enabled = bool(
+            row_store_cache_control_mode
+            == _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1
+        )
+        self._posix_fadvise = getattr(os, "posix_fadvise", None)
+        self._posix_fadvise_dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
         self._rows: np.memmap | None = np.memmap(
             self._path,
             mode="r+",
@@ -434,9 +453,21 @@ class _FileBackedFeatureRowStore:
         self._read_chunk_cache_nbytes = 0
         self._telemetry_recorder = telemetry_recorder
         self._closed = False
-        self._diagnostic_stats: dict[str, float | int | None] = {
+        self._diagnostic_stats: dict[str, object] = {
             "append_call_count": 0,
             "append_row_count": 0,
+            "row_store_cache_control_effective_mode": (
+                self._row_store_cache_control_effective_mode
+            ),
+            "row_store_cache_control_advisory_available": int(
+                callable(self._posix_fadvise) and self._posix_fadvise_dontneed is not None
+            ),
+            "row_store_cache_control_advisory_call_count": 0,
+            "row_store_cache_control_advisory_bytes": 0,
+            "row_store_cache_control_advisory_failure_count": 0,
+            "row_store_cache_control_advisory_unavailable_count": 0,
+            "row_store_cache_control_advisory_skipped_count": 0,
+            "row_store_cache_control_advisory_last_error": None,
             "read_call_count": 0,
             "read_row_count": 0,
             "read_last_row_start": None,
@@ -558,6 +589,47 @@ class _FileBackedFeatureRowStore:
         for key in overlapping:
             self._drop_read_chunk(key, count_eviction=True)
 
+    def _increment_diagnostic_counter(self, key: str, *, delta: int = 1) -> None:
+        self._diagnostic_stats[key] = int(self._diagnostic_stats.get(key, 0) or 0) + int(delta)
+
+    def _apply_row_store_cache_control_after_append(
+        self,
+        *,
+        write_fd: int,
+        byte_offset: int,
+        byte_length: int,
+    ) -> None:
+        if byte_length <= 0 or not self._fadvise_dontneed_after_append_enabled:
+            self._increment_diagnostic_counter("row_store_cache_control_advisory_skipped_count")
+            return
+
+        posix_fadvise = self._posix_fadvise
+        dontneed_flag = self._posix_fadvise_dontneed
+        if not callable(posix_fadvise) or dontneed_flag is None:
+            self._diagnostic_stats["row_store_cache_control_advisory_available"] = 0
+            self._increment_diagnostic_counter("row_store_cache_control_advisory_unavailable_count")
+            return
+
+        try:
+            posix_fadvise(
+                write_fd,
+                int(byte_offset),
+                int(byte_length),
+                int(dontneed_flag),
+            )
+        except Exception as exc:
+            self._increment_diagnostic_counter("row_store_cache_control_advisory_failure_count")
+            self._diagnostic_stats["row_store_cache_control_advisory_last_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+
+        self._increment_diagnostic_counter("row_store_cache_control_advisory_call_count")
+        self._increment_diagnostic_counter(
+            "row_store_cache_control_advisory_bytes",
+            delta=int(byte_length),
+        )
+
     def append_rows(
         self,
         *,
@@ -634,6 +706,11 @@ class _FileBackedFeatureRowStore:
                 if wrote <= 0:
                     raise OSError("feature row store append write failed")
                 bytes_written += wrote
+            self._apply_row_store_cache_control_after_append(
+                write_fd=write_fd,
+                byte_offset=byte_offset,
+                byte_length=expected_nbytes,
+            )
 
             row_abs_max_cpu = row_abs_max.detach()
             if (
@@ -793,7 +870,7 @@ class _FileBackedFeatureRowStore:
 
         return dense
 
-    def get_diagnostic_snapshot(self) -> dict[str, float | int | None]:
+    def get_diagnostic_snapshot(self) -> dict[str, object]:
         return dict(self._diagnostic_stats)
 
     @property
@@ -1812,12 +1889,27 @@ def _resolve_row_store_cache_control(
 
 def _resolve_row_store_cache_control_config(
     row_store_cache_control: str,
+    *,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
 ) -> _RowStoreCacheControlConfig:
     requested_mode = _resolve_row_store_cache_control(row_store_cache_control)
-    effective_mode = cast(
-        Literal["off", "fadvise_dontneed_after_append_v1"],
-        _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE[requested_mode],
-    )
+    mode_applicable = bool(compact_output and exact_chunked_decoder)
+    fallback_reason: str | None = None
+    if (
+        requested_mode == _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1
+        and not mode_applicable
+    ):
+        effective_mode = cast(Literal["off", "fadvise_dontneed_after_append_v1"], "off")
+        fallback_reason = (
+            "fadvise_dontneed_after_append_v1 requires compact_output=True and "
+            "exact_chunked_decoder=True; falling back to off execution"
+        )
+    else:
+        effective_mode = cast(
+            Literal["off", "fadvise_dontneed_after_append_v1"],
+            _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE[requested_mode],
+        )
     effective_behavior: Literal["requested", "off_reference_execution"] = (
         "requested" if requested_mode == effective_mode else "off_reference_execution"
     )
@@ -1825,7 +1917,9 @@ def _resolve_row_store_cache_control_config(
         requested_mode=requested_mode,
         effective_mode=effective_mode,
         default_mode=_ROW_STORE_CACHE_CONTROL_DEFAULT,
+        mode_applicable=mode_applicable,
         effective_behavior=effective_behavior,
+        fallback_reason=fallback_reason,
     )
 
 
@@ -1837,9 +1931,11 @@ def _build_row_store_cache_control_metadata(
         "row_store_cache_control": row_store_cache_control_config.requested_mode,
         "row_store_cache_control_default": row_store_cache_control_config.default_mode,
         "row_store_cache_control_effective": row_store_cache_control_config.effective_mode,
+        "row_store_cache_control_applicable": bool(row_store_cache_control_config.mode_applicable),
         "row_store_cache_control_effective_behavior": (
             row_store_cache_control_config.effective_behavior
         ),
+        "row_store_cache_control_fallback_reason": row_store_cache_control_config.fallback_reason,
         "row_store_cache_control_reference_execution": bool(
             row_store_cache_control_config.requested_mode
             != row_store_cache_control_config.effective_mode
@@ -4583,7 +4679,9 @@ def _run_attribution(
     phase4_ranker_config = _resolve_phase4_ranker_config(phase4_ranker)
     phase4_ranker_metadata = _build_phase4_ranker_metadata(phase4_ranker_config)
     row_store_cache_control_config = _resolve_row_store_cache_control_config(
-        row_store_cache_control
+        row_store_cache_control,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
     )
     row_store_cache_control_metadata = _build_row_store_cache_control_metadata(
         row_store_cache_control_config
@@ -5124,6 +5222,7 @@ def _run_attribution(
                 dtype=exact_trace_internal_dtype_resolved,
                 row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
                 read_chunk_cache_bytes=256 * 1024 * 1024,
+                row_store_cache_control_mode=row_store_cache_control_config.effective_mode,
                 telemetry_recorder=telemetry_recorder,
             )
         else:

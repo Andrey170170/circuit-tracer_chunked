@@ -1086,7 +1086,7 @@ def test_phase4_ranker_topk_tie_metadata_documents_cutoff_membership_behavior() 
     assert "argsort" in argsort_selection.tie_behavior
 
 
-def test_row_store_cache_control_config_validates_and_falls_back_to_off() -> None:
+def test_row_store_cache_control_config_validates_and_tracks_effective_mode() -> None:
     assert _resolve_row_store_cache_control("off") == "off"
     assert (
         _resolve_row_store_cache_control("fadvise_dontneed_after_append_v1")
@@ -1095,12 +1095,29 @@ def test_row_store_cache_control_config_validates_and_falls_back_to_off() -> Non
     with pytest.raises(ValueError, match="row_store_cache_control must be one of"):
         _resolve_row_store_cache_control("fadvise")
 
-    config = _resolve_row_store_cache_control_config("fadvise_dontneed_after_append_v1")
+    config = _resolve_row_store_cache_control_config(
+        "fadvise_dontneed_after_append_v1",
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
     metadata = _build_row_store_cache_control_metadata(config)
     assert metadata["row_store_cache_control_requested"] == "fadvise_dontneed_after_append_v1"
-    assert metadata["row_store_cache_control_effective"] == "off"
+    assert metadata["row_store_cache_control_effective"] == "fadvise_dontneed_after_append_v1"
     assert metadata["row_store_cache_control_default"] == "off"
-    assert metadata["row_store_cache_control_reference_execution"] is True
+    assert metadata["row_store_cache_control_reference_execution"] is False
+    assert metadata["row_store_cache_control_applicable"] is True
+    assert metadata["row_store_cache_control_fallback_reason"] is None
+
+    fallback_config = _resolve_row_store_cache_control_config(
+        "fadvise_dontneed_after_append_v1",
+        compact_output=False,
+        exact_chunked_decoder=False,
+    )
+    fallback_metadata = _build_row_store_cache_control_metadata(fallback_config)
+    assert fallback_metadata["row_store_cache_control_effective"] == "off"
+    assert fallback_metadata["row_store_cache_control_reference_execution"] is True
+    assert fallback_metadata["row_store_cache_control_applicable"] is False
+    assert fallback_metadata["row_store_cache_control_fallback_reason"] is not None
 
 
 def test_exact_encoder_residency_config_validates_and_falls_back_to_lazy() -> None:
