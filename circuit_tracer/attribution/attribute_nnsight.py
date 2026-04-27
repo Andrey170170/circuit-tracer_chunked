@@ -137,6 +137,16 @@ _PHASE0_ACTIVATION_THRESHOLD_COMPARE_MODE_BY_NAME: dict[str, str] = {
     "torch.float64": "fp64",
 }
 
+_PHASE0_REPLAY_MODE_BY_NAME: dict[str, str] = {
+    "disabled": "disabled",
+    "donor_phase0": "donor_phase0",
+}
+
+_PHASE0_DONOR_CONTEXT_POLICY_BY_NAME: dict[str, str] = {
+    "strict": "strict",
+    "warn": "warn",
+}
+
 
 def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype:
     if isinstance(value, torch.dtype):
@@ -167,6 +177,24 @@ def _resolve_phase0_activation_threshold_compare_mode(value: str) -> str:
         raise ValueError(
             f"phase0_activation_threshold_compare_mode must be one of: {allowed} (got {value!r})"
         )
+    return resolved
+
+
+def _resolve_phase0_replay_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    resolved = _PHASE0_REPLAY_MODE_BY_NAME.get(normalized)
+    if resolved is None:
+        allowed = ", ".join(sorted(_PHASE0_REPLAY_MODE_BY_NAME))
+        raise ValueError(f"phase0_replay_mode must be one of: {allowed} (got {value!r})")
+    return resolved
+
+
+def _resolve_phase0_donor_context_policy(value: str) -> str:
+    normalized = str(value).strip().lower()
+    resolved = _PHASE0_DONOR_CONTEXT_POLICY_BY_NAME.get(normalized)
+    if resolved is None:
+        allowed = ", ".join(sorted(_PHASE0_DONOR_CONTEXT_POLICY_BY_NAME))
+        raise ValueError(f"phase0_donor_context_policy must be one of: {allowed} (got {value!r})")
     return resolved
 
 
@@ -1465,33 +1493,6 @@ def _load_phase0_donor_bundle_npz(
                 f"(expected={expected_target_hash}, computed={computed_target_token_ids_hash})"
             )
 
-        expected_raw_hash = _phase0_npz_optional_str(
-            validation_context.get("active_feature_membership_hash_raw_order")
-        )
-        if (
-            expected_raw_hash is not None
-            and computed_membership_hash_raw is not None
-            and expected_raw_hash != computed_membership_hash_raw
-        ):
-            validation_issues.append(
-                "active_feature_membership_hash_raw_order mismatch with validation_context "
-                f"(expected={expected_raw_hash}, computed={computed_membership_hash_raw})"
-            )
-
-        expected_canonical_hash = _phase0_npz_optional_str(
-            validation_context.get("active_feature_membership_hash_canonical")
-        )
-        if (
-            expected_canonical_hash is not None
-            and computed_membership_hash_canonical is not None
-            and expected_canonical_hash != computed_membership_hash_canonical
-        ):
-            validation_issues.append(
-                "active_feature_membership_hash_canonical mismatch with validation_context "
-                "(expected="
-                f"{expected_canonical_hash}, computed={computed_membership_hash_canonical})"
-            )
-
         expected_clt_hash = _phase0_npz_optional_str(validation_context.get("clt_constants_hash"))
         if (
             expected_clt_hash is not None
@@ -1548,6 +1549,116 @@ def _load_phase0_donor_bundle_npz(
         "target_token_ids": target_token_ids,
         "dtype_metadata": dtype_metadata,
         "validation_metadata": validation_metadata,
+    }
+
+
+def _build_phase0_replay_validation_context(
+    *,
+    input_tokens: torch.Tensor,
+    target_token_ids: torch.Tensor,
+    activation_matrix: torch.Tensor,
+    clt_constants_hash: str | None,
+) -> dict[str, object]:
+    activation_matrix = activation_matrix.coalesce()
+    activation_indices = activation_matrix.indices()
+    activation_shape = tuple(int(dim) for dim in activation_matrix.shape)
+    input_tokens_cpu = input_tokens.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    target_token_ids_cpu = target_token_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+
+    return {
+        "input_tokens": input_tokens_cpu,
+        "input_tokens_hash": _hash_index_tensor(input_tokens_cpu),
+        "target_token_ids": target_token_ids_cpu,
+        "target_token_ids_hash": (
+            _hash_index_tensor(target_token_ids_cpu)
+            if int(target_token_ids_cpu.numel()) > 0
+            else None
+        ),
+        "active_feature_membership_hash_raw_order": _hash_sparse_membership_indices(
+            activation_indices,
+            shape=activation_shape,
+            canonicalize=False,
+        ),
+        "active_feature_membership_hash_canonical": _hash_sparse_membership_indices(
+            activation_indices,
+            shape=activation_shape,
+            canonicalize=True,
+        ),
+        "clt_constants_hash": clt_constants_hash,
+    }
+
+
+def _build_phase0_activation_matrix_from_loaded_bundle(
+    loaded_bundle: dict[str, object],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    active_features = cast(torch.Tensor, loaded_bundle["active_features"])
+    activation_values = cast(torch.Tensor, loaded_bundle["activation_values"])
+    activation_shape = tuple(int(dim) for dim in loaded_bundle["activation_matrix_shape"])
+    if len(activation_shape) != 3:
+        raise ValueError(
+            "loaded Phase-0 donor activation_matrix_shape must have length 3 "
+            f"(got {activation_shape})"
+        )
+    if active_features.ndim != 2 or active_features.shape[1] != 3:
+        raise ValueError(
+            "loaded Phase-0 donor active_features must have shape [N, 3] "
+            f"(got {tuple(active_features.shape)})"
+        )
+
+    activation_indices = active_features.T.to(device=device, dtype=torch.int64, non_blocking=True)
+    activation_values = activation_values.to(device=device, non_blocking=True)
+    return torch.sparse_coo_tensor(
+        activation_indices,
+        activation_values,
+        size=activation_shape,
+        device=device,
+        dtype=activation_values.dtype,
+    ).coalesce()
+
+
+def _build_phase0_replay_metadata(
+    *,
+    mode: str,
+    status: str,
+    donor_bundle_path: str | os.PathLike[str] | None,
+    context_policy: str,
+    validation_warnings: list[str] | None = None,
+    validation_failure_count: int = 0,
+    dtype_metadata: dict[str, object] | None = None,
+    host_hashes: dict[str, object] | None = None,
+    donor_hashes: dict[str, object] | None = None,
+    host_active_feature_count: int | None = None,
+    donor_active_feature_count: int | None = None,
+    replay_single_step_intended: bool = True,
+    note: str | None = None,
+) -> dict[str, object]:
+    donor_path_text = os.fspath(donor_bundle_path) if donor_bundle_path is not None else None
+    warnings = list(validation_warnings or [])
+    warning_count = int(len(warnings))
+    if warning_count == 0:
+        warning_count = int(max(validation_failure_count, 0))
+
+    return {
+        "schema_version": 1,
+        "status": str(status),
+        "mode": str(mode),
+        "context_policy": str(context_policy),
+        "donor_bundle_path": donor_path_text,
+        "donor_bundle_basename": (
+            os.path.basename(donor_path_text) if isinstance(donor_path_text, str) else None
+        ),
+        "validation_warnings": warnings,
+        "validation_warning_count": int(warning_count),
+        "validation_failure_count": int(validation_failure_count),
+        "dtype_metadata": dict(dtype_metadata) if isinstance(dtype_metadata, dict) else {},
+        "host_active_feature_count": host_active_feature_count,
+        "donor_active_feature_count": donor_active_feature_count,
+        "host_hashes": dict(host_hashes) if isinstance(host_hashes, dict) else {},
+        "donor_hashes": dict(donor_hashes) if isinstance(donor_hashes, dict) else {},
+        "replay_single_step_intended": bool(replay_single_step_intended),
+        "note": note,
     }
 
 
@@ -2517,6 +2628,9 @@ def attribute(
     semantic_descriptor_dim: int = 64,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
+    phase0_donor_bundle: str | os.PathLike[str] | None = None,
+    phase0_replay_mode: Literal["disabled", "donor_phase0"] = "disabled",
+    phase0_donor_context_policy: Literal["strict", "warn"] = "strict",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
@@ -2595,6 +2709,13 @@ def attribute(
             for each candidate feature sketch.
         telemetry_max_events: Optional cap for in-memory telemetry event storage.
             If omitted, an environment/default policy is used.
+        phase0_donor_bundle: Optional path to a saved Phase-0 donor bundle
+            (``*.npz``) used for replay in compact exact-chunked runs.
+        phase0_replay_mode: Phase-0 donor replay mode. ``"disabled"`` keeps
+            host Phase-0 active features. ``"donor_phase0"`` replaces host
+            Phase-0 active features with the donor bundle.
+        phase0_donor_context_policy: Validation policy for donor/host context
+            mismatches (``"strict"`` raises, ``"warn"`` records warnings).
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
             normalization/influence ranking path. ``"fp64"`` uses float64
             internals; ``"fp32"`` uses float32 internals.
@@ -2659,6 +2780,9 @@ def attribute(
             semantic_descriptor_dim=semantic_descriptor_dim,
             telemetry_max_events=telemetry_max_events,
             compact_output=compact_output,
+            phase0_donor_bundle=phase0_donor_bundle,
+            phase0_replay_mode=phase0_replay_mode,
+            phase0_donor_context_policy=phase0_donor_context_policy,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
             logger=logger,
@@ -2711,6 +2835,9 @@ def _run_attribution(
     semantic_descriptor_dim: int = 64,
     telemetry_max_events: int | None = None,
     compact_output: bool = False,
+    phase0_donor_bundle: str | os.PathLike[str] | None = None,
+    phase0_replay_mode: Literal["disabled", "donor_phase0"] = "disabled",
+    phase0_donor_context_policy: Literal["strict", "warn"] = "strict",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
@@ -2726,6 +2853,13 @@ def _run_attribution(
     )
     phase0_activation_threshold_compare_mode_resolved = (
         _resolve_phase0_activation_threshold_compare_mode(phase0_activation_threshold_compare_mode)
+    )
+    phase0_replay_mode_resolved = _resolve_phase0_replay_mode(phase0_replay_mode)
+    phase0_donor_context_policy_resolved = _resolve_phase0_donor_context_policy(
+        phase0_donor_context_policy
+    )
+    phase0_donor_bundle_path = (
+        os.fspath(phase0_donor_bundle) if phase0_donor_bundle is not None else None
     )
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
@@ -2747,6 +2881,13 @@ def _run_attribution(
         raise ValueError("feature_batch_min_free_fraction must be in [0, 1)")
     if feature_batch_probe_batches <= 0:
         raise ValueError("feature_batch_probe_batches must be > 0")
+    if phase0_replay_mode_resolved == "disabled" and phase0_donor_bundle_path is not None:
+        raise ValueError(
+            "phase0_donor_bundle was provided but phase0_replay_mode is disabled; "
+            "refusing potentially accidental replay configuration"
+        )
+    if phase0_replay_mode_resolved != "disabled" and not phase0_donor_bundle_path:
+        raise ValueError("phase0_replay_mode requires a phase0_donor_bundle path")
 
     phase4_anomaly_debug_enabled = _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug)
     internal_precision_requested = _resolve_internal_precision_requested(internal_precision)
@@ -2794,6 +2935,9 @@ def _run_attribution(
             "phase0_activation_threshold_compare_mode": (
                 phase0_activation_threshold_compare_mode_resolved
             ),
+            "phase0_replay_mode": phase0_replay_mode_resolved,
+            "phase0_donor_bundle_supplied": bool(phase0_donor_bundle_path is not None),
+            "phase0_donor_context_policy": phase0_donor_context_policy_resolved,
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
@@ -2861,6 +3005,10 @@ def _run_attribution(
             "capture_feature_semantic_descriptors requires compact_output=True and "
             "exact_chunked_decoder=True"
         )
+    if phase0_replay_mode_resolved != "disabled" and not (compact_output and exact_chunked_decoder):
+        raise ValueError(
+            "phase0 donor replay requires compact_output=True and exact_chunked_decoder=True"
+        )
     if phase4_anomaly_debug_enabled:
         anomaly_debug_result = {
             "schema_version": 2,
@@ -2879,6 +3027,13 @@ def _run_attribution(
             "enabled": True,
             "status": "collecting",
             "mode": "early_phase_scalar_summary",
+            "phase0_replay_mode": phase0_replay_mode_resolved,
+            "phase0_donor_context_policy": phase0_donor_context_policy_resolved,
+            "phase0_donor_bundle_basename": (
+                os.path.basename(phase0_donor_bundle_path)
+                if isinstance(phase0_donor_bundle_path, str)
+                else None
+            ),
             "phase0_activation_threshold_compare_mode": (
                 phase0_activation_threshold_compare_mode_resolved
             ),
@@ -2960,6 +3115,14 @@ def _run_attribution(
     phase0_donor_bundle_payload: dict[str, object] | None = None
     phase3_seed_bundle_payload: dict[str, object] | None = None
     feature_semantic_descriptors_payload: dict[str, object] | None = None
+    phase0_replay_metadata: dict[str, object] = _build_phase0_replay_metadata(
+        mode=phase0_replay_mode_resolved,
+        status="disabled" if phase0_replay_mode_resolved == "disabled" else "pending",
+        donor_bundle_path=phase0_donor_bundle_path,
+        context_policy=phase0_donor_context_policy_resolved,
+        replay_single_step_intended=True,
+        note="single-step intended replay mode",
+    )
 
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
@@ -3312,9 +3475,6 @@ def _run_attribution(
         logger.info("Phase 2: Building input vectors")
         phase2_start = time.perf_counter()
         _log_memory_boundary(logger, "Phase 2 start", model.device)
-        feat_layers, feat_pos, feat_ids = activation_matrix.indices()
-        n_layers, n_pos, _ = activation_matrix.shape
-        total_active_feats = activation_matrix._nnz()
 
         # Create AttributionTargets using NNSight's unembed_weight accessor
         last_token_logits = ctx.get_last_token_logits()[0]
@@ -3328,29 +3488,171 @@ def _run_attribution(
         )
 
         log_attribution_target_info(targets, attribution_targets, logger)
-        if capture_phase0_donor_bundle_enabled:
-            target_token_ids = torch.tensor(
-                [int(target.vocab_idx) for target in targets.logit_targets],
-                dtype=torch.int64,
-                device=last_token_logits.device,
+        target_token_ids_tensor = torch.tensor(
+            [int(target.vocab_idx) for target in targets.logit_targets],
+            dtype=torch.int64,
+            device=last_token_logits.device,
+        )
+
+        host_activation_matrix = activation_matrix.coalesce()
+        host_transcoder_snapshot_for_replay = _snapshot_diagnostics(model.transcoders)
+        host_clt_constants_hash = _extract_clt_constants_hash_from_snapshot(
+            host_transcoder_snapshot_for_replay
+        )
+        host_validation_context = _build_phase0_replay_validation_context(
+            input_tokens=input_ids,
+            target_token_ids=target_token_ids_tensor,
+            activation_matrix=host_activation_matrix,
+            clt_constants_hash=host_clt_constants_hash,
+        )
+        host_hashes_for_replay_metadata = {
+            "input_tokens_hash": host_validation_context.get("input_tokens_hash"),
+            "target_token_ids_hash": host_validation_context.get("target_token_ids_hash"),
+            "active_feature_membership_hash_raw_order": host_validation_context.get(
+                "active_feature_membership_hash_raw_order"
+            ),
+            "active_feature_membership_hash_canonical": host_validation_context.get(
+                "active_feature_membership_hash_canonical"
+            ),
+            "clt_constants_hash": host_validation_context.get("clt_constants_hash"),
+        }
+
+        if phase0_replay_mode_resolved == "donor_phase0":
+            assert phase0_donor_bundle_path is not None
+            loaded_phase0_donor_bundle = _load_phase0_donor_bundle_npz(
+                phase0_donor_bundle_path,
+                context_policy=cast(
+                    Literal["strict", "warn"],
+                    phase0_donor_context_policy_resolved,
+                ),
+                validation_context=host_validation_context,
             )
-            valid_target_mask = (target_token_ids >= 0) & (
-                target_token_ids < int(last_token_logits.shape[0])
+            donor_activation_matrix = _build_phase0_activation_matrix_from_loaded_bundle(
+                loaded_phase0_donor_bundle,
+                device=host_activation_matrix.device,
+            )
+            replace_phase0_activation_state = getattr(ctx, "replace_phase0_activation_state", None)
+            if callable(replace_phase0_activation_state):
+                replace_phase0_activation_state(donor_activation_matrix)
+            else:
+                raise RuntimeError(
+                    "Attribution context does not support Phase-0 activation-state replacement"
+                )
+
+            activation_matrix = ctx.activation_matrix.coalesce()
+            donor_validation_metadata = cast(
+                dict[str, object],
+                loaded_phase0_donor_bundle.get("validation_metadata", {}),
+            )
+            donor_dtype_metadata = cast(
+                dict[str, object],
+                loaded_phase0_donor_bundle.get("dtype_metadata", {}),
+            )
+            donor_computed_hashes = cast(
+                dict[str, object],
+                donor_validation_metadata.get("computed_hashes", {}),
+            )
+            donor_stored_hashes = cast(
+                dict[str, object],
+                donor_validation_metadata.get("stored_hashes", {}),
+            )
+            donor_warning_list = [
+                str(item)
+                for item in cast(list[object], donor_validation_metadata.get("warnings", []))
+            ]
+            donor_warning_count = int(
+                donor_validation_metadata.get(
+                    "validation_failure_count",
+                    len(donor_warning_list),
+                )
+            )
+            phase0_replay_status = "applied_with_warnings" if donor_warning_list else "applied"
+            phase0_replay_metadata = _build_phase0_replay_metadata(
+                mode=phase0_replay_mode_resolved,
+                status=phase0_replay_status,
+                donor_bundle_path=phase0_donor_bundle_path,
+                context_policy=phase0_donor_context_policy_resolved,
+                validation_warnings=donor_warning_list,
+                validation_failure_count=donor_warning_count,
+                dtype_metadata=donor_dtype_metadata,
+                host_hashes=host_hashes_for_replay_metadata,
+                donor_hashes={
+                    "computed": donor_computed_hashes,
+                    "stored": donor_stored_hashes,
+                },
+                host_active_feature_count=int(host_activation_matrix._nnz()),
+                donor_active_feature_count=int(activation_matrix._nnz()),
+                replay_single_step_intended=True,
+                note="single-step intended replay mode",
+            )
+            telemetry_recorder.record_event(
+                scope="phase",
+                name="phase2.phase0_replay",
+                phase="phase2",
+                attrs={
+                    "phase0_replay_mode": phase0_replay_mode_resolved,
+                    "phase0_replay_status": phase0_replay_status,
+                    "context_policy": phase0_donor_context_policy_resolved,
+                    "validation_warning_count": int(len(donor_warning_list)),
+                    "dtype_roundtrip_loss": bool(
+                        donor_dtype_metadata.get("dtype_roundtrip_loss", False)
+                    ),
+                    "host_active_feature_count": int(host_activation_matrix._nnz()),
+                    "donor_active_feature_count": int(activation_matrix._nnz()),
+                },
+            )
+        else:
+            phase0_replay_metadata = _build_phase0_replay_metadata(
+                mode=phase0_replay_mode_resolved,
+                status="disabled",
+                donor_bundle_path=None,
+                context_policy=phase0_donor_context_policy_resolved,
+                host_hashes=host_hashes_for_replay_metadata,
+                host_active_feature_count=int(host_activation_matrix._nnz()),
+                replay_single_step_intended=True,
+                note="single-step intended replay mode",
+            )
+            telemetry_recorder.record_event(
+                scope="phase",
+                name="phase2.phase0_replay",
+                phase="phase2",
+                attrs={
+                    "phase0_replay_mode": phase0_replay_mode_resolved,
+                    "phase0_replay_status": "disabled",
+                },
+            )
+
+        if capture_phase0_donor_bundle_enabled:
+            valid_target_mask = (target_token_ids_tensor >= 0) & (
+                target_token_ids_tensor < int(last_token_logits.shape[0])
             )
             target_logits = (
-                last_token_logits[target_token_ids[valid_target_mask]]
+                last_token_logits[target_token_ids_tensor[valid_target_mask]]
                 if bool(valid_target_mask.any().item())
                 else None
+            )
+            capture_status = (
+                "captured_replayed_effective_state"
+                if phase0_replay_mode_resolved != "disabled"
+                else "captured"
             )
             phase0_donor_bundle_payload = _build_phase0_donor_bundle_payload(
                 activation_matrix=activation_matrix,
                 input_tokens=input_ids,
-                target_token_ids=target_token_ids,
+                target_token_ids=target_token_ids_tensor,
                 target_probabilities=targets.logit_probabilities,
                 target_logits=target_logits,
                 transcoder_diagnostic_snapshot=_snapshot_diagnostics(model.transcoders),
-                status="captured",
+                status=capture_status,
             )
+            phase0_donor_bundle_payload["replayed_effective_state"] = bool(
+                phase0_replay_mode_resolved != "disabled"
+            )
+            phase0_donor_bundle_payload["phase0_replay_mode"] = phase0_replay_mode_resolved
+
+        feat_layers, feat_pos, feat_ids = activation_matrix.indices()
+        n_layers, n_pos, _ = activation_matrix.shape
+        total_active_feats = activation_matrix._nnz()
 
         if cross_cluster_debug_summary is not None:
             phase1_runtime_summary, phase1_runtime_stream = _build_cross_cluster_runtime_snapshot(
@@ -3403,6 +3705,25 @@ def _run_attribution(
                 summary_payload=phase1_summary_checkpoint,
                 stream_payload=phase1_stream_checkpoint,
             )
+            cross_cluster_debug_summary["phase0_replay_metadata"] = phase0_replay_metadata
+            _record_cross_cluster_checkpoint(
+                cross_cluster_debug_summary=cross_cluster_debug_summary,
+                cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+                checkpoint_name="phase2_phase0_replay",
+                phase="phase2",
+                summary_payload=phase0_replay_metadata,
+                stream_payload={
+                    "phase0_replay_mode": phase0_replay_metadata.get("mode"),
+                    "phase0_replay_status": phase0_replay_metadata.get("status"),
+                    "validation_warning_count": phase0_replay_metadata.get(
+                        "validation_warning_count"
+                    ),
+                    "dtype_roundtrip_loss": cast(
+                        dict[str, object],
+                        phase0_replay_metadata.get("dtype_metadata", {}),
+                    ).get("dtype_roundtrip_loss"),
+                },
+            )
 
         if offload:
             offload_handles += offload_modules([model.embed_location], offload)
@@ -3450,7 +3771,12 @@ def _run_attribution(
                 "compact_feature_file_backed_dense"
                 if use_compact_feature_row_store
                 else "dense_full"
-            )
+            ),
+            "phase0_replay_mode": phase0_replay_metadata.get("mode"),
+            "phase0_replay_status": phase0_replay_metadata.get("status"),
+            "phase0_replay_validation_warning_count": phase0_replay_metadata.get(
+                "validation_warning_count"
+            ),
         }
         if use_compact_feature_row_store:
             assert feature_row_store is not None
@@ -3517,6 +3843,11 @@ def _run_attribution(
                 "feat_pos_hash": _hash_index_tensor(feat_pos),
                 "feat_ids_hash": _hash_index_tensor(feat_ids),
                 "feature_count": int(total_active_feats),
+                "phase0_replay_mode": phase0_replay_metadata.get("mode"),
+                "phase0_replay_status": phase0_replay_metadata.get("status"),
+                "phase0_replay_validation_warning_count": phase0_replay_metadata.get(
+                    "validation_warning_count"
+                ),
                 "decoder_chunk_size": (
                     int(getattr(model.transcoders, "decoder_chunk_size", 0))
                     if getattr(model.transcoders, "decoder_chunk_size", None) is not None
@@ -3533,6 +3864,11 @@ def _run_attribution(
                 "feat_pos_hash": phase2_summary_checkpoint["feat_pos_hash"],
                 "feat_ids_hash": phase2_summary_checkpoint["feat_ids_hash"],
                 "feature_count": int(total_active_feats),
+                "phase0_replay_mode": phase0_replay_metadata.get("mode"),
+                "phase0_replay_status": phase0_replay_metadata.get("status"),
+                "phase0_replay_validation_warning_count": phase0_replay_metadata.get(
+                    "validation_warning_count"
+                ),
                 "decoder_chunk_size": phase2_summary_checkpoint["decoder_chunk_size"],
                 "row_store_mode": phase2_summary_checkpoint["row_store_mode"],
                 "row_store_expected_bytes": int(row_store_expected_bytes),
@@ -5079,6 +5415,23 @@ def _run_attribution(
                 "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
                 "cross_cluster_debug_enabled": bool(cross_cluster_debug_enabled),
+                "phase0_replay_mode": phase0_replay_metadata.get("mode"),
+                "phase0_replay_status": phase0_replay_metadata.get("status"),
+                "phase0_replay_context_policy": phase0_replay_metadata.get("context_policy"),
+                "phase0_replay_donor_bundle_path": phase0_replay_metadata.get("donor_bundle_path"),
+                "phase0_replay_donor_bundle_basename": phase0_replay_metadata.get(
+                    "donor_bundle_basename"
+                ),
+                "phase0_replay_validation_warning_count": phase0_replay_metadata.get(
+                    "validation_warning_count"
+                ),
+                "phase0_replay_validation_warnings": phase0_replay_metadata.get(
+                    "validation_warnings"
+                ),
+                "phase0_replay_dtype_roundtrip_loss": cast(
+                    dict[str, object],
+                    phase0_replay_metadata.get("dtype_metadata", {}),
+                ).get("dtype_roundtrip_loss"),
                 "capture_phase0_donor_bundle_enabled": bool(capture_phase0_donor_bundle_enabled),
                 "capture_phase3_seed_bundle_enabled": bool(capture_phase3_seed_bundle_enabled),
                 "capture_feature_semantic_descriptors_enabled": bool(
@@ -5115,6 +5468,7 @@ def _run_attribution(
                 "cfg": model.config,
                 "scan": model.scan,
             }
+            compact_output_result["phase0_replay_metadata"] = phase0_replay_metadata
             if capture_phase0_donor_bundle_enabled:
                 compact_output_result["phase0_donor_bundle"] = phase0_donor_bundle_payload
             if capture_phase3_seed_bundle_enabled:

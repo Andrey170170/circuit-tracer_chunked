@@ -527,6 +527,50 @@ class AttributionContext:
         self._row_size = self.activation_matrix._nnz() + (n_layers + 1) * n_pos
         return total_active_feats, self.activation_matrix._nnz()
 
+    def replace_phase0_activation_state(
+        self,
+        activation_matrix: torch.Tensor,
+    ) -> dict[str, int]:
+        activation_matrix = activation_matrix.coalesce()
+        n_layers, n_pos, _ = activation_matrix.shape
+
+        if self.error_vectors.ndim >= 2 and (
+            int(self.error_vectors.shape[0]) != int(n_layers)
+            or int(self.error_vectors.shape[1]) != int(n_pos)
+        ):
+            raise ValueError(
+                "replacement activation_matrix shape must match error_vectors on "
+                "(layers, positions)"
+            )
+        if self.token_vectors.ndim >= 1 and int(self.token_vectors.shape[0]) != int(n_pos):
+            raise ValueError(
+                "replacement activation_matrix positions must match token_vectors length"
+            )
+
+        old_active_feature_count = int(self.activation_matrix._nnz())
+        self.activation_matrix = activation_matrix
+        self.n_layers = int(n_layers)
+
+        if self.chunked_decoder_state is not None:
+            activation_indices = activation_matrix.indices()
+            self.chunked_decoder_state = {
+                "source_layers": activation_indices[0].contiguous(),
+                "positions": activation_indices[1].contiguous(),
+                "feature_ids": activation_indices[2].contiguous(),
+                "activation_values": activation_matrix.values().contiguous(),
+            }
+            self._refresh_chunked_layer_spans()
+            self.reset_decoder_cache()
+
+        self._materialized_error_vector_layers.clear()
+        self._row_size = int(self.activation_matrix._nnz()) + (self.n_layers + 1) * int(n_pos)
+        return {
+            "old_active_feature_count": old_active_feature_count,
+            "new_active_feature_count": int(self.activation_matrix._nnz()),
+            "n_layers": int(n_layers),
+            "n_positions": int(n_pos),
+        }
+
     def _compute_chunked_feature_attributions_from_grads(
         self,
         output_layer_grads: list[torch.Tensor | None],

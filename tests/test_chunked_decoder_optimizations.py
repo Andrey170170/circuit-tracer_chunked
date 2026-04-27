@@ -12,7 +12,10 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_cross_cluster_runtime_snapshot,
     _build_matrix_abs_stats,
     _build_feature_semantic_descriptors_payload,
+    _build_phase0_activation_matrix_from_loaded_bundle,
     _build_phase0_donor_bundle_payload,
+    _build_phase0_replay_metadata,
+    _build_phase0_replay_validation_context,
     _build_phase4_normalization_stats,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
@@ -29,6 +32,8 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_internal_dtype_map,
     _resolve_internal_precision_requested,
     _resolve_phase0_activation_threshold_compare_mode,
+    _resolve_phase0_donor_context_policy,
+    _resolve_phase0_replay_mode,
     _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
     _hash_sparse_membership_indices,
@@ -270,6 +275,42 @@ def test_nnsight_chunked_attr_requires_sorted_source_layers() -> None:
                 "activation_values": torch.tensor([2.0, 1.0]),
             },
         )
+
+
+def test_nnsight_context_replace_phase0_activation_state_refreshes_chunked_state() -> None:
+    ctx, provider = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    assert ctx.decoder_chunk_cache is not None
+
+    donor_activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 2], [1, 0], [1, 0]], dtype=torch.int64),
+        values=torch.tensor([4.0, -3.0], dtype=torch.float32),
+        size=(3, 2, 2),
+        check_invariants=True,
+    ).coalesce()
+
+    stats = ctx.replace_phase0_activation_state(donor_activation_matrix)
+
+    assert stats["old_active_feature_count"] == 3
+    assert stats["new_active_feature_count"] == 2
+    assert ctx._row_size == donor_activation_matrix._nnz() + (3 + 1) * 2
+    assert provider.clear_calls >= 1
+    assert ctx.decoder_chunk_cache is not None
+    assert torch.equal(ctx.activation_matrix.indices(), donor_activation_matrix.indices())
+    assert torch.equal(ctx.activation_matrix.values(), donor_activation_matrix.values())
+    assert ctx._chunked_layer_spans == [(0, 1), None, (1, 2)]
+    assert ctx.chunked_decoder_state is not None
+    assert torch.equal(
+        ctx.chunked_decoder_state["source_layers"],
+        donor_activation_matrix.indices()[0],
+    )
+    assert torch.equal(
+        ctx.chunked_decoder_state["positions"],
+        donor_activation_matrix.indices()[1],
+    )
+    assert torch.equal(
+        ctx.chunked_decoder_state["feature_ids"],
+        donor_activation_matrix.indices()[2],
+    )
 
 
 def test_transformerlens_chunked_attr_reuses_decoder_block_loads() -> None:
@@ -1031,6 +1072,87 @@ def test_load_phase0_donor_bundle_npz_warn_policy_returns_warnings(tmp_path: Pat
     assert len(warnings) >= 1
     assert any("validation_context" in warning for warning in warnings)
     assert cast(torch.Tensor, loaded["active_features"]).shape == (2, 3)
+
+
+def test_build_phase0_replay_validation_context_hashes_host_state() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 1], [1, 0], [2, 3]], dtype=torch.int64),
+        values=torch.tensor([0.5, -0.2], dtype=torch.float32),
+        size=(2, 2, 8),
+        check_invariants=True,
+    ).coalesce()
+    target_token_ids = torch.tensor([7, 8], dtype=torch.int64)
+    validation_context = _build_phase0_replay_validation_context(
+        input_tokens=torch.tensor([11, 22, 33], dtype=torch.int64),
+        target_token_ids=target_token_ids,
+        activation_matrix=activation_matrix,
+        clt_constants_hash="clt1234",
+    )
+
+    assert validation_context["clt_constants_hash"] == "clt1234"
+    assert validation_context["input_tokens_hash"]
+    assert validation_context["target_token_ids_hash"]
+    assert validation_context["active_feature_membership_hash_raw_order"]
+    assert validation_context["active_feature_membership_hash_canonical"]
+
+
+def test_build_phase0_activation_matrix_from_loaded_bundle_reconstructs_sparse_matrix() -> None:
+    loaded_bundle = {
+        "active_features": torch.tensor([[0, 1, 2], [1, 0, 3]], dtype=torch.int64),
+        "activation_values": torch.tensor([0.25, -0.75], dtype=torch.float32),
+        "activation_matrix_shape": (2, 2, 8),
+    }
+
+    activation_matrix = _build_phase0_activation_matrix_from_loaded_bundle(
+        loaded_bundle,
+        device=torch.device("cpu"),
+    )
+
+    assert activation_matrix.shape == (2, 2, 8)
+    assert activation_matrix._nnz() == 2
+    assert torch.equal(
+        activation_matrix.indices().T,
+        cast(torch.Tensor, loaded_bundle["active_features"]),
+    )
+    assert torch.equal(
+        activation_matrix.values(),
+        cast(torch.Tensor, loaded_bundle["activation_values"]),
+    )
+
+
+def test_build_phase0_replay_metadata_tracks_warnings_and_dtype_loss() -> None:
+    metadata = _build_phase0_replay_metadata(
+        mode="donor_phase0",
+        status="applied_with_warnings",
+        donor_bundle_path="/tmp/step_000_phase0_donor_bundle.npz",
+        context_policy="warn",
+        validation_warnings=["target_token_ids_hash mismatch"],
+        validation_failure_count=1,
+        dtype_metadata={"dtype_roundtrip_loss": True},
+        host_hashes={"input_tokens_hash": "abcd"},
+        donor_hashes={"computed": {"input_tokens_hash": "efgh"}},
+        host_active_feature_count=10,
+        donor_active_feature_count=9,
+    )
+
+    assert metadata["status"] == "applied_with_warnings"
+    assert metadata["mode"] == "donor_phase0"
+    assert metadata["context_policy"] == "warn"
+    assert metadata["donor_bundle_basename"] == "step_000_phase0_donor_bundle.npz"
+    assert metadata["validation_warning_count"] == 1
+    assert cast(dict[str, object], metadata["dtype_metadata"])["dtype_roundtrip_loss"] is True
+
+
+def test_phase0_replay_mode_and_context_policy_resolution() -> None:
+    assert _resolve_phase0_replay_mode("disabled") == "disabled"
+    assert _resolve_phase0_replay_mode("donor_phase0") == "donor_phase0"
+    assert _resolve_phase0_donor_context_policy("strict") == "strict"
+    assert _resolve_phase0_donor_context_policy("warn") == "warn"
+
+    with pytest.raises(ValueError, match="phase0_replay_mode"):
+        _resolve_phase0_replay_mode("legacy")
+    with pytest.raises(ValueError, match="phase0_donor_context_policy"):
+        _resolve_phase0_donor_context_policy("ignore")
 
 
 def test_build_feature_semantic_descriptors_payload_is_bounded_and_deterministic() -> None:
