@@ -211,6 +211,7 @@ def attribute(
             (``"batched"`` or ``"streaming_v1"``).
         phase1_trace_batch_policy: Requested Phase-1 trace-batch sizing policy.
         phase1_trace_batch_size_max: Optional Phase-1 trace-batch cap.
+            Used by ``"cap_effective_batches"``; ignored by legacy execution.
         phase4_refresh_policy: Requested Phase-4 refresh cadence policy.
         phase4_refresh_interval_multiplier: Requested Phase-4 refresh interval multiplier.
         phase4_ranker: Requested Phase-4 ranker implementation.

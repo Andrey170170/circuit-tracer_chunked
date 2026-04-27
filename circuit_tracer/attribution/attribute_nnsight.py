@@ -191,7 +191,7 @@ _PHASE1_TRACE_BATCH_POLICY_DEFAULT: Literal["legacy"] = "legacy"
 _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT: int | None = None
 _PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
     "legacy": "legacy",
-    "cap_effective_batches": "legacy",
+    "cap_effective_batches": "cap_effective_batches",
 }
 
 _PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
@@ -268,7 +268,31 @@ class _Phase1TraceBatchConfig:
     effective_batch_size_max: int | None
     default_policy: Literal["legacy"]
     default_batch_size_max: int | None
-    effective_behavior: Literal["requested", "legacy_reference_execution"]
+    effective_behavior: Literal["requested", "legacy_fallback_missing_batch_size_max"]
+    fallback_reason: str | None
+
+
+@dataclass(frozen=True)
+class _Phase1TraceBatchSizing:
+    requested_source_batch_size: int
+    requested_feature_batch_size: int
+    requested_logit_batch_size: int
+    requested_phase4_max_feature_batch_size: int
+    requested_feature_batch_size_defaulted: bool
+    requested_logit_batch_size_defaulted: bool
+    effective_source_batch_size: int
+    effective_feature_batch_size: int
+    effective_logit_batch_size: int
+    effective_phase4_max_feature_batch_size: int
+    source_batch_size_cap_applied: bool
+    feature_batch_size_cap_applied: bool
+    logit_batch_size_cap_applied: bool
+    phase4_max_feature_batch_size_cap_applied: bool
+    cap_applied: bool
+    cap_reason: str
+    trace_batch_size_legacy: int
+    trace_batch_size_effective_pre_planner: int
+    trace_batch_size_cap_applied: bool
 
 
 @dataclass(frozen=True)
@@ -1198,16 +1222,29 @@ def _resolve_phase1_trace_batch_config(
 ) -> _Phase1TraceBatchConfig:
     requested_policy = _resolve_phase1_trace_batch_policy(phase1_trace_batch_policy)
     requested_batch_size_max = _resolve_phase1_trace_batch_size_max(phase1_trace_batch_size_max)
+    cap_requested = requested_policy == "cap_effective_batches"
+    fallback_missing_batch_size_max = cap_requested and requested_batch_size_max is None
     effective_policy = cast(
         Literal["legacy", "cap_effective_batches"],
-        _PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy],
+        (
+            _PHASE1_TRACE_BATCH_POLICY_DEFAULT
+            if fallback_missing_batch_size_max
+            else _PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy]
+        ),
     )
-    effective_batch_size_max = _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT
-    effective_behavior: Literal["requested", "legacy_reference_execution"] = (
-        "requested"
-        if requested_policy == _PHASE1_TRACE_BATCH_POLICY_DEFAULT
-        and requested_batch_size_max == _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT
-        else "legacy_reference_execution"
+    effective_batch_size_max = (
+        requested_batch_size_max
+        if effective_policy == "cap_effective_batches"
+        else _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT
+    )
+    effective_behavior: Literal["requested", "legacy_fallback_missing_batch_size_max"] = (
+        "legacy_fallback_missing_batch_size_max" if fallback_missing_batch_size_max else "requested"
+    )
+    fallback_reason = (
+        "cap_effective_batches requested without phase1_trace_batch_size_max; "
+        "falling back to legacy execution"
+        if fallback_missing_batch_size_max
+        else None
     )
     return _Phase1TraceBatchConfig(
         requested_policy=requested_policy,
@@ -1217,6 +1254,7 @@ def _resolve_phase1_trace_batch_config(
         default_policy=_PHASE1_TRACE_BATCH_POLICY_DEFAULT,
         default_batch_size_max=_PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT,
         effective_behavior=effective_behavior,
+        fallback_reason=fallback_reason,
     )
 
 
@@ -1229,6 +1267,7 @@ def _build_phase1_trace_batch_metadata(
         "trace_batch_policy_default": phase1_trace_batch_config.default_policy,
         "trace_batch_policy_effective": phase1_trace_batch_config.effective_policy,
         "trace_batch_policy_effective_behavior": phase1_trace_batch_config.effective_behavior,
+        "trace_batch_policy_fallback_reason": phase1_trace_batch_config.fallback_reason,
         "trace_batch_policy_reference_execution": bool(
             phase1_trace_batch_config.requested_policy != phase1_trace_batch_config.effective_policy
         ),
@@ -1240,6 +1279,131 @@ def _build_phase1_trace_batch_metadata(
             phase1_trace_batch_config.requested_batch_size_max
             != phase1_trace_batch_config.effective_batch_size_max
         ),
+    }
+
+
+def _resolve_phase1_trace_batch_sizing(
+    *,
+    batch_size: int,
+    feature_batch_size: int | None,
+    logit_batch_size: int | None,
+    feature_batch_size_max: int | None,
+    phase1_trace_batch_config: _Phase1TraceBatchConfig,
+) -> _Phase1TraceBatchSizing:
+    requested_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
+    requested_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
+    requested_phase4_max_feature_batch_size = (
+        requested_feature_batch_size if feature_batch_size_max is None else feature_batch_size_max
+    )
+
+    cap_limit = (
+        int(phase1_trace_batch_config.effective_batch_size_max)
+        if phase1_trace_batch_config.effective_policy == "cap_effective_batches"
+        and phase1_trace_batch_config.effective_batch_size_max is not None
+        else None
+    )
+
+    if cap_limit is None:
+        effective_source_batch_size = int(batch_size)
+        effective_feature_batch_size = int(requested_feature_batch_size)
+        effective_logit_batch_size = int(requested_logit_batch_size)
+        effective_phase4_max_feature_batch_size = int(requested_phase4_max_feature_batch_size)
+    else:
+        effective_source_batch_size = min(int(batch_size), cap_limit)
+        effective_feature_batch_size = min(int(requested_feature_batch_size), cap_limit)
+        effective_logit_batch_size = min(int(requested_logit_batch_size), cap_limit)
+        effective_phase4_max_feature_batch_size = min(
+            int(requested_phase4_max_feature_batch_size),
+            cap_limit,
+        )
+
+    source_batch_size_cap_applied = effective_source_batch_size < int(batch_size)
+    feature_batch_size_cap_applied = effective_feature_batch_size < int(
+        requested_feature_batch_size
+    )
+    logit_batch_size_cap_applied = effective_logit_batch_size < int(requested_logit_batch_size)
+    phase4_max_feature_batch_size_cap_applied = effective_phase4_max_feature_batch_size < int(
+        requested_phase4_max_feature_batch_size
+    )
+    cap_applied = (
+        source_batch_size_cap_applied
+        or feature_batch_size_cap_applied
+        or logit_batch_size_cap_applied
+        or phase4_max_feature_batch_size_cap_applied
+    )
+
+    if cap_limit is not None:
+        cap_reason = (
+            "cap_effective_batches_applied"
+            if cap_applied
+            else "cap_effective_batches_no_reduction_needed"
+        )
+    elif phase1_trace_batch_config.requested_policy == "cap_effective_batches":
+        cap_reason = "cap_effective_batches_fallback_missing_batch_size_max"
+    elif phase1_trace_batch_config.requested_batch_size_max is not None:
+        cap_reason = "legacy_policy_ignores_phase1_trace_batch_size_max"
+    else:
+        cap_reason = "legacy_policy_no_cap"
+
+    trace_batch_size_legacy = max(
+        int(batch_size),
+        int(requested_feature_batch_size),
+        int(requested_logit_batch_size),
+    )
+    trace_batch_size_effective_pre_planner = max(
+        effective_source_batch_size,
+        effective_feature_batch_size,
+        effective_logit_batch_size,
+    )
+
+    return _Phase1TraceBatchSizing(
+        requested_source_batch_size=int(batch_size),
+        requested_feature_batch_size=int(requested_feature_batch_size),
+        requested_logit_batch_size=int(requested_logit_batch_size),
+        requested_phase4_max_feature_batch_size=int(requested_phase4_max_feature_batch_size),
+        requested_feature_batch_size_defaulted=(feature_batch_size is None),
+        requested_logit_batch_size_defaulted=(logit_batch_size is None),
+        effective_source_batch_size=effective_source_batch_size,
+        effective_feature_batch_size=effective_feature_batch_size,
+        effective_logit_batch_size=effective_logit_batch_size,
+        effective_phase4_max_feature_batch_size=effective_phase4_max_feature_batch_size,
+        source_batch_size_cap_applied=source_batch_size_cap_applied,
+        feature_batch_size_cap_applied=feature_batch_size_cap_applied,
+        logit_batch_size_cap_applied=logit_batch_size_cap_applied,
+        phase4_max_feature_batch_size_cap_applied=phase4_max_feature_batch_size_cap_applied,
+        cap_applied=cap_applied,
+        cap_reason=cap_reason,
+        trace_batch_size_legacy=trace_batch_size_legacy,
+        trace_batch_size_effective_pre_planner=trace_batch_size_effective_pre_planner,
+        trace_batch_size_cap_applied=(
+            trace_batch_size_effective_pre_planner < trace_batch_size_legacy
+        ),
+    )
+
+
+def _build_phase1_trace_batch_sizing_metadata(
+    sizing: _Phase1TraceBatchSizing,
+) -> dict[str, object]:
+    return {
+        "source_batch_size_requested": sizing.requested_source_batch_size,
+        "source_batch_size_effective": sizing.effective_source_batch_size,
+        "source_batch_size_cap_applied": sizing.source_batch_size_cap_applied,
+        "feature_batch_size_requested": sizing.requested_feature_batch_size,
+        "feature_batch_size_defaulted": sizing.requested_feature_batch_size_defaulted,
+        "feature_batch_size_effective": sizing.effective_feature_batch_size,
+        "feature_batch_size_cap_applied": sizing.feature_batch_size_cap_applied,
+        "logit_batch_size_requested": sizing.requested_logit_batch_size,
+        "logit_batch_size_defaulted": sizing.requested_logit_batch_size_defaulted,
+        "logit_batch_size_effective": sizing.effective_logit_batch_size,
+        "logit_batch_size_cap_applied": sizing.logit_batch_size_cap_applied,
+        "phase4_feature_batch_size_max_requested": sizing.requested_phase4_max_feature_batch_size,
+        "phase4_feature_batch_size_max_effective": sizing.effective_phase4_max_feature_batch_size,
+        "phase4_feature_batch_size_max_cap_applied": sizing.phase4_max_feature_batch_size_cap_applied,
+        "trace_batch_size_legacy": sizing.trace_batch_size_legacy,
+        "trace_batch_size_effective_pre_planner": sizing.trace_batch_size_effective_pre_planner,
+        "trace_batch_size_cap_applied": sizing.trace_batch_size_cap_applied,
+        "trace_batch_cap_applied": sizing.cap_applied,
+        "trace_batch_cap_reason": sizing.cap_reason,
     }
 
 
@@ -3903,11 +4067,13 @@ def attribute(
             compact exact-trace Phase-4 feature rows in smaller compute micro-batches
             while preserving scheduler frontier membership/order semantics.
         phase1_trace_batch_policy: Requested Phase-1 trace-batch sizing policy.
-            ``"legacy"`` keeps current behavior; ``"cap_effective_batches"`` is
-            currently validated/plumbed only and falls back to legacy execution.
+            ``"legacy"`` keeps current behavior. ``"cap_effective_batches"``
+            caps effective source/feature/logit trace batches (and Phase-4
+            feature-batch max) to ``phase1_trace_batch_size_max``.
         phase1_trace_batch_size_max: Optional cap paired with
-            ``phase1_trace_batch_policy``. Currently validated/plumbed only and
-            does not change execution behavior.
+            ``phase1_trace_batch_policy``. Required to activate
+            ``"cap_effective_batches"``; when omitted under that policy, execution
+            falls back to ``"legacy"`` with explicit metadata.
         phase4_refresh_policy: Requested Phase-4 refresh cadence policy.
             ``"standard"`` keeps current behavior; ``"deferred_v1"`` is
             currently validated/plumbed only and falls back to standard execution.
@@ -4120,6 +4286,22 @@ def _run_attribution(
         phase1_trace_batch_size_max=phase1_trace_batch_size_max,
     )
     phase1_trace_batch_metadata = _build_phase1_trace_batch_metadata(phase1_trace_batch_config)
+    phase1_trace_batch_sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=batch_size,
+        feature_batch_size=feature_batch_size,
+        logit_batch_size=logit_batch_size,
+        feature_batch_size_max=feature_batch_size_max,
+        phase1_trace_batch_config=phase1_trace_batch_config,
+    )
+    phase1_trace_batch_metadata.update(
+        _build_phase1_trace_batch_sizing_metadata(phase1_trace_batch_sizing)
+    )
+    effective_source_batch_size = phase1_trace_batch_sizing.effective_source_batch_size
+    effective_feature_batch_size = phase1_trace_batch_sizing.effective_feature_batch_size
+    effective_logit_batch_size = phase1_trace_batch_sizing.effective_logit_batch_size
+    max_phase4_feature_batch_size = (
+        phase1_trace_batch_sizing.effective_phase4_max_feature_batch_size
+    )
     phase4_refresh_policy_config = _resolve_phase4_refresh_policy_config(
         phase4_refresh_policy=phase4_refresh_policy,
         phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
@@ -4181,10 +4363,6 @@ def _run_attribution(
         },
     )
 
-    effective_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
-    max_phase4_feature_batch_size = (
-        effective_feature_batch_size if feature_batch_size_max is None else feature_batch_size_max
-    )
     planner_enabled = _resolve_phase4_feature_batch_planner_enabled(
         plan_feature_batch_size=plan_feature_batch_size,
         auto_scale_feature_batch_size=auto_scale_feature_batch_size,
@@ -4197,7 +4375,6 @@ def _run_attribution(
         )
     if (not planner_enabled) and max_phase4_feature_batch_size < effective_feature_batch_size:
         raise ValueError("feature_batch_size_max must be >= the effective feature batch size")
-    effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
 
     exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
     planner_status, planner_skip_reason = _resolve_phase4_feature_batch_planner_status(
@@ -4277,7 +4454,7 @@ def _run_attribution(
                 model=model,
                 prompt=prompt,
                 attribution_targets=attribution_targets,
-                batch_size=batch_size,
+                batch_size=effective_source_batch_size,
                 initial_feature_batch_size=planner_probe_feature_batch_size,
                 effective_logit_batch_size=effective_logit_batch_size,
                 max_feature_batch_size=max_phase4_feature_batch_size,
@@ -4306,12 +4483,12 @@ def _run_attribution(
             planner_status = "executed"
 
     trace_batch_size = max(
-        batch_size,
+        effective_source_batch_size,
         effective_feature_batch_size,
         effective_logit_batch_size,
     )
     phase1_trace_batch_metadata.update(
-        trace_batch_size_legacy=int(trace_batch_size),
+        trace_batch_size_legacy=int(phase1_trace_batch_sizing.trace_batch_size_legacy),
         trace_batch_size_effective=int(trace_batch_size),
     )
     ctx = None
@@ -4365,8 +4542,11 @@ def _run_attribution(
             f"exact_encoder_residency={exact_encoder_residency_config.requested_mode} "
             f"(effective={exact_encoder_residency_config.effective_mode}) | "
             f"exact_trace_internal_dtype={exact_trace_internal_dtype_name} | "
-            f"prompt_tokens={input_ids.shape[-1]} | feature_batch_size={effective_feature_batch_size} | "
-            f"logit_batch_size={effective_logit_batch_size}"
+            f"prompt_tokens={input_ids.shape[-1]} | "
+            f"source_batch_size={effective_source_batch_size} | "
+            f"feature_batch_size={effective_feature_batch_size} | "
+            f"logit_batch_size={effective_logit_batch_size} | "
+            f"trace_batch_cap_reason={phase1_trace_batch_metadata.get('trace_batch_cap_reason')}"
         )
 
     ctx = model.setup_attribution(
@@ -4526,6 +4706,10 @@ def _run_attribution(
             f"requested_size_max={phase1_trace_batch_config.requested_batch_size_max} | "
             f"effective_size_max={phase1_trace_batch_config.effective_batch_size_max} | "
             f"effective_behavior={phase1_trace_batch_config.effective_behavior} | "
+            f"source_batch_size={effective_source_batch_size} | "
+            f"feature_batch_size={effective_feature_batch_size} | "
+            f"logit_batch_size={effective_logit_batch_size} | "
+            f"cap_reason={phase1_trace_batch_metadata.get('trace_batch_cap_reason')} | "
             f"trace_batch_size={trace_batch_size}"
         )
         phase_start = time.perf_counter()
@@ -6760,6 +6944,7 @@ def _run_attribution(
                     phase4_row_executor_config.requested_mode
                     != phase4_row_executor_config.effective_mode
                 ),
+                **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
                 "phase4_executor_configured_reference_batch_size": int(
                     phase4_executor_reference_batch_size
                 ),

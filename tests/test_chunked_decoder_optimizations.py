@@ -43,6 +43,8 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_phase1_trace_batch_size_max,
     _resolve_phase1_trace_batch_config,
     _build_phase1_trace_batch_metadata,
+    _resolve_phase1_trace_batch_sizing,
+    _build_phase1_trace_batch_sizing_metadata,
     _resolve_phase4_refresh_policy,
     _resolve_phase4_refresh_interval_multiplier,
     _resolve_phase4_refresh_policy_config,
@@ -819,7 +821,7 @@ def test_phase4_refresh_optimization_falls_back_off_when_compact_refresh_unavail
     assert metadata["refresh_optimization_effective_behavior"] == "off_reference_execution"
 
 
-def test_phase1_trace_batch_policy_config_validates_and_falls_back_to_legacy() -> None:
+def test_phase1_trace_batch_policy_config_validates_and_tracks_effective_behavior() -> None:
     assert _resolve_phase1_trace_batch_policy("legacy") == "legacy"
     assert _resolve_phase1_trace_batch_policy("cap_effective_batches") == "cap_effective_batches"
     assert _resolve_phase1_trace_batch_size_max(None) is None
@@ -835,13 +837,46 @@ def test_phase1_trace_batch_policy_config_validates_and_falls_back_to_legacy() -
     )
     metadata = _build_phase1_trace_batch_metadata(config)
     assert metadata["trace_batch_policy_requested"] == "cap_effective_batches"
-    assert metadata["trace_batch_policy_effective"] == "legacy"
+    assert metadata["trace_batch_policy_effective"] == "cap_effective_batches"
     assert metadata["trace_batch_policy_default"] == "legacy"
-    assert metadata["trace_batch_policy_reference_execution"] is True
+    assert metadata["trace_batch_policy_reference_execution"] is False
     assert metadata["trace_batch_size_max_requested"] == 64
-    assert metadata["trace_batch_size_max_effective"] is None
+    assert metadata["trace_batch_size_max_effective"] == 64
     assert metadata["trace_batch_size_max_default"] is None
-    assert metadata["trace_batch_size_max_reference_execution"] is True
+    assert metadata["trace_batch_size_max_reference_execution"] is False
+    assert metadata["trace_batch_policy_fallback_reason"] is None
+
+    cap_missing_max = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=None,
+    )
+    cap_missing_max_metadata = _build_phase1_trace_batch_metadata(cap_missing_max)
+    assert cap_missing_max_metadata["trace_batch_policy_effective"] == "legacy"
+    assert cap_missing_max_metadata["trace_batch_policy_reference_execution"] is True
+    assert (
+        cap_missing_max_metadata["trace_batch_policy_effective_behavior"]
+        == "legacy_fallback_missing_batch_size_max"
+    )
+    assert (
+        cap_missing_max_metadata["trace_batch_policy_fallback_reason"]
+        == "cap_effective_batches requested without phase1_trace_batch_size_max; "
+        "falling back to legacy execution"
+    )
+    cap_missing_max_sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=128,
+        feature_batch_size=None,
+        logit_batch_size=None,
+        feature_batch_size_max=None,
+        phase1_trace_batch_config=cap_missing_max,
+    )
+    cap_missing_max_sizing_metadata = _build_phase1_trace_batch_sizing_metadata(
+        cap_missing_max_sizing
+    )
+    assert cap_missing_max_sizing_metadata["trace_batch_cap_applied"] is False
+    assert (
+        cap_missing_max_sizing_metadata["trace_batch_cap_reason"]
+        == "cap_effective_batches_fallback_missing_batch_size_max"
+    )
 
     legacy_with_cap = _resolve_phase1_trace_batch_config(
         phase1_trace_batch_policy="legacy",
@@ -851,6 +886,57 @@ def test_phase1_trace_batch_policy_config_validates_and_falls_back_to_legacy() -
     assert legacy_with_cap_metadata["trace_batch_policy_effective"] == "legacy"
     assert legacy_with_cap_metadata["trace_batch_size_max_effective"] is None
     assert legacy_with_cap_metadata["trace_batch_size_max_reference_execution"] is True
+
+
+def test_phase1_trace_batch_sizing_caps_effective_batches_consistently() -> None:
+    config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=64,
+    )
+    sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=128,
+        feature_batch_size=None,
+        logit_batch_size=96,
+        feature_batch_size_max=200,
+        phase1_trace_batch_config=config,
+    )
+    metadata = _build_phase1_trace_batch_sizing_metadata(sizing)
+
+    assert metadata["source_batch_size_requested"] == 128
+    assert metadata["source_batch_size_effective"] == 64
+    assert metadata["feature_batch_size_requested"] == 128
+    assert metadata["feature_batch_size_defaulted"] is True
+    assert metadata["feature_batch_size_effective"] == 64
+    assert metadata["logit_batch_size_requested"] == 96
+    assert metadata["logit_batch_size_effective"] == 64
+    assert metadata["phase4_feature_batch_size_max_requested"] == 200
+    assert metadata["phase4_feature_batch_size_max_effective"] == 64
+    assert metadata["trace_batch_size_legacy"] == 128
+    assert metadata["trace_batch_size_effective_pre_planner"] == 64
+    assert metadata["trace_batch_cap_applied"] is True
+    assert metadata["trace_batch_cap_reason"] == "cap_effective_batches_applied"
+
+
+def test_phase1_trace_batch_sizing_legacy_policy_ignores_requested_cap() -> None:
+    config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="legacy",
+        phase1_trace_batch_size_max=64,
+    )
+    sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=128,
+        feature_batch_size=80,
+        logit_batch_size=None,
+        feature_batch_size_max=256,
+        phase1_trace_batch_config=config,
+    )
+    metadata = _build_phase1_trace_batch_sizing_metadata(sizing)
+
+    assert metadata["source_batch_size_effective"] == 128
+    assert metadata["feature_batch_size_effective"] == 80
+    assert metadata["logit_batch_size_effective"] == 128
+    assert metadata["phase4_feature_batch_size_max_effective"] == 256
+    assert metadata["trace_batch_cap_applied"] is False
+    assert metadata["trace_batch_cap_reason"] == "legacy_policy_ignores_phase1_trace_batch_size_max"
 
 
 def test_phase4_refresh_policy_config_validates_and_falls_back_to_standard() -> None:
