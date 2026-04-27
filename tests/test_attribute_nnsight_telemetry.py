@@ -173,6 +173,41 @@ def test_phase4_scheduler_defaults_match_between_public_entrypoints() -> None:
         == nnsight_sig.parameters["phase4_row_executor"].default
         == "batched"
     )
+    assert (
+        entrypoint_sig.parameters["phase1_trace_batch_policy"].default
+        == nnsight_sig.parameters["phase1_trace_batch_policy"].default
+        == "legacy"
+    )
+    assert (
+        entrypoint_sig.parameters["phase1_trace_batch_size_max"].default
+        == nnsight_sig.parameters["phase1_trace_batch_size_max"].default
+        is None
+    )
+    assert (
+        entrypoint_sig.parameters["phase4_refresh_policy"].default
+        == nnsight_sig.parameters["phase4_refresh_policy"].default
+        == "standard"
+    )
+    assert (
+        entrypoint_sig.parameters["phase4_refresh_interval_multiplier"].default
+        == nnsight_sig.parameters["phase4_refresh_interval_multiplier"].default
+        == 1
+    )
+    assert (
+        entrypoint_sig.parameters["phase4_ranker"].default
+        == nnsight_sig.parameters["phase4_ranker"].default
+        == "argsort"
+    )
+    assert (
+        entrypoint_sig.parameters["row_store_cache_control"].default
+        == nnsight_sig.parameters["row_store_cache_control"].default
+        == "off"
+    )
+    assert (
+        entrypoint_sig.parameters["exact_encoder_residency"].default
+        == nnsight_sig.parameters["exact_encoder_residency"].default
+        == "lazy"
+    )
 
 
 def test_phase4_scheduler_mode_type_hints_include_planner_v2() -> None:
@@ -206,6 +241,47 @@ def test_phase4_execution_flag_type_hints_include_new_modes() -> None:
     nnsight_row_modes = set(get_args(nnsight_sig.parameters["phase4_row_executor"].annotation))
     assert "streaming_v1" in entry_row_modes
     assert "streaming_v1" in nnsight_row_modes
+
+    entry_phase1_batch_modes = set(
+        get_args(entrypoint_sig.parameters["phase1_trace_batch_policy"].annotation)
+    )
+    nnsight_phase1_batch_modes = set(
+        get_args(nnsight_sig.parameters["phase1_trace_batch_policy"].annotation)
+    )
+    assert "cap_effective_batches" in entry_phase1_batch_modes
+    assert "cap_effective_batches" in nnsight_phase1_batch_modes
+
+    entry_refresh_policy_modes = set(
+        get_args(entrypoint_sig.parameters["phase4_refresh_policy"].annotation)
+    )
+    nnsight_refresh_policy_modes = set(
+        get_args(nnsight_sig.parameters["phase4_refresh_policy"].annotation)
+    )
+    assert "deferred_v1" in entry_refresh_policy_modes
+    assert "deferred_v1" in nnsight_refresh_policy_modes
+
+    entry_ranker_modes = set(get_args(entrypoint_sig.parameters["phase4_ranker"].annotation))
+    nnsight_ranker_modes = set(get_args(nnsight_sig.parameters["phase4_ranker"].annotation))
+    assert "topk_v1" in entry_ranker_modes
+    assert "topk_v1" in nnsight_ranker_modes
+
+    entry_row_store_modes = set(
+        get_args(entrypoint_sig.parameters["row_store_cache_control"].annotation)
+    )
+    nnsight_row_store_modes = set(
+        get_args(nnsight_sig.parameters["row_store_cache_control"].annotation)
+    )
+    assert "fadvise_dontneed_after_append_v1" in entry_row_store_modes
+    assert "fadvise_dontneed_after_append_v1" in nnsight_row_store_modes
+
+    entry_encoder_residency_modes = set(
+        get_args(entrypoint_sig.parameters["exact_encoder_residency"].annotation)
+    )
+    nnsight_encoder_residency_modes = set(
+        get_args(nnsight_sig.parameters["exact_encoder_residency"].annotation)
+    )
+    assert "active_pinned_cpu" in entry_encoder_residency_modes
+    assert "active_pinned_cpu" in nnsight_encoder_residency_modes
 
 
 def test_exact_trace_internal_dtype_resolution_rejects_unknown_value() -> None:

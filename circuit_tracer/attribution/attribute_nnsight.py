@@ -187,6 +187,39 @@ _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "streaming_v1": "streaming_v1",
 }
 
+_PHASE1_TRACE_BATCH_POLICY_DEFAULT: Literal["legacy"] = "legacy"
+_PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT: int | None = None
+_PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
+    "legacy": "legacy",
+    "cap_effective_batches": "legacy",
+}
+
+_PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
+_PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT = 1
+_PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
+    "standard": "standard",
+    "deferred_v1": "standard",
+}
+
+_PHASE4_RANKER_DEFAULT: Literal["argsort"] = "argsort"
+_PHASE4_RANKER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "argsort": "argsort",
+    "topk_v1": "argsort",
+}
+
+_ROW_STORE_CACHE_CONTROL_DEFAULT: Literal["off"] = "off"
+_ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "off": "off",
+    "fadvise_dontneed_after_append_v1": "off",
+}
+
+_EXACT_ENCODER_RESIDENCY_DEFAULT: Literal["lazy"] = "lazy"
+_EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "lazy": "lazy",
+    "active_cpu": "lazy",
+    "active_pinned_cpu": "lazy",
+}
+
 _PHASE4_STREAMING_V1_MAX_MICROBATCH_SIZE = 64
 
 _PHASE4_PLANNER_V2_POLICY_VERSION = "planner_v2_bounded_membership_v1"
@@ -225,6 +258,52 @@ class _Phase4RowExecutorConfig:
     version: str
     effective_version: str
     effective_behavior: Literal["requested", "batched_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _Phase1TraceBatchConfig:
+    requested_policy: Literal["legacy", "cap_effective_batches"]
+    effective_policy: Literal["legacy", "cap_effective_batches"]
+    requested_batch_size_max: int | None
+    effective_batch_size_max: int | None
+    default_policy: Literal["legacy"]
+    default_batch_size_max: int | None
+    effective_behavior: Literal["requested", "legacy_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _Phase4RefreshPolicyConfig:
+    requested_policy: Literal["standard", "deferred_v1"]
+    effective_policy: Literal["standard", "deferred_v1"]
+    requested_interval_multiplier: int
+    effective_interval_multiplier: int
+    default_policy: Literal["standard"]
+    default_interval_multiplier: int
+    effective_behavior: Literal["requested", "standard_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _Phase4RankerConfig:
+    requested_mode: Literal["argsort", "topk_v1"]
+    effective_mode: Literal["argsort", "topk_v1"]
+    default_mode: Literal["argsort"]
+    effective_behavior: Literal["requested", "argsort_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _RowStoreCacheControlConfig:
+    requested_mode: Literal["off", "fadvise_dontneed_after_append_v1"]
+    effective_mode: Literal["off", "fadvise_dontneed_after_append_v1"]
+    default_mode: Literal["off"]
+    effective_behavior: Literal["requested", "off_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _ExactEncoderResidencyConfig:
+    requested_mode: Literal["lazy", "active_cpu", "active_pinned_cpu"]
+    effective_mode: Literal["lazy", "active_cpu", "active_pinned_cpu"]
+    default_mode: Literal["lazy"]
+    effective_behavior: Literal["requested", "lazy_reference_execution"]
 
 
 @dataclass(frozen=True)
@@ -1083,6 +1162,309 @@ def _build_phase4_row_executor_metadata(
         "row_executor_effective_behavior": phase4_row_executor_config.effective_behavior,
         "row_executor_reference_execution": bool(
             phase4_row_executor_config.requested_mode != phase4_row_executor_config.effective_mode
+        ),
+    }
+
+
+def _resolve_phase1_trace_batch_policy(
+    phase1_trace_batch_policy: str,
+) -> Literal["legacy", "cap_effective_batches"]:
+    normalized = str(phase1_trace_batch_policy).strip().lower()
+    allowed_values = {"legacy", "cap_effective_batches"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            "phase1_trace_batch_policy must be one of: "
+            f"{allowed} (got {phase1_trace_batch_policy!r})"
+        )
+    return cast(Literal["legacy", "cap_effective_batches"], normalized)
+
+
+def _resolve_phase1_trace_batch_size_max(
+    phase1_trace_batch_size_max: int | None,
+) -> int | None:
+    if phase1_trace_batch_size_max is None:
+        return None
+    resolved = int(phase1_trace_batch_size_max)
+    if resolved <= 0:
+        raise ValueError("phase1_trace_batch_size_max must be > 0 when provided")
+    return resolved
+
+
+def _resolve_phase1_trace_batch_config(
+    *,
+    phase1_trace_batch_policy: str,
+    phase1_trace_batch_size_max: int | None,
+) -> _Phase1TraceBatchConfig:
+    requested_policy = _resolve_phase1_trace_batch_policy(phase1_trace_batch_policy)
+    requested_batch_size_max = _resolve_phase1_trace_batch_size_max(phase1_trace_batch_size_max)
+    effective_policy = cast(
+        Literal["legacy", "cap_effective_batches"],
+        _PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy],
+    )
+    effective_batch_size_max = _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT
+    effective_behavior: Literal["requested", "legacy_reference_execution"] = (
+        "requested"
+        if requested_policy == _PHASE1_TRACE_BATCH_POLICY_DEFAULT
+        and requested_batch_size_max == _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT
+        else "legacy_reference_execution"
+    )
+    return _Phase1TraceBatchConfig(
+        requested_policy=requested_policy,
+        effective_policy=effective_policy,
+        requested_batch_size_max=requested_batch_size_max,
+        effective_batch_size_max=effective_batch_size_max,
+        default_policy=_PHASE1_TRACE_BATCH_POLICY_DEFAULT,
+        default_batch_size_max=_PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT,
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase1_trace_batch_metadata(
+    phase1_trace_batch_config: _Phase1TraceBatchConfig,
+) -> dict[str, object]:
+    return {
+        "trace_batch_policy_requested": phase1_trace_batch_config.requested_policy,
+        "trace_batch_policy": phase1_trace_batch_config.requested_policy,
+        "trace_batch_policy_default": phase1_trace_batch_config.default_policy,
+        "trace_batch_policy_effective": phase1_trace_batch_config.effective_policy,
+        "trace_batch_policy_effective_behavior": phase1_trace_batch_config.effective_behavior,
+        "trace_batch_policy_reference_execution": bool(
+            phase1_trace_batch_config.requested_policy != phase1_trace_batch_config.effective_policy
+        ),
+        "trace_batch_size_max_requested": phase1_trace_batch_config.requested_batch_size_max,
+        "trace_batch_size_max": phase1_trace_batch_config.requested_batch_size_max,
+        "trace_batch_size_max_default": phase1_trace_batch_config.default_batch_size_max,
+        "trace_batch_size_max_effective": phase1_trace_batch_config.effective_batch_size_max,
+        "trace_batch_size_max_reference_execution": bool(
+            phase1_trace_batch_config.requested_batch_size_max
+            != phase1_trace_batch_config.effective_batch_size_max
+        ),
+    }
+
+
+def _resolve_phase4_refresh_policy(
+    phase4_refresh_policy: str,
+) -> Literal["standard", "deferred_v1"]:
+    normalized = str(phase4_refresh_policy).strip().lower()
+    allowed_values = {"standard", "deferred_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"phase4_refresh_policy must be one of: {allowed} (got {phase4_refresh_policy!r})"
+        )
+    return cast(Literal["standard", "deferred_v1"], normalized)
+
+
+def _resolve_phase4_refresh_interval_multiplier(
+    phase4_refresh_interval_multiplier: int,
+) -> int:
+    resolved = int(phase4_refresh_interval_multiplier)
+    if resolved <= 0:
+        raise ValueError("phase4_refresh_interval_multiplier must be > 0")
+    return resolved
+
+
+def _resolve_phase4_refresh_policy_config(
+    *,
+    phase4_refresh_policy: str,
+    phase4_refresh_interval_multiplier: int,
+) -> _Phase4RefreshPolicyConfig:
+    requested_policy = _resolve_phase4_refresh_policy(phase4_refresh_policy)
+    requested_interval_multiplier = _resolve_phase4_refresh_interval_multiplier(
+        phase4_refresh_interval_multiplier
+    )
+    effective_policy = cast(
+        Literal["standard", "deferred_v1"],
+        _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy],
+    )
+    effective_interval_multiplier = _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT
+    effective_behavior: Literal["requested", "standard_reference_execution"] = (
+        "requested"
+        if requested_policy == _PHASE4_REFRESH_POLICY_DEFAULT
+        and requested_interval_multiplier == effective_interval_multiplier
+        else "standard_reference_execution"
+    )
+    return _Phase4RefreshPolicyConfig(
+        requested_policy=requested_policy,
+        effective_policy=effective_policy,
+        requested_interval_multiplier=requested_interval_multiplier,
+        effective_interval_multiplier=effective_interval_multiplier,
+        default_policy=_PHASE4_REFRESH_POLICY_DEFAULT,
+        default_interval_multiplier=_PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT,
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase4_refresh_policy_metadata(
+    phase4_refresh_policy_config: _Phase4RefreshPolicyConfig,
+) -> dict[str, object]:
+    return {
+        "refresh_policy_requested": phase4_refresh_policy_config.requested_policy,
+        "refresh_policy": phase4_refresh_policy_config.requested_policy,
+        "refresh_policy_default": phase4_refresh_policy_config.default_policy,
+        "refresh_policy_effective": phase4_refresh_policy_config.effective_policy,
+        "refresh_policy_effective_behavior": phase4_refresh_policy_config.effective_behavior,
+        "refresh_policy_reference_execution": bool(
+            phase4_refresh_policy_config.requested_policy
+            != phase4_refresh_policy_config.effective_policy
+        ),
+        "refresh_interval_multiplier_requested": (
+            phase4_refresh_policy_config.requested_interval_multiplier
+        ),
+        "refresh_interval_multiplier": phase4_refresh_policy_config.requested_interval_multiplier,
+        "refresh_interval_multiplier_default": phase4_refresh_policy_config.default_interval_multiplier,
+        "refresh_interval_multiplier_effective": (
+            phase4_refresh_policy_config.effective_interval_multiplier
+        ),
+        "refresh_interval_multiplier_reference_execution": bool(
+            phase4_refresh_policy_config.requested_interval_multiplier
+            != phase4_refresh_policy_config.effective_interval_multiplier
+        ),
+    }
+
+
+def _resolve_phase4_ranker(
+    phase4_ranker: str,
+) -> Literal["argsort", "topk_v1"]:
+    normalized = str(phase4_ranker).strip().lower()
+    allowed_values = {"argsort", "topk_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(f"phase4_ranker must be one of: {allowed} (got {phase4_ranker!r})")
+    return cast(Literal["argsort", "topk_v1"], normalized)
+
+
+def _resolve_phase4_ranker_config(
+    phase4_ranker: str,
+) -> _Phase4RankerConfig:
+    requested_mode = _resolve_phase4_ranker(phase4_ranker)
+    effective_mode = cast(
+        Literal["argsort", "topk_v1"],
+        _PHASE4_RANKER_EFFECTIVE_MODE_BY_MODE[requested_mode],
+    )
+    effective_behavior: Literal["requested", "argsort_reference_execution"] = (
+        "requested" if requested_mode == effective_mode else "argsort_reference_execution"
+    )
+    return _Phase4RankerConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        default_mode=_PHASE4_RANKER_DEFAULT,
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase4_ranker_metadata(
+    phase4_ranker_config: _Phase4RankerConfig,
+) -> dict[str, object]:
+    return {
+        "ranker_requested": phase4_ranker_config.requested_mode,
+        "ranker": phase4_ranker_config.requested_mode,
+        "ranker_default": phase4_ranker_config.default_mode,
+        "ranker_effective": phase4_ranker_config.effective_mode,
+        "ranker_effective_behavior": phase4_ranker_config.effective_behavior,
+        "ranker_reference_execution": bool(
+            phase4_ranker_config.requested_mode != phase4_ranker_config.effective_mode
+        ),
+    }
+
+
+def _resolve_row_store_cache_control(
+    row_store_cache_control: str,
+) -> Literal["off", "fadvise_dontneed_after_append_v1"]:
+    normalized = str(row_store_cache_control).strip().lower()
+    allowed_values = {"off", "fadvise_dontneed_after_append_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"row_store_cache_control must be one of: {allowed} (got {row_store_cache_control!r})"
+        )
+    return cast(Literal["off", "fadvise_dontneed_after_append_v1"], normalized)
+
+
+def _resolve_row_store_cache_control_config(
+    row_store_cache_control: str,
+) -> _RowStoreCacheControlConfig:
+    requested_mode = _resolve_row_store_cache_control(row_store_cache_control)
+    effective_mode = cast(
+        Literal["off", "fadvise_dontneed_after_append_v1"],
+        _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE[requested_mode],
+    )
+    effective_behavior: Literal["requested", "off_reference_execution"] = (
+        "requested" if requested_mode == effective_mode else "off_reference_execution"
+    )
+    return _RowStoreCacheControlConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        default_mode=_ROW_STORE_CACHE_CONTROL_DEFAULT,
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_row_store_cache_control_metadata(
+    row_store_cache_control_config: _RowStoreCacheControlConfig,
+) -> dict[str, object]:
+    return {
+        "row_store_cache_control_requested": row_store_cache_control_config.requested_mode,
+        "row_store_cache_control": row_store_cache_control_config.requested_mode,
+        "row_store_cache_control_default": row_store_cache_control_config.default_mode,
+        "row_store_cache_control_effective": row_store_cache_control_config.effective_mode,
+        "row_store_cache_control_effective_behavior": (
+            row_store_cache_control_config.effective_behavior
+        ),
+        "row_store_cache_control_reference_execution": bool(
+            row_store_cache_control_config.requested_mode
+            != row_store_cache_control_config.effective_mode
+        ),
+    }
+
+
+def _resolve_exact_encoder_residency(
+    exact_encoder_residency: str,
+) -> Literal["lazy", "active_cpu", "active_pinned_cpu"]:
+    normalized = str(exact_encoder_residency).strip().lower()
+    allowed_values = {"lazy", "active_cpu", "active_pinned_cpu"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"exact_encoder_residency must be one of: {allowed} (got {exact_encoder_residency!r})"
+        )
+    return cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], normalized)
+
+
+def _resolve_exact_encoder_residency_config(
+    exact_encoder_residency: str,
+) -> _ExactEncoderResidencyConfig:
+    requested_mode = _resolve_exact_encoder_residency(exact_encoder_residency)
+    effective_mode = cast(
+        Literal["lazy", "active_cpu", "active_pinned_cpu"],
+        _EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE[requested_mode],
+    )
+    effective_behavior: Literal["requested", "lazy_reference_execution"] = (
+        "requested" if requested_mode == effective_mode else "lazy_reference_execution"
+    )
+    return _ExactEncoderResidencyConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        default_mode=_EXACT_ENCODER_RESIDENCY_DEFAULT,
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_exact_encoder_residency_metadata(
+    exact_encoder_residency_config: _ExactEncoderResidencyConfig,
+) -> dict[str, object]:
+    return {
+        "exact_encoder_residency_requested": exact_encoder_residency_config.requested_mode,
+        "exact_encoder_residency": exact_encoder_residency_config.requested_mode,
+        "exact_encoder_residency_default": exact_encoder_residency_config.default_mode,
+        "exact_encoder_residency_effective": exact_encoder_residency_config.effective_mode,
+        "exact_encoder_residency_effective_behavior": (
+            exact_encoder_residency_config.effective_behavior
+        ),
+        "exact_encoder_residency_reference_execution": bool(
+            exact_encoder_residency_config.requested_mode
+            != exact_encoder_residency_config.effective_mode
         ),
     }
 
@@ -3429,6 +3811,13 @@ def attribute(
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
+    phase1_trace_batch_size_max: int | None = None,
+    phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
+    phase4_refresh_interval_multiplier: int = 1,
+    phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
+    row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
@@ -3513,6 +3902,27 @@ def attribute(
             ``"batched"`` keeps current behavior. ``"streaming_v1"`` executes
             compact exact-trace Phase-4 feature rows in smaller compute micro-batches
             while preserving scheduler frontier membership/order semantics.
+        phase1_trace_batch_policy: Requested Phase-1 trace-batch sizing policy.
+            ``"legacy"`` keeps current behavior; ``"cap_effective_batches"`` is
+            currently validated/plumbed only and falls back to legacy execution.
+        phase1_trace_batch_size_max: Optional cap paired with
+            ``phase1_trace_batch_policy``. Currently validated/plumbed only and
+            does not change execution behavior.
+        phase4_refresh_policy: Requested Phase-4 refresh cadence policy.
+            ``"standard"`` keeps current behavior; ``"deferred_v1"`` is
+            currently validated/plumbed only and falls back to standard execution.
+        phase4_refresh_interval_multiplier: Positive integer cadence multiplier
+            for refresh policy plumbing. Currently metadata-only.
+        phase4_ranker: Requested Phase-4 ranking implementation.
+            ``"argsort"`` keeps current behavior; ``"topk_v1"`` is currently
+            validated/plumbed only and falls back to argsort execution.
+        row_store_cache_control: Requested compact row-store cache control mode.
+            ``"off"`` keeps current behavior;
+            ``"fadvise_dontneed_after_append_v1"`` is currently validated/
+            plumbed only and falls back to ``"off"`` execution.
+        exact_encoder_residency: Requested exact encoder residency mode.
+            ``"lazy"`` keeps current behavior; active residency modes are
+            currently validated/plumbed only and fall back to ``"lazy"``.
         exact_trace_internal_dtype: Internal dtype for compact exact-trace
             normalization/influence ranking path. ``"fp32"`` uses float32
             internals and is the post-fix default; ``"fp64"`` uses float64
@@ -3575,6 +3985,13 @@ def attribute(
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             phase4_refresh_optimization=phase4_refresh_optimization,
             phase4_row_executor=phase4_row_executor,
+            phase1_trace_batch_policy=phase1_trace_batch_policy,
+            phase1_trace_batch_size_max=phase1_trace_batch_size_max,
+            phase4_refresh_policy=phase4_refresh_policy,
+            phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
+            phase4_ranker=phase4_ranker,
+            row_store_cache_control=row_store_cache_control,
+            exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             logger=logger,
         )
@@ -3626,6 +4043,13 @@ def _run_attribution(
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
+    phase1_trace_batch_size_max: int | None = None,
+    phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
+    phase4_refresh_interval_multiplier: int = 1,
+    phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
+    row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ):
     start_time = time.time()
@@ -3691,10 +4115,40 @@ def _run_attribution(
         exact_chunked_decoder=exact_chunked_decoder,
     )
     phase4_row_executor_metadata = _build_phase4_row_executor_metadata(phase4_row_executor_config)
+    phase1_trace_batch_config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy=phase1_trace_batch_policy,
+        phase1_trace_batch_size_max=phase1_trace_batch_size_max,
+    )
+    phase1_trace_batch_metadata = _build_phase1_trace_batch_metadata(phase1_trace_batch_config)
+    phase4_refresh_policy_config = _resolve_phase4_refresh_policy_config(
+        phase4_refresh_policy=phase4_refresh_policy,
+        phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
+    )
+    phase4_refresh_policy_metadata = _build_phase4_refresh_policy_metadata(
+        phase4_refresh_policy_config
+    )
+    phase4_ranker_config = _resolve_phase4_ranker_config(phase4_ranker)
+    phase4_ranker_metadata = _build_phase4_ranker_metadata(phase4_ranker_config)
+    row_store_cache_control_config = _resolve_row_store_cache_control_config(
+        row_store_cache_control
+    )
+    row_store_cache_control_metadata = _build_row_store_cache_control_metadata(
+        row_store_cache_control_config
+    )
+    exact_encoder_residency_config = _resolve_exact_encoder_residency_config(
+        exact_encoder_residency
+    )
+    exact_encoder_residency_metadata = _build_exact_encoder_residency_metadata(
+        exact_encoder_residency_config
+    )
     phase4_execution_metadata: dict[str, object] = {
         **phase4_scheduler_metadata,
         **phase4_refresh_optimization_metadata,
         **phase4_row_executor_metadata,
+        **phase4_refresh_policy_metadata,
+        **phase4_ranker_metadata,
+        **row_store_cache_control_metadata,
+        **exact_encoder_residency_metadata,
     }
     phase4_debug_summary_enabled = phase4_anomaly_debug_enabled or cross_cluster_debug_enabled
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
@@ -3722,6 +4176,7 @@ def _run_attribution(
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
+            **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
             **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
         },
     )
@@ -3782,7 +4237,9 @@ def _run_attribution(
             "mode": "early_phase_scalar_summary",
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
+            "phase1_trace_batch": phase1_trace_batch_metadata,
             "phase4_scheduler": phase4_scheduler_metadata,
+            "phase4_execution": phase4_execution_metadata,
             "environment": _build_phase4_environment_fingerprint(),
             "checkpoints": {},
         }
@@ -3853,6 +4310,10 @@ def _run_attribution(
         effective_feature_batch_size,
         effective_logit_batch_size,
     )
+    phase1_trace_batch_metadata.update(
+        trace_batch_size_legacy=int(trace_batch_size),
+        trace_batch_size_effective=int(trace_batch_size),
+    )
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
     compact_output_result: dict[str, object] | None = None
@@ -3889,6 +4350,20 @@ def _run_attribution(
             f"row_subchunk_size={row_subchunk_size} | "
             f"planner_enabled={planner_enabled} | "
             f"feature_batch_size_max={max_phase4_feature_batch_size} | "
+            f"phase1_trace_batch_policy={phase1_trace_batch_config.requested_policy} "
+            f"(effective={phase1_trace_batch_config.effective_policy}, "
+            f"size_max={phase1_trace_batch_config.requested_batch_size_max}, "
+            f"size_max_effective={phase1_trace_batch_config.effective_batch_size_max}) | "
+            f"phase4_refresh_policy={phase4_refresh_policy_config.requested_policy} "
+            f"(effective={phase4_refresh_policy_config.effective_policy}, "
+            f"interval_multiplier={phase4_refresh_policy_config.requested_interval_multiplier}, "
+            f"interval_multiplier_effective={phase4_refresh_policy_config.effective_interval_multiplier}) | "
+            f"phase4_ranker={phase4_ranker_config.requested_mode} "
+            f"(effective={phase4_ranker_config.effective_mode}) | "
+            f"row_store_cache_control={row_store_cache_control_config.requested_mode} "
+            f"(effective={row_store_cache_control_config.effective_mode}) | "
+            f"exact_encoder_residency={exact_encoder_residency_config.requested_mode} "
+            f"(effective={exact_encoder_residency_config.effective_mode}) | "
             f"exact_trace_internal_dtype={exact_trace_internal_dtype_name} | "
             f"prompt_tokens={input_ids.shape[-1]} | feature_batch_size={effective_feature_batch_size} | "
             f"logit_batch_size={effective_logit_batch_size}"
@@ -3913,6 +4388,13 @@ def _run_attribution(
         configure_ctx_trace_logging(
             logger.info if profile else None,
             telemetry_recorder=telemetry_recorder,
+        )
+    if isinstance(getattr(ctx, "setup_diagnostic_stats", None), dict):
+        ctx.setup_diagnostic_stats.update(
+            {
+                "phase1_trace_batch": dict(phase1_trace_batch_metadata),
+                "phase4_execution": dict(phase4_execution_metadata),
+            }
         )
 
     if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
@@ -4037,6 +4519,15 @@ def _run_attribution(
 
         # Phase 1: forward pass
         logger.info("Phase 1: Running forward pass")
+        logger.info(
+            "Phase 1 trace-batch policy | "
+            f"requested_policy={phase1_trace_batch_config.requested_policy} | "
+            f"effective_policy={phase1_trace_batch_config.effective_policy} | "
+            f"requested_size_max={phase1_trace_batch_config.requested_batch_size_max} | "
+            f"effective_size_max={phase1_trace_batch_config.effective_batch_size_max} | "
+            f"effective_behavior={phase1_trace_batch_config.effective_behavior} | "
+            f"trace_batch_size={trace_batch_size}"
+        )
         phase_start = time.perf_counter()
         _log_memory_boundary(logger, "Phase 1 start", model.device)
         with model.trace() as tracer:
@@ -4056,6 +4547,10 @@ def _run_attribution(
             name="phase1.forward_pass",
             phase="phase1",
             elapsed_ms=phase1_elapsed_ms,
+            attrs={
+                "trace_batch_size": int(trace_batch_size),
+                **phase1_trace_batch_metadata,
+            },
         )
         telemetry_recorder.record_wall_clock_duration(
             scope="phase",
@@ -4727,9 +5222,23 @@ def _run_attribution(
             f"refresh_optimization={phase4_refresh_optimization_config.requested_mode}"
             f" (effective={phase4_refresh_optimization_config.effective_mode}, "
             f"behavior={phase4_refresh_optimization_config.effective_behavior}) | "
+            f"refresh_policy={phase4_refresh_policy_config.requested_policy}"
+            f" (effective={phase4_refresh_policy_config.effective_policy}, "
+            f"interval_multiplier={phase4_refresh_policy_config.requested_interval_multiplier}, "
+            f"interval_multiplier_effective={phase4_refresh_policy_config.effective_interval_multiplier}, "
+            f"behavior={phase4_refresh_policy_config.effective_behavior}) | "
+            f"ranker={phase4_ranker_config.requested_mode}"
+            f" (effective={phase4_ranker_config.effective_mode}, "
+            f"behavior={phase4_ranker_config.effective_behavior}) | "
             f"row_executor={phase4_row_executor_config.requested_mode}"
             f" (effective={phase4_row_executor_config.effective_mode}, "
             f"behavior={phase4_row_executor_config.effective_behavior}) | "
+            f"row_store_cache_control={row_store_cache_control_config.requested_mode}"
+            f" (effective={row_store_cache_control_config.effective_mode}, "
+            f"behavior={row_store_cache_control_config.effective_behavior}) | "
+            f"exact_encoder_residency={exact_encoder_residency_config.requested_mode}"
+            f" (effective={exact_encoder_residency_config.effective_mode}, "
+            f"behavior={exact_encoder_residency_config.effective_behavior}) | "
             f"executor_reference_batch_size={phase4_executor_reference_batch_size} | "
             f"executor_microbatch_size={phase4_executor_microbatch_size}"
         )

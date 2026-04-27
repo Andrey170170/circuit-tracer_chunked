@@ -39,6 +39,23 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_phase4_refresh_optimization_mode,
     _resolve_phase4_refresh_optimization_config,
     _build_phase4_refresh_optimization_metadata,
+    _resolve_phase1_trace_batch_policy,
+    _resolve_phase1_trace_batch_size_max,
+    _resolve_phase1_trace_batch_config,
+    _build_phase1_trace_batch_metadata,
+    _resolve_phase4_refresh_policy,
+    _resolve_phase4_refresh_interval_multiplier,
+    _resolve_phase4_refresh_policy_config,
+    _build_phase4_refresh_policy_metadata,
+    _resolve_phase4_ranker,
+    _resolve_phase4_ranker_config,
+    _build_phase4_ranker_metadata,
+    _resolve_row_store_cache_control,
+    _resolve_row_store_cache_control_config,
+    _build_row_store_cache_control_metadata,
+    _resolve_exact_encoder_residency,
+    _resolve_exact_encoder_residency_config,
+    _build_exact_encoder_residency_metadata,
     _resolve_phase4_row_executor_mode,
     _resolve_phase4_row_executor_config,
     _resolve_phase4_streaming_v1_microbatch_size,
@@ -800,6 +817,119 @@ def test_phase4_refresh_optimization_falls_back_off_when_compact_refresh_unavail
     assert metadata["refresh_optimization_effective_version"] == "off_v1"
     assert metadata["refresh_optimization_reference_execution"] is True
     assert metadata["refresh_optimization_effective_behavior"] == "off_reference_execution"
+
+
+def test_phase1_trace_batch_policy_config_validates_and_falls_back_to_legacy() -> None:
+    assert _resolve_phase1_trace_batch_policy("legacy") == "legacy"
+    assert _resolve_phase1_trace_batch_policy("cap_effective_batches") == "cap_effective_batches"
+    assert _resolve_phase1_trace_batch_size_max(None) is None
+    assert _resolve_phase1_trace_batch_size_max(64) == 64
+    with pytest.raises(ValueError, match="phase1_trace_batch_policy must be one of"):
+        _resolve_phase1_trace_batch_policy("cap")
+    with pytest.raises(ValueError, match="phase1_trace_batch_size_max must be > 0"):
+        _resolve_phase1_trace_batch_size_max(0)
+
+    config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=64,
+    )
+    metadata = _build_phase1_trace_batch_metadata(config)
+    assert metadata["trace_batch_policy_requested"] == "cap_effective_batches"
+    assert metadata["trace_batch_policy_effective"] == "legacy"
+    assert metadata["trace_batch_policy_default"] == "legacy"
+    assert metadata["trace_batch_policy_reference_execution"] is True
+    assert metadata["trace_batch_size_max_requested"] == 64
+    assert metadata["trace_batch_size_max_effective"] is None
+    assert metadata["trace_batch_size_max_default"] is None
+    assert metadata["trace_batch_size_max_reference_execution"] is True
+
+    legacy_with_cap = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="legacy",
+        phase1_trace_batch_size_max=64,
+    )
+    legacy_with_cap_metadata = _build_phase1_trace_batch_metadata(legacy_with_cap)
+    assert legacy_with_cap_metadata["trace_batch_policy_effective"] == "legacy"
+    assert legacy_with_cap_metadata["trace_batch_size_max_effective"] is None
+    assert legacy_with_cap_metadata["trace_batch_size_max_reference_execution"] is True
+
+
+def test_phase4_refresh_policy_config_validates_and_falls_back_to_standard() -> None:
+    assert _resolve_phase4_refresh_policy("standard") == "standard"
+    assert _resolve_phase4_refresh_policy("deferred_v1") == "deferred_v1"
+    assert _resolve_phase4_refresh_interval_multiplier(3) == 3
+    with pytest.raises(ValueError, match="phase4_refresh_policy must be one of"):
+        _resolve_phase4_refresh_policy("deferred")
+    with pytest.raises(ValueError, match="phase4_refresh_interval_multiplier must be > 0"):
+        _resolve_phase4_refresh_interval_multiplier(0)
+
+    config = _resolve_phase4_refresh_policy_config(
+        phase4_refresh_policy="deferred_v1",
+        phase4_refresh_interval_multiplier=3,
+    )
+    metadata = _build_phase4_refresh_policy_metadata(config)
+    assert metadata["refresh_policy_requested"] == "deferred_v1"
+    assert metadata["refresh_policy_effective"] == "standard"
+    assert metadata["refresh_policy_default"] == "standard"
+    assert metadata["refresh_policy_reference_execution"] is True
+    assert metadata["refresh_interval_multiplier_requested"] == 3
+    assert metadata["refresh_interval_multiplier_effective"] == 1
+    assert metadata["refresh_interval_multiplier_default"] == 1
+    assert metadata["refresh_interval_multiplier_reference_execution"] is True
+
+    standard_nondefault = _resolve_phase4_refresh_policy_config(
+        phase4_refresh_policy="standard",
+        phase4_refresh_interval_multiplier=3,
+    )
+    standard_nondefault_metadata = _build_phase4_refresh_policy_metadata(standard_nondefault)
+    assert standard_nondefault_metadata["refresh_policy_effective"] == "standard"
+    assert standard_nondefault_metadata["refresh_interval_multiplier_effective"] == 1
+    assert standard_nondefault_metadata["refresh_interval_multiplier_reference_execution"] is True
+
+
+def test_phase4_ranker_config_validates_and_falls_back_to_argsort() -> None:
+    assert _resolve_phase4_ranker("argsort") == "argsort"
+    assert _resolve_phase4_ranker("topk_v1") == "topk_v1"
+    with pytest.raises(ValueError, match="phase4_ranker must be one of"):
+        _resolve_phase4_ranker("topk")
+
+    config = _resolve_phase4_ranker_config("topk_v1")
+    metadata = _build_phase4_ranker_metadata(config)
+    assert metadata["ranker_requested"] == "topk_v1"
+    assert metadata["ranker_effective"] == "argsort"
+    assert metadata["ranker_default"] == "argsort"
+    assert metadata["ranker_reference_execution"] is True
+
+
+def test_row_store_cache_control_config_validates_and_falls_back_to_off() -> None:
+    assert _resolve_row_store_cache_control("off") == "off"
+    assert (
+        _resolve_row_store_cache_control("fadvise_dontneed_after_append_v1")
+        == "fadvise_dontneed_after_append_v1"
+    )
+    with pytest.raises(ValueError, match="row_store_cache_control must be one of"):
+        _resolve_row_store_cache_control("fadvise")
+
+    config = _resolve_row_store_cache_control_config("fadvise_dontneed_after_append_v1")
+    metadata = _build_row_store_cache_control_metadata(config)
+    assert metadata["row_store_cache_control_requested"] == "fadvise_dontneed_after_append_v1"
+    assert metadata["row_store_cache_control_effective"] == "off"
+    assert metadata["row_store_cache_control_default"] == "off"
+    assert metadata["row_store_cache_control_reference_execution"] is True
+
+
+def test_exact_encoder_residency_config_validates_and_falls_back_to_lazy() -> None:
+    assert _resolve_exact_encoder_residency("lazy") == "lazy"
+    assert _resolve_exact_encoder_residency("active_cpu") == "active_cpu"
+    assert _resolve_exact_encoder_residency("active_pinned_cpu") == "active_pinned_cpu"
+    with pytest.raises(ValueError, match="exact_encoder_residency must be one of"):
+        _resolve_exact_encoder_residency("active")
+
+    config = _resolve_exact_encoder_residency_config("active_pinned_cpu")
+    metadata = _build_exact_encoder_residency_metadata(config)
+    assert metadata["exact_encoder_residency_requested"] == "active_pinned_cpu"
+    assert metadata["exact_encoder_residency_effective"] == "lazy"
+    assert metadata["exact_encoder_residency_default"] == "lazy"
+    assert metadata["exact_encoder_residency_reference_execution"] is True
 
 
 def test_phase4_row_executor_mode_resolves_and_rejects_unknown() -> None:
@@ -1778,6 +1908,13 @@ def test_top_level_attribute_forwards_phase4_scheduler_args_to_nnsight(
         phase4_scheduler_telemetry_detail="debug",
         phase4_refresh_optimization="v1",
         phase4_row_executor="streaming_v1",
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=32,
+        phase4_refresh_policy="deferred_v1",
+        phase4_refresh_interval_multiplier=2,
+        phase4_ranker="topk_v1",
+        row_store_cache_control="fadvise_dontneed_after_append_v1",
+        exact_encoder_residency="active_cpu",
     )
 
     assert result is sentinel
@@ -1786,6 +1923,13 @@ def test_top_level_attribute_forwards_phase4_scheduler_args_to_nnsight(
     assert captured["phase4_scheduler_telemetry_detail"] == "debug"
     assert captured["phase4_refresh_optimization"] == "v1"
     assert captured["phase4_row_executor"] == "streaming_v1"
+    assert captured["phase1_trace_batch_policy"] == "cap_effective_batches"
+    assert captured["phase1_trace_batch_size_max"] == 32
+    assert captured["phase4_refresh_policy"] == "deferred_v1"
+    assert captured["phase4_refresh_interval_multiplier"] == 2
+    assert captured["phase4_ranker"] == "topk_v1"
+    assert captured["row_store_cache_control"] == "fadvise_dontneed_after_append_v1"
+    assert captured["exact_encoder_residency"] == "active_cpu"
 
 
 def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transformerlens(
@@ -1814,6 +1958,13 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
         phase4_scheduler_telemetry_detail="normal",
         phase4_refresh_optimization="off",
         phase4_row_executor="batched",
+        phase1_trace_batch_policy="legacy",
+        phase1_trace_batch_size_max=None,
+        phase4_refresh_policy="standard",
+        phase4_refresh_interval_multiplier=1,
+        phase4_ranker="argsort",
+        row_store_cache_control="off",
+        exact_encoder_residency="lazy",
     )
 
     assert result is sentinel
@@ -1822,6 +1973,13 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
     assert "phase4_scheduler_telemetry_detail" not in captured
     assert "phase4_refresh_optimization" not in captured
     assert "phase4_row_executor" not in captured
+    assert "phase1_trace_batch_policy" not in captured
+    assert "phase1_trace_batch_size_max" not in captured
+    assert "phase4_refresh_policy" not in captured
+    assert "phase4_refresh_interval_multiplier" not in captured
+    assert "phase4_ranker" not in captured
+    assert "row_store_cache_control" not in captured
+    assert "exact_encoder_residency" not in captured
 
 
 @pytest.mark.parametrize(
@@ -1833,6 +1991,13 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
         {"phase4_scheduler_telemetry_detail": "summary"},
         {"phase4_refresh_optimization": "v1"},
         {"phase4_row_executor": "streaming_v1"},
+        {"phase1_trace_batch_policy": "cap_effective_batches"},
+        {"phase1_trace_batch_size_max": 8},
+        {"phase4_refresh_policy": "deferred_v1"},
+        {"phase4_refresh_interval_multiplier": 2},
+        {"phase4_ranker": "topk_v1"},
+        {"row_store_cache_control": "fadvise_dontneed_after_append_v1"},
+        {"exact_encoder_residency": "active_cpu"},
     ],
 )
 def test_top_level_attribute_rejects_non_default_phase4_scheduler_args_on_transformerlens(
