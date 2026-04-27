@@ -30,6 +30,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _compute_phase4_planned_feature_batch_size,
     _compute_phase4_locality_shaped_batch_end,
     _compute_phase4_locality_shaped_frontier_size,
+    _compute_phase4_refresh_queue_window_size,
     _plan_phase4_frontier_membership_preserving_v1,
     _reorder_pending_for_phase4_locality,
     _resolve_internal_dtype_map,
@@ -939,7 +940,7 @@ def test_phase1_trace_batch_sizing_legacy_policy_ignores_requested_cap() -> None
     assert metadata["trace_batch_cap_reason"] == "legacy_policy_ignores_phase1_trace_batch_size_max"
 
 
-def test_phase4_refresh_policy_config_validates_and_falls_back_to_standard() -> None:
+def test_phase4_refresh_policy_config_validates_and_activates_deferred_when_applicable() -> None:
     assert _resolve_phase4_refresh_policy("standard") == "standard"
     assert _resolve_phase4_refresh_policy("deferred_v1") == "deferred_v1"
     assert _resolve_phase4_refresh_interval_multiplier(3) == 3
@@ -951,25 +952,74 @@ def test_phase4_refresh_policy_config_validates_and_falls_back_to_standard() -> 
     config = _resolve_phase4_refresh_policy_config(
         phase4_refresh_policy="deferred_v1",
         phase4_refresh_interval_multiplier=3,
+        compact_output=True,
+        exact_chunked_decoder=True,
     )
     metadata = _build_phase4_refresh_policy_metadata(config)
     assert metadata["refresh_policy_requested"] == "deferred_v1"
-    assert metadata["refresh_policy_effective"] == "standard"
+    assert metadata["refresh_policy_effective"] == "deferred_v1"
     assert metadata["refresh_policy_default"] == "standard"
+    assert metadata["refresh_policy_reference_execution"] is False
+    assert metadata["refresh_policy_applicable"] is True
+    assert metadata["refresh_policy_fallback_reason"] is None
+    assert metadata["refresh_interval_multiplier_requested"] == 3
+    assert metadata["refresh_interval_multiplier_effective"] == 3
+    assert metadata["refresh_interval_multiplier_default"] == 1
+    assert metadata["refresh_interval_multiplier_reference_execution"] is False
+    assert metadata["refresh_queue_multiplier_effective"] == 3
+
+
+def test_phase4_refresh_policy_config_falls_back_when_deferred_path_unavailable() -> None:
+    config = _resolve_phase4_refresh_policy_config(
+        phase4_refresh_policy="deferred_v1",
+        phase4_refresh_interval_multiplier=3,
+        compact_output=False,
+        exact_chunked_decoder=False,
+    )
+    metadata = _build_phase4_refresh_policy_metadata(config)
+
+    assert metadata["refresh_policy_requested"] == "deferred_v1"
+    assert metadata["refresh_policy_effective"] == "standard"
     assert metadata["refresh_policy_reference_execution"] is True
+    assert metadata["refresh_policy_applicable"] is False
+    assert metadata["refresh_policy_fallback_reason"] is not None
     assert metadata["refresh_interval_multiplier_requested"] == 3
     assert metadata["refresh_interval_multiplier_effective"] == 1
-    assert metadata["refresh_interval_multiplier_default"] == 1
+    assert metadata["refresh_queue_multiplier_effective"] == 1
     assert metadata["refresh_interval_multiplier_reference_execution"] is True
 
     standard_nondefault = _resolve_phase4_refresh_policy_config(
         phase4_refresh_policy="standard",
         phase4_refresh_interval_multiplier=3,
+        compact_output=True,
+        exact_chunked_decoder=True,
     )
     standard_nondefault_metadata = _build_phase4_refresh_policy_metadata(standard_nondefault)
     assert standard_nondefault_metadata["refresh_policy_effective"] == "standard"
     assert standard_nondefault_metadata["refresh_interval_multiplier_effective"] == 1
+    assert standard_nondefault_metadata["refresh_queue_multiplier_effective"] == 1
     assert standard_nondefault_metadata["refresh_interval_multiplier_reference_execution"] is True
+
+
+def test_phase4_refresh_queue_window_size_scales_with_multiplier_and_reduces_refreshes() -> None:
+    feature_count = 100
+    standard_queue = _compute_phase4_refresh_queue_window_size(
+        update_interval=2,
+        phase4_feature_batch_size=8,
+        queue_multiplier=1,
+    )
+    deferred_queue = _compute_phase4_refresh_queue_window_size(
+        update_interval=2,
+        phase4_feature_batch_size=8,
+        queue_multiplier=3,
+    )
+
+    assert standard_queue == 16
+    assert deferred_queue == 48
+
+    standard_refreshes = (feature_count + standard_queue - 1) // standard_queue
+    deferred_refreshes = (feature_count + deferred_queue - 1) // deferred_queue
+    assert deferred_refreshes < standard_refreshes
 
 
 def test_phase4_ranker_config_validates_and_falls_back_to_argsort() -> None:

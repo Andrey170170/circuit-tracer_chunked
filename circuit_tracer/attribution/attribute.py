@@ -214,6 +214,7 @@ def attribute(
             Used by ``"cap_effective_batches"``; ignored by legacy execution.
         phase4_refresh_policy: Requested Phase-4 refresh cadence policy.
         phase4_refresh_interval_multiplier: Requested Phase-4 refresh interval multiplier.
+            Used by ``"deferred_v1"`` on compact exact-trace Phase 4.
         phase4_ranker: Requested Phase-4 ranker implementation.
         row_store_cache_control: Requested compact row-store cache-control mode.
         exact_encoder_residency: Requested exact encoder residency mode.

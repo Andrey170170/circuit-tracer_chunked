@@ -198,7 +198,7 @@ _PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
 _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT = 1
 _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
     "standard": "standard",
-    "deferred_v1": "standard",
+    "deferred_v1": "deferred_v1",
 }
 
 _PHASE4_RANKER_DEFAULT: Literal["argsort"] = "argsort"
@@ -301,9 +301,12 @@ class _Phase4RefreshPolicyConfig:
     effective_policy: Literal["standard", "deferred_v1"]
     requested_interval_multiplier: int
     effective_interval_multiplier: int
+    effective_queue_multiplier: int
     default_policy: Literal["standard"]
     default_interval_multiplier: int
+    policy_applicable: bool
     effective_behavior: Literal["requested", "standard_reference_execution"]
+    fallback_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -979,6 +982,46 @@ def _compute_phase4_locality_shaped_frontier_size(
     return pending_offset
 
 
+def _compute_phase4_refresh_cycle_batches(
+    *,
+    update_interval: int,
+    queue_multiplier: int,
+) -> int:
+    resolved_update_interval = int(update_interval)
+    resolved_queue_multiplier = int(queue_multiplier)
+    if resolved_update_interval <= 0:
+        raise ValueError("update_interval must be > 0")
+    if resolved_queue_multiplier <= 0:
+        raise ValueError("queue_multiplier must be > 0")
+    return resolved_update_interval * resolved_queue_multiplier
+
+
+def _compute_phase4_refresh_queue_window_size(
+    *,
+    update_interval: int,
+    phase4_feature_batch_size: int,
+    queue_multiplier: int,
+    remaining_feature_count: int | None = None,
+) -> int:
+    resolved_feature_batch_size = int(phase4_feature_batch_size)
+    if resolved_feature_batch_size <= 0:
+        raise ValueError("phase4_feature_batch_size must be > 0")
+
+    refresh_cycle_batches = _compute_phase4_refresh_cycle_batches(
+        update_interval=update_interval,
+        queue_multiplier=queue_multiplier,
+    )
+    queue_window_size = refresh_cycle_batches * resolved_feature_batch_size
+
+    if remaining_feature_count is None:
+        return int(queue_window_size)
+
+    resolved_remaining = int(remaining_feature_count)
+    if resolved_remaining < 0:
+        raise ValueError("remaining_feature_count must be >= 0 when provided")
+    return min(int(queue_window_size), resolved_remaining)
+
+
 def _resolve_phase4_scheduler_mode(
     phase4_scheduler_mode: str,
 ) -> Literal["locality", "planner_v1", "planner_v2"]:
@@ -1433,30 +1476,57 @@ def _resolve_phase4_refresh_policy_config(
     *,
     phase4_refresh_policy: str,
     phase4_refresh_interval_multiplier: int,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
 ) -> _Phase4RefreshPolicyConfig:
     requested_policy = _resolve_phase4_refresh_policy(phase4_refresh_policy)
     requested_interval_multiplier = _resolve_phase4_refresh_interval_multiplier(
         phase4_refresh_interval_multiplier
     )
-    effective_policy = cast(
-        Literal["standard", "deferred_v1"],
-        _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy],
-    )
-    effective_interval_multiplier = _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT
-    effective_behavior: Literal["requested", "standard_reference_execution"] = (
-        "requested"
-        if requested_policy == _PHASE4_REFRESH_POLICY_DEFAULT
-        and requested_interval_multiplier == effective_interval_multiplier
-        else "standard_reference_execution"
-    )
+    policy_applicable = bool(compact_output and exact_chunked_decoder)
+
+    fallback_reason: str | None = None
+    if requested_policy == "deferred_v1" and not policy_applicable:
+        effective_policy = cast(Literal["standard", "deferred_v1"], "standard")
+        effective_interval_multiplier = _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT
+        effective_behavior: Literal["requested", "standard_reference_execution"] = (
+            "standard_reference_execution"
+        )
+        fallback_reason = (
+            "deferred_v1 requires compact_output=True and exact_chunked_decoder=True; "
+            "falling back to standard execution"
+        )
+    elif requested_policy == "standard":
+        effective_policy = cast(
+            Literal["standard", "deferred_v1"],
+            _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy],
+        )
+        effective_interval_multiplier = _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT
+        effective_behavior = (
+            "requested"
+            if requested_interval_multiplier == _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT
+            else "standard_reference_execution"
+        )
+    else:
+        effective_policy = cast(
+            Literal["standard", "deferred_v1"],
+            _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy],
+        )
+        effective_interval_multiplier = requested_interval_multiplier
+        effective_behavior = "requested"
+
+    effective_queue_multiplier = int(effective_interval_multiplier)
     return _Phase4RefreshPolicyConfig(
         requested_policy=requested_policy,
         effective_policy=effective_policy,
         requested_interval_multiplier=requested_interval_multiplier,
         effective_interval_multiplier=effective_interval_multiplier,
+        effective_queue_multiplier=effective_queue_multiplier,
         default_policy=_PHASE4_REFRESH_POLICY_DEFAULT,
         default_interval_multiplier=_PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT,
+        policy_applicable=policy_applicable,
         effective_behavior=effective_behavior,
+        fallback_reason=fallback_reason,
     )
 
 
@@ -1468,7 +1538,9 @@ def _build_phase4_refresh_policy_metadata(
         "refresh_policy": phase4_refresh_policy_config.requested_policy,
         "refresh_policy_default": phase4_refresh_policy_config.default_policy,
         "refresh_policy_effective": phase4_refresh_policy_config.effective_policy,
+        "refresh_policy_applicable": bool(phase4_refresh_policy_config.policy_applicable),
         "refresh_policy_effective_behavior": phase4_refresh_policy_config.effective_behavior,
+        "refresh_policy_fallback_reason": phase4_refresh_policy_config.fallback_reason,
         "refresh_policy_reference_execution": bool(
             phase4_refresh_policy_config.requested_policy
             != phase4_refresh_policy_config.effective_policy
@@ -1480,6 +1552,9 @@ def _build_phase4_refresh_policy_metadata(
         "refresh_interval_multiplier_default": phase4_refresh_policy_config.default_interval_multiplier,
         "refresh_interval_multiplier_effective": (
             phase4_refresh_policy_config.effective_interval_multiplier
+        ),
+        "refresh_queue_multiplier_effective": (
+            phase4_refresh_policy_config.effective_queue_multiplier
         ),
         "refresh_interval_multiplier_reference_execution": bool(
             phase4_refresh_policy_config.requested_interval_multiplier
@@ -4075,10 +4150,13 @@ def attribute(
             ``"cap_effective_batches"``; when omitted under that policy, execution
             falls back to ``"legacy"`` with explicit metadata.
         phase4_refresh_policy: Requested Phase-4 refresh cadence policy.
-            ``"standard"`` keeps current behavior; ``"deferred_v1"`` is
-            currently validated/plumbed only and falls back to standard execution.
+            ``"standard"`` keeps current behavior; ``"deferred_v1"`` expands
+            the per-refresh pending/frontier queue for compact exact-trace Phase 4
+            (``compact_output=True`` + exact chunked decoder). Outside that path,
+            execution falls back to ``"standard"`` with explicit metadata.
         phase4_refresh_interval_multiplier: Positive integer cadence multiplier
-            for refresh policy plumbing. Currently metadata-only.
+            used by ``"deferred_v1"`` to scale the Phase-4 pending/frontier
+            queue window while keeping executor microbatch sizing unchanged.
         phase4_ranker: Requested Phase-4 ranking implementation.
             ``"argsort"`` keeps current behavior; ``"topk_v1"`` is currently
             validated/plumbed only and falls back to argsort execution.
@@ -4305,6 +4383,8 @@ def _run_attribution(
     phase4_refresh_policy_config = _resolve_phase4_refresh_policy_config(
         phase4_refresh_policy=phase4_refresh_policy,
         phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
     )
     phase4_refresh_policy_metadata = _build_phase4_refresh_policy_metadata(
         phase4_refresh_policy_config
@@ -4534,7 +4614,8 @@ def _run_attribution(
             f"phase4_refresh_policy={phase4_refresh_policy_config.requested_policy} "
             f"(effective={phase4_refresh_policy_config.effective_policy}, "
             f"interval_multiplier={phase4_refresh_policy_config.requested_interval_multiplier}, "
-            f"interval_multiplier_effective={phase4_refresh_policy_config.effective_interval_multiplier}) | "
+            f"interval_multiplier_effective={phase4_refresh_policy_config.effective_interval_multiplier}, "
+            f"queue_multiplier_effective={phase4_refresh_policy_config.effective_queue_multiplier}) | "
             f"phase4_ranker={phase4_ranker_config.requested_mode} "
             f"(effective={phase4_ranker_config.effective_mode}) | "
             f"row_store_cache_control={row_store_cache_control_config.requested_mode} "
@@ -5190,8 +5271,12 @@ def _run_attribution(
                     descending=True,
                 ).cpu()
                 queue_size = min(
-                    update_interval * effective_feature_batch_size,
-                    actual_max_feature_nodes,
+                    _compute_phase4_refresh_queue_window_size(
+                        update_interval=update_interval,
+                        phase4_feature_batch_size=effective_feature_batch_size,
+                        queue_multiplier=phase4_refresh_policy_config.effective_queue_multiplier,
+                    ),
+                    int(actual_max_feature_nodes),
                 )
                 pre_locality_pending = unvisited_feature_rank[:queue_size]
                 post_locality_pending = _reorder_pending_for_phase4_locality(
@@ -5359,6 +5444,27 @@ def _run_attribution(
         _log_memory_boundary(logger, "Phase 4 start", model.device)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
         phase4_feature_batch_size = effective_feature_batch_size
+        phase4_refresh_queue_multiplier = int(
+            phase4_refresh_policy_config.effective_queue_multiplier
+        )
+        phase4_refresh_cycle_batches = _compute_phase4_refresh_cycle_batches(
+            update_interval=update_interval,
+            queue_multiplier=phase4_refresh_queue_multiplier,
+        )
+        phase4_refresh_reference_cycle_batches = _compute_phase4_refresh_cycle_batches(
+            update_interval=update_interval,
+            queue_multiplier=1,
+        )
+        phase4_refresh_reference_queue_size = _compute_phase4_refresh_queue_window_size(
+            update_interval=update_interval,
+            phase4_feature_batch_size=phase4_feature_batch_size,
+            queue_multiplier=1,
+        )
+        phase4_refresh_effective_queue_size = _compute_phase4_refresh_queue_window_size(
+            update_interval=update_interval,
+            phase4_feature_batch_size=phase4_feature_batch_size,
+            queue_multiplier=phase4_refresh_queue_multiplier,
+        )
         phase4_row_executor_effective_mode = phase4_row_executor_config.effective_mode
         phase4_executor_reference_batch_size = int(phase4_feature_batch_size)
         phase4_executor_microbatch_size = phase4_executor_reference_batch_size
@@ -5373,6 +5479,10 @@ def _run_attribution(
                 ),
                 "executor_reference_batch_size": int(phase4_executor_reference_batch_size),
                 "executor_microbatch_size": int(phase4_executor_microbatch_size),
+                "refresh_cycle_batches_reference": int(phase4_refresh_reference_cycle_batches),
+                "refresh_cycle_batches_effective": int(phase4_refresh_cycle_batches),
+                "refresh_queue_size_reference": int(phase4_refresh_reference_queue_size),
+                "refresh_queue_size_effective": int(phase4_refresh_effective_queue_size),
             }
         )
         logger.info(
@@ -5410,6 +5520,9 @@ def _run_attribution(
             f" (effective={phase4_refresh_policy_config.effective_policy}, "
             f"interval_multiplier={phase4_refresh_policy_config.requested_interval_multiplier}, "
             f"interval_multiplier_effective={phase4_refresh_policy_config.effective_interval_multiplier}, "
+            f"queue_multiplier_effective={phase4_refresh_policy_config.effective_queue_multiplier}, "
+            f"queue_size_reference={phase4_refresh_reference_queue_size}, "
+            f"queue_size_effective={phase4_refresh_effective_queue_size}, "
             f"behavior={phase4_refresh_policy_config.effective_behavior}) | "
             f"ranker={phase4_ranker_config.requested_mode}"
             f" (effective={phase4_ranker_config.effective_mode}, "
@@ -5667,8 +5780,12 @@ def _run_attribution(
                     else None
                 )
                 max_frontier_size = min(
-                    update_interval * phase4_feature_batch_size,
-                    actual_max_feature_nodes - n_visited,
+                    _compute_phase4_refresh_queue_window_size(
+                        update_interval=update_interval,
+                        phase4_feature_batch_size=phase4_feature_batch_size,
+                        queue_multiplier=phase4_refresh_queue_multiplier,
+                    ),
+                    int(actual_max_feature_nodes - n_visited),
                 )
                 pending_candidates = unvisited_feature_rank[:max_frontier_size]
                 refresh_rank_topk_elapsed_ms = (time.perf_counter() - rank_topk_start) * 1000.0
@@ -5679,7 +5796,7 @@ def _run_attribution(
                     phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
                         pending_candidates,
                         max_batch_size=phase4_feature_batch_size,
-                        max_batches=update_interval,
+                        max_batches=phase4_refresh_cycle_batches,
                         feat_layers=feat_layers,
                         feat_positions=feat_pos,
                         feat_ids=feat_ids,
@@ -5710,7 +5827,7 @@ def _run_attribution(
                     queue_size = _compute_phase4_locality_shaped_frontier_size(
                         pending,
                         max_batch_size=phase4_feature_batch_size,
-                        max_batches=update_interval,
+                        max_batches=phase4_refresh_cycle_batches,
                         feat_layers=feat_layers,
                         feat_ids=feat_ids,
                         exact_chunked_decoder=exact_chunked_decoder,
@@ -5735,7 +5852,7 @@ def _run_attribution(
                         candidate_scores=planner_v2_candidate_scores,
                         visited=visited,
                         max_batch_size=phase4_feature_batch_size,
-                        max_batches=update_interval,
+                        max_batches=phase4_refresh_cycle_batches,
                         feat_layers=feat_layers,
                         feat_positions=feat_pos,
                         feat_ids=feat_ids,
