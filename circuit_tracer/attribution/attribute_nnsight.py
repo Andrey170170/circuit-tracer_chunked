@@ -1728,6 +1728,161 @@ def _build_phase3_seed_bundle_payload(
     }
 
 
+def _build_phase3_gradient_bundle_payload(
+    *,
+    gradient_captures: list[dict[str, object]],
+    active_features: torch.Tensor,
+    activation_values: torch.Tensor,
+    target_token_ids: torch.Tensor,
+    target_probabilities: torch.Tensor,
+    status: str,
+) -> dict[str, object]:
+    target_token_ids_cpu = target_token_ids.detach().to(device="cpu", dtype=torch.int64)
+    target_probabilities_cpu = target_probabilities.detach().to(device="cpu")
+    active_features_cpu = active_features.detach().to(device="cpu", dtype=torch.int64)
+    activation_values_cpu = activation_values.detach().to(device="cpu")
+
+    gradient_tensors: list[torch.Tensor] = []
+    layer_masks: list[torch.Tensor] = []
+    batch_call_indices: list[int] = []
+    for capture in gradient_captures:
+        gradients = capture.get("gradients")
+        layer_mask = capture.get("layer_mask")
+        if not isinstance(gradients, torch.Tensor) or not isinstance(layer_mask, torch.Tensor):
+            continue
+        gradient_tensors.append(gradients.detach().to(device="cpu", dtype=torch.float32))
+        layer_masks.append(layer_mask.detach().to(device="cpu", dtype=torch.bool))
+        batch_call_indices.append(int(capture.get("batch_call_index", len(batch_call_indices))))
+
+    if gradient_tensors:
+        gradients_by_layer = torch.cat(gradient_tensors, dim=1).contiguous()
+        layer_mask = torch.stack(layer_masks, dim=0).any(dim=0).to(dtype=torch.bool)
+    else:
+        gradients_by_layer = torch.empty((0, 0, 0, 0), dtype=torch.float32)
+        layer_mask = torch.empty((0,), dtype=torch.bool)
+
+    per_layer_abs_sum: list[float] = []
+    per_layer_max_abs: list[float] = []
+    per_layer_nonfinite_count: list[int] = []
+    per_layer_hashes: list[str] = []
+    for layer_idx in range(int(gradients_by_layer.shape[0])):
+        layer_values = gradients_by_layer[layer_idx]
+        per_layer_hashes.append(_hash_float_tensor(layer_values, dtype=torch.float32))
+        finite = torch.isfinite(layer_values)
+        per_layer_nonfinite_count.append(int((~finite).sum().item()))
+        abs_values = layer_values.detach().abs()
+        per_layer_abs_sum.append(float(abs_values.sum(dtype=torch.float64).item()))
+        per_layer_max_abs.append(float(abs_values.max().item()) if abs_values.numel() else 0.0)
+
+    return {
+        "schema_version": 1,
+        "status": status,
+        "capture_kind": "phase3_gradient_bundle_v1",
+        "target_token_ids": target_token_ids_cpu,
+        "target_probabilities": target_probabilities_cpu,
+        "target_token_ids_hash": _hash_index_tensor(target_token_ids_cpu),
+        "target_probability_hash": _hash_float_tensor(
+            target_probabilities_cpu,
+            dtype=torch.float64,
+        ),
+        "active_feature_count": int(active_features_cpu.shape[0]),
+        "active_features_hash": _hash_index_tensor(active_features_cpu.reshape(-1)),
+        "activation_values_hash": _hash_tensor_raw_bytes(activation_values_cpu),
+        "gradients": gradients_by_layer,
+        "layer_mask": layer_mask,
+        "batch_call_indices": torch.tensor(batch_call_indices, dtype=torch.int64),
+        "per_layer_abs_sum": torch.tensor(per_layer_abs_sum, dtype=torch.float64),
+        "per_layer_max_abs": torch.tensor(per_layer_max_abs, dtype=torch.float64),
+        "per_layer_nonfinite_count": torch.tensor(per_layer_nonfinite_count, dtype=torch.int64),
+        "per_layer_hashes": per_layer_hashes,
+        "gradient_hash": _hash_float_tensor(gradients_by_layer, dtype=torch.float32),
+    }
+
+
+def _build_phase3_row_bundle_payload(
+    *,
+    feature_rows: list[torch.Tensor],
+    row_abs_sums: list[torch.Tensor],
+    feature_abs_sums: list[torch.Tensor],
+    error_abs_sums: list[torch.Tensor],
+    token_abs_sums: list[torch.Tensor],
+    active_features: torch.Tensor,
+    activation_values: torch.Tensor,
+    target_token_ids: torch.Tensor,
+    target_probabilities: torch.Tensor,
+    total_active_features: int,
+    error_column_count: int,
+    token_column_count: int,
+    status: str,
+) -> dict[str, object]:
+    target_token_ids_cpu = target_token_ids.detach().to(device="cpu", dtype=torch.int64)
+    target_probabilities_cpu = target_probabilities.detach().to(device="cpu")
+    active_features_cpu = active_features.detach().to(device="cpu", dtype=torch.int64)
+    activation_values_cpu = activation_values.detach().to(device="cpu")
+
+    feature_rows_cpu = (
+        torch.cat(
+            [row.detach().to(device="cpu", dtype=torch.float32) for row in feature_rows], dim=0
+        )
+        if feature_rows
+        else torch.empty((0, int(total_active_features)), dtype=torch.float32)
+    )
+    row_abs_sums_cpu = (
+        torch.cat(
+            [row.detach().to(device="cpu", dtype=torch.float64) for row in row_abs_sums], dim=0
+        )
+        if row_abs_sums
+        else torch.empty((0,), dtype=torch.float64)
+    )
+    feature_abs_sums_cpu = (
+        torch.cat(
+            [row.detach().to(device="cpu", dtype=torch.float64) for row in feature_abs_sums], dim=0
+        )
+        if feature_abs_sums
+        else torch.empty((0,), dtype=torch.float64)
+    )
+    error_abs_sums_cpu = (
+        torch.cat(
+            [row.detach().to(device="cpu", dtype=torch.float64) for row in error_abs_sums], dim=0
+        )
+        if error_abs_sums
+        else torch.empty((0,), dtype=torch.float64)
+    )
+    token_abs_sums_cpu = (
+        torch.cat(
+            [row.detach().to(device="cpu", dtype=torch.float64) for row in token_abs_sums], dim=0
+        )
+        if token_abs_sums
+        else torch.empty((0,), dtype=torch.float64)
+    )
+
+    return {
+        "schema_version": 1,
+        "status": status,
+        "capture_kind": "phase3_row_bundle_v1",
+        "target_token_ids": target_token_ids_cpu,
+        "target_probabilities": target_probabilities_cpu,
+        "target_token_ids_hash": _hash_index_tensor(target_token_ids_cpu),
+        "target_probability_hash": _hash_float_tensor(
+            target_probabilities_cpu,
+            dtype=torch.float64,
+        ),
+        "active_feature_count": int(active_features_cpu.shape[0]),
+        "active_features_hash": _hash_index_tensor(active_features_cpu.reshape(-1)),
+        "activation_values_hash": _hash_tensor_raw_bytes(activation_values_cpu),
+        "phase3_feature_rows": feature_rows_cpu,
+        "row_abs_sums": row_abs_sums_cpu,
+        "feature_abs_sums": feature_abs_sums_cpu,
+        "error_abs_sums": error_abs_sums_cpu,
+        "token_abs_sums": token_abs_sums_cpu,
+        "total_active_features": int(total_active_features),
+        "error_column_count": int(error_column_count),
+        "token_column_count": int(token_column_count),
+        "row_hash": _hash_float_tensor(feature_rows_cpu, dtype=torch.float32),
+        "row_abs_sum_hash": _hash_float_tensor(row_abs_sums_cpu, dtype=torch.float64),
+    }
+
+
 def _build_semantic_sketch_fallback(
     *,
     candidate_features: torch.Tensor,
@@ -2623,6 +2778,8 @@ def attribute(
     cross_cluster_debug: bool = False,
     capture_phase0_donor_bundle: bool = False,
     capture_phase3_seed_bundle: bool = False,
+    capture_phase3_gradient_bundle: bool = False,
+    capture_phase3_row_bundle: bool = False,
     capture_feature_semantic_descriptors: bool = False,
     semantic_descriptor_top_k: int = 2048,
     semantic_descriptor_dim: int = 64,
@@ -2701,6 +2858,10 @@ def attribute(
             capture for compact exact-chunked runs.
         capture_phase3_seed_bundle: Enable opt-in Phase-3 seed-bundle payload
             capture for compact exact-chunked runs.
+        capture_phase3_gradient_bundle: Enable opt-in Phase-3 backward-gradient
+            payload capture for compact exact-chunked runs.
+        capture_phase3_row_bundle: Enable opt-in Phase-3 direct-effect row
+            payload capture for compact exact-chunked runs.
         capture_feature_semantic_descriptors: Enable opt-in bounded semantic
             descriptor payload for Phase-3 candidate features.
         semantic_descriptor_top_k: Maximum number of candidate features to
@@ -2775,6 +2936,8 @@ def attribute(
             cross_cluster_debug=cross_cluster_debug,
             capture_phase0_donor_bundle=capture_phase0_donor_bundle,
             capture_phase3_seed_bundle=capture_phase3_seed_bundle,
+            capture_phase3_gradient_bundle=capture_phase3_gradient_bundle,
+            capture_phase3_row_bundle=capture_phase3_row_bundle,
             capture_feature_semantic_descriptors=capture_feature_semantic_descriptors,
             semantic_descriptor_top_k=semantic_descriptor_top_k,
             semantic_descriptor_dim=semantic_descriptor_dim,
@@ -2830,6 +2993,8 @@ def _run_attribution(
     cross_cluster_debug: bool = False,
     capture_phase0_donor_bundle: bool = False,
     capture_phase3_seed_bundle: bool = False,
+    capture_phase3_gradient_bundle: bool = False,
+    capture_phase3_row_bundle: bool = False,
     capture_feature_semantic_descriptors: bool = False,
     semantic_descriptor_top_k: int = 2048,
     semantic_descriptor_dim: int = 64,
@@ -2903,6 +3068,8 @@ def _run_attribution(
     cross_cluster_debug_enabled = bool(cross_cluster_debug)
     capture_phase0_donor_bundle_enabled = bool(capture_phase0_donor_bundle)
     capture_phase3_seed_bundle_enabled = bool(capture_phase3_seed_bundle)
+    capture_phase3_gradient_bundle_enabled = bool(capture_phase3_gradient_bundle)
+    capture_phase3_row_bundle_enabled = bool(capture_phase3_row_bundle)
     capture_feature_semantic_descriptors_enabled = bool(capture_feature_semantic_descriptors)
     semantic_descriptor_top_k = int(semantic_descriptor_top_k)
     semantic_descriptor_dim = int(semantic_descriptor_dim)
@@ -2943,6 +3110,8 @@ def _run_attribution(
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
             "capture_phase0_donor_bundle_enabled": capture_phase0_donor_bundle_enabled,
             "capture_phase3_seed_bundle_enabled": capture_phase3_seed_bundle_enabled,
+            "capture_phase3_gradient_bundle_enabled": capture_phase3_gradient_bundle_enabled,
+            "capture_phase3_row_bundle_enabled": capture_phase3_row_bundle_enabled,
             "capture_feature_semantic_descriptors_enabled": (
                 capture_feature_semantic_descriptors_enabled
             ),
@@ -2997,6 +3166,15 @@ def _run_attribution(
     if capture_phase3_seed_bundle_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "capture_phase3_seed_bundle requires compact_output=True and exact_chunked_decoder=True"
+        )
+    if capture_phase3_gradient_bundle_enabled and not (compact_output and exact_chunked_decoder):
+        raise ValueError(
+            "capture_phase3_gradient_bundle requires compact_output=True and "
+            "exact_chunked_decoder=True"
+        )
+    if capture_phase3_row_bundle_enabled and not (compact_output and exact_chunked_decoder):
+        raise ValueError(
+            "capture_phase3_row_bundle requires compact_output=True and exact_chunked_decoder=True"
         )
     if capture_feature_semantic_descriptors_enabled and not (
         compact_output and exact_chunked_decoder
@@ -3114,6 +3292,8 @@ def _run_attribution(
     compact_output_result: dict[str, object] | None = None
     phase0_donor_bundle_payload: dict[str, object] | None = None
     phase3_seed_bundle_payload: dict[str, object] | None = None
+    phase3_gradient_bundle_payload: dict[str, object] | None = None
+    phase3_row_bundle_payload: dict[str, object] | None = None
     feature_semantic_descriptors_payload: dict[str, object] | None = None
     phase0_replay_metadata: dict[str, object] = _build_phase0_replay_metadata(
         mode=phase0_replay_mode_resolved,
@@ -3187,6 +3367,8 @@ def _run_attribution(
     )
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
+    if capture_phase3_gradient_bundle_enabled:
+        setattr(ctx, "capture_phase3_gradients", True)
     configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
     if callable(configure_ctx_trace_logging):
         configure_ctx_trace_logging(
@@ -3894,6 +4076,11 @@ def _run_attribution(
             (len(targets) + effective_logit_batch_size - 1) // effective_logit_batch_size,
             1,
         )
+        phase3_feature_row_batches: list[torch.Tensor] = []
+        phase3_row_abs_sum_batches: list[torch.Tensor] = []
+        phase3_feature_abs_sum_batches: list[torch.Tensor] = []
+        phase3_error_abs_sum_batches: list[torch.Tensor] = []
+        phase3_token_abs_sum_batches: list[torch.Tensor] = []
         for i in range(0, len(targets), effective_logit_batch_size):
             batch = targets.logit_vectors[i : i + effective_logit_batch_size]
             ctx_before = _snapshot_diagnostics(ctx) if profile else None
@@ -3911,6 +4098,31 @@ def _run_attribution(
                 row_input_slice,
                 dtype=exact_trace_internal_dtype_resolved,
             )
+            if capture_phase3_row_bundle_enabled:
+                feature_rows_cpu = rows_cpu[:, :total_active_feats].contiguous()
+                error_start = int(total_active_feats)
+                error_end = int(total_active_feats + n_layers * n_pos)
+                token_end = int(logit_offset)
+                phase3_feature_row_batches.append(feature_rows_cpu)
+                phase3_row_abs_sum_batches.append(row_abs_sums_cpu.contiguous())
+                phase3_feature_abs_sum_batches.append(
+                    _compute_row_abs_sums(
+                        feature_rows_cpu,
+                        dtype=exact_trace_internal_dtype_resolved,
+                    ).contiguous()
+                )
+                phase3_error_abs_sum_batches.append(
+                    _compute_row_abs_sums(
+                        rows_cpu[:, error_start:error_end],
+                        dtype=exact_trace_internal_dtype_resolved,
+                    ).contiguous()
+                )
+                phase3_token_abs_sum_batches.append(
+                    _compute_row_abs_sums(
+                        rows_cpu[:, error_end:token_end],
+                        dtype=exact_trace_internal_dtype_resolved,
+                    ).contiguous()
+                )
             if anomaly_debug_result is not None:
                 logit_row_batches = anomaly_debug_result.setdefault(
                     "phase3_logit_row_batches",
@@ -4034,6 +4246,39 @@ def _run_attribution(
         reset_decoder_cache = getattr(ctx, "reset_decoder_cache", None)
         if callable(reset_decoder_cache):
             reset_decoder_cache()
+
+        phase3_target_token_ids = torch.tensor(
+            [int(target.vocab_idx) for target in targets.logit_targets],
+            dtype=torch.int64,
+        )
+        if capture_phase3_gradient_bundle_enabled:
+            gradient_captures = getattr(ctx, "phase3_gradient_captures", [])
+            phase3_gradient_bundle_payload = _build_phase3_gradient_bundle_payload(
+                gradient_captures=(
+                    gradient_captures if isinstance(gradient_captures, list) else []
+                ),
+                active_features=activation_matrix.indices().T,
+                activation_values=activation_matrix.values(),
+                target_token_ids=phase3_target_token_ids,
+                target_probabilities=targets.logit_probabilities,
+                status="captured",
+            )
+        if capture_phase3_row_bundle_enabled:
+            phase3_row_bundle_payload = _build_phase3_row_bundle_payload(
+                feature_rows=phase3_feature_row_batches,
+                row_abs_sums=phase3_row_abs_sum_batches,
+                feature_abs_sums=phase3_feature_abs_sum_batches,
+                error_abs_sums=phase3_error_abs_sum_batches,
+                token_abs_sums=phase3_token_abs_sum_batches,
+                active_features=activation_matrix.indices().T,
+                activation_values=activation_matrix.values(),
+                target_token_ids=phase3_target_token_ids,
+                target_probabilities=targets.logit_probabilities,
+                total_active_features=int(total_active_feats),
+                error_column_count=int(n_layers * n_pos),
+                token_column_count=int(n_pos),
+                status="captured",
+            )
 
         if (
             cross_cluster_debug_summary is not None
@@ -5434,6 +5679,10 @@ def _run_attribution(
                 ).get("dtype_roundtrip_loss"),
                 "capture_phase0_donor_bundle_enabled": bool(capture_phase0_donor_bundle_enabled),
                 "capture_phase3_seed_bundle_enabled": bool(capture_phase3_seed_bundle_enabled),
+                "capture_phase3_gradient_bundle_enabled": bool(
+                    capture_phase3_gradient_bundle_enabled
+                ),
+                "capture_phase3_row_bundle_enabled": bool(capture_phase3_row_bundle_enabled),
                 "capture_feature_semantic_descriptors_enabled": bool(
                     capture_feature_semantic_descriptors_enabled
                 ),
@@ -5473,6 +5722,10 @@ def _run_attribution(
                 compact_output_result["phase0_donor_bundle"] = phase0_donor_bundle_payload
             if capture_phase3_seed_bundle_enabled:
                 compact_output_result["phase3_seed_bundle"] = phase3_seed_bundle_payload
+            if capture_phase3_gradient_bundle_enabled:
+                compact_output_result["phase3_gradient_bundle"] = phase3_gradient_bundle_payload
+            if capture_phase3_row_bundle_enabled:
+                compact_output_result["phase3_row_bundle"] = phase3_row_bundle_payload
             if capture_feature_semantic_descriptors_enabled:
                 compact_output_result["feature_semantic_descriptors"] = (
                     feature_semantic_descriptors_payload

@@ -124,6 +124,8 @@ class AttributionContext:
         self._trace_logger = None
         self._telemetry_recorder: TelemetryRecorder | None = None
         self._trace_chunk_interval = 16
+        self.capture_phase3_gradients = False
+        self.phase3_gradient_captures: list[dict[str, torch.Tensor | int]] = []
         self._compute_batch_call_index = 0
         self._diagnostic_stats: dict[str, object] = {
             "compute_batch_calls": 0.0,
@@ -942,6 +944,12 @@ class AttributionContext:
         layers_in_batch = sorted(layers.unique().tolist(), reverse=True)
         chunked_feature_grads = {} if self.chunked_decoder_state is not None else None
         chunked_feature_grad_layers: list[int] = []
+        capture_phase3_gradients = bool(
+            self.capture_phase3_gradients and phase_label == "phase3_logits"
+        )
+        captured_phase3_grads: list[torch.Tensor | None] | None = (
+            [None] * self.n_layers if capture_phase3_gradients else None
+        )
 
         last_layer = max(layers_in_batch)
         try:
@@ -952,6 +960,10 @@ class AttributionContext:
                 for layer in reversed(range(last_layer + 1)):
                     if layer != last_layer:
                         grad = self._feature_output_activations[layer + 1].grad.detach()  # type:ignore
+                        if captured_phase3_grads is not None and 0 <= layer < self.n_layers:
+                            captured_phase3_grads[layer] = (
+                                grad.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                            )
                         feature_start = time.perf_counter()
                         if chunked_feature_grads is None:
                             self.compute_feature_attributions(
@@ -1019,6 +1031,25 @@ class AttributionContext:
                     )
         finally:
             self._clear_saved_grads()
+
+        if captured_phase3_grads is not None:
+            present = [grad is not None for grad in captured_phase3_grads]
+            if any(present):
+                sample_grad = next(grad for grad in captured_phase3_grads if grad is not None)
+                assert sample_grad is not None
+                stacked_grads = []
+                for grad in captured_phase3_grads:
+                    if grad is None:
+                        stacked_grads.append(torch.zeros_like(sample_grad))
+                    else:
+                        stacked_grads.append(grad)
+                self.phase3_gradient_captures.append(
+                    {
+                        "batch_call_index": int(batch_call_index),
+                        "layer_mask": torch.tensor(present, dtype=torch.bool),
+                        "gradients": torch.stack(stacked_grads, dim=0),
+                    }
+                )
 
         buf, self._batch_buffer = self._batch_buffer, None
         elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
