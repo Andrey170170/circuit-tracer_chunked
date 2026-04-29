@@ -1453,17 +1453,15 @@ def _resolve_phase1_trace_batch_sizing(
 
     if cap_limit is None:
         effective_source_batch_size = int(batch_size)
-        effective_feature_batch_size = int(requested_feature_batch_size)
-        effective_logit_batch_size = int(requested_logit_batch_size)
-        effective_phase4_max_feature_batch_size = int(requested_phase4_max_feature_batch_size)
     else:
+        # Phase-1-only cap decoupling: cap applies only to the source/invoke
+        # trace batch size used to drive the Phase-1 forward/cache footprint.
         effective_source_batch_size = min(int(batch_size), cap_limit)
-        effective_feature_batch_size = min(int(requested_feature_batch_size), cap_limit)
-        effective_logit_batch_size = min(int(requested_logit_batch_size), cap_limit)
-        effective_phase4_max_feature_batch_size = min(
-            int(requested_phase4_max_feature_batch_size),
-            cap_limit,
-        )
+
+    # Keep downstream phase/requested batch knobs unchanged by the Phase-1 cap.
+    effective_feature_batch_size = int(requested_feature_batch_size)
+    effective_logit_batch_size = int(requested_logit_batch_size)
+    effective_phase4_max_feature_batch_size = int(requested_phase4_max_feature_batch_size)
 
     source_batch_size_cap_applied = effective_source_batch_size < int(batch_size)
     feature_batch_size_cap_applied = effective_feature_batch_size < int(
@@ -1498,11 +1496,7 @@ def _resolve_phase1_trace_batch_sizing(
         int(requested_feature_batch_size),
         int(requested_logit_batch_size),
     )
-    trace_batch_size_effective_pre_planner = max(
-        effective_source_batch_size,
-        effective_feature_batch_size,
-        effective_logit_batch_size,
-    )
+    trace_batch_size_effective_pre_planner = effective_source_batch_size
 
     return _Phase1TraceBatchSizing(
         requested_source_batch_size=int(batch_size),
@@ -1523,9 +1517,7 @@ def _resolve_phase1_trace_batch_sizing(
         cap_reason=cap_reason,
         trace_batch_size_legacy=trace_batch_size_legacy,
         trace_batch_size_effective_pre_planner=trace_batch_size_effective_pre_planner,
-        trace_batch_size_cap_applied=(
-            trace_batch_size_effective_pre_planner < trace_batch_size_legacy
-        ),
+        trace_batch_size_cap_applied=source_batch_size_cap_applied,
     )
 
 
@@ -4461,8 +4453,8 @@ def attribute(
             while preserving scheduler frontier membership/order semantics.
         phase1_trace_batch_policy: Requested Phase-1 trace-batch sizing policy.
             ``"legacy"`` keeps current behavior. ``"cap_effective_batches"``
-            caps effective source/feature/logit trace batches (and Phase-4
-            feature-batch max) to ``phase1_trace_batch_size_max``.
+            caps only the effective Phase-1 source/invoke trace batch size to
+            ``phase1_trace_batch_size_max``.
         phase1_trace_batch_size_max: Optional cap paired with
             ``phase1_trace_batch_policy``. Required to activate
             ``"cap_effective_batches"``; when omitted under that policy, execution
