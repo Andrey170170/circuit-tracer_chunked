@@ -1740,6 +1740,7 @@ def _load_phase3_gradient_donor_bundle_npz(
     active_features: torch.Tensor,
     activation_values: torch.Tensor,
     expected_n_layers: int,
+    expected_gradient_batch_size: int,
     expected_n_positions: int,
     expected_d_model: int,
     validation_policy: Literal["strict"] = "strict",
@@ -1821,16 +1822,21 @@ def _load_phase3_gradient_donor_bundle_npz(
         )
     elif (
         int(gradients.shape[0]) != int(expected_n_layers)
-        or int(gradients.shape[1]) != int(target_token_ids_cpu.numel())
+        or int(gradients.shape[1]) != int(expected_gradient_batch_size)
         or int(gradients.shape[2]) != int(expected_n_positions)
         or int(gradients.shape[3]) != int(expected_d_model)
     ):
         validation_issues.append(
             "gradients shape mismatch "
             "(expected layers="
-            f"{int(expected_n_layers)}, batch={int(target_token_ids_cpu.numel())}, "
+            f"{int(expected_n_layers)}, batch={int(expected_gradient_batch_size)}, "
             f"positions={int(expected_n_positions)}, d_model={int(expected_d_model)}; "
             f"got={tuple(gradients.shape)})"
+        )
+    elif int(gradients.shape[1]) < int(target_token_ids_cpu.numel()):
+        validation_issues.append(
+            "gradients batch width is smaller than target token count "
+            f"(batch={int(gradients.shape[1])}, targets={int(target_token_ids_cpu.numel())})"
         )
     if not torch.isfinite(gradients).all().item():
         validation_issues.append("gradients contain nonfinite values")
@@ -4572,6 +4578,7 @@ def _run_attribution(
                 active_features=activation_matrix.indices().T,
                 activation_values=activation_matrix.values(),
                 expected_n_layers=int(n_layers),
+                expected_gradient_batch_size=int(trace_batch_size),
                 expected_n_positions=int(n_pos),
                 expected_d_model=int(targets.logit_vectors.shape[-1]),
                 validation_policy=cast(Literal["strict"], phase3_replay_validation_policy_resolved),

@@ -49,6 +49,7 @@ def test_phase3_gradient_donor_validation_rejects_target_mismatch(tmp_path):
             active_features=active_features,
             activation_values=activation_values,
             expected_n_layers=2,
+            expected_gradient_batch_size=4,
             expected_n_positions=3,
             expected_d_model=5,
         )
@@ -132,17 +133,60 @@ def test_phase3_gradient_donor_validation_rejects_active_feature_hash_mismatch(t
             active_features=runtime_active,
             activation_values=activation_values,
             expected_n_layers=2,
+            expected_gradient_batch_size=1,
             expected_n_positions=3,
             expected_d_model=5,
         )
 
 
-def test_phase3_gradient_donor_validation_rejects_extra_target_columns(tmp_path):
+def test_phase3_gradient_donor_validation_accepts_trace_batch_width(tmp_path):
     gradients = torch.zeros((2, 2, 3, 5), dtype=torch.float32)
     target_ids = torch.tensor([10], dtype=torch.int64)
     active_features = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.int64)
     activation_values = torch.tensor([1.0, 2.0], dtype=torch.float32)
-    path = tmp_path / "gradient_extra_targets.npz"
+    path = tmp_path / "gradient_trace_batch.npz"
+    np.savez_compressed(
+        path,
+        schema_version=np.array(1, dtype=np.int64),
+        status=np.array("captured"),
+        capture_kind=np.array("phase3_gradient_bundle_v1"),
+        target_token_ids=target_ids.numpy(),
+        target_probabilities=np.array([1.0], dtype=np.float32),
+        target_token_ids_hash=np.array(_hash_index_tensor(target_ids)),
+        target_probability_hash=np.array("unused"),
+        active_feature_count=np.array(2, dtype=np.int64),
+        active_features_hash=np.array(_hash_index_tensor(active_features.reshape(-1))),
+        activation_values_hash=np.array(_hash_tensor_raw_bytes(activation_values)),
+        gradients=gradients.numpy(),
+        layer_mask=np.array([True, True]),
+        batch_call_indices=np.array([1], dtype=np.int64),
+        per_layer_abs_sum=np.zeros((2,), dtype=np.float64),
+        per_layer_max_abs=np.zeros((2,), dtype=np.float64),
+        per_layer_nonfinite_count=np.zeros((2,), dtype=np.int64),
+        per_layer_hashes=np.array(["a", "b"]),
+        gradient_hash=np.array(_hash_float_tensor(gradients, dtype=torch.float32)),
+    )
+
+    loaded = _load_phase3_gradient_donor_bundle_npz(
+        path,
+        target_token_ids=target_ids,
+        active_features=active_features,
+        activation_values=activation_values,
+        expected_n_layers=2,
+        expected_gradient_batch_size=2,
+        expected_n_positions=3,
+        expected_d_model=5,
+    )
+
+    assert torch.equal(loaded["gradients"], gradients)
+
+
+def test_phase3_gradient_donor_validation_rejects_wrong_trace_batch_width(tmp_path):
+    gradients = torch.zeros((2, 2, 3, 5), dtype=torch.float32)
+    target_ids = torch.tensor([10], dtype=torch.int64)
+    active_features = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.int64)
+    activation_values = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    path = tmp_path / "gradient_wrong_batch_width.npz"
     np.savez_compressed(
         path,
         schema_version=np.array(1, dtype=np.int64),
@@ -172,6 +216,7 @@ def test_phase3_gradient_donor_validation_rejects_extra_target_columns(tmp_path)
             active_features=active_features,
             activation_values=activation_values,
             expected_n_layers=2,
+            expected_gradient_batch_size=1,
             expected_n_positions=3,
             expected_d_model=5,
         )
