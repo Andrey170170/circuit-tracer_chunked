@@ -147,6 +147,15 @@ _PHASE0_DONOR_CONTEXT_POLICY_BY_NAME: dict[str, str] = {
     "warn": "warn",
 }
 
+_PHASE3_REPLAY_MODE_BY_NAME: dict[str, str] = {
+    "disabled": "disabled",
+    "donor": "donor",
+}
+
+_PHASE3_REPLAY_VALIDATION_POLICY_BY_NAME: dict[str, str] = {
+    "strict": "strict",
+}
+
 
 def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype:
     if isinstance(value, torch.dtype):
@@ -195,6 +204,26 @@ def _resolve_phase0_donor_context_policy(value: str) -> str:
     if resolved is None:
         allowed = ", ".join(sorted(_PHASE0_DONOR_CONTEXT_POLICY_BY_NAME))
         raise ValueError(f"phase0_donor_context_policy must be one of: {allowed} (got {value!r})")
+    return resolved
+
+
+def _resolve_phase3_replay_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    resolved = _PHASE3_REPLAY_MODE_BY_NAME.get(normalized)
+    if resolved is None:
+        allowed = ", ".join(sorted(_PHASE3_REPLAY_MODE_BY_NAME))
+        raise ValueError(f"phase3 replay mode must be one of: {allowed} (got {value!r})")
+    return resolved
+
+
+def _resolve_phase3_replay_validation_policy(value: str) -> str:
+    normalized = str(value).strip().lower()
+    resolved = _PHASE3_REPLAY_VALIDATION_POLICY_BY_NAME.get(normalized)
+    if resolved is None:
+        allowed = ", ".join(sorted(_PHASE3_REPLAY_VALIDATION_POLICY_BY_NAME))
+        raise ValueError(
+            f"phase3_replay_validation_policy must be one of: {allowed} (got {value!r})"
+        )
     return resolved
 
 
@@ -1662,6 +1691,385 @@ def _build_phase0_replay_metadata(
     }
 
 
+def _phase3_npz_optional_str(value: object) -> str | None:
+    return _phase0_npz_optional_str(value)
+
+
+def _phase3_npz_int(value: object, *, default: int = 0) -> int:
+    return _phase0_npz_int(value, default=default)
+
+
+def _build_phase3_replay_metadata(
+    *,
+    replay_kind: str,
+    mode: str,
+    status: str,
+    donor_bundle_path: str | os.PathLike[str] | None,
+    validation_policy: str,
+    validation_failure_count: int = 0,
+    error: str | None = None,
+    donor_hashes: dict[str, object] | None = None,
+    host_hashes: dict[str, object] | None = None,
+    source: str | None = None,
+    note: str | None = None,
+) -> dict[str, object]:
+    donor_path_text = os.fspath(donor_bundle_path) if donor_bundle_path is not None else None
+    return {
+        "schema_version": 1,
+        "replay_kind": str(replay_kind),
+        "mode": str(mode),
+        "status": str(status),
+        "validation_policy": str(validation_policy),
+        "donor_bundle_path": donor_path_text,
+        "donor_bundle_basename": (
+            os.path.basename(donor_path_text) if isinstance(donor_path_text, str) else None
+        ),
+        "validation_failure_count": int(validation_failure_count),
+        "error": error,
+        "donor_hashes": dict(donor_hashes) if isinstance(donor_hashes, dict) else {},
+        "host_hashes": dict(host_hashes) if isinstance(host_hashes, dict) else {},
+        "source": source,
+        "note": note,
+    }
+
+
+def _load_phase3_gradient_donor_bundle_npz(
+    donor_bundle_path: str | os.PathLike[str],
+    *,
+    target_token_ids: torch.Tensor,
+    active_features: torch.Tensor,
+    activation_values: torch.Tensor,
+    expected_n_layers: int,
+    expected_n_positions: int,
+    expected_d_model: int,
+    validation_policy: Literal["strict"] = "strict",
+) -> dict[str, object]:
+    if validation_policy != "strict":
+        raise ValueError("Phase-3 replay currently supports only strict validation")
+
+    with np.load(donor_bundle_path, allow_pickle=False) as donor_npz:
+        donor_payload = {key: donor_npz[key] for key in donor_npz.files}
+
+    schema_version = _phase3_npz_int(donor_payload.get("schema_version"), default=0)
+    capture_kind = _phase3_npz_optional_str(donor_payload.get("capture_kind")) or ""
+    status = _phase3_npz_optional_str(donor_payload.get("status")) or ""
+    gradients_array = np.ascontiguousarray(
+        np.asarray(donor_payload.get("gradients", np.empty((0, 0, 0, 0), dtype=np.float32)))
+    )
+    gradients = torch.from_numpy(gradients_array).to(dtype=torch.float32)
+    donor_target_ids = _phase0_to_int64_tensor(
+        donor_payload.get("target_token_ids", np.empty((0,), dtype=np.int64))
+    ).reshape(-1)
+
+    target_token_ids_cpu = target_token_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    active_features_cpu = active_features.detach().to(device="cpu", dtype=torch.int64)
+    activation_values_cpu = activation_values.detach().to(device="cpu")
+    computed_target_hash = (
+        _hash_index_tensor(donor_target_ids) if donor_target_ids.numel() else None
+    )
+    stored_target_hash = _phase3_npz_optional_str(donor_payload.get("target_token_ids_hash"))
+    active_feature_count = _phase3_npz_int(
+        donor_payload.get("active_feature_count"), default=int(active_features_cpu.shape[0])
+    )
+    computed_active_hash = _hash_index_tensor(active_features_cpu.reshape(-1))
+    stored_active_hash = _phase3_npz_optional_str(donor_payload.get("active_features_hash"))
+    computed_activation_hash = _hash_tensor_raw_bytes(activation_values_cpu)
+    stored_activation_hash = _phase3_npz_optional_str(donor_payload.get("activation_values_hash"))
+    stored_gradient_hash = _phase3_npz_optional_str(donor_payload.get("gradient_hash"))
+    computed_gradient_hash = _hash_float_tensor(gradients, dtype=torch.float32)
+
+    validation_issues: list[str] = []
+    if schema_version != 1:
+        validation_issues.append(f"schema_version mismatch (expected 1, got {schema_version})")
+    if capture_kind != "phase3_gradient_bundle_v1":
+        validation_issues.append(
+            f"capture_kind mismatch (expected 'phase3_gradient_bundle_v1', got {capture_kind!r})"
+        )
+    if status not in {"captured", "captured_replayed_effective_state"}:
+        validation_issues.append(f"unexpected status {status!r}")
+    if not torch.equal(donor_target_ids, target_token_ids_cpu):
+        validation_issues.append("target_token_ids mismatch with runtime targets")
+    if not stored_target_hash:
+        validation_issues.append("missing target_token_ids_hash")
+    if stored_target_hash and computed_target_hash and stored_target_hash != computed_target_hash:
+        validation_issues.append(
+            "target_token_ids_hash mismatch within donor bundle "
+            f"(stored={stored_target_hash}, computed={computed_target_hash})"
+        )
+    if active_feature_count != int(active_features_cpu.shape[0]):
+        validation_issues.append(
+            "active_feature_count mismatch "
+            f"(declared={active_feature_count}, runtime={int(active_features_cpu.shape[0])})"
+        )
+    if not stored_active_hash:
+        validation_issues.append("missing active_features_hash")
+    elif stored_active_hash != computed_active_hash:
+        validation_issues.append(
+            "active_features_hash mismatch with runtime active feature order "
+            f"(donor={stored_active_hash}, runtime={computed_active_hash})"
+        )
+    if not stored_activation_hash:
+        validation_issues.append("missing activation_values_hash")
+    elif stored_activation_hash != computed_activation_hash:
+        validation_issues.append(
+            "activation_values_hash mismatch with runtime activation values "
+            f"(donor={stored_activation_hash}, runtime={computed_activation_hash})"
+        )
+    if gradients.ndim != 4:
+        validation_issues.append(
+            f"gradients must have shape [layers, batch, positions, d_model] (got={tuple(gradients.shape)})"
+        )
+    elif (
+        int(gradients.shape[0]) != int(expected_n_layers)
+        or int(gradients.shape[1]) != int(target_token_ids_cpu.numel())
+        or int(gradients.shape[2]) != int(expected_n_positions)
+        or int(gradients.shape[3]) != int(expected_d_model)
+    ):
+        validation_issues.append(
+            "gradients shape mismatch "
+            "(expected layers="
+            f"{int(expected_n_layers)}, batch={int(target_token_ids_cpu.numel())}, "
+            f"positions={int(expected_n_positions)}, d_model={int(expected_d_model)}; "
+            f"got={tuple(gradients.shape)})"
+        )
+    if not torch.isfinite(gradients).all().item():
+        validation_issues.append("gradients contain nonfinite values")
+    if not stored_gradient_hash:
+        validation_issues.append("missing gradient_hash")
+    elif stored_gradient_hash != computed_gradient_hash:
+        validation_issues.append(
+            "gradient_hash mismatch within donor bundle "
+            f"(stored={stored_gradient_hash}, computed={computed_gradient_hash})"
+        )
+
+    if validation_issues:
+        raise ValueError(
+            "Phase-3 gradient donor bundle validation failed: " + "; ".join(validation_issues)
+        )
+
+    return {
+        "status": status,
+        "gradients": gradients,
+        "validation_metadata": {
+            "validated": True,
+            "validation_failure_count": 0,
+            "computed_hashes": {
+                "target_token_ids_hash": computed_target_hash,
+                "active_features_hash": computed_active_hash,
+                "activation_values_hash": computed_activation_hash,
+                "gradient_hash": computed_gradient_hash,
+            },
+            "stored_hashes": {
+                "target_token_ids_hash": stored_target_hash,
+                "active_features_hash": stored_active_hash,
+                "activation_values_hash": stored_activation_hash,
+                "gradient_hash": stored_gradient_hash,
+            },
+        },
+    }
+
+
+def _load_phase3_row_donor_bundle_npz(
+    donor_bundle_path: str | os.PathLike[str],
+    *,
+    target_token_ids: torch.Tensor,
+    active_features: torch.Tensor,
+    activation_values: torch.Tensor,
+    expected_total_active_features: int,
+    validation_policy: Literal["strict"] = "strict",
+) -> dict[str, object]:
+    if validation_policy != "strict":
+        raise ValueError("Phase-3 replay currently supports only strict validation")
+
+    with np.load(donor_bundle_path, allow_pickle=False) as donor_npz:
+        donor_payload = {key: donor_npz[key] for key in donor_npz.files}
+
+    schema_version = _phase3_npz_int(donor_payload.get("schema_version"), default=0)
+    capture_kind = _phase3_npz_optional_str(donor_payload.get("capture_kind")) or ""
+    status = _phase3_npz_optional_str(donor_payload.get("status")) or ""
+    feature_rows_array = np.ascontiguousarray(
+        np.asarray(donor_payload.get("phase3_feature_rows", np.empty((0, 0), dtype=np.float32)))
+    )
+    feature_rows = torch.from_numpy(feature_rows_array).to(dtype=torch.float32)
+    row_abs_sums = torch.from_numpy(
+        np.ascontiguousarray(
+            np.asarray(donor_payload.get("row_abs_sums", np.empty((0,), dtype=np.float64)))
+        )
+    ).to(dtype=torch.float64)
+    feature_abs_sums = torch.from_numpy(
+        np.ascontiguousarray(
+            np.asarray(donor_payload.get("feature_abs_sums", np.empty((0,), dtype=np.float64)))
+        )
+    ).to(dtype=torch.float64)
+    error_abs_sums = torch.from_numpy(
+        np.ascontiguousarray(
+            np.asarray(donor_payload.get("error_abs_sums", np.empty((0,), dtype=np.float64)))
+        )
+    ).to(dtype=torch.float64)
+    token_abs_sums = torch.from_numpy(
+        np.ascontiguousarray(
+            np.asarray(donor_payload.get("token_abs_sums", np.empty((0,), dtype=np.float64)))
+        )
+    ).to(dtype=torch.float64)
+    donor_target_ids = _phase0_to_int64_tensor(
+        donor_payload.get("target_token_ids", np.empty((0,), dtype=np.int64))
+    ).reshape(-1)
+
+    target_token_ids_cpu = target_token_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    active_features_cpu = active_features.detach().to(device="cpu", dtype=torch.int64)
+    activation_values_cpu = activation_values.detach().to(device="cpu")
+    computed_target_hash = (
+        _hash_index_tensor(donor_target_ids) if donor_target_ids.numel() else None
+    )
+    stored_target_hash = _phase3_npz_optional_str(donor_payload.get("target_token_ids_hash"))
+    computed_active_hash = _hash_index_tensor(active_features_cpu.reshape(-1))
+    stored_active_hash = _phase3_npz_optional_str(donor_payload.get("active_features_hash"))
+    computed_activation_hash = _hash_tensor_raw_bytes(activation_values_cpu)
+    stored_activation_hash = _phase3_npz_optional_str(donor_payload.get("activation_values_hash"))
+    stored_row_hash = _phase3_npz_optional_str(donor_payload.get("row_hash"))
+    computed_row_hash = _hash_float_tensor(feature_rows, dtype=torch.float32)
+    stored_row_abs_hash = _phase3_npz_optional_str(donor_payload.get("row_abs_sum_hash"))
+    computed_row_abs_hash = _hash_float_tensor(row_abs_sums, dtype=torch.float64)
+    active_feature_count = _phase3_npz_int(
+        donor_payload.get("active_feature_count"), default=int(feature_rows.shape[1])
+    )
+    total_active_features = _phase3_npz_int(
+        donor_payload.get("total_active_features"), default=int(feature_rows.shape[1])
+    )
+
+    validation_issues: list[str] = []
+    if schema_version != 1:
+        validation_issues.append(f"schema_version mismatch (expected 1, got {schema_version})")
+    if capture_kind != "phase3_row_bundle_v1":
+        validation_issues.append(
+            f"capture_kind mismatch (expected 'phase3_row_bundle_v1', got {capture_kind!r})"
+        )
+    if status not in {"captured", "captured_replayed_effective_state"}:
+        validation_issues.append(f"unexpected status {status!r}")
+    if not torch.equal(donor_target_ids, target_token_ids_cpu):
+        validation_issues.append("target_token_ids mismatch with runtime targets")
+    if not stored_target_hash:
+        validation_issues.append("missing target_token_ids_hash")
+    if stored_target_hash and computed_target_hash and stored_target_hash != computed_target_hash:
+        validation_issues.append(
+            "target_token_ids_hash mismatch within donor bundle "
+            f"(stored={stored_target_hash}, computed={computed_target_hash})"
+        )
+    expected_shape = (int(target_token_ids_cpu.numel()), int(expected_total_active_features))
+    if tuple(feature_rows.shape) != expected_shape:
+        validation_issues.append(
+            f"phase3_feature_rows shape mismatch (expected={expected_shape}, got={tuple(feature_rows.shape)})"
+        )
+    if tuple(row_abs_sums.shape) != (int(target_token_ids_cpu.numel()),):
+        validation_issues.append(
+            "row_abs_sums shape mismatch "
+            f"(expected={(int(target_token_ids_cpu.numel()),)}, got={tuple(row_abs_sums.shape)})"
+        )
+    for name, values in (
+        ("feature_abs_sums", feature_abs_sums),
+        ("error_abs_sums", error_abs_sums),
+        ("token_abs_sums", token_abs_sums),
+    ):
+        if tuple(values.shape) != (int(target_token_ids_cpu.numel()),):
+            validation_issues.append(
+                f"{name} shape mismatch (expected={(int(target_token_ids_cpu.numel()),)}, got={tuple(values.shape)})"
+            )
+    if active_feature_count != int(expected_total_active_features):
+        validation_issues.append(
+            "active_feature_count mismatch "
+            f"(declared={active_feature_count}, runtime={int(expected_total_active_features)})"
+        )
+    if total_active_features != int(expected_total_active_features):
+        validation_issues.append(
+            "total_active_features mismatch "
+            f"(declared={total_active_features}, runtime={int(expected_total_active_features)})"
+        )
+    if not stored_active_hash:
+        validation_issues.append("missing active_features_hash")
+    elif stored_active_hash != computed_active_hash:
+        validation_issues.append(
+            "active_features_hash mismatch with runtime active feature order "
+            f"(donor={stored_active_hash}, runtime={computed_active_hash})"
+        )
+    if not stored_activation_hash:
+        validation_issues.append("missing activation_values_hash")
+    elif stored_activation_hash != computed_activation_hash:
+        validation_issues.append(
+            "activation_values_hash mismatch with runtime activation values "
+            f"(donor={stored_activation_hash}, runtime={computed_activation_hash})"
+        )
+    if not torch.isfinite(feature_rows).all().item():
+        validation_issues.append("phase3_feature_rows contain nonfinite values")
+    if not torch.isfinite(row_abs_sums).all().item():
+        validation_issues.append("row_abs_sums contain nonfinite values")
+    if not torch.isfinite(feature_abs_sums).all().item():
+        validation_issues.append("feature_abs_sums contain nonfinite values")
+    if not torch.isfinite(error_abs_sums).all().item():
+        validation_issues.append("error_abs_sums contain nonfinite values")
+    if not torch.isfinite(token_abs_sums).all().item():
+        validation_issues.append("token_abs_sums contain nonfinite values")
+    if tuple(feature_abs_sums.shape) == (int(target_token_ids_cpu.numel()),):
+        computed_feature_abs_sums = _compute_row_abs_sums(feature_rows, dtype=torch.float64)
+        if not torch.allclose(feature_abs_sums, computed_feature_abs_sums, rtol=1e-5, atol=1e-6):
+            validation_issues.append(
+                "feature_abs_sums do not match phase3_feature_rows absolute sums"
+            )
+    if (
+        tuple(row_abs_sums.shape)
+        == tuple(feature_abs_sums.shape)
+        == tuple(error_abs_sums.shape)
+        == tuple(token_abs_sums.shape)
+    ):
+        split_total = feature_abs_sums + error_abs_sums + token_abs_sums
+        if not torch.allclose(row_abs_sums, split_total, rtol=1e-5, atol=1e-6):
+            validation_issues.append("row_abs_sums do not match feature/error/token split sums")
+    if not stored_row_hash:
+        validation_issues.append("missing row_hash")
+    elif stored_row_hash != computed_row_hash:
+        validation_issues.append(
+            f"row_hash mismatch within donor bundle (stored={stored_row_hash}, computed={computed_row_hash})"
+        )
+    if not stored_row_abs_hash:
+        validation_issues.append("missing row_abs_sum_hash")
+    elif stored_row_abs_hash != computed_row_abs_hash:
+        validation_issues.append(
+            "row_abs_sum_hash mismatch within donor bundle "
+            f"(stored={stored_row_abs_hash}, computed={computed_row_abs_hash})"
+        )
+
+    if validation_issues:
+        raise ValueError(
+            "Phase-3 row donor bundle validation failed: " + "; ".join(validation_issues)
+        )
+
+    return {
+        "status": status,
+        "phase3_feature_rows": feature_rows,
+        "row_abs_sums": row_abs_sums,
+        "feature_abs_sums": feature_abs_sums,
+        "error_abs_sums": error_abs_sums,
+        "token_abs_sums": token_abs_sums,
+        "validation_metadata": {
+            "validated": True,
+            "validation_failure_count": 0,
+            "computed_hashes": {
+                "target_token_ids_hash": computed_target_hash,
+                "active_features_hash": computed_active_hash,
+                "activation_values_hash": computed_activation_hash,
+                "row_hash": computed_row_hash,
+                "row_abs_sum_hash": computed_row_abs_hash,
+            },
+            "stored_hashes": {
+                "target_token_ids_hash": stored_target_hash,
+                "active_features_hash": stored_active_hash,
+                "activation_values_hash": stored_activation_hash,
+                "row_hash": stored_row_hash,
+                "row_abs_sum_hash": stored_row_abs_hash,
+            },
+        },
+    }
+
+
 def _build_phase3_seed_influence_topk(
     *,
     ranked_feature_indices: torch.Tensor,
@@ -2788,6 +3196,11 @@ def attribute(
     phase0_donor_bundle: str | os.PathLike[str] | None = None,
     phase0_replay_mode: Literal["disabled", "donor_phase0"] = "disabled",
     phase0_donor_context_policy: Literal["strict", "warn"] = "strict",
+    phase3_gradient_donor_bundle: str | os.PathLike[str] | None = None,
+    phase3_gradient_replay_mode: Literal["disabled", "donor"] = "disabled",
+    phase3_row_donor_bundle: str | os.PathLike[str] | None = None,
+    phase3_row_replay_mode: Literal["disabled", "donor"] = "disabled",
+    phase3_replay_validation_policy: Literal["strict"] = "strict",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
@@ -2946,6 +3359,11 @@ def attribute(
             phase0_donor_bundle=phase0_donor_bundle,
             phase0_replay_mode=phase0_replay_mode,
             phase0_donor_context_policy=phase0_donor_context_policy,
+            phase3_gradient_donor_bundle=phase3_gradient_donor_bundle,
+            phase3_gradient_replay_mode=phase3_gradient_replay_mode,
+            phase3_row_donor_bundle=phase3_row_donor_bundle,
+            phase3_row_replay_mode=phase3_row_replay_mode,
+            phase3_replay_validation_policy=phase3_replay_validation_policy,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
             logger=logger,
@@ -3003,6 +3421,11 @@ def _run_attribution(
     phase0_donor_bundle: str | os.PathLike[str] | None = None,
     phase0_replay_mode: Literal["disabled", "donor_phase0"] = "disabled",
     phase0_donor_context_policy: Literal["strict", "warn"] = "strict",
+    phase3_gradient_donor_bundle: str | os.PathLike[str] | None = None,
+    phase3_gradient_replay_mode: Literal["disabled", "donor"] = "disabled",
+    phase3_row_donor_bundle: str | os.PathLike[str] | None = None,
+    phase3_row_replay_mode: Literal["disabled", "donor"] = "disabled",
+    phase3_replay_validation_policy: Literal["strict"] = "strict",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
@@ -3023,8 +3446,21 @@ def _run_attribution(
     phase0_donor_context_policy_resolved = _resolve_phase0_donor_context_policy(
         phase0_donor_context_policy
     )
+    phase3_gradient_replay_mode_resolved = _resolve_phase3_replay_mode(phase3_gradient_replay_mode)
+    phase3_row_replay_mode_resolved = _resolve_phase3_replay_mode(phase3_row_replay_mode)
+    phase3_replay_validation_policy_resolved = _resolve_phase3_replay_validation_policy(
+        phase3_replay_validation_policy
+    )
     phase0_donor_bundle_path = (
         os.fspath(phase0_donor_bundle) if phase0_donor_bundle is not None else None
+    )
+    phase3_gradient_donor_bundle_path = (
+        os.fspath(phase3_gradient_donor_bundle)
+        if phase3_gradient_donor_bundle is not None
+        else None
+    )
+    phase3_row_donor_bundle_path = (
+        os.fspath(phase3_row_donor_bundle) if phase3_row_donor_bundle is not None else None
     )
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
@@ -3053,6 +3489,18 @@ def _run_attribution(
         )
     if phase0_replay_mode_resolved != "disabled" and not phase0_donor_bundle_path:
         raise ValueError("phase0_replay_mode requires a phase0_donor_bundle path")
+    if phase3_gradient_replay_mode_resolved == "disabled" and phase3_gradient_donor_bundle_path:
+        raise ValueError(
+            "phase3_gradient_donor_bundle was provided but phase3_gradient_replay_mode is disabled"
+        )
+    if phase3_gradient_replay_mode_resolved != "disabled" and not phase3_gradient_donor_bundle_path:
+        raise ValueError("phase3_gradient_replay_mode requires a phase3_gradient_donor_bundle path")
+    if phase3_row_replay_mode_resolved == "disabled" and phase3_row_donor_bundle_path:
+        raise ValueError(
+            "phase3_row_donor_bundle was provided but phase3_row_replay_mode is disabled"
+        )
+    if phase3_row_replay_mode_resolved != "disabled" and not phase3_row_donor_bundle_path:
+        raise ValueError("phase3_row_replay_mode requires a phase3_row_donor_bundle path")
 
     phase4_anomaly_debug_enabled = _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug)
     internal_precision_requested = _resolve_internal_precision_requested(internal_precision)
@@ -3105,6 +3553,13 @@ def _run_attribution(
             "phase0_replay_mode": phase0_replay_mode_resolved,
             "phase0_donor_bundle_supplied": bool(phase0_donor_bundle_path is not None),
             "phase0_donor_context_policy": phase0_donor_context_policy_resolved,
+            "phase3_gradient_replay_mode": phase3_gradient_replay_mode_resolved,
+            "phase3_gradient_donor_bundle_supplied": bool(
+                phase3_gradient_donor_bundle_path is not None
+            ),
+            "phase3_row_replay_mode": phase3_row_replay_mode_resolved,
+            "phase3_row_donor_bundle_supplied": bool(phase3_row_donor_bundle_path is not None),
+            "phase3_replay_validation_policy": phase3_replay_validation_policy_resolved,
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
@@ -3187,6 +3642,18 @@ def _run_attribution(
         raise ValueError(
             "phase0 donor replay requires compact_output=True and exact_chunked_decoder=True"
         )
+    if phase3_gradient_replay_mode_resolved != "disabled" and not (
+        compact_output and exact_chunked_decoder
+    ):
+        raise ValueError(
+            "Phase-3 gradient replay requires compact_output=True and exact_chunked_decoder=True"
+        )
+    if phase3_row_replay_mode_resolved != "disabled" and not (
+        compact_output and exact_chunked_decoder
+    ):
+        raise ValueError(
+            "Phase-3 row replay requires compact_output=True and exact_chunked_decoder=True"
+        )
     if phase4_anomaly_debug_enabled:
         anomaly_debug_result = {
             "schema_version": 2,
@@ -3212,6 +3679,19 @@ def _run_attribution(
                 if isinstance(phase0_donor_bundle_path, str)
                 else None
             ),
+            "phase3_gradient_replay_mode": phase3_gradient_replay_mode_resolved,
+            "phase3_gradient_donor_bundle_basename": (
+                os.path.basename(phase3_gradient_donor_bundle_path)
+                if isinstance(phase3_gradient_donor_bundle_path, str)
+                else None
+            ),
+            "phase3_row_replay_mode": phase3_row_replay_mode_resolved,
+            "phase3_row_donor_bundle_basename": (
+                os.path.basename(phase3_row_donor_bundle_path)
+                if isinstance(phase3_row_donor_bundle_path, str)
+                else None
+            ),
+            "phase3_replay_validation_policy": phase3_replay_validation_policy_resolved,
             "phase0_activation_threshold_compare_mode": (
                 phase0_activation_threshold_compare_mode_resolved
             ),
@@ -3303,6 +3783,23 @@ def _run_attribution(
         replay_single_step_intended=True,
         note="single-step intended replay mode",
     )
+    phase3_gradient_replay_metadata: dict[str, object] = _build_phase3_replay_metadata(
+        replay_kind="phase3_gradient_replay_v1",
+        mode=phase3_gradient_replay_mode_resolved,
+        status="disabled" if phase3_gradient_replay_mode_resolved == "disabled" else "pending",
+        donor_bundle_path=phase3_gradient_donor_bundle_path,
+        validation_policy=phase3_replay_validation_policy_resolved,
+        source="host_computed" if phase3_gradient_replay_mode_resolved == "disabled" else None,
+    )
+    phase3_row_replay_metadata: dict[str, object] = _build_phase3_replay_metadata(
+        replay_kind="phase3_row_replay_v1",
+        mode=phase3_row_replay_mode_resolved,
+        status="disabled" if phase3_row_replay_mode_resolved == "disabled" else "pending",
+        donor_bundle_path=phase3_row_donor_bundle_path,
+        validation_policy=phase3_replay_validation_policy_resolved,
+        source="host_computed" if phase3_row_replay_mode_resolved == "disabled" else None,
+    )
+    loaded_phase3_row_donor_bundle: dict[str, object] | None = None
 
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
@@ -4067,6 +4564,91 @@ def _run_attribution(
                 stream_payload=phase2_stream_checkpoint,
             )
 
+        if phase3_gradient_replay_mode_resolved == "donor":
+            assert phase3_gradient_donor_bundle_path is not None
+            loaded_gradient_bundle = _load_phase3_gradient_donor_bundle_npz(
+                phase3_gradient_donor_bundle_path,
+                target_token_ids=target_token_ids_tensor,
+                active_features=activation_matrix.indices().T,
+                activation_values=activation_matrix.values(),
+                expected_n_layers=int(n_layers),
+                expected_n_positions=int(n_pos),
+                expected_d_model=int(targets.logit_vectors.shape[-1]),
+                validation_policy=cast(Literal["strict"], phase3_replay_validation_policy_resolved),
+            )
+            gradient_tensor = cast(torch.Tensor, loaded_gradient_bundle["gradients"])
+            setattr(ctx, "phase3_gradient_replay_tensor", gradient_tensor)
+            setattr(ctx, "phase3_gradient_replay_status", "applied")
+            gradient_validation_metadata = cast(
+                dict[str, object], loaded_gradient_bundle.get("validation_metadata", {})
+            )
+            phase3_gradient_replay_metadata = _build_phase3_replay_metadata(
+                replay_kind="phase3_gradient_replay_v1",
+                mode=phase3_gradient_replay_mode_resolved,
+                status="applied",
+                donor_bundle_path=phase3_gradient_donor_bundle_path,
+                validation_policy=phase3_replay_validation_policy_resolved,
+                validation_failure_count=int(
+                    gradient_validation_metadata.get("validation_failure_count", 0)
+                ),
+                donor_hashes=cast(
+                    dict[str, object], gradient_validation_metadata.get("stored_hashes", {})
+                ),
+                host_hashes={
+                    "target_token_ids_hash": host_validation_context.get("target_token_ids_hash"),
+                    "active_features_hash": _hash_index_tensor(
+                        activation_matrix.indices().T.detach().cpu().reshape(-1)
+                    ),
+                    "activation_values_hash": _hash_tensor_raw_bytes(activation_matrix.values()),
+                    "active_feature_count": int(total_active_feats),
+                },
+                source="donor_gradient_bundle",
+                note="feature/error gradients replayed from donor; token gradient remains host-computed",
+            )
+        else:
+            setattr(ctx, "phase3_gradient_replay_tensor", None)
+            setattr(ctx, "phase3_gradient_replay_status", "disabled")
+
+        if phase3_row_replay_mode_resolved == "donor":
+            assert phase3_row_donor_bundle_path is not None
+            loaded_phase3_row_donor_bundle = _load_phase3_row_donor_bundle_npz(
+                phase3_row_donor_bundle_path,
+                target_token_ids=target_token_ids_tensor,
+                active_features=activation_matrix.indices().T,
+                activation_values=activation_matrix.values(),
+                expected_total_active_features=int(total_active_feats),
+                validation_policy=cast(Literal["strict"], phase3_replay_validation_policy_resolved),
+            )
+            row_validation_metadata = cast(
+                dict[str, object], loaded_phase3_row_donor_bundle.get("validation_metadata", {})
+            )
+            phase3_row_replay_metadata = _build_phase3_replay_metadata(
+                replay_kind="phase3_row_replay_v1",
+                mode=phase3_row_replay_mode_resolved,
+                status="applied",
+                donor_bundle_path=phase3_row_donor_bundle_path,
+                validation_policy=phase3_replay_validation_policy_resolved,
+                validation_failure_count=int(
+                    row_validation_metadata.get("validation_failure_count", 0)
+                ),
+                donor_hashes=cast(
+                    dict[str, object], row_validation_metadata.get("stored_hashes", {})
+                ),
+                host_hashes={
+                    "target_token_ids_hash": host_validation_context.get("target_token_ids_hash"),
+                    "active_features_hash": _hash_index_tensor(
+                        activation_matrix.indices().T.detach().cpu().reshape(-1)
+                    ),
+                    "activation_values_hash": _hash_tensor_raw_bytes(activation_matrix.values()),
+                    "active_feature_count": int(total_active_feats),
+                },
+                source="donor_row_bundle_override",
+                note=(
+                    "donor row bundle overrides feature rows and row normalizers; "
+                    "dense token/error columns remain host-computed"
+                ),
+            )
+
         # Phase 3: logit attribution
         logger.info("Phase 3: Computing logit attributions")
         phase3_start = time.perf_counter()
@@ -4086,6 +4668,8 @@ def _run_attribution(
             ctx_before = _snapshot_diagnostics(ctx) if profile else None
             transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
             batch_start = time.perf_counter()
+            if phase3_gradient_replay_mode_resolved == "donor":
+                setattr(ctx, "phase3_gradient_replay_column_offset", int(i))
             rows = ctx.compute_batch(
                 layers=torch.full((batch.shape[0],), n_layers),
                 positions=torch.full((batch.shape[0],), n_pos - 1),
@@ -4098,6 +4682,35 @@ def _run_attribution(
                 row_input_slice,
                 dtype=exact_trace_internal_dtype_resolved,
             )
+            donor_feature_abs_sums: torch.Tensor | None = None
+            donor_error_abs_sums: torch.Tensor | None = None
+            donor_token_abs_sums: torch.Tensor | None = None
+            if loaded_phase3_row_donor_bundle is not None:
+                end = i + batch.shape[0]
+                donor_feature_rows = cast(
+                    torch.Tensor,
+                    loaded_phase3_row_donor_bundle["phase3_feature_rows"],
+                )[i:end].to(dtype=rows_cpu.dtype)
+                donor_row_abs_sums = cast(
+                    torch.Tensor,
+                    loaded_phase3_row_donor_bundle["row_abs_sums"],
+                )[i:end].to(dtype=exact_trace_internal_dtype_resolved)
+                donor_feature_abs_sums = cast(
+                    torch.Tensor,
+                    loaded_phase3_row_donor_bundle["feature_abs_sums"],
+                )[i:end].to(dtype=exact_trace_internal_dtype_resolved)
+                donor_error_abs_sums = cast(
+                    torch.Tensor,
+                    loaded_phase3_row_donor_bundle["error_abs_sums"],
+                )[i:end].to(dtype=exact_trace_internal_dtype_resolved)
+                donor_token_abs_sums = cast(
+                    torch.Tensor,
+                    loaded_phase3_row_donor_bundle["token_abs_sums"],
+                )[i:end].to(dtype=exact_trace_internal_dtype_resolved)
+                rows_cpu = rows_cpu.clone()
+                rows_cpu[:, :total_active_feats] = donor_feature_rows
+                row_input_slice = rows_cpu[:, :logit_offset]
+                row_abs_sums_cpu = donor_row_abs_sums.contiguous()
             if capture_phase3_row_bundle_enabled:
                 feature_rows_cpu = rows_cpu[:, :total_active_feats].contiguous()
                 error_start = int(total_active_feats)
@@ -4105,24 +4718,33 @@ def _run_attribution(
                 token_end = int(logit_offset)
                 phase3_feature_row_batches.append(feature_rows_cpu)
                 phase3_row_abs_sum_batches.append(row_abs_sums_cpu.contiguous())
-                phase3_feature_abs_sum_batches.append(
-                    _compute_row_abs_sums(
-                        feature_rows_cpu,
-                        dtype=exact_trace_internal_dtype_resolved,
-                    ).contiguous()
-                )
-                phase3_error_abs_sum_batches.append(
-                    _compute_row_abs_sums(
-                        rows_cpu[:, error_start:error_end],
-                        dtype=exact_trace_internal_dtype_resolved,
-                    ).contiguous()
-                )
-                phase3_token_abs_sum_batches.append(
-                    _compute_row_abs_sums(
-                        rows_cpu[:, error_end:token_end],
-                        dtype=exact_trace_internal_dtype_resolved,
-                    ).contiguous()
-                )
+                if (
+                    donor_feature_abs_sums is not None
+                    and donor_error_abs_sums is not None
+                    and donor_token_abs_sums is not None
+                ):
+                    phase3_feature_abs_sum_batches.append(donor_feature_abs_sums.contiguous())
+                    phase3_error_abs_sum_batches.append(donor_error_abs_sums.contiguous())
+                    phase3_token_abs_sum_batches.append(donor_token_abs_sums.contiguous())
+                else:
+                    phase3_feature_abs_sum_batches.append(
+                        _compute_row_abs_sums(
+                            feature_rows_cpu,
+                            dtype=exact_trace_internal_dtype_resolved,
+                        ).contiguous()
+                    )
+                    phase3_error_abs_sum_batches.append(
+                        _compute_row_abs_sums(
+                            rows_cpu[:, error_start:error_end],
+                            dtype=exact_trace_internal_dtype_resolved,
+                        ).contiguous()
+                    )
+                    phase3_token_abs_sum_batches.append(
+                        _compute_row_abs_sums(
+                            rows_cpu[:, error_end:token_end],
+                            dtype=exact_trace_internal_dtype_resolved,
+                        ).contiguous()
+                    )
             if anomaly_debug_result is not None:
                 logit_row_batches = anomaly_debug_result.setdefault(
                     "phase3_logit_row_batches",
@@ -4261,7 +4883,11 @@ def _run_attribution(
                 activation_values=activation_matrix.values(),
                 target_token_ids=phase3_target_token_ids,
                 target_probabilities=targets.logit_probabilities,
-                status="captured",
+                status=(
+                    "captured_replayed_effective_state"
+                    if phase3_gradient_replay_mode_resolved != "disabled"
+                    else "captured"
+                ),
             )
         if capture_phase3_row_bundle_enabled:
             phase3_row_bundle_payload = _build_phase3_row_bundle_payload(
@@ -4277,7 +4903,14 @@ def _run_attribution(
                 total_active_features=int(total_active_feats),
                 error_column_count=int(n_layers * n_pos),
                 token_column_count=int(n_pos),
-                status="captured",
+                status=(
+                    "captured_replayed_effective_state"
+                    if (
+                        phase3_gradient_replay_mode_resolved != "disabled"
+                        or phase3_row_replay_mode_resolved != "disabled"
+                    )
+                    else "captured"
+                ),
             )
 
         if (
@@ -5677,6 +6310,31 @@ def _run_attribution(
                     dict[str, object],
                     phase0_replay_metadata.get("dtype_metadata", {}),
                 ).get("dtype_roundtrip_loss"),
+                "phase3_gradient_replay_mode": phase3_gradient_replay_metadata.get("mode"),
+                "phase3_gradient_replay_status": phase3_gradient_replay_metadata.get("status"),
+                "phase3_gradient_replay_donor_bundle_path": phase3_gradient_replay_metadata.get(
+                    "donor_bundle_path"
+                ),
+                "phase3_gradient_replay_donor_bundle_basename": (
+                    phase3_gradient_replay_metadata.get("donor_bundle_basename")
+                ),
+                "phase3_gradient_replay_validation_failure_count": (
+                    phase3_gradient_replay_metadata.get("validation_failure_count")
+                ),
+                "phase3_gradient_replay_error": phase3_gradient_replay_metadata.get("error"),
+                "phase3_row_replay_mode": phase3_row_replay_metadata.get("mode"),
+                "phase3_row_replay_status": phase3_row_replay_metadata.get("status"),
+                "phase3_row_replay_donor_bundle_path": phase3_row_replay_metadata.get(
+                    "donor_bundle_path"
+                ),
+                "phase3_row_replay_donor_bundle_basename": phase3_row_replay_metadata.get(
+                    "donor_bundle_basename"
+                ),
+                "phase3_row_replay_validation_failure_count": phase3_row_replay_metadata.get(
+                    "validation_failure_count"
+                ),
+                "phase3_row_replay_error": phase3_row_replay_metadata.get("error"),
+                "phase3_row_replay_source": phase3_row_replay_metadata.get("source"),
                 "capture_phase0_donor_bundle_enabled": bool(capture_phase0_donor_bundle_enabled),
                 "capture_phase3_seed_bundle_enabled": bool(capture_phase3_seed_bundle_enabled),
                 "capture_phase3_gradient_bundle_enabled": bool(
@@ -5718,6 +6376,10 @@ def _run_attribution(
                 "scan": model.scan,
             }
             compact_output_result["phase0_replay_metadata"] = phase0_replay_metadata
+            compact_output_result["phase3_gradient_replay_metadata"] = (
+                phase3_gradient_replay_metadata
+            )
+            compact_output_result["phase3_row_replay_metadata"] = phase3_row_replay_metadata
             if capture_phase0_donor_bundle_enabled:
                 compact_output_result["phase0_donor_bundle"] = phase0_donor_bundle_payload
             if capture_phase3_seed_bundle_enabled:

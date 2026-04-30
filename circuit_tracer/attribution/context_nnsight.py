@@ -19,6 +19,25 @@ if TYPE_CHECKING:
     )
 
 
+def _slice_phase3_gradient_replay_batch(
+    replay_gradients: torch.Tensor,
+    *,
+    layer: int,
+    column_offset: int,
+    batch_size: int,
+) -> torch.Tensor:
+    """Return one Phase-3 target/logit batch from a donor gradient tensor."""
+
+    replay_grad = replay_gradients[layer, column_offset : column_offset + batch_size]
+    if int(replay_grad.shape[0]) != int(batch_size):
+        raise ValueError(
+            "Phase-3 gradient replay batch slice shape mismatch "
+            f"(offset={int(column_offset)}, expected={int(batch_size)}, "
+            f"got={int(replay_grad.shape[0])})"
+        )
+    return replay_grad
+
+
 class AttributionContext:
     """Manage hooks for computing attribution rows.
 
@@ -126,6 +145,9 @@ class AttributionContext:
         self._trace_chunk_interval = 16
         self.capture_phase3_gradients = False
         self.phase3_gradient_captures: list[dict[str, torch.Tensor | int]] = []
+        self.phase3_gradient_replay_tensor: torch.Tensor | None = None
+        self.phase3_gradient_replay_status = "disabled"
+        self.phase3_gradient_replay_column_offset = 0
         self._compute_batch_call_index = 0
         self._diagnostic_stats: dict[str, object] = {
             "compute_batch_calls": 0.0,
@@ -947,9 +969,14 @@ class AttributionContext:
         capture_phase3_gradients = bool(
             self.capture_phase3_gradients and phase_label == "phase3_logits"
         )
+        replay_phase3_gradients = bool(
+            self.phase3_gradient_replay_tensor is not None and phase_label == "phase3_logits"
+        )
         captured_phase3_grads: list[torch.Tensor | None] | None = (
             [None] * self.n_layers if capture_phase3_gradients else None
         )
+        replay_gradients = self.phase3_gradient_replay_tensor
+        replay_gradient_offset = int(self.phase3_gradient_replay_column_offset)
 
         last_layer = max(layers_in_batch)
         try:
@@ -960,6 +987,20 @@ class AttributionContext:
                 for layer in reversed(range(last_layer + 1)):
                     if layer != last_layer:
                         grad = self._feature_output_activations[layer + 1].grad.detach()  # type:ignore
+                        if replay_phase3_gradients:
+                            assert replay_gradients is not None
+                            replay_grad = _slice_phase3_gradient_replay_batch(
+                                replay_gradients,
+                                layer=layer,
+                                column_offset=replay_gradient_offset,
+                                batch_size=batch_size,
+                            )
+                            grad = replay_grad.to(
+                                device=grad.device,
+                                dtype=grad.dtype,
+                                non_blocking=replay_gradients.device.type == "cpu"
+                                and grad.device.type == "cuda",
+                            )
                         if captured_phase3_grads is not None and 0 <= layer < self.n_layers:
                             captured_phase3_grads[layer] = (
                                 grad.detach().to(device="cpu", dtype=torch.float32).contiguous()
@@ -1018,7 +1059,8 @@ class AttributionContext:
                         )
 
                 token_start = time.perf_counter()
-                self.compute_token_attributions(self._feature_output_activations[0].grad)
+                token_grad = self._feature_output_activations[0].grad
+                self.compute_token_attributions(token_grad)
                 if self.diagnostic_mode:
                     self._add_stat("token_attr_seconds", time.perf_counter() - token_start)
 
