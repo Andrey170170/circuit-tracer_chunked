@@ -521,14 +521,20 @@ class NNSightReplacementModel(LanguageModel):
         transcoders = self.transcoders
         trace_event = getattr(transcoders, "emit_trace_event", None)
 
-        # Prefix-cache lookup for temporal tracing.  Always ran and logged
-        # when a cache is passed; compute-skipping lives in downstream work
-        # (see Direction 2 plan — backward reuse / KV integration).
+        # Prefix-cache lookup for temporal tracing.  When the cache holds
+        # both activations *and* a past_key_values for this prefix, we
+        # try the KV-splice path: run the forward only on the new tokens
+        # and reuse the cached prefix activations.  Otherwise we fall
+        # back to the cold path (full forward) but still capture KV for
+        # the next step.
         cache_fingerprint: str | None = None
         cache_diag = None
+        cached_entry = None
+        splice_prefix_len = 0
+        splice_kv: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None
         if prefix_cache is not None:
             cache_fingerprint = prefix_cache.compute_model_fingerprint(self)
-            _entry, cache_diag = prefix_cache.lookup(
+            cached_entry, cache_diag = prefix_cache.lookup(
                 tokens, model_fingerprint=cache_fingerprint
             )
             if callable(trace_event):
@@ -541,58 +547,229 @@ class NNSightReplacementModel(LanguageModel):
                     recomputed_positions=cache_diag.recomputed_positions,
                     reason=cache_diag.reason,
                 )
+            # Only the partial-hit path is splice-eligible: we need at
+            # least one new token to extend the prefix with.
+            if (
+                cached_entry is not None
+                and cache_diag is not None
+                and cache_diag.cache_state == "partial_hit"
+                and cached_entry.has_kv
+            ):
+                splice_prefix_len = cache_diag.cached_prefix_len
+                try:
+                    splice_kv_legacy = prefix_cache.load_past_key_values(
+                        cached_entry, target_device=self.device
+                    )
+                    if splice_kv_legacy is not None:
+                        # HF Gemma3.forward (transformers >=4.36) expects
+                        # a Cache instance, not a legacy tuple — see
+                        # gemma3.modeling_gemma3.forward line 522:
+                        #   past_key_values.get_seq_length()
+                        # which fails AttributeError on a tuple.  Wrap
+                        # the stored legacy tuple in a DynamicCache so
+                        # the model can use it.
+                        from transformers.cache_utils import DynamicCache
+
+                        splice_kv = DynamicCache.from_legacy_cache(
+                            splice_kv_legacy
+                        )
+                    else:
+                        splice_kv = None
+                except Exception as e:  # noqa: BLE001
+                    warnings.warn(
+                        f"prefix_cache.load_past_key_values failed: {e!r}; "
+                        "falling back to cold trace"
+                    )
+                    splice_prefix_len = 0
+                    splice_kv = None
+
+        splice_active = splice_prefix_len > 0 and splice_kv is not None
+        captured_kv: object | None = None
 
         trace_start = time.perf_counter()
         if callable(trace_event):
             trace_event(
-                "phase0.setup.trace_start", backend="nnsight", token_count=int(tokens.numel())
+                "phase0.setup.trace_start",
+                backend="nnsight",
+                token_count=int(tokens.numel()),
+                splice_active=bool(splice_active),
+                splice_prefix_len=int(splice_prefix_len),
             )
 
-        with self.trace(tokens):
-            mlp_in_cache, mlp_out_cache = [], []
-            for feature_input_loc, feature_output_loc in zip(
-                self.feature_input_locs, self.feature_output_locs
-            ):
-                mlp_in_cache.append(feature_input_loc.output)
+        if splice_active:
+            new_tokens = tokens[splice_prefix_len:]
+            try:
+                with self.trace(
+                    new_tokens, past_key_values=splice_kv, use_cache=True
+                ):
+                    mlp_in_new_list, mlp_out_new_list = [], []
+                    for feature_input_loc, feature_output_loc in zip(
+                        self.feature_input_locs, self.feature_output_locs
+                    ):
+                        mlp_in_new_list.append(feature_input_loc.output)
+                        y = feature_output_loc.output
+                        if y.ndim == 2:
+                            y = y.unsqueeze(0)
+                        mlp_out_new_list.append(y)
 
-                # we expect a dummy dimension 0, but GPT-OSS doesn't have one, so we add it.
-                y = feature_output_loc.output
-                if y.ndim == 2:
-                    y = y.unsqueeze(0)  # type: ignore
-                mlp_out_cache.append(y)
+                    mlp_in_new = save(torch.cat(mlp_in_new_list, dim=0))  # type: ignore
+                    mlp_out_new = save(torch.cat(mlp_out_new_list, dim=0))  # type: ignore
+                    new_kv_proxy = save(self.output.past_key_values)
+                    logits = save(self.output.logits)
+                # Resolve saved values; nnsight Save proxies become real
+                # objects after the trace context exits.
+                captured_kv = new_kv_proxy
 
-            mlp_in_cache = save(torch.cat(mlp_in_cache, dim=0))  # type: ignore
-            mlp_out_cache = save(torch.cat(mlp_out_cache, dim=0))  # type: ignore
-            logits = save(self.output.logits)
+                # Splice cached prefix with new positions.  Calling the
+                # staticmethod via the instance keeps the import chain
+                # lazy (PrefixActivationCache is TYPE_CHECKING-only).
+                cached_mlp_in, cached_mlp_out = (
+                    prefix_cache.extract_prefix_slices(
+                        cached_entry,
+                        prefix_len=splice_prefix_len,
+                        target_device=self.device,
+                    )
+                )
+                if mlp_in_new.shape[1] != int(new_tokens.numel()):
+                    raise RuntimeError(
+                        f"KV splice: trace returned mlp_in with "
+                        f"{mlp_in_new.shape[1]} positions but expected "
+                        f"{int(new_tokens.numel())} new tokens "
+                        f"(full shape={tuple(mlp_in_new.shape)})"
+                    )
+                mlp_in_cache = torch.cat([cached_mlp_in, mlp_in_new], dim=1)
+                mlp_out_cache = torch.cat([cached_mlp_out, mlp_out_new], dim=1)
+                if callable(trace_event):
+                    trace_event(
+                        "phase0.setup.kv_splice_done",
+                        backend="nnsight",
+                        cached_prefix_len=int(splice_prefix_len),
+                        new_positions=int(new_tokens.numel()),
+                        full_mlp_in_shape=tuple(mlp_in_cache.shape),
+                    )
+            except Exception as e:  # noqa: BLE001
+                # Splice failed.  Dump the full chained traceback to
+                # stderr completely untruncated, also dump the full
+                # str(e) and repr(e), and emit a trace event with the
+                # full traceback as the message so debugging never
+                # depends on a truncation limit somewhere downstream.
+                import sys as _sys
+                import traceback as _tb
+
+                full_tb = _tb.format_exc()
+                full_str = str(e)
+                full_repr = repr(e)
+                cause_str = repr(getattr(e, "__cause__", None))
+                context_str = repr(getattr(e, "__context__", None))
+
+                # stderr dump — use sys.stderr.write directly to bypass
+                # any logging filters and make the boundaries grep-able.
+                _sys.stderr.write(
+                    "\n[KV_SPLICE_TRACEBACK_BEGIN]\n"
+                    f"exception_type={type(e).__name__}\n"
+                    f"--- repr(e) ---\n{full_repr}\n"
+                    f"--- str(e) ---\n{full_str}\n"
+                    f"--- __cause__ ---\n{cause_str}\n"
+                    f"--- __context__ ---\n{context_str}\n"
+                    f"--- traceback.format_exc ---\n{full_tb}\n"
+                    "[KV_SPLICE_TRACEBACK_END]\n"
+                )
+                _sys.stderr.flush()
+
+                warnings.warn(
+                    f"KV splice failed at runtime ({type(e).__name__}); "
+                    "see [KV_SPLICE_TRACEBACK_BEGIN] block in stderr "
+                    "for full untruncated traceback"
+                )
+                if callable(trace_event):
+                    # No truncation — pass everything through.  Any
+                    # downstream truncation is the consumer's problem.
+                    trace_event(
+                        "phase0.setup.kv_splice_fallback",
+                        backend="nnsight",
+                        error=type(e).__name__,
+                        full_str=full_str,
+                        full_repr=full_repr,
+                        cause=cause_str,
+                        context=context_str,
+                        traceback=full_tb,
+                    )
+                splice_active = False
+                captured_kv = None
+
+        if not splice_active:
+            with self.trace(tokens):
+                mlp_in_cache, mlp_out_cache = [], []
+                for feature_input_loc, feature_output_loc in zip(
+                    self.feature_input_locs, self.feature_output_locs
+                ):
+                    mlp_in_cache.append(feature_input_loc.output)
+
+                    # we expect a dummy dimension 0, but GPT-OSS doesn't have one, so we add it.
+                    y = feature_output_loc.output
+                    if y.ndim == 2:
+                        y = y.unsqueeze(0)  # type: ignore
+                    mlp_out_cache.append(y)
+
+                mlp_in_cache = save(torch.cat(mlp_in_cache, dim=0))  # type: ignore
+                mlp_out_cache = save(torch.cat(mlp_out_cache, dim=0))  # type: ignore
+                # Capture KV for next-step splice.  Wrapped in try so an
+                # nnsight save() failure on the cache object falls back to
+                # cleanly storing the entry without KV.
+                try:
+                    new_kv_proxy = save(self.output.past_key_values)
+                except Exception as e:  # noqa: BLE001
+                    warnings.warn(
+                        f"save(self.output.past_key_values) failed: {e!r}; "
+                        "cache will record activations only this step"
+                    )
+                    new_kv_proxy = None
+                logits = save(self.output.logits)
+            captured_kv = new_kv_proxy
+
         trace_seconds = time.perf_counter() - trace_start
         if callable(trace_event):
             trace_event(
                 "phase0.setup.trace_done",
                 backend="nnsight",
                 elapsed_s=f"{trace_seconds:.2f}",
+                splice_active=bool(splice_active),
                 mlp_in_shape=tuple(mlp_in_cache.shape),
                 mlp_out_shape=tuple(mlp_out_cache.shape),
             )
 
         # Populate the prefix cache with this run's raw pre-sparsification
-        # tensors so future temporal-tracing steps can reuse them.  We cache
-        # the pre-sparsification activations deliberately (see
-        # prefix_cache.py docstring) — sparsification picks a global top-K
-        # that fluctuates at the boundary when the prompt grows; caching
-        # the raw tensors and re-sparsifying each step preserves byte-exact
-        # uncached behavior.
+        # tensors plus the KV state so the next temporal-tracing step can
+        # reuse them via the splice path.
         if prefix_cache is not None and cache_fingerprint is not None:
-            prefix_cache.store(
-                token_ids=tokens,
-                mlp_in=mlp_in_cache,
-                mlp_out=mlp_out_cache,
-                model_fingerprint=cache_fingerprint,
-            )
+            store_kv: object | None = captured_kv
+            stored_with_kv = store_kv is not None
+            try:
+                prefix_cache.store(
+                    token_ids=tokens,
+                    mlp_in=mlp_in_cache,
+                    mlp_out=mlp_out_cache,
+                    model_fingerprint=cache_fingerprint,
+                    past_key_values=store_kv,
+                )
+            except Exception as e:  # noqa: BLE001
+                warnings.warn(
+                    f"prefix_cache.store with KV failed: {e!r}; "
+                    "retrying without KV"
+                )
+                stored_with_kv = False
+                prefix_cache.store(
+                    token_ids=tokens,
+                    mlp_in=mlp_in_cache,
+                    mlp_out=mlp_out_cache,
+                    model_fingerprint=cache_fingerprint,
+                )
             if callable(trace_event):
                 trace_event(
                     "phase0.setup.prefix_cache_store",
                     backend="nnsight",
                     stored_prefix_len=int(tokens.numel()),
+                    stored_with_kv=bool(stored_with_kv),
                 )
 
         component_start = time.perf_counter()

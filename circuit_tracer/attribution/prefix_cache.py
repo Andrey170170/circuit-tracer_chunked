@@ -12,7 +12,7 @@ Design principles
 -----------------
 
 1. **Cache the pre-sparsification tensors only.**  The brief
-   (``prefix_caching/BRIEF.md``) is unambiguous that a cached trace must
+   (``prefix_caching/docs/BRIEF.md``) is unambiguous that a cached trace must
    match an uncached trace in the parts that matter.  Sparsification picks
    a top-K candidate set that depends on the whole prompt's activation
    distribution, so it shifts at the boundary when the prompt grows.  To
@@ -99,16 +99,27 @@ class _CacheEntry:
     Stored tensors are on CPU by default to avoid growing VRAM pressure as
     the generation loop proceeds.  Callers move them back to the model's
     device on hit; storage and transport costs stay inside the cache.
+
+    ``past_key_values`` is the HuggingFace KV state captured from the
+    cold forward pass, normalized to ``tuple[tuple[Tensor K, Tensor V],
+    ...]`` (per-layer).  When set, a follow-up call can ask the model to
+    skip the forward pass over the cached positions by passing the KV
+    back into ``model.trace(input_ids=new_tokens, past_key_values=...)``.
     """
 
     token_ids: tuple[int, ...]
     model_fingerprint: str
     mlp_in: torch.Tensor
     mlp_out: torch.Tensor
+    past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None
 
     @property
     def prefix_len(self) -> int:
         return len(self.token_ids)
+
+    @property
+    def has_kv(self) -> bool:
+        return self.past_key_values is not None
 
 
 class PrefixCacheMiss(Exception):
@@ -306,6 +317,7 @@ class PrefixActivationCache:
         mlp_in: torch.Tensor,
         mlp_out: torch.Tensor,
         model_fingerprint: str,
+        past_key_values: object | None = None,
     ) -> None:
         """Replace the cached entry with fresh activations.
 
@@ -313,6 +325,14 @@ class PrefixActivationCache:
         ``(n_layers, n_pos, d_model)`` with ``n_pos == len(token_ids)``.
         Tensors are moved to ``storage_device`` and detached from the
         autograd graph before storage.
+
+        ``past_key_values``, when given, is normalized to
+        ``tuple[tuple[Tensor K, Tensor V], ...]`` and stored alongside
+        the MLP tensors.  Accepted forms are:
+        * legacy tuple-of-tuples, ``((K, V), (K, V), ...)``
+        * HF ``DynamicCache`` (any object exposing ``.key_cache`` and
+          ``.value_cache`` lists, or ``.to_legacy_cache()``).
+        Anything else is rejected with ``TypeError``.
         """
 
         self._coerce_token_tensor(token_ids)
@@ -322,11 +342,18 @@ class PrefixActivationCache:
         self._validate_shape(mlp_in, n_pos, name="mlp_in")
         self._validate_shape(mlp_out, n_pos, name="mlp_out")
 
+        normalized_kv: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None
+        if past_key_values is not None:
+            normalized_kv = self._normalize_past_key_values(
+                past_key_values, n_pos=n_pos
+            )
+
         self._entry = _CacheEntry(
             token_ids=tokens,
             model_fingerprint=model_fingerprint,
             mlp_in=mlp_in.detach().to(self._storage_device, copy=True),
             mlp_out=mlp_out.detach().to(self._storage_device, copy=True),
+            past_key_values=normalized_kv,
         )
 
     # ------------------------------------------------------------------
@@ -361,6 +388,98 @@ class PrefixActivationCache:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def load_past_key_values(
+        self,
+        entry: _CacheEntry,
+        *,
+        target_device: torch.device | str,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...] | None:
+        """Move the cached ``past_key_values`` to ``target_device``.
+
+        Returns ``None`` if the entry has no KV stored.  The returned
+        tuple is a fresh device-resident copy; the cache keeps its CPU
+        copy intact so the next step can still read it.
+        """
+        if entry.past_key_values is None:
+            return None
+        device = torch.device(target_device)
+        return tuple(
+            (k.to(device), v.to(device)) for (k, v) in entry.past_key_values
+        )
+
+    def _normalize_past_key_values(
+        self,
+        past_key_values: object,
+        *,
+        n_pos: int,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Coerce HF KV-cache objects into a per-layer tuple-of-tuples.
+
+        Stored tensors are detached, moved to ``storage_device``, and
+        copied so the cache owns its own memory.
+        """
+        # Tuple-of-tuples (legacy form HF still emits with
+        # ``return_legacy_cache=True`` or when use_cache produces a
+        # past tuple directly).
+        layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+        if isinstance(past_key_values, tuple):
+            for i, layer in enumerate(past_key_values):
+                if not (isinstance(layer, tuple) and len(layer) == 2):
+                    raise TypeError(
+                        f"past_key_values[{i}] must be a (K, V) tuple, "
+                        f"got {type(layer).__name__}"
+                    )
+                k, v = layer
+                if not (isinstance(k, torch.Tensor) and isinstance(v, torch.Tensor)):
+                    raise TypeError(
+                        f"past_key_values[{i}] entries must be tensors"
+                    )
+                layers.append((k, v))
+        elif hasattr(past_key_values, "to_legacy_cache"):
+            legacy = past_key_values.to_legacy_cache()
+            return self._normalize_past_key_values(legacy, n_pos=n_pos)
+        elif hasattr(past_key_values, "key_cache") and hasattr(
+            past_key_values, "value_cache"
+        ):
+            keys = list(past_key_values.key_cache)
+            values = list(past_key_values.value_cache)
+            if len(keys) != len(values):
+                raise TypeError(
+                    f"DynamicCache key/value layer count mismatch: "
+                    f"{len(keys)} vs {len(values)}"
+                )
+            for k, v in zip(keys, values):
+                layers.append((k, v))
+        else:
+            raise TypeError(
+                f"Unsupported past_key_values type: "
+                f"{type(past_key_values).__name__}"
+            )
+
+        # Sanity: KV seq-len axis should equal prefix length.
+        # HF convention: K/V shape is (batch, n_heads, seq_len, head_dim).
+        for i, (k, v) in enumerate(layers):
+            if k.ndim != 4 or v.ndim != 4:
+                raise ValueError(
+                    f"past_key_values[{i}]: expected 4-D K/V "
+                    f"(batch, n_heads, seq_len, head_dim), got K={tuple(k.shape)}, "
+                    f"V={tuple(v.shape)}"
+                )
+            if k.shape[2] != n_pos or v.shape[2] != n_pos:
+                raise ValueError(
+                    f"past_key_values[{i}]: seq_len axis must equal "
+                    f"prefix length {n_pos}, got K seq_len={k.shape[2]}, "
+                    f"V seq_len={v.shape[2]}"
+                )
+
+        return tuple(
+            (
+                k.detach().to(self._storage_device, copy=True),
+                v.detach().to(self._storage_device, copy=True),
+            )
+            for (k, v) in layers
+        )
 
     @staticmethod
     def _coerce_token_tensor(token_ids: torch.Tensor) -> None:

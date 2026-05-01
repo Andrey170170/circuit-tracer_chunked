@@ -358,6 +358,141 @@ def test_hit_and_miss_counters_track_correctly() -> None:
 # --------------------------------------------------------------------- #
 
 
+def _make_kv(
+    n_pos: int,
+    *,
+    n_layers: int = N_LAYERS,
+    n_heads: int = 2,
+    head_dim: int = 4,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Build a deterministic per-layer (K, V) tuple.
+
+    Shape per tensor: (batch=1, n_heads, n_pos, head_dim) — matches the
+    HF convention. Values depend on (layer, pos, dim) so slicing errors
+    are visible.
+    """
+    layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer in range(n_layers):
+        k = torch.zeros(1, n_heads, n_pos, head_dim, dtype=torch.float32)
+        v = torch.zeros(1, n_heads, n_pos, head_dim, dtype=torch.float32)
+        for pos in range(n_pos):
+            for dim in range(head_dim):
+                k[0, :, pos, dim] = layer * 1000 + pos * 10 + dim
+                v[0, :, pos, dim] = layer * 1000 + pos * 10 + dim + 0.5
+        layers.append((k, v))
+    return tuple(layers)
+
+
+def test_store_and_lookup_round_trips_past_key_values() -> None:
+    cache = PrefixActivationCache()
+    tokens = _make_tokens([1, 2, 3])
+    kv = _make_kv(3)
+    cache.store(
+        token_ids=tokens,
+        mlp_in=_make_activation(3, fill=0.0),
+        mlp_out=_make_activation(3, fill=0.5),
+        model_fingerprint=FINGERPRINT,
+        past_key_values=kv,
+    )
+
+    entry, _ = cache.lookup(tokens, model_fingerprint=FINGERPRINT)
+    assert entry is not None
+    assert entry.has_kv
+    assert entry.past_key_values is not None
+    assert len(entry.past_key_values) == N_LAYERS
+    for (orig_k, orig_v), (got_k, got_v) in zip(kv, entry.past_key_values):
+        assert torch.equal(orig_k, got_k)
+        assert torch.equal(orig_v, got_v)
+
+
+def test_load_past_key_values_returns_none_when_absent() -> None:
+    cache = PrefixActivationCache()
+    _populate(cache, [1, 2, 3])  # populates without KV
+    entry, _ = cache.lookup(_make_tokens([1, 2, 3]), model_fingerprint=FINGERPRINT)
+    assert entry is not None
+    assert not entry.has_kv
+    assert cache.load_past_key_values(entry, target_device="cpu") is None
+
+
+def test_load_past_key_values_copies_to_target_device() -> None:
+    cache = PrefixActivationCache()
+    tokens = _make_tokens([1, 2])
+    kv = _make_kv(2)
+    cache.store(
+        token_ids=tokens,
+        mlp_in=_make_activation(2),
+        mlp_out=_make_activation(2),
+        model_fingerprint=FINGERPRINT,
+        past_key_values=kv,
+    )
+
+    entry, _ = cache.lookup(tokens, model_fingerprint=FINGERPRINT)
+    assert entry is not None
+
+    moved = cache.load_past_key_values(entry, target_device="cpu")
+    assert moved is not None
+    assert len(moved) == N_LAYERS
+    for (k, v) in moved:
+        assert k.device.type == "cpu"
+        assert v.device.type == "cpu"
+
+
+def test_store_rejects_kv_with_wrong_seq_len() -> None:
+    cache = PrefixActivationCache()
+    tokens = _make_tokens([1, 2, 3])
+    bad_kv = _make_kv(5)  # seq_len 5 vs prefix len 3
+    with pytest.raises(ValueError, match="seq_len axis must equal"):
+        cache.store(
+            token_ids=tokens,
+            mlp_in=_make_activation(3),
+            mlp_out=_make_activation(3),
+            model_fingerprint=FINGERPRINT,
+            past_key_values=bad_kv,
+        )
+
+
+def test_store_rejects_kv_with_wrong_rank() -> None:
+    cache = PrefixActivationCache()
+    tokens = _make_tokens([1, 2, 3])
+    flat_k = torch.zeros(3, 4)  # 2-D, wrong rank
+    flat_v = torch.zeros(3, 4)
+    with pytest.raises(ValueError, match="expected 4-D"):
+        cache.store(
+            token_ids=tokens,
+            mlp_in=_make_activation(3),
+            mlp_out=_make_activation(3),
+            model_fingerprint=FINGERPRINT,
+            past_key_values=((flat_k, flat_v),),
+        )
+
+
+def test_store_accepts_dynamic_cache_via_legacy() -> None:
+    """A duck-typed object exposing key_cache/value_cache lists is
+    normalized just like a HF DynamicCache."""
+
+    class FakeDynamicCache:
+        def __init__(self, layers):
+            self.key_cache = [k for (k, _) in layers]
+            self.value_cache = [v for (_, v) in layers]
+
+    cache = PrefixActivationCache()
+    tokens = _make_tokens([1, 2])
+    kv = _make_kv(2)
+    fake = FakeDynamicCache(list(kv))
+
+    cache.store(
+        token_ids=tokens,
+        mlp_in=_make_activation(2),
+        mlp_out=_make_activation(2),
+        model_fingerprint=FINGERPRINT,
+        past_key_values=fake,
+    )
+
+    entry, _ = cache.lookup(tokens, model_fingerprint=FINGERPRINT)
+    assert entry is not None and entry.has_kv
+    assert len(entry.past_key_values) == N_LAYERS
+
+
 def test_diagnostics_to_dict_has_stable_keys() -> None:
     diag = CacheDiagnostics(
         cached_prefix_len=5,
