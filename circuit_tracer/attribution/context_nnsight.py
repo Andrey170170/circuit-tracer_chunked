@@ -4,13 +4,18 @@ Attribution context for managing hooks during attribution computation.
 
 import time
 import weakref
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 import torch
 from einops import einsum
 
-from circuit_tracer.utils.telemetry import TelemetryRecorder
+from circuit_tracer.utils.telemetry import (
+    TelemetryRecorder,
+    build_memory_before_after_attrs,
+    build_memory_snapshot_attrs,
+    get_memory_snapshot,
+)
 
 
 if TYPE_CHECKING:
@@ -36,6 +41,18 @@ def _slice_phase3_gradient_replay_batch(
             f"got={int(replay_grad.shape[0])})"
         )
     return replay_grad
+
+
+_COMPUTE_BATCH_MEMORY_ATTR_KEYS: tuple[str, ...] = (
+    "rss_current_gib",
+    "proc_rss_anon_gib",
+    "proc_rss_file_gib",
+    "cgroup_memory_current_gib",
+    "cgroup_memory_anon_gib",
+    "cgroup_memory_file_gib",
+    "cuda_allocated_gib",
+    "cuda_reserved_gib",
+)
 
 
 class AttributionContext:
@@ -81,6 +98,8 @@ class AttributionContext:
         error_vector_prefetch_lookahead: int = 2,
         chunked_feature_replay_window: int = 4,
         row_subchunk_size: int | None = None,
+        exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
+        materialized_encoder_vecs_during_phase0: bool = False,
         internal_precision_requested: str | None = None,
         resolved_dtype_map: dict[str, str] | None = None,
     ) -> None:
@@ -93,8 +112,23 @@ class AttributionContext:
         self.n_layers: int = n_layers
 
         exact_chunked_mode = chunked_decoder_state is not None
+        requested_encoder_residency = self._normalize_exact_encoder_residency(
+            exact_encoder_residency
+        )
+        encoder_residency_applicable = bool(exact_chunked_mode)
+        encoder_residency_fallback_reason: str | None = None
+        effective_encoder_residency = requested_encoder_residency
+        if requested_encoder_residency != "lazy" and not encoder_residency_applicable:
+            effective_encoder_residency = "lazy"
+            encoder_residency_fallback_reason = (
+                "active encoder residency requires exact chunked decoder state; "
+                "falling back to lazy execution"
+            )
+
         if stage_encoder_vecs_on_cpu is None:
             stage_encoder_vecs_on_cpu = exact_chunked_mode and encoder_vecs.numel() > 0
+        if effective_encoder_residency != "lazy":
+            stage_encoder_vecs_on_cpu = True
         if stage_error_vectors_on_cpu is None:
             stage_error_vectors_on_cpu = exact_chunked_mode and error_vectors.numel() > 0
 
@@ -108,6 +142,20 @@ class AttributionContext:
         )
         self._materialized_error_vector_layers: dict[int, torch.Tensor] = {}
         self._cleanup_complete = False
+        self.exact_encoder_residency_requested = requested_encoder_residency
+        self.exact_encoder_residency_effective = effective_encoder_residency
+        self.exact_encoder_residency_applicable = encoder_residency_applicable
+        self.exact_encoder_residency_fallback_reason = encoder_residency_fallback_reason
+        self.exact_encoder_materialized_during_phase0 = bool(
+            materialized_encoder_vecs_during_phase0
+        )
+        self.exact_encoder_pinned_requested = bool(
+            effective_encoder_residency == "active_pinned_cpu"
+        )
+        self.exact_encoder_pinned_effective = False
+        self.exact_encoder_pinning_success: bool | None = None
+        self.exact_encoder_pinning_failure_reason: str | None = None
+        self.exact_encoder_staging_destination = "none"
 
         self.logits = logits
         self.full_logits = full_logits
@@ -125,9 +173,22 @@ class AttributionContext:
         self.token_vectors = token_vectors
         self.decoder_vecs = decoder_vecs
         if self._stage_encoder_vecs_on_cpu:
-            self.encoder_vecs = self._stage_tensor_on_cpu(encoder_vecs)
+            self.encoder_vecs, pinning_success, pinning_failure_reason = self._stage_encoder_tensor(
+                encoder_vecs,
+                pin_memory=self.exact_encoder_pinned_requested,
+            )
+            self.exact_encoder_pinning_success = pinning_success
+            self.exact_encoder_pinning_failure_reason = pinning_failure_reason
+            self.exact_encoder_pinned_effective = bool(
+                self.exact_encoder_pinned_requested and self.encoder_vecs.is_pinned()
+            )
         else:
             self.encoder_vecs = encoder_vecs
+        self.exact_encoder_staging_destination = self._resolve_encoder_staging_destination(
+            self.encoder_vecs,
+            exact_chunked_mode=exact_chunked_mode,
+            encoder_residency=self.exact_encoder_residency_effective,
+        )
 
         self.encoder_to_decoder_map = encoder_to_decoder_map
         self.decoder_locations = decoder_locations
@@ -174,12 +235,55 @@ class AttributionContext:
         staged = tensor.detach()
         if staged.device.type != "cpu":
             staged = staged.to(device="cpu", non_blocking=staged.device.type == "cuda")
-        staged = staged.contiguous()
-        try:
-            staged = staged.pin_memory()
-        except RuntimeError:
-            pass
+        else:
+            staged = staged.clone()
         return staged
+
+    @staticmethod
+    def _stage_encoder_tensor(
+        tensor: torch.Tensor,
+        *,
+        pin_memory: bool,
+    ) -> tuple[torch.Tensor, bool | None, str | None]:
+        staged = AttributionContext._stage_tensor_on_cpu(tensor)
+        if not pin_memory:
+            return staged, None, None
+        try:
+            pinned = staged.pin_memory()
+        except Exception as exc:  # pragma: no cover - platform dependent
+            return staged, False, f"{type(exc).__name__}: {exc}"
+        if not pinned.is_pinned():
+            return pinned, False, "pin_memory returned a non-pinned tensor"
+        return pinned, True, None
+
+    @staticmethod
+    def _normalize_exact_encoder_residency(
+        exact_encoder_residency: str,
+    ) -> Literal["lazy", "active_cpu", "active_pinned_cpu"]:
+        normalized = str(exact_encoder_residency).strip().lower()
+        allowed_values = {"lazy", "active_cpu", "active_pinned_cpu"}
+        if normalized not in allowed_values:
+            allowed = ", ".join(sorted(allowed_values))
+            raise ValueError(
+                "exact_encoder_residency must be one of: "
+                f"{allowed} (got {exact_encoder_residency!r})"
+            )
+        return cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], normalized)
+
+    @staticmethod
+    def _resolve_encoder_staging_destination(
+        encoder_vecs: torch.Tensor,
+        *,
+        exact_chunked_mode: bool,
+        encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"],
+    ) -> str:
+        if encoder_residency == "lazy":
+            if exact_chunked_mode and encoder_vecs.numel() == 0:
+                return "lazy_chunk_materialization"
+            return "none"
+        if encoder_vecs.device.type != "cpu":
+            return str(encoder_vecs.device)
+        return "pinned_cpu" if encoder_vecs.is_pinned() else "cpu"
 
     def _materialize_tensor(
         self,
@@ -430,6 +534,26 @@ class AttributionContext:
         if self.chunked_decoder_state is not None:
             snapshot["row_subchunk_size"] = float(self._effective_row_subchunk_size())
         snapshot["logit_retention"] = self.logit_retention
+        snapshot["exact_encoder_residency_requested"] = self.exact_encoder_residency_requested
+        snapshot["exact_encoder_residency_effective"] = self.exact_encoder_residency_effective
+        snapshot["exact_encoder_residency_applicable"] = bool(
+            self.exact_encoder_residency_applicable
+        )
+        snapshot["exact_encoder_residency_fallback_reason"] = (
+            self.exact_encoder_residency_fallback_reason
+        )
+        snapshot["exact_encoder_staging_destination"] = self.exact_encoder_staging_destination
+        snapshot["exact_encoder_materialized_during_phase0"] = bool(
+            self.exact_encoder_materialized_during_phase0
+        )
+        snapshot["active_encoder_shape"] = tuple(self.encoder_vecs.shape)
+        snapshot["active_encoder_bytes"] = float(
+            int(self.encoder_vecs.numel() * self.encoder_vecs.element_size())
+        )
+        snapshot["exact_encoder_pinned_requested"] = bool(self.exact_encoder_pinned_requested)
+        snapshot["exact_encoder_pinned_effective"] = bool(self.exact_encoder_pinned_effective)
+        snapshot["exact_encoder_pinning_success"] = self.exact_encoder_pinning_success
+        snapshot["exact_encoder_pinning_failure_reason"] = self.exact_encoder_pinning_failure_reason
         snapshot["internal_precision_requested"] = self.internal_precision_requested
         snapshot["resolved_dtype_map"] = self.resolved_dtype_map
         return snapshot
@@ -524,6 +648,14 @@ class AttributionContext:
         ).coalesce()
         if self.encoder_vecs.numel() > 0:
             self.encoder_vecs = self.encoder_vecs[selected.to(device=self.encoder_vecs.device)]
+            self.exact_encoder_pinned_effective = bool(
+                self.exact_encoder_pinned_requested and self.encoder_vecs.is_pinned()
+            )
+            self.exact_encoder_staging_destination = self._resolve_encoder_staging_destination(
+                self.encoder_vecs,
+                exact_chunked_mode=self.chunked_decoder_state is not None,
+                encoder_residency=self.exact_encoder_residency_effective,
+            )
 
         if self.chunked_decoder_state is not None:
             for key in self.chunked_decoder_state:
@@ -646,15 +778,39 @@ class AttributionContext:
             layer_rows = torch.arange(layer_start, layer_end, device=feature_ids.device)
             layer_feature_ids = feature_ids[layer_start:layer_end]
             layer_chunk_ids = torch.div(layer_feature_ids, chunk_size, rounding_mode="floor")
-            unique_chunk_ids = torch.unique(layer_chunk_ids, sorted=True)
-            for chunk_position, chunk_id_tensor in enumerate(unique_chunk_ids, start=1):
+            monotonic_chunk_order = bool(
+                layer_chunk_ids.numel() <= 1
+                or torch.all(layer_chunk_ids[1:] >= layer_chunk_ids[:-1])
+            )
+            if monotonic_chunk_order:
+                ordered_chunk_ids, ordered_chunk_counts = torch.unique_consecutive(
+                    layer_chunk_ids,
+                    return_counts=True,
+                )
+            else:
+                ordered_chunk_ids = torch.unique(layer_chunk_ids, sorted=True)
+                ordered_chunk_counts = None
+
+            total_chunks = int(ordered_chunk_ids.numel())
+            chunk_offset = 0
+            for chunk_position, chunk_id_tensor in enumerate(ordered_chunk_ids, start=1):
                 chunk_id = int(chunk_id_tensor.item())
-                chunk_mask = layer_chunk_ids == chunk_id_tensor
-                chunk_rows = layer_rows[chunk_mask]
-                chunk_positions = positions[chunk_rows]
-                chunk_local_feat_ids = (
-                    layer_feature_ids[chunk_mask] - (chunk_id * chunk_size)
-                ).long()
+                if ordered_chunk_counts is not None:
+                    chunk_count = int(ordered_chunk_counts[chunk_position - 1].item())
+                    chunk_end = chunk_offset + chunk_count
+                    chunk_rows = layer_rows[chunk_offset:chunk_end]
+                    chunk_positions = positions[chunk_rows]
+                    chunk_local_feat_ids = (
+                        layer_feature_ids[chunk_offset:chunk_end] - (chunk_id * chunk_size)
+                    ).long()
+                    chunk_offset = chunk_end
+                else:
+                    chunk_mask = layer_chunk_ids == chunk_id_tensor
+                    chunk_rows = layer_rows[chunk_mask]
+                    chunk_positions = positions[chunk_rows]
+                    chunk_local_feat_ids = (
+                        layer_feature_ids[chunk_mask] - (chunk_id * chunk_size)
+                    ).long()
                 decoder_chunk = self.decoder_provider.get_decoder_chunk(
                     source_layer,
                     chunk_id,
@@ -717,8 +873,8 @@ class AttributionContext:
                                 source_layer=source_layer,
                                 chunk=chunk_counts[output_layer],
                                 decoder_chunk_id=chunk_id,
-                                processed_chunks=min(chunk_position, len(unique_chunk_ids)),
-                                total_chunks=len(unique_chunk_ids),
+                                processed_chunks=chunk_position,
+                                total_chunks=total_chunks,
                                 row_subchunk=row_subchunk_idx,
                                 total_row_subchunks=total_row_subchunks,
                             )
@@ -739,7 +895,7 @@ class AttributionContext:
                 elapsed_ms=(time.perf_counter() - source_layer_start) * 1000.0,
                 attrs={
                     "source_layer": source_layer,
-                    "active_decoder_chunks": int(len(unique_chunk_ids)),
+                    "active_decoder_chunks": total_chunks,
                     "relevant_output_layers": int(len(relevant_output_layers)),
                 },
             )
@@ -905,15 +1061,30 @@ class AttributionContext:
         batch_start = time.perf_counter()
         self._compute_batch_call_index += 1
         batch_call_index = self._compute_batch_call_index
+        batch_nodes = int(len(layers))
+        unique_layers_count = int(layers.unique().numel())
+        execution_device = self._resid_activations[0].device
+        memory_before = get_memory_snapshot(execution_device)
+        inject_values_input_nbytes = int(inject_values.numel() * inject_values.element_size())
+        planned_batch_buffer_nbytes = int(
+            self._row_size * batch_size * torch.tensor([], dtype=torch.float32).element_size()
+        )
         self._emit_trace(
             "compute_batch.start",
             phase=phase_label,
-            batch_nodes=len(layers),
-            unique_layers=len(layers.unique()),
+            batch_nodes=batch_nodes,
+            unique_layers=unique_layers_count,
             retain_graph=retain_graph,
+            inject_values_input_nbytes=inject_values_input_nbytes,
+            planned_batch_buffer_nbytes=planned_batch_buffer_nbytes,
+            chunked_feature_replay_window=int(self._chunked_feature_replay_window),
+            **build_memory_snapshot_attrs(
+                memory_before,
+                keys=_COMPUTE_BATCH_MEMORY_ATTR_KEYS,
+                prefix="memory_before",
+            ),
         )
         self._clear_saved_grads()
-        execution_device = self._resid_activations[0].device
         layers = layers.to(
             device=execution_device,
             dtype=torch.long,
@@ -929,12 +1100,14 @@ class AttributionContext:
             device=execution_device,
             dtype=inject_values.dtype,
         )
+        inject_values_nbytes = int(inject_values.numel() * inject_values.element_size())
         self._batch_buffer = torch.zeros(
             self._row_size,
             batch_size,
             dtype=torch.float32,
             device=inject_values.device,
         )
+        batch_buffer_nbytes = int(self._batch_buffer.numel() * self._batch_buffer.element_size())
 
         # Custom gradient injection (per-layer registration)
         batch_idx = torch.arange(len(layers), device=layers.device)
@@ -977,6 +1150,7 @@ class AttributionContext:
         )
         replay_gradients = self.phase3_gradient_replay_tensor
         replay_gradient_offset = int(self.phase3_gradient_replay_column_offset)
+        chunked_feature_grad_window_peak = 0
 
         last_layer = max(layers_in_batch)
         try:
@@ -1022,6 +1196,10 @@ class AttributionContext:
                         else:
                             chunked_feature_grads[layer] = grad
                             chunked_feature_grad_layers.append(layer)
+                            chunked_feature_grad_window_peak = max(
+                                chunked_feature_grad_window_peak,
+                                len(chunked_feature_grad_layers),
+                            )
                             if self.diagnostic_mode:
                                 peak = cast(
                                     float, self._diagnostic_stats["chunked_attr_grad_window_peak"]
@@ -1095,6 +1273,7 @@ class AttributionContext:
 
         buf, self._batch_buffer = self._batch_buffer, None
         elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+        memory_after = get_memory_snapshot(execution_device)
         if self.diagnostic_mode:
             self._add_stat("compute_batch_calls", 1)
             elapsed = elapsed_ms / 1000.0
@@ -1111,17 +1290,40 @@ class AttributionContext:
             batch_index=batch_call_index,
             elapsed_ms=elapsed_ms,
             attrs={
-                "batch_nodes": len(layers),
+                "batch_nodes": batch_nodes,
+                "batch_size": int(batch_size),
+                "row_size": int(self._row_size),
                 "unique_layers": len(layers_in_batch),
                 "retain_graph": retain_graph,
                 "chunked_decoder": self.chunked_decoder_state is not None,
+                "inject_values_input_nbytes": inject_values_input_nbytes,
+                "inject_values_nbytes": inject_values_nbytes,
+                "batch_buffer_nbytes": batch_buffer_nbytes,
+                "chunked_feature_replay_window": int(self._chunked_feature_replay_window),
+                "chunked_feature_grad_window_peak": int(chunked_feature_grad_window_peak),
+                **build_memory_before_after_attrs(
+                    before=memory_before,
+                    after=memory_after,
+                    keys=_COMPUTE_BATCH_MEMORY_ATTR_KEYS,
+                ),
             },
         )
         self._emit_trace(
             "compute_batch.done",
             phase=phase_label,
-            batch_nodes=len(layers),
+            batch_nodes=batch_nodes,
+            unique_layers=unique_layers_count,
+            retain_graph=retain_graph,
+            inject_values_nbytes=inject_values_nbytes,
+            batch_buffer_nbytes=batch_buffer_nbytes,
+            chunked_feature_replay_window=int(self._chunked_feature_replay_window),
+            chunked_feature_grad_window_peak=int(chunked_feature_grad_window_peak),
             elapsed_s=f"{elapsed_ms / 1000.0:.2f}",
             elapsed_ms=elapsed_ms,
+            **build_memory_before_after_attrs(
+                before=memory_before,
+                after=memory_after,
+                keys=_COMPUTE_BATCH_MEMORY_ATTR_KEYS,
+            ),
         )
         return buf.T[: len(layers)]

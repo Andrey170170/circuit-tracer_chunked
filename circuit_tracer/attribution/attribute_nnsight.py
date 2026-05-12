@@ -31,6 +31,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Literal, cast
 
 import numpy as np
@@ -53,6 +54,7 @@ from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightRe
 from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.utils.telemetry import (
     TelemetryRecorder,
+    build_memory_before_after_attrs,
     diff_numeric_metrics,
     get_memory_snapshot,
     format_memory_snapshot,
@@ -81,14 +83,17 @@ def _log_batch_profile(
     logger,
     label: str,
     batch_idx: int,
-    total_batches: int,
+    total_batches: int | None,
     elapsed: float,
     ctx_before: dict[str, object] | None,
     ctx_after: dict[str, object] | None,
     transcoder_before: dict[str, object] | None,
     transcoder_after: dict[str, object] | None,
 ):
-    parts = [f"{label} batch {batch_idx}/{total_batches} in {elapsed:.2f}s"]
+    batch_progress = (
+        f"batch {batch_idx}/{total_batches}" if total_batches is not None else f"batch {batch_idx}"
+    )
+    parts = [f"{label} {batch_progress} in {elapsed:.2f}s"]
     ctx_delta = diff_numeric_metrics(ctx_before, ctx_after) if ctx_after is not None else {}
     transcoder_delta = (
         diff_numeric_metrics(transcoder_before, transcoder_after)
@@ -155,6 +160,253 @@ _PHASE3_REPLAY_MODE_BY_NAME: dict[str, str] = {
 _PHASE3_REPLAY_VALIDATION_POLICY_BY_NAME: dict[str, str] = {
     "strict": "strict",
 }
+
+_PHASE4_REFRESH_MEMORY_ATTR_KEYS: tuple[str, ...] = (
+    "rss_current_gib",
+    "proc_rss_anon_gib",
+    "proc_rss_file_gib",
+    "cgroup_memory_current_gib",
+    "cgroup_memory_anon_gib",
+    "cgroup_memory_file_gib",
+    "cuda_allocated_gib",
+    "cuda_reserved_gib",
+)
+
+_PHASE4_SCHEDULER_MODE_ALIAS: dict[str, str] = {
+    "legacy": "locality",
+}
+
+_PHASE4_SCHEDULER_TELEMETRY_DETAIL_ALIAS: dict[str, str] = {
+    "compact": "summary",
+    "full": "debug",
+}
+
+_PHASE4_SCHEDULER_VERSION_BY_MODE: dict[str, str] = {
+    "locality": "locality_v1",
+    "planner_v1": "planner_v1",
+    "planner_v2": "planner_v2",
+}
+
+_PHASE4_SCHEDULER_POLICY_BY_MODE: dict[str, str] = {
+    "locality": "fixed_frontier_locality",
+    "planner_v1": "membership_preserving_locality",
+    "planner_v2": "bounded_membership_selection",
+}
+
+_PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "locality": "locality",
+    "planner_v1": "planner_v1",
+    "planner_v2": "planner_v2",
+}
+
+_PHASE4_REFRESH_OPTIMIZATION_VERSION_BY_MODE: dict[str, str] = {
+    "off": "off_v1",
+    "v1": "v1",
+}
+
+_PHASE4_REFRESH_OPTIMIZATION_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "off": "off",
+    "v1": "v1",
+}
+
+_PHASE4_ROW_EXECUTOR_VERSION_BY_MODE: dict[str, str] = {
+    "batched": "batched_v1",
+    "streaming_v1": "streaming_v1",
+}
+
+_PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "batched": "batched",
+    "streaming_v1": "streaming_v1",
+}
+
+_PHASE1_TRACE_BATCH_POLICY_DEFAULT: Literal["legacy"] = "legacy"
+_PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT: int | None = None
+_PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
+    "legacy": "legacy",
+    "cap_effective_batches": "cap_effective_batches",
+}
+
+_PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
+_PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT = 1
+_PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
+    "standard": "standard",
+    "deferred_v1": "deferred_v1",
+}
+
+_PHASE4_RANKER_DEFAULT: Literal["argsort"] = "argsort"
+_PHASE4_RANKER_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "argsort": "argsort",
+    "topk_v1": "topk_v1",
+}
+
+_PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE: dict[str, str] = {
+    "argsort": (
+        "argsort preserves the current behavior; equal-score ordering follows torch.argsort "
+        "backend semantics."
+    ),
+    "topk_v1": (
+        "topk_v1 uses torch.topk for frontier membership; ties at the cutoff can select a "
+        "different equal-score member than argsort. Selected members are then ordered by "
+        "descending score (deterministic index tie-break for telemetry/debug stability)."
+    ),
+}
+
+_ROW_STORE_CACHE_CONTROL_DEFAULT: Literal["off"] = "off"
+_ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1: Literal[
+    "fadvise_dontneed_after_append_v1"
+] = "fadvise_dontneed_after_append_v1"
+_ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "off": "off",
+    "fadvise_dontneed_after_append_v1": "fadvise_dontneed_after_append_v1",
+}
+
+_EXACT_ENCODER_RESIDENCY_DEFAULT: Literal["lazy"] = "lazy"
+_EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
+    "lazy": "lazy",
+    "active_cpu": "active_cpu",
+    "active_pinned_cpu": "active_pinned_cpu",
+}
+
+_PHASE4_STREAMING_V1_MAX_MICROBATCH_SIZE = 64
+
+_PHASE4_PLANNER_V2_POLICY_VERSION = "planner_v2_bounded_membership_v1"
+_PHASE4_PLANNER_V2_CANDIDATE_WINDOW_MULTIPLIER = 2.0
+_PHASE4_PLANNER_V2_LOCKED_PREFIX_FRACTION = 0.5
+_PHASE4_PLANNER_V2_MAX_REPLACEMENT_FRACTION = 0.25
+_PHASE4_PLANNER_V2_MIN_SCORE_RATIO = 0.995
+
+
+@dataclass(frozen=True)
+class _Phase4SchedulerConfig:
+    requested_mode: Literal["locality", "planner_v1", "planner_v2"]
+    effective_mode: Literal["locality", "planner_v1", "planner_v2"]
+    version: str
+    policy: str
+    effective_version: str
+    effective_policy: str
+    effective_behavior: Literal["requested", "planner_v1_reference_execution"]
+    debug: bool
+    telemetry_detail: Literal["summary", "normal", "debug"]
+
+
+@dataclass(frozen=True)
+class _Phase4RefreshOptimizationConfig:
+    requested_mode: Literal["off", "v1"]
+    effective_mode: Literal["off", "v1"]
+    version: str
+    effective_version: str
+    effective_behavior: Literal["requested", "off_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _Phase4RowExecutorConfig:
+    requested_mode: Literal["batched", "streaming_v1"]
+    effective_mode: Literal["batched", "streaming_v1"]
+    version: str
+    effective_version: str
+    effective_behavior: Literal["requested", "batched_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _Phase1TraceBatchConfig:
+    requested_policy: Literal["legacy", "cap_effective_batches"]
+    effective_policy: Literal["legacy", "cap_effective_batches"]
+    requested_batch_size_max: int | None
+    effective_batch_size_max: int | None
+    default_policy: Literal["legacy"]
+    default_batch_size_max: int | None
+    effective_behavior: Literal["requested", "legacy_fallback_missing_batch_size_max"]
+    fallback_reason: str | None
+
+
+@dataclass(frozen=True)
+class _Phase1TraceBatchSizing:
+    requested_source_batch_size: int
+    requested_feature_batch_size: int
+    requested_logit_batch_size: int
+    requested_phase4_max_feature_batch_size: int
+    requested_feature_batch_size_defaulted: bool
+    requested_logit_batch_size_defaulted: bool
+    effective_source_batch_size: int
+    effective_feature_batch_size: int
+    effective_logit_batch_size: int
+    effective_phase4_max_feature_batch_size: int
+    source_batch_size_cap_applied: bool
+    feature_batch_size_cap_applied: bool
+    logit_batch_size_cap_applied: bool
+    phase4_max_feature_batch_size_cap_applied: bool
+    cap_applied: bool
+    cap_reason: str
+    trace_batch_size_legacy: int
+    trace_batch_size_effective_pre_planner: int
+    trace_batch_size_cap_applied: bool
+
+
+@dataclass(frozen=True)
+class _Phase4RefreshPolicyConfig:
+    requested_policy: Literal["standard", "deferred_v1"]
+    effective_policy: Literal["standard", "deferred_v1"]
+    requested_interval_multiplier: int
+    effective_interval_multiplier: int
+    effective_queue_multiplier: int
+    default_policy: Literal["standard"]
+    default_interval_multiplier: int
+    policy_applicable: bool
+    effective_behavior: Literal["requested", "standard_reference_execution"]
+    fallback_reason: str | None
+
+
+@dataclass(frozen=True)
+class _Phase4RankerConfig:
+    requested_mode: Literal["argsort", "topk_v1"]
+    effective_mode: Literal["argsort", "topk_v1"]
+    default_mode: Literal["argsort"]
+    effective_behavior: Literal["requested", "argsort_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _RowStoreCacheControlConfig:
+    requested_mode: Literal["off", "fadvise_dontneed_after_append_v1"]
+    effective_mode: Literal["off", "fadvise_dontneed_after_append_v1"]
+    default_mode: Literal["off"]
+    mode_applicable: bool
+    effective_behavior: Literal["requested", "off_reference_execution"]
+    fallback_reason: str | None
+
+
+@dataclass(frozen=True)
+class _ExactEncoderResidencyConfig:
+    requested_mode: Literal["lazy", "active_cpu", "active_pinned_cpu"]
+    effective_mode: Literal["lazy", "active_cpu", "active_pinned_cpu"]
+    default_mode: Literal["lazy"]
+    mode_applicable: bool
+    effective_behavior: Literal["requested", "lazy_reference_execution"]
+    fallback_reason: str | None
+
+
+@dataclass(frozen=True)
+class _Phase4FrontierPlan:
+    selected_frontier: torch.Tensor
+    batch_boundaries: list[tuple[int, int]]
+    selected_membership_hash: str | None
+    selected_order_hash: str | None
+    locality_fragmentation_summary: dict[str, object]
+    boundary_reason_counts: dict[str, int]
+    invariant_summary: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _Phase4FrontierRankSelection:
+    selected_frontier: torch.Tensor
+    selected_scores: torch.Tensor
+    candidate_count: int
+    selected_count: int
+    selected_order_hash: str | None
+    selected_membership_hash: str | None
+    cutoff_score: float | None
+    tie_count_at_cutoff: int
+    tie_at_cutoff: bool
+    tie_behavior: str
 
 
 def _resolve_exact_trace_internal_dtype(value: str | torch.dtype) -> torch.dtype:
@@ -268,24 +520,44 @@ class _FileBackedFeatureRowStore:
         dtype: torch.dtype,
         row_abs_sum_dtype: torch.dtype = torch.float32,
         read_chunk_cache_bytes: int = 0,
+        row_store_cache_control_mode: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
         telemetry_recorder: TelemetryRecorder | None = None,
     ) -> None:
         if dtype not in (torch.float32, torch.float64):
             raise ValueError(f"Unsupported feature row store dtype: {dtype}")
         if row_abs_sum_dtype not in (torch.float32, torch.float64):
             raise ValueError(f"Unsupported row_abs_sum_dtype: {row_abs_sum_dtype}")
+        if row_store_cache_control_mode not in _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE:
+            allowed = ", ".join(sorted(_ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE))
+            raise ValueError(
+                "Unsupported row_store_cache_control_mode: "
+                f"{row_store_cache_control_mode!r}; expected one of: {allowed}"
+            )
 
         self.n_rows = n_rows
         self.n_feature_columns = n_feature_columns
-        self.row_abs_sums = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
+        self.row_abs_max = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
+        self.row_l1_scaled = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
 
         self._dtype = dtype
         self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
         self._tmpdir = tempfile.TemporaryDirectory(prefix="ct_feature_rows_")
         self._path = f"{self._tmpdir.name}/feature_rows.memmap"
+        self._row_nbytes = int(np.dtype(self._np_dtype).itemsize * n_feature_columns)
+        total_nbytes = int(self._row_nbytes * n_rows)
+        with open(self._path, "wb") as handle:
+            handle.truncate(total_nbytes)
+        self._write_fd: int | None = os.open(self._path, os.O_RDWR)
+        self._row_store_cache_control_effective_mode = row_store_cache_control_mode
+        self._fadvise_dontneed_after_append_enabled = bool(
+            row_store_cache_control_mode
+            == _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1
+        )
+        self._posix_fadvise = getattr(os, "posix_fadvise", None)
+        self._posix_fadvise_dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
         self._rows: np.memmap | None = np.memmap(
             self._path,
-            mode="w+",
+            mode="r+",
             dtype=self._np_dtype,
             shape=(n_rows, n_feature_columns),
         )
@@ -294,9 +566,21 @@ class _FileBackedFeatureRowStore:
         self._read_chunk_cache_nbytes = 0
         self._telemetry_recorder = telemetry_recorder
         self._closed = False
-        self._diagnostic_stats: dict[str, float | int | None] = {
+        self._diagnostic_stats: dict[str, object] = {
             "append_call_count": 0,
             "append_row_count": 0,
+            "row_store_cache_control_effective_mode": (
+                self._row_store_cache_control_effective_mode
+            ),
+            "row_store_cache_control_advisory_available": int(
+                callable(self._posix_fadvise) and self._posix_fadvise_dontneed is not None
+            ),
+            "row_store_cache_control_advisory_call_count": 0,
+            "row_store_cache_control_advisory_bytes": 0,
+            "row_store_cache_control_advisory_failure_count": 0,
+            "row_store_cache_control_advisory_unavailable_count": 0,
+            "row_store_cache_control_advisory_skipped_count": 0,
+            "row_store_cache_control_advisory_last_error": None,
             "read_call_count": 0,
             "read_row_count": 0,
             "read_last_row_start": None,
@@ -350,6 +634,11 @@ class _FileBackedFeatureRowStore:
         if self._closed or self._rows is None:
             raise RuntimeError("feature row store has been cleaned up")
         return self._rows
+
+    def _require_open_write_fd(self) -> int:
+        if self._closed or self._write_fd is None:
+            raise RuntimeError("feature row store has been cleaned up")
+        return self._write_fd
 
     @staticmethod
     def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -413,12 +702,54 @@ class _FileBackedFeatureRowStore:
         for key in overlapping:
             self._drop_read_chunk(key, count_eviction=True)
 
+    def _increment_diagnostic_counter(self, key: str, *, delta: int = 1) -> None:
+        self._diagnostic_stats[key] = int(self._diagnostic_stats.get(key, 0) or 0) + int(delta)
+
+    def _apply_row_store_cache_control_after_append(
+        self,
+        *,
+        write_fd: int,
+        byte_offset: int,
+        byte_length: int,
+    ) -> None:
+        if byte_length <= 0 or not self._fadvise_dontneed_after_append_enabled:
+            self._increment_diagnostic_counter("row_store_cache_control_advisory_skipped_count")
+            return
+
+        posix_fadvise = self._posix_fadvise
+        dontneed_flag = self._posix_fadvise_dontneed
+        if not callable(posix_fadvise) or dontneed_flag is None:
+            self._diagnostic_stats["row_store_cache_control_advisory_available"] = 0
+            self._increment_diagnostic_counter("row_store_cache_control_advisory_unavailable_count")
+            return
+
+        try:
+            posix_fadvise(
+                write_fd,
+                int(byte_offset),
+                int(byte_length),
+                int(dontneed_flag),
+            )
+        except Exception as exc:
+            self._increment_diagnostic_counter("row_store_cache_control_advisory_failure_count")
+            self._diagnostic_stats["row_store_cache_control_advisory_last_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+
+        self._increment_diagnostic_counter("row_store_cache_control_advisory_call_count")
+        self._increment_diagnostic_counter(
+            "row_store_cache_control_advisory_bytes",
+            delta=int(byte_length),
+        )
+
     def append_rows(
         self,
         *,
         row_start: int,
         feature_rows: torch.Tensor,
-        full_row_abs_sums: torch.Tensor,
+        row_denominator_scaled_l1: tuple[torch.Tensor, torch.Tensor] | None = None,
+        full_row_abs_sums: torch.Tensor | None = None,
         phase: str | None = None,
     ) -> None:
         if feature_rows.ndim != 2:
@@ -428,8 +759,29 @@ class _FileBackedFeatureRowStore:
             raise ValueError(
                 "feature_rows second dimension must equal configured n_feature_columns"
             )
-        if full_row_abs_sums.numel() != row_count:
-            raise ValueError("full_row_abs_sums length must equal number of feature_rows")
+        if row_denominator_scaled_l1 is not None and full_row_abs_sums is not None:
+            raise ValueError(
+                "Provide either row_denominator_scaled_l1 or full_row_abs_sums, not both"
+            )
+
+        if row_denominator_scaled_l1 is not None:
+            row_abs_max, row_l1_scaled = row_denominator_scaled_l1
+            if row_abs_max.numel() != row_count:
+                raise ValueError("row_abs_max length must equal number of feature_rows")
+            if row_l1_scaled.numel() != row_count:
+                raise ValueError("row_l1_scaled length must equal number of feature_rows")
+        elif full_row_abs_sums is not None:
+            if full_row_abs_sums.numel() != row_count:
+                raise ValueError("full_row_abs_sums length must equal number of feature_rows")
+            row_abs_max = full_row_abs_sums
+            row_l1_scaled = torch.where(
+                full_row_abs_sums > 0,
+                torch.ones_like(full_row_abs_sums),
+                torch.zeros_like(full_row_abs_sums),
+            )
+        else:
+            raise ValueError("row denominator data must be provided")
+
         row_end = row_start + row_count
         if row_start < 0 or row_end > self.n_rows:
             raise ValueError("row range is out of bounds for file-backed store")
@@ -444,17 +796,56 @@ class _FileBackedFeatureRowStore:
                 "feature_columns": n_feature_cols,
             },
         ):
-            rows = self._require_open_rows()
-            feature_rows_cpu = feature_rows.to(
-                device=self.row_abs_sums.device,
-                dtype=self._dtype,
-            ).contiguous()
-            rows[row_start:row_end] = feature_rows_cpu.numpy()
+            write_fd = self._require_open_write_fd()
+            feature_rows_cpu = feature_rows.detach()
+            if feature_rows_cpu.device.type != "cpu" or feature_rows_cpu.dtype != self._dtype:
+                feature_rows_cpu = feature_rows_cpu.to(device="cpu", dtype=self._dtype)
 
-            self.row_abs_sums[row_start:row_end] = full_row_abs_sums.to(
-                device=self.row_abs_sums.device,
-                dtype=self.row_abs_sums.dtype,
+            feature_rows_np = np.asarray(feature_rows_cpu.numpy(), dtype=self._np_dtype, order="C")
+            if not feature_rows_np.flags.c_contiguous:
+                feature_rows_np = np.ascontiguousarray(feature_rows_np, dtype=self._np_dtype)
+            payload = memoryview(feature_rows_np).cast("B")
+            expected_nbytes = int(row_count * self._row_nbytes)
+            if payload.nbytes != expected_nbytes:
+                raise RuntimeError(
+                    "feature row store append payload size mismatch: "
+                    f"expected {expected_nbytes} bytes, got {payload.nbytes}"
+                )
+
+            byte_offset = int(row_start * self._row_nbytes)
+            bytes_written = 0
+            while bytes_written < expected_nbytes:
+                wrote = os.pwrite(write_fd, payload[bytes_written:], byte_offset + bytes_written)
+                if wrote <= 0:
+                    raise OSError("feature row store append write failed")
+                bytes_written += wrote
+            self._apply_row_store_cache_control_after_append(
+                write_fd=write_fd,
+                byte_offset=byte_offset,
+                byte_length=expected_nbytes,
             )
+
+            row_abs_max_cpu = row_abs_max.detach()
+            if (
+                row_abs_max_cpu.device.type != "cpu"
+                or row_abs_max_cpu.dtype != self.row_abs_max.dtype
+            ):
+                row_abs_max_cpu = row_abs_max_cpu.to(
+                    device=self.row_abs_max.device,
+                    dtype=self.row_abs_max.dtype,
+                )
+            row_l1_scaled_cpu = row_l1_scaled.detach()
+            if (
+                row_l1_scaled_cpu.device.type != "cpu"
+                or row_l1_scaled_cpu.dtype != self.row_l1_scaled.dtype
+            ):
+                row_l1_scaled_cpu = row_l1_scaled_cpu.to(
+                    device=self.row_l1_scaled.device,
+                    dtype=self.row_l1_scaled.dtype,
+                )
+
+            self.row_abs_max[row_start:row_end] = row_abs_max_cpu
+            self.row_l1_scaled[row_start:row_end] = row_l1_scaled_cpu
 
         self._diagnostic_stats["append_call_count"] = (
             int(self._diagnostic_stats["append_call_count"] or 0) + 1
@@ -539,13 +930,15 @@ class _FileBackedFeatureRowStore:
 
         n_rows = row_end - row_start
         n_cols = selected_feature_columns.numel()
-        dense = torch.zeros((n_rows, n_cols), dtype=self.row_abs_sums.dtype)
+        dense = torch.empty((n_rows, n_cols), dtype=self.row_abs_max.dtype)
         if n_rows == 0 or n_cols == 0:
             return dense
 
         selected_cols = selected_feature_columns.to(dtype=torch.long, device="cpu")
         if selected_cols.min() < 0 or selected_cols.max() >= self.n_feature_columns:
             raise ValueError("selected feature column indices must be in [0, n_feature_columns)")
+        selected_cols_np = selected_cols.numpy()
+        same_dtype_fast_path = dense.dtype == self._dtype
 
         with self._telemetry_timer(
             name="feature_row_store.materialize_dense_slice",
@@ -559,11 +952,22 @@ class _FileBackedFeatureRowStore:
             },
         ):
             rows = self._require_open_rows()
+            row_slice = rows[row_start:row_end]
+            dense_np = dense.numpy() if same_dtype_fast_path else None
             for col_start in range(0, n_cols, col_chunk_size):
                 col_end = min(col_start + col_chunk_size, n_cols)
-                cols_np = selected_cols[col_start:col_end].numpy()
-                chunk_np = np.asarray(rows[row_start:row_end, cols_np], dtype=self._np_dtype)
-                dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
+                cols_np = selected_cols_np[col_start:col_end]
+                if same_dtype_fast_path:
+                    assert dense_np is not None
+                    np.take(
+                        row_slice,
+                        cols_np,
+                        axis=1,
+                        out=dense_np[:, col_start:col_end],
+                    )
+                else:
+                    chunk_np = np.asarray(row_slice[:, cols_np], dtype=self._np_dtype)
+                    dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
 
         self._diagnostic_stats["materialize_call_count"] = (
             int(self._diagnostic_stats["materialize_call_count"] or 0) + 1
@@ -579,8 +983,17 @@ class _FileBackedFeatureRowStore:
 
         return dense
 
-    def get_diagnostic_snapshot(self) -> dict[str, float | int | None]:
+    def get_diagnostic_snapshot(self) -> dict[str, object]:
         return dict(self._diagnostic_stats)
+
+    @property
+    def row_denominator_scaled_l1(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (self.row_abs_max, self.row_l1_scaled)
+
+    @property
+    def row_abs_sums(self) -> torch.Tensor:
+        """Backward-compatible legacy accessor (non-hot-path only)."""
+        return self.row_abs_max * self.row_l1_scaled
 
     def cleanup(self) -> None:
         if self._closed:
@@ -592,6 +1005,14 @@ class _FileBackedFeatureRowStore:
         if rows is not None:
             try:
                 rows.flush()
+            except Exception:
+                pass
+
+        write_fd = self._write_fd
+        self._write_fd = None
+        if write_fd is not None:
+            try:
+                os.close(write_fd)
             except Exception:
                 pass
 
@@ -641,6 +1062,2091 @@ def _reorder_pending_for_phase4_locality(
         )
     )
     return torch.tensor(pending_list, dtype=pending.dtype, device=pending.device)
+
+
+def _compute_phase4_locality_shaped_batch_end_with_reason(
+    pending: torch.Tensor,
+    *,
+    pending_offset: int,
+    max_batch_size: int,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> tuple[int, str]:
+    """Pick a Phase-4 batch end that prefers layer/chunk run boundaries.
+
+    This keeps the frontier membership fixed and preserves ordering while avoiding
+    unnecessary splits of contiguous ``(source_layer, decoder_chunk)`` runs when
+    a boundary is available within the current max-size slice.
+
+    To avoid over-splitting, only take the earlier boundary when the resulting
+    split batch is not too small and the preserved suffix run is short.
+    """
+
+    total_pending = int(pending.numel())
+    if pending_offset >= total_pending:
+        return total_pending, "pending_exhausted"
+
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be > 0")
+
+    if max_batch_size == 1:
+        return min(pending_offset + max_batch_size, total_pending), "max_batch_size_one"
+
+    baseline_end = min(pending_offset + max_batch_size, total_pending)
+    if baseline_end >= total_pending:
+        return baseline_end, "tail_complete"
+
+    use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
+    probe = pending[pending_offset : baseline_end + 1]
+    probe_layers = feat_layers[probe]
+    if use_chunk_key:
+        probe_chunks = torch.div(
+            feat_ids[probe],
+            int(decoder_chunk_size),
+            rounding_mode="floor",
+        )
+    else:
+        probe_chunks = torch.zeros_like(probe_layers)
+
+    split_index = max_batch_size - 1
+    if int(probe_layers[split_index].item()) != int(probe_layers[split_index + 1].item()):
+        return baseline_end, "boundary_aligned"
+    if int(probe_chunks[split_index].item()) != int(probe_chunks[split_index + 1].item()):
+        return baseline_end, "boundary_aligned"
+
+    prefix_layers = probe_layers[:max_batch_size]
+    prefix_chunks = probe_chunks[:max_batch_size]
+    boundaries = (prefix_layers[1:] != prefix_layers[:-1]) | (
+        prefix_chunks[1:] != prefix_chunks[:-1]
+    )
+    boundary_positions = torch.nonzero(boundaries, as_tuple=False)
+    if boundary_positions.numel() == 0:
+        return baseline_end, "split_unavailable"
+
+    last_boundary = int(boundary_positions[-1].item())
+    split_batch_size = last_boundary + 1
+    preserved_suffix_run = max_batch_size - split_batch_size
+
+    # Keep the shaping heuristic intentionally conservative so easy prompts do
+    # not fragment into many tiny refresh batches.
+    min_split_batch_size = max(2, max_batch_size // 2)
+    max_preserved_suffix_run = max(1, max_batch_size // 3)
+    if split_batch_size < min_split_batch_size:
+        return baseline_end, "split_too_small"
+    if preserved_suffix_run > max_preserved_suffix_run:
+        return baseline_end, "preserved_suffix_too_long"
+
+    return pending_offset + split_batch_size, "split_at_last_boundary"
+
+
+def _compute_phase4_locality_shaped_batch_end(
+    pending: torch.Tensor,
+    *,
+    pending_offset: int,
+    max_batch_size: int,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> int:
+    batch_end, _ = _compute_phase4_locality_shaped_batch_end_with_reason(
+        pending,
+        pending_offset=pending_offset,
+        max_batch_size=max_batch_size,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=exact_chunked_decoder,
+        decoder_chunk_size=decoder_chunk_size,
+    )
+    return batch_end
+
+
+def _compute_phase4_locality_shaped_frontier_size(
+    pending: torch.Tensor,
+    *,
+    max_batch_size: int,
+    max_batches: int,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> int:
+    """Return the pending-prefix size covering at most ``max_batches`` shaped batches."""
+
+    if max_batches <= 0:
+        raise ValueError("max_batches must be > 0")
+
+    pending_offset = 0
+    pending_size = int(pending.numel())
+    for _ in range(max_batches):
+        if pending_offset >= pending_size:
+            break
+        batch_end = _compute_phase4_locality_shaped_batch_end(
+            pending,
+            pending_offset=pending_offset,
+            max_batch_size=max_batch_size,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        if batch_end <= pending_offset:
+            raise RuntimeError("Phase 4 locality shaping produced a non-advancing batch boundary")
+        pending_offset = batch_end
+    return pending_offset
+
+
+def _compute_phase4_refresh_cycle_batches(
+    *,
+    update_interval: int,
+    queue_multiplier: int,
+) -> int:
+    resolved_update_interval = int(update_interval)
+    resolved_queue_multiplier = int(queue_multiplier)
+    if resolved_update_interval <= 0:
+        raise ValueError("update_interval must be > 0")
+    if resolved_queue_multiplier <= 0:
+        raise ValueError("queue_multiplier must be > 0")
+    return resolved_update_interval * resolved_queue_multiplier
+
+
+def _compute_phase4_refresh_queue_window_size(
+    *,
+    update_interval: int,
+    phase4_feature_batch_size: int,
+    queue_multiplier: int,
+    remaining_feature_count: int | None = None,
+) -> int:
+    resolved_feature_batch_size = int(phase4_feature_batch_size)
+    if resolved_feature_batch_size <= 0:
+        raise ValueError("phase4_feature_batch_size must be > 0")
+
+    refresh_cycle_batches = _compute_phase4_refresh_cycle_batches(
+        update_interval=update_interval,
+        queue_multiplier=queue_multiplier,
+    )
+    queue_window_size = refresh_cycle_batches * resolved_feature_batch_size
+
+    if remaining_feature_count is None:
+        return int(queue_window_size)
+
+    resolved_remaining = int(remaining_feature_count)
+    if resolved_remaining < 0:
+        raise ValueError("remaining_feature_count must be >= 0 when provided")
+    return min(int(queue_window_size), resolved_remaining)
+
+
+def _resolve_phase4_scheduler_mode(
+    phase4_scheduler_mode: str,
+) -> Literal["locality", "planner_v1", "planner_v2"]:
+    normalized = str(phase4_scheduler_mode).strip().lower()
+    normalized = _PHASE4_SCHEDULER_MODE_ALIAS.get(normalized, normalized)
+    if normalized not in _PHASE4_SCHEDULER_POLICY_BY_MODE:
+        allowed = ", ".join(
+            sorted(set(_PHASE4_SCHEDULER_POLICY_BY_MODE) | set(_PHASE4_SCHEDULER_MODE_ALIAS))
+        )
+        raise ValueError(
+            f"phase4_scheduler_mode must be one of: {allowed} (got {phase4_scheduler_mode!r})"
+        )
+    return cast(Literal["locality", "planner_v1", "planner_v2"], normalized)
+
+
+def _resolve_phase4_scheduler_telemetry_detail(
+    phase4_scheduler_telemetry_detail: str,
+) -> Literal["summary", "normal", "debug"]:
+    normalized = str(phase4_scheduler_telemetry_detail).strip().lower()
+    normalized = _PHASE4_SCHEDULER_TELEMETRY_DETAIL_ALIAS.get(normalized, normalized)
+    allowed_values = {"summary", "normal", "debug"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values | set(_PHASE4_SCHEDULER_TELEMETRY_DETAIL_ALIAS)))
+        raise ValueError(
+            "phase4_scheduler_telemetry_detail must be one of: "
+            f"{allowed} (got {phase4_scheduler_telemetry_detail!r})"
+        )
+    return cast(Literal["summary", "normal", "debug"], normalized)
+
+
+def _resolve_phase4_scheduler_config(
+    *,
+    phase4_scheduler_mode: str,
+    phase4_scheduler_debug: bool,
+    phase4_scheduler_telemetry_detail: str,
+) -> _Phase4SchedulerConfig:
+    requested_mode = _resolve_phase4_scheduler_mode(phase4_scheduler_mode)
+    effective_mode = cast(
+        Literal["locality", "planner_v1", "planner_v2"],
+        _PHASE4_SCHEDULER_EFFECTIVE_MODE_BY_MODE[requested_mode],
+    )
+    effective_behavior: Literal["requested", "planner_v1_reference_execution"] = (
+        "planner_v1_reference_execution" if requested_mode != effective_mode else "requested"
+    )
+    return _Phase4SchedulerConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        version=_PHASE4_SCHEDULER_VERSION_BY_MODE[requested_mode],
+        policy=_PHASE4_SCHEDULER_POLICY_BY_MODE[requested_mode],
+        effective_version=_PHASE4_SCHEDULER_VERSION_BY_MODE[effective_mode],
+        effective_policy=_PHASE4_SCHEDULER_POLICY_BY_MODE[effective_mode],
+        effective_behavior=effective_behavior,
+        debug=bool(phase4_scheduler_debug),
+        telemetry_detail=_resolve_phase4_scheduler_telemetry_detail(
+            phase4_scheduler_telemetry_detail
+        ),
+    )
+
+
+def _build_phase4_scheduler_metadata(
+    phase4_scheduler_config: _Phase4SchedulerConfig,
+) -> dict[str, object]:
+    return {
+        "scheduler_requested_mode": phase4_scheduler_config.requested_mode,
+        "scheduler_mode_requested": phase4_scheduler_config.requested_mode,
+        "scheduler_mode": phase4_scheduler_config.requested_mode,
+        "scheduler_version": phase4_scheduler_config.version,
+        "scheduler_version_requested": phase4_scheduler_config.version,
+        "scheduler_policy": phase4_scheduler_config.policy,
+        "scheduler_policy_requested": phase4_scheduler_config.policy,
+        "scheduler_effective_mode": phase4_scheduler_config.effective_mode,
+        "scheduler_mode_effective": phase4_scheduler_config.effective_mode,
+        "scheduler_effective_version": phase4_scheduler_config.effective_version,
+        "scheduler_version_effective": phase4_scheduler_config.effective_version,
+        "scheduler_effective_policy": phase4_scheduler_config.effective_policy,
+        "scheduler_policy_effective": phase4_scheduler_config.effective_policy,
+        "scheduler_effective_behavior": phase4_scheduler_config.effective_behavior,
+        "scheduler_reference_execution": bool(
+            phase4_scheduler_config.requested_mode != phase4_scheduler_config.effective_mode
+        ),
+        "scheduler_debug": bool(phase4_scheduler_config.debug),
+        "scheduler_telemetry_detail": phase4_scheduler_config.telemetry_detail,
+    }
+
+
+def _resolve_phase4_refresh_optimization_mode(
+    phase4_refresh_optimization: str,
+) -> Literal["off", "v1"]:
+    normalized = str(phase4_refresh_optimization).strip().lower()
+    allowed_values = {"off", "v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            "phase4_refresh_optimization must be one of: "
+            f"{allowed} (got {phase4_refresh_optimization!r})"
+        )
+    return cast(Literal["off", "v1"], normalized)
+
+
+def _resolve_phase4_refresh_optimization_config(
+    phase4_refresh_optimization: str,
+    *,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
+) -> _Phase4RefreshOptimizationConfig:
+    requested_mode = _resolve_phase4_refresh_optimization_mode(phase4_refresh_optimization)
+    refresh_optimization_applicable = bool(compact_output and exact_chunked_decoder)
+    effective_mode = cast(
+        Literal["off", "v1"],
+        requested_mode if requested_mode == "off" or refresh_optimization_applicable else "off",
+    )
+    effective_behavior: Literal["requested", "off_reference_execution"] = (
+        "off_reference_execution" if requested_mode != effective_mode else "requested"
+    )
+    return _Phase4RefreshOptimizationConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        version=_PHASE4_REFRESH_OPTIMIZATION_VERSION_BY_MODE[requested_mode],
+        effective_version=_PHASE4_REFRESH_OPTIMIZATION_VERSION_BY_MODE[effective_mode],
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase4_refresh_optimization_metadata(
+    phase4_refresh_optimization_config: _Phase4RefreshOptimizationConfig,
+) -> dict[str, object]:
+    return {
+        "refresh_optimization_requested": phase4_refresh_optimization_config.requested_mode,
+        "refresh_optimization_mode_requested": phase4_refresh_optimization_config.requested_mode,
+        "refresh_optimization": phase4_refresh_optimization_config.requested_mode,
+        "refresh_optimization_version": phase4_refresh_optimization_config.version,
+        "refresh_optimization_version_requested": phase4_refresh_optimization_config.version,
+        "refresh_optimization_effective": phase4_refresh_optimization_config.effective_mode,
+        "refresh_optimization_mode_effective": phase4_refresh_optimization_config.effective_mode,
+        "refresh_optimization_effective_version": phase4_refresh_optimization_config.effective_version,
+        "refresh_optimization_version_effective": phase4_refresh_optimization_config.effective_version,
+        "refresh_optimization_effective_behavior": phase4_refresh_optimization_config.effective_behavior,
+        "refresh_optimization_reference_execution": bool(
+            phase4_refresh_optimization_config.requested_mode
+            != phase4_refresh_optimization_config.effective_mode
+        ),
+    }
+
+
+def _resolve_phase4_row_executor_mode(
+    phase4_row_executor: str,
+) -> Literal["batched", "streaming_v1"]:
+    normalized = str(phase4_row_executor).strip().lower()
+    allowed_values = {"batched", "streaming_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"phase4_row_executor must be one of: {allowed} (got {phase4_row_executor!r})"
+        )
+    return cast(Literal["batched", "streaming_v1"], normalized)
+
+
+def _resolve_phase4_row_executor_config(
+    phase4_row_executor: str,
+    *,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
+) -> _Phase4RowExecutorConfig:
+    requested_mode = _resolve_phase4_row_executor_mode(phase4_row_executor)
+    streaming_executor_applicable = bool(compact_output and exact_chunked_decoder)
+    effective_mode = cast(
+        Literal["batched", "streaming_v1"],
+        (
+            _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE[requested_mode]
+            if requested_mode == "batched" or streaming_executor_applicable
+            else "batched"
+        ),
+    )
+    effective_behavior: Literal["requested", "batched_reference_execution"] = (
+        "batched_reference_execution" if requested_mode != effective_mode else "requested"
+    )
+    return _Phase4RowExecutorConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        version=_PHASE4_ROW_EXECUTOR_VERSION_BY_MODE[requested_mode],
+        effective_version=_PHASE4_ROW_EXECUTOR_VERSION_BY_MODE[effective_mode],
+        effective_behavior=effective_behavior,
+    )
+
+
+def _resolve_phase4_streaming_v1_microbatch_size(reference_batch_size: int) -> int:
+    if reference_batch_size <= 0:
+        raise ValueError("reference_batch_size must be > 0")
+    return min(reference_batch_size, _PHASE4_STREAMING_V1_MAX_MICROBATCH_SIZE)
+
+
+def _build_phase4_row_executor_metadata(
+    phase4_row_executor_config: _Phase4RowExecutorConfig,
+) -> dict[str, object]:
+    return {
+        "row_executor_requested": phase4_row_executor_config.requested_mode,
+        "row_executor_mode_requested": phase4_row_executor_config.requested_mode,
+        "row_executor": phase4_row_executor_config.requested_mode,
+        "row_executor_version": phase4_row_executor_config.version,
+        "row_executor_version_requested": phase4_row_executor_config.version,
+        "row_executor_effective": phase4_row_executor_config.effective_mode,
+        "row_executor_mode_effective": phase4_row_executor_config.effective_mode,
+        "row_executor_effective_version": phase4_row_executor_config.effective_version,
+        "row_executor_version_effective": phase4_row_executor_config.effective_version,
+        "row_executor_effective_behavior": phase4_row_executor_config.effective_behavior,
+        "row_executor_reference_execution": bool(
+            phase4_row_executor_config.requested_mode != phase4_row_executor_config.effective_mode
+        ),
+    }
+
+
+def _resolve_phase1_trace_batch_policy(
+    phase1_trace_batch_policy: str,
+) -> Literal["legacy", "cap_effective_batches"]:
+    normalized = str(phase1_trace_batch_policy).strip().lower()
+    allowed_values = {"legacy", "cap_effective_batches"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            "phase1_trace_batch_policy must be one of: "
+            f"{allowed} (got {phase1_trace_batch_policy!r})"
+        )
+    return cast(Literal["legacy", "cap_effective_batches"], normalized)
+
+
+def _resolve_phase1_trace_batch_size_max(
+    phase1_trace_batch_size_max: int | None,
+) -> int | None:
+    if phase1_trace_batch_size_max is None:
+        return None
+    resolved = int(phase1_trace_batch_size_max)
+    if resolved <= 0:
+        raise ValueError("phase1_trace_batch_size_max must be > 0 when provided")
+    return resolved
+
+
+def _resolve_phase1_trace_batch_config(
+    *,
+    phase1_trace_batch_policy: str,
+    phase1_trace_batch_size_max: int | None,
+) -> _Phase1TraceBatchConfig:
+    requested_policy = _resolve_phase1_trace_batch_policy(phase1_trace_batch_policy)
+    requested_batch_size_max = _resolve_phase1_trace_batch_size_max(phase1_trace_batch_size_max)
+    cap_requested = requested_policy == "cap_effective_batches"
+    fallback_missing_batch_size_max = cap_requested and requested_batch_size_max is None
+    effective_policy = cast(
+        Literal["legacy", "cap_effective_batches"],
+        (
+            _PHASE1_TRACE_BATCH_POLICY_DEFAULT
+            if fallback_missing_batch_size_max
+            else _PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy]
+        ),
+    )
+    effective_batch_size_max = (
+        requested_batch_size_max
+        if effective_policy == "cap_effective_batches"
+        else _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT
+    )
+    effective_behavior: Literal["requested", "legacy_fallback_missing_batch_size_max"] = (
+        "legacy_fallback_missing_batch_size_max" if fallback_missing_batch_size_max else "requested"
+    )
+    fallback_reason = (
+        "cap_effective_batches requested without phase1_trace_batch_size_max; "
+        "falling back to legacy execution"
+        if fallback_missing_batch_size_max
+        else None
+    )
+    return _Phase1TraceBatchConfig(
+        requested_policy=requested_policy,
+        effective_policy=effective_policy,
+        requested_batch_size_max=requested_batch_size_max,
+        effective_batch_size_max=effective_batch_size_max,
+        default_policy=_PHASE1_TRACE_BATCH_POLICY_DEFAULT,
+        default_batch_size_max=_PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT,
+        effective_behavior=effective_behavior,
+        fallback_reason=fallback_reason,
+    )
+
+
+def _build_phase1_trace_batch_metadata(
+    phase1_trace_batch_config: _Phase1TraceBatchConfig,
+) -> dict[str, object]:
+    return {
+        "trace_batch_policy_requested": phase1_trace_batch_config.requested_policy,
+        "trace_batch_policy": phase1_trace_batch_config.requested_policy,
+        "trace_batch_policy_default": phase1_trace_batch_config.default_policy,
+        "trace_batch_policy_effective": phase1_trace_batch_config.effective_policy,
+        "trace_batch_policy_effective_behavior": phase1_trace_batch_config.effective_behavior,
+        "trace_batch_policy_fallback_reason": phase1_trace_batch_config.fallback_reason,
+        "trace_batch_policy_reference_execution": bool(
+            phase1_trace_batch_config.requested_policy != phase1_trace_batch_config.effective_policy
+        ),
+        "trace_batch_size_max_requested": phase1_trace_batch_config.requested_batch_size_max,
+        "trace_batch_size_max": phase1_trace_batch_config.requested_batch_size_max,
+        "trace_batch_size_max_default": phase1_trace_batch_config.default_batch_size_max,
+        "trace_batch_size_max_effective": phase1_trace_batch_config.effective_batch_size_max,
+        "trace_batch_size_max_reference_execution": bool(
+            phase1_trace_batch_config.requested_batch_size_max
+            != phase1_trace_batch_config.effective_batch_size_max
+        ),
+    }
+
+
+def _resolve_phase1_trace_batch_sizing(
+    *,
+    batch_size: int,
+    feature_batch_size: int | None,
+    logit_batch_size: int | None,
+    feature_batch_size_max: int | None,
+    phase1_trace_batch_config: _Phase1TraceBatchConfig,
+) -> _Phase1TraceBatchSizing:
+    requested_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
+    requested_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
+    requested_phase4_max_feature_batch_size = (
+        requested_feature_batch_size if feature_batch_size_max is None else feature_batch_size_max
+    )
+
+    cap_limit = (
+        int(phase1_trace_batch_config.effective_batch_size_max)
+        if phase1_trace_batch_config.effective_policy == "cap_effective_batches"
+        and phase1_trace_batch_config.effective_batch_size_max is not None
+        else None
+    )
+
+    if cap_limit is None:
+        effective_source_batch_size = int(batch_size)
+    else:
+        # Phase-1-only cap decoupling: cap applies only to the source/invoke
+        # trace batch size used to drive the Phase-1 forward/cache footprint.
+        effective_source_batch_size = min(int(batch_size), cap_limit)
+
+    # Keep downstream phase/requested batch knobs unchanged by the Phase-1 cap.
+    effective_feature_batch_size = int(requested_feature_batch_size)
+    effective_logit_batch_size = int(requested_logit_batch_size)
+    effective_phase4_max_feature_batch_size = int(requested_phase4_max_feature_batch_size)
+
+    source_batch_size_cap_applied = effective_source_batch_size < int(batch_size)
+    feature_batch_size_cap_applied = effective_feature_batch_size < int(
+        requested_feature_batch_size
+    )
+    logit_batch_size_cap_applied = effective_logit_batch_size < int(requested_logit_batch_size)
+    phase4_max_feature_batch_size_cap_applied = effective_phase4_max_feature_batch_size < int(
+        requested_phase4_max_feature_batch_size
+    )
+    cap_applied = (
+        source_batch_size_cap_applied
+        or feature_batch_size_cap_applied
+        or logit_batch_size_cap_applied
+        or phase4_max_feature_batch_size_cap_applied
+    )
+
+    if cap_limit is not None:
+        cap_reason = (
+            "cap_effective_batches_applied"
+            if cap_applied
+            else "cap_effective_batches_no_reduction_needed"
+        )
+    elif phase1_trace_batch_config.requested_policy == "cap_effective_batches":
+        cap_reason = "cap_effective_batches_fallback_missing_batch_size_max"
+    elif phase1_trace_batch_config.requested_batch_size_max is not None:
+        cap_reason = "legacy_policy_ignores_phase1_trace_batch_size_max"
+    else:
+        cap_reason = "legacy_policy_no_cap"
+
+    trace_batch_size_legacy = max(
+        int(batch_size),
+        int(requested_feature_batch_size),
+        int(requested_logit_batch_size),
+    )
+    trace_batch_size_effective_pre_planner = effective_source_batch_size
+
+    return _Phase1TraceBatchSizing(
+        requested_source_batch_size=int(batch_size),
+        requested_feature_batch_size=int(requested_feature_batch_size),
+        requested_logit_batch_size=int(requested_logit_batch_size),
+        requested_phase4_max_feature_batch_size=int(requested_phase4_max_feature_batch_size),
+        requested_feature_batch_size_defaulted=(feature_batch_size is None),
+        requested_logit_batch_size_defaulted=(logit_batch_size is None),
+        effective_source_batch_size=effective_source_batch_size,
+        effective_feature_batch_size=effective_feature_batch_size,
+        effective_logit_batch_size=effective_logit_batch_size,
+        effective_phase4_max_feature_batch_size=effective_phase4_max_feature_batch_size,
+        source_batch_size_cap_applied=source_batch_size_cap_applied,
+        feature_batch_size_cap_applied=feature_batch_size_cap_applied,
+        logit_batch_size_cap_applied=logit_batch_size_cap_applied,
+        phase4_max_feature_batch_size_cap_applied=phase4_max_feature_batch_size_cap_applied,
+        cap_applied=cap_applied,
+        cap_reason=cap_reason,
+        trace_batch_size_legacy=trace_batch_size_legacy,
+        trace_batch_size_effective_pre_planner=trace_batch_size_effective_pre_planner,
+        trace_batch_size_cap_applied=source_batch_size_cap_applied,
+    )
+
+
+def _build_phase1_trace_batch_sizing_metadata(
+    sizing: _Phase1TraceBatchSizing,
+) -> dict[str, object]:
+    return {
+        "source_batch_size_requested": sizing.requested_source_batch_size,
+        "source_batch_size_effective": sizing.effective_source_batch_size,
+        "source_batch_size_cap_applied": sizing.source_batch_size_cap_applied,
+        "feature_batch_size_requested": sizing.requested_feature_batch_size,
+        "feature_batch_size_defaulted": sizing.requested_feature_batch_size_defaulted,
+        "feature_batch_size_effective": sizing.effective_feature_batch_size,
+        "feature_batch_size_cap_applied": sizing.feature_batch_size_cap_applied,
+        "logit_batch_size_requested": sizing.requested_logit_batch_size,
+        "logit_batch_size_defaulted": sizing.requested_logit_batch_size_defaulted,
+        "logit_batch_size_effective": sizing.effective_logit_batch_size,
+        "logit_batch_size_cap_applied": sizing.logit_batch_size_cap_applied,
+        "phase4_feature_batch_size_max_requested": sizing.requested_phase4_max_feature_batch_size,
+        "phase4_feature_batch_size_max_effective": sizing.effective_phase4_max_feature_batch_size,
+        "phase4_feature_batch_size_max_cap_applied": sizing.phase4_max_feature_batch_size_cap_applied,
+        "trace_batch_size_legacy": sizing.trace_batch_size_legacy,
+        "trace_batch_size_effective_pre_planner": sizing.trace_batch_size_effective_pre_planner,
+        "trace_batch_size_cap_applied": sizing.trace_batch_size_cap_applied,
+        "trace_batch_cap_applied": sizing.cap_applied,
+        "trace_batch_cap_reason": sizing.cap_reason,
+    }
+
+
+def _resolve_phase4_refresh_policy(
+    phase4_refresh_policy: str,
+) -> Literal["standard", "deferred_v1"]:
+    normalized = str(phase4_refresh_policy).strip().lower()
+    allowed_values = {"standard", "deferred_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"phase4_refresh_policy must be one of: {allowed} (got {phase4_refresh_policy!r})"
+        )
+    return cast(Literal["standard", "deferred_v1"], normalized)
+
+
+def _resolve_phase4_refresh_interval_multiplier(
+    phase4_refresh_interval_multiplier: int,
+) -> int:
+    resolved = int(phase4_refresh_interval_multiplier)
+    if resolved <= 0:
+        raise ValueError("phase4_refresh_interval_multiplier must be > 0")
+    return resolved
+
+
+def _resolve_phase4_refresh_policy_config(
+    *,
+    phase4_refresh_policy: str,
+    phase4_refresh_interval_multiplier: int,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
+) -> _Phase4RefreshPolicyConfig:
+    requested_policy = _resolve_phase4_refresh_policy(phase4_refresh_policy)
+    requested_interval_multiplier = _resolve_phase4_refresh_interval_multiplier(
+        phase4_refresh_interval_multiplier
+    )
+    policy_applicable = bool(compact_output and exact_chunked_decoder)
+
+    fallback_reason: str | None = None
+    if requested_policy == "deferred_v1" and not policy_applicable:
+        effective_policy = cast(Literal["standard", "deferred_v1"], "standard")
+        effective_interval_multiplier = _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT
+        effective_behavior: Literal["requested", "standard_reference_execution"] = (
+            "standard_reference_execution"
+        )
+        fallback_reason = (
+            "deferred_v1 requires compact_output=True and exact_chunked_decoder=True; "
+            "falling back to standard execution"
+        )
+    elif requested_policy == "standard":
+        effective_policy = cast(
+            Literal["standard", "deferred_v1"],
+            _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy],
+        )
+        effective_interval_multiplier = _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT
+        effective_behavior = (
+            "requested"
+            if requested_interval_multiplier == _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT
+            else "standard_reference_execution"
+        )
+    else:
+        effective_policy = cast(
+            Literal["standard", "deferred_v1"],
+            _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY[requested_policy],
+        )
+        effective_interval_multiplier = requested_interval_multiplier
+        effective_behavior = "requested"
+
+    effective_queue_multiplier = int(effective_interval_multiplier)
+    return _Phase4RefreshPolicyConfig(
+        requested_policy=requested_policy,
+        effective_policy=effective_policy,
+        requested_interval_multiplier=requested_interval_multiplier,
+        effective_interval_multiplier=effective_interval_multiplier,
+        effective_queue_multiplier=effective_queue_multiplier,
+        default_policy=_PHASE4_REFRESH_POLICY_DEFAULT,
+        default_interval_multiplier=_PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT,
+        policy_applicable=policy_applicable,
+        effective_behavior=effective_behavior,
+        fallback_reason=fallback_reason,
+    )
+
+
+def _build_phase4_refresh_policy_metadata(
+    phase4_refresh_policy_config: _Phase4RefreshPolicyConfig,
+) -> dict[str, object]:
+    return {
+        "refresh_policy_requested": phase4_refresh_policy_config.requested_policy,
+        "refresh_policy": phase4_refresh_policy_config.requested_policy,
+        "refresh_policy_default": phase4_refresh_policy_config.default_policy,
+        "refresh_policy_effective": phase4_refresh_policy_config.effective_policy,
+        "refresh_policy_applicable": bool(phase4_refresh_policy_config.policy_applicable),
+        "refresh_policy_effective_behavior": phase4_refresh_policy_config.effective_behavior,
+        "refresh_policy_fallback_reason": phase4_refresh_policy_config.fallback_reason,
+        "refresh_policy_reference_execution": bool(
+            phase4_refresh_policy_config.requested_policy
+            != phase4_refresh_policy_config.effective_policy
+        ),
+        "refresh_interval_multiplier_requested": (
+            phase4_refresh_policy_config.requested_interval_multiplier
+        ),
+        "refresh_interval_multiplier": phase4_refresh_policy_config.requested_interval_multiplier,
+        "refresh_interval_multiplier_default": phase4_refresh_policy_config.default_interval_multiplier,
+        "refresh_interval_multiplier_effective": (
+            phase4_refresh_policy_config.effective_interval_multiplier
+        ),
+        "refresh_queue_multiplier_effective": (
+            phase4_refresh_policy_config.effective_queue_multiplier
+        ),
+        "refresh_interval_multiplier_reference_execution": bool(
+            phase4_refresh_policy_config.requested_interval_multiplier
+            != phase4_refresh_policy_config.effective_interval_multiplier
+        ),
+    }
+
+
+def _resolve_phase4_ranker(
+    phase4_ranker: str,
+) -> Literal["argsort", "topk_v1"]:
+    normalized = str(phase4_ranker).strip().lower()
+    allowed_values = {"argsort", "topk_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(f"phase4_ranker must be one of: {allowed} (got {phase4_ranker!r})")
+    return cast(Literal["argsort", "topk_v1"], normalized)
+
+
+def _resolve_phase4_ranker_config(
+    phase4_ranker: str,
+) -> _Phase4RankerConfig:
+    requested_mode = _resolve_phase4_ranker(phase4_ranker)
+    effective_mode = cast(
+        Literal["argsort", "topk_v1"],
+        _PHASE4_RANKER_EFFECTIVE_MODE_BY_MODE[requested_mode],
+    )
+    effective_behavior: Literal["requested", "argsort_reference_execution"] = (
+        "requested" if requested_mode == effective_mode else "argsort_reference_execution"
+    )
+    return _Phase4RankerConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        default_mode=_PHASE4_RANKER_DEFAULT,
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase4_ranker_metadata(
+    phase4_ranker_config: _Phase4RankerConfig,
+) -> dict[str, object]:
+    return {
+        "ranker_requested": phase4_ranker_config.requested_mode,
+        "ranker": phase4_ranker_config.requested_mode,
+        "ranker_default": phase4_ranker_config.default_mode,
+        "ranker_effective": phase4_ranker_config.effective_mode,
+        "ranker_effective_behavior": phase4_ranker_config.effective_behavior,
+        "ranker_reference_execution": bool(
+            phase4_ranker_config.requested_mode != phase4_ranker_config.effective_mode
+        ),
+    }
+
+
+def _rank_phase4_unvisited_features_argsort(
+    feature_influences: torch.Tensor,
+    visited: torch.Tensor,
+) -> torch.Tensor:
+    feature_rank = (
+        torch.argsort(feature_influences, descending=True)
+        .detach()
+        .to(
+            device="cpu",
+            dtype=torch.long,
+        )
+    )
+    visited_cpu = visited.detach().to(device="cpu", dtype=torch.bool).flatten()
+    if visited_cpu.numel() != feature_rank.numel():
+        raise ValueError(
+            "feature_influences and visited must have matching flattened lengths "
+            f"(got {feature_rank.numel()} and {visited_cpu.numel()})"
+        )
+    return feature_rank[~visited_cpu[feature_rank]]
+
+
+def _compute_phase4_rank_selection_cutoff_metadata(
+    *,
+    unvisited_scores: torch.Tensor,
+    selected_scores: torch.Tensor,
+    selected_count: int,
+    candidate_count: int,
+) -> tuple[float | None, int, bool]:
+    if selected_count <= 0 or candidate_count <= 0 or unvisited_scores.numel() <= 0:
+        return None, 0, False
+
+    scores_cpu = unvisited_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+    selected_scores_cpu = selected_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+    if scores_cpu.numel() < candidate_count:
+        candidate_count = int(scores_cpu.numel())
+        selected_count = min(selected_count, candidate_count)
+    if selected_scores_cpu.numel() < selected_count:
+        selected_count = int(selected_scores_cpu.numel())
+
+    if selected_count <= 0:
+        return None, 0, False
+
+    cutoff_score = float(selected_scores_cpu[selected_count - 1].item())
+    tie_count_at_cutoff = int((scores_cpu[:candidate_count] == cutoff_score).sum().item())
+    strictly_greater_count = int((scores_cpu[:candidate_count] > cutoff_score).sum().item())
+    tie_at_cutoff = bool(
+        selected_count < candidate_count
+        and tie_count_at_cutoff > 1
+        and strictly_greater_count < selected_count
+    )
+    return cutoff_score, tie_count_at_cutoff, tie_at_cutoff
+
+
+def _select_phase4_frontier_rank_selection(
+    *,
+    feature_influences: torch.Tensor,
+    visited: torch.Tensor,
+    frontier_size: int,
+    ranker_mode: Literal["argsort", "topk_v1"],
+) -> _Phase4FrontierRankSelection:
+    if frontier_size < 0:
+        raise ValueError("frontier_size must be >= 0")
+
+    visited_cpu = visited.detach().to(device="cpu", dtype=torch.bool).flatten()
+    if feature_influences.numel() != visited_cpu.numel():
+        raise ValueError(
+            "feature_influences and visited must have matching flattened lengths "
+            f"(got {feature_influences.numel()} and {visited_cpu.numel()})"
+        )
+
+    candidate_count = int((~visited_cpu).sum().item())
+    selected_count = min(int(frontier_size), candidate_count)
+    if selected_count <= 0:
+        return _Phase4FrontierRankSelection(
+            selected_frontier=torch.empty(0, dtype=torch.long),
+            selected_scores=torch.empty(0, dtype=torch.float64),
+            candidate_count=candidate_count,
+            selected_count=0,
+            selected_order_hash=None,
+            selected_membership_hash=None,
+            cutoff_score=None,
+            tie_count_at_cutoff=0,
+            tie_at_cutoff=False,
+            tie_behavior=_PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE[ranker_mode],
+        )
+
+    if ranker_mode == "argsort":
+        unvisited_rank = _rank_phase4_unvisited_features_argsort(feature_influences, visited_cpu)
+        unvisited_scores = (
+            feature_influences[unvisited_rank.to(feature_influences.device)]
+            .detach()
+            .to(device="cpu", dtype=torch.float64)
+        )
+        selected_frontier = unvisited_rank[:selected_count]
+        selected_scores = unvisited_scores[:selected_count]
+    else:
+        unvisited_indices = (
+            torch.nonzero(~visited_cpu, as_tuple=False).flatten().to(dtype=torch.long)
+        )
+        if unvisited_indices.numel() != candidate_count:
+            raise RuntimeError(
+                "Phase-4 topk_v1 candidate_count mismatch against unvisited index selection "
+                f"(count={candidate_count}, selected={int(unvisited_indices.numel())})"
+            )
+        unvisited_scores_device = feature_influences[
+            unvisited_indices.to(feature_influences.device)
+        ]
+        top_scores, top_positions = torch.topk(
+            unvisited_scores_device,
+            k=selected_count,
+            largest=True,
+            sorted=False,
+        )
+        top_scores_cpu = top_scores.detach().to(device="cpu", dtype=torch.float64)
+        top_indices_cpu = unvisited_indices[
+            top_positions.detach().to(device="cpu", dtype=torch.long)
+        ]
+
+        selected_entries = sorted(
+            zip(top_indices_cpu.tolist(), top_scores_cpu.tolist(), strict=False),
+            key=lambda item: (-float(item[1]), int(item[0])),
+        )
+        selected_frontier = torch.tensor(
+            [int(index) for index, _ in selected_entries],
+            dtype=torch.long,
+        )
+        selected_scores = torch.tensor(
+            [float(score) for _, score in selected_entries],
+            dtype=torch.float64,
+        )
+        unvisited_scores = unvisited_scores_device.detach().to(device="cpu", dtype=torch.float64)
+
+    cutoff_score, tie_count_at_cutoff, tie_at_cutoff = (
+        _compute_phase4_rank_selection_cutoff_metadata(
+            unvisited_scores=unvisited_scores,
+            selected_scores=selected_scores,
+            selected_count=selected_count,
+            candidate_count=candidate_count,
+        )
+    )
+
+    selected_membership_hash = (
+        _hash_index_tensor(torch.sort(selected_frontier).values)
+        if selected_frontier.numel() > 0
+        else None
+    )
+    selected_order_hash = (
+        _hash_index_tensor(selected_frontier) if selected_frontier.numel() > 0 else None
+    )
+    return _Phase4FrontierRankSelection(
+        selected_frontier=selected_frontier,
+        selected_scores=selected_scores,
+        candidate_count=candidate_count,
+        selected_count=selected_count,
+        selected_order_hash=selected_order_hash,
+        selected_membership_hash=selected_membership_hash,
+        cutoff_score=cutoff_score,
+        tie_count_at_cutoff=tie_count_at_cutoff,
+        tie_at_cutoff=tie_at_cutoff,
+        tie_behavior=_PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE[ranker_mode],
+    )
+
+
+def _resolve_row_store_cache_control(
+    row_store_cache_control: str,
+) -> Literal["off", "fadvise_dontneed_after_append_v1"]:
+    normalized = str(row_store_cache_control).strip().lower()
+    allowed_values = {"off", "fadvise_dontneed_after_append_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"row_store_cache_control must be one of: {allowed} (got {row_store_cache_control!r})"
+        )
+    return cast(Literal["off", "fadvise_dontneed_after_append_v1"], normalized)
+
+
+def _resolve_row_store_cache_control_config(
+    row_store_cache_control: str,
+    *,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
+) -> _RowStoreCacheControlConfig:
+    requested_mode = _resolve_row_store_cache_control(row_store_cache_control)
+    mode_applicable = bool(compact_output and exact_chunked_decoder)
+    fallback_reason: str | None = None
+    if (
+        requested_mode == _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1
+        and not mode_applicable
+    ):
+        effective_mode = cast(Literal["off", "fadvise_dontneed_after_append_v1"], "off")
+        fallback_reason = (
+            "fadvise_dontneed_after_append_v1 requires compact_output=True and "
+            "exact_chunked_decoder=True; falling back to off execution"
+        )
+    else:
+        effective_mode = cast(
+            Literal["off", "fadvise_dontneed_after_append_v1"],
+            _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE[requested_mode],
+        )
+    effective_behavior: Literal["requested", "off_reference_execution"] = (
+        "requested" if requested_mode == effective_mode else "off_reference_execution"
+    )
+    return _RowStoreCacheControlConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        default_mode=_ROW_STORE_CACHE_CONTROL_DEFAULT,
+        mode_applicable=mode_applicable,
+        effective_behavior=effective_behavior,
+        fallback_reason=fallback_reason,
+    )
+
+
+def _build_row_store_cache_control_metadata(
+    row_store_cache_control_config: _RowStoreCacheControlConfig,
+) -> dict[str, object]:
+    return {
+        "row_store_cache_control_requested": row_store_cache_control_config.requested_mode,
+        "row_store_cache_control": row_store_cache_control_config.requested_mode,
+        "row_store_cache_control_default": row_store_cache_control_config.default_mode,
+        "row_store_cache_control_effective": row_store_cache_control_config.effective_mode,
+        "row_store_cache_control_applicable": bool(row_store_cache_control_config.mode_applicable),
+        "row_store_cache_control_effective_behavior": (
+            row_store_cache_control_config.effective_behavior
+        ),
+        "row_store_cache_control_fallback_reason": row_store_cache_control_config.fallback_reason,
+        "row_store_cache_control_reference_execution": bool(
+            row_store_cache_control_config.requested_mode
+            != row_store_cache_control_config.effective_mode
+        ),
+    }
+
+
+def _resolve_exact_encoder_residency(
+    exact_encoder_residency: str,
+) -> Literal["lazy", "active_cpu", "active_pinned_cpu"]:
+    normalized = str(exact_encoder_residency).strip().lower()
+    allowed_values = {"lazy", "active_cpu", "active_pinned_cpu"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"exact_encoder_residency must be one of: {allowed} (got {exact_encoder_residency!r})"
+        )
+    return cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], normalized)
+
+
+def _resolve_exact_encoder_residency_config(
+    exact_encoder_residency: str,
+    *,
+    exact_chunked_decoder: bool,
+) -> _ExactEncoderResidencyConfig:
+    requested_mode = _resolve_exact_encoder_residency(exact_encoder_residency)
+    mode_applicable = bool(exact_chunked_decoder)
+    fallback_reason: str | None = None
+    if requested_mode != "lazy" and not mode_applicable:
+        effective_mode = cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], "lazy")
+        fallback_reason = (
+            "active encoder residency requires exact_chunked_decoder=True; "
+            "falling back to lazy execution"
+        )
+    else:
+        effective_mode = cast(
+            Literal["lazy", "active_cpu", "active_pinned_cpu"],
+            _EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE[requested_mode],
+        )
+    effective_behavior: Literal["requested", "lazy_reference_execution"] = (
+        "requested" if requested_mode == effective_mode else "lazy_reference_execution"
+    )
+    return _ExactEncoderResidencyConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        default_mode=_EXACT_ENCODER_RESIDENCY_DEFAULT,
+        mode_applicable=mode_applicable,
+        effective_behavior=effective_behavior,
+        fallback_reason=fallback_reason,
+    )
+
+
+def _build_exact_encoder_residency_metadata(
+    exact_encoder_residency_config: _ExactEncoderResidencyConfig,
+) -> dict[str, object]:
+    effective_mode = exact_encoder_residency_config.effective_mode
+    return {
+        "exact_encoder_residency_requested": exact_encoder_residency_config.requested_mode,
+        "exact_encoder_residency": exact_encoder_residency_config.requested_mode,
+        "exact_encoder_residency_default": exact_encoder_residency_config.default_mode,
+        "exact_encoder_residency_effective": exact_encoder_residency_config.effective_mode,
+        "exact_encoder_residency_applicable": bool(exact_encoder_residency_config.mode_applicable),
+        "exact_encoder_residency_effective_behavior": (
+            exact_encoder_residency_config.effective_behavior
+        ),
+        "exact_encoder_residency_fallback_reason": exact_encoder_residency_config.fallback_reason,
+        "exact_encoder_materialize_phase0": bool(effective_mode != "lazy"),
+        "exact_encoder_staging_destination_planned": (
+            "none"
+            if effective_mode == "lazy"
+            else ("pinned_cpu" if effective_mode == "active_pinned_cpu" else "cpu")
+        ),
+        "exact_encoder_pinned_requested": bool(
+            exact_encoder_residency_config.requested_mode == "active_pinned_cpu"
+        ),
+        "exact_encoder_pinned_planned": bool(effective_mode == "active_pinned_cpu"),
+        "exact_encoder_pinned_effective": None,
+        "exact_encoder_pinning_success": None,
+        "exact_encoder_pinning_failure_reason": None,
+        "exact_encoder_residency_reference_execution": bool(
+            exact_encoder_residency_config.requested_mode
+            != exact_encoder_residency_config.effective_mode
+        ),
+    }
+
+
+def _build_phase4_scheduler_plan_telemetry(
+    *,
+    phase4_frontier_plan: _Phase4FrontierPlan | None,
+    telemetry_detail: Literal["summary", "normal", "debug"],
+) -> dict[str, object]:
+    if phase4_frontier_plan is None:
+        return {
+            "scheduler_plan_frontier_size": None,
+            "scheduler_plan_membership_hash": None,
+            "scheduler_plan_order_hash": None,
+            "scheduler_plan_batch_count": None,
+            "scheduler_plan_boundary_reason_counts": None,
+            "scheduler_plan_invariants": None,
+            "scheduler_plan_layer_chunk_run_count": None,
+            "scheduler_plan_layer_chunk_transition_count": None,
+            "scheduler_plan_layer_chunk_fragmentation_ratio": None,
+            "scheduler_plan_batch_fragmentation_ratio": None,
+        }
+
+    locality_summary = phase4_frontier_plan.locality_fragmentation_summary
+    boundary_reason_counts = {
+        str(key): int(value) for key, value in phase4_frontier_plan.boundary_reason_counts.items()
+    }
+    invariant_summary = {
+        str(key): value for key, value in phase4_frontier_plan.invariant_summary.items()
+    }
+    if telemetry_detail == "summary":
+        invariant_summary = {
+            "membership_preserved": bool(invariant_summary.get("membership_preserved")),
+            "duplicate_count": int(invariant_summary.get("duplicate_count", 0)),
+            "missing_count": int(invariant_summary.get("missing_count", 0)),
+            "unexpected_count": int(invariant_summary.get("unexpected_count", 0)),
+            "non_advancing_boundary_count": int(
+                invariant_summary.get("non_advancing_boundary_count", 0)
+            ),
+        }
+
+    payload: dict[str, object] = {
+        "scheduler_plan_frontier_size": int(phase4_frontier_plan.selected_frontier.numel()),
+        "scheduler_plan_membership_hash": phase4_frontier_plan.selected_membership_hash,
+        "scheduler_plan_order_hash": phase4_frontier_plan.selected_order_hash,
+        "scheduler_plan_batch_count": int(len(phase4_frontier_plan.batch_boundaries)),
+        "scheduler_plan_boundary_reason_counts": boundary_reason_counts,
+        "scheduler_plan_invariants": invariant_summary,
+        "scheduler_plan_layer_chunk_run_count": int(
+            locality_summary.get("layer_chunk_run_count", 0)
+        ),
+        "scheduler_plan_layer_chunk_transition_count": int(
+            locality_summary.get("layer_chunk_transition_count", 0)
+        ),
+        "scheduler_plan_layer_chunk_fragmentation_ratio": _safe_float(
+            locality_summary.get("layer_chunk_fragmentation_ratio")
+        ),
+        "scheduler_plan_batch_fragmentation_ratio": _safe_float(
+            locality_summary.get("batch_fragmentation_ratio")
+        ),
+    }
+    if telemetry_detail in {"normal", "debug"}:
+        payload["scheduler_plan_locality_fragmentation"] = dict(locality_summary)
+    if telemetry_detail == "debug":
+        boundary_sample = phase4_frontier_plan.batch_boundaries[:8]
+        payload["scheduler_plan_batch_boundaries_sample"] = [
+            [int(start), int(end)] for start, end in boundary_sample
+        ]
+        payload["scheduler_plan_batch_boundaries_sample_count"] = int(len(boundary_sample))
+    return payload
+
+
+def _build_phase4_planner_v2_refresh_telemetry_disabled() -> dict[str, object]:
+    return {
+        "scheduler_planner_v2_enabled": False,
+        "scheduler_planner_v2_policy_version": None,
+        "scheduler_planner_v2_reference_frontier_size": None,
+        "scheduler_planner_v2_candidate_window_size": None,
+        "scheduler_planner_v2_candidate_window_multiplier": None,
+        "scheduler_planner_v2_locked_prefix_fraction": None,
+        "scheduler_planner_v2_locked_prefix_size": None,
+        "scheduler_planner_v2_max_replacement_fraction": None,
+        "scheduler_planner_v2_max_replacement_count": None,
+        "scheduler_planner_v2_min_score_ratio": None,
+        "scheduler_planner_v2_score_cutoff": None,
+        "scheduler_planner_v2_score_threshold": None,
+        "scheduler_planner_v2_score_threshold_applied": None,
+        "scheduler_planner_v2_candidate_window_order_hash": None,
+        "scheduler_planner_v2_candidate_window_membership_hash": None,
+        "scheduler_planner_v2_candidate_window_includes_reference": None,
+        "scheduler_planner_v2_selection_attempted": None,
+        "scheduler_planner_v2_selection_applied": None,
+        "scheduler_planner_v2_selection_changed_membership": None,
+        "scheduler_planner_v2_fallback_to_reference": None,
+        "scheduler_planner_v2_fallback_reason": None,
+        "scheduler_planner_v2_reference_membership_hash": None,
+        "scheduler_planner_v2_selected_membership_hash": None,
+        "scheduler_planner_v2_locked_prefix_membership_hash": None,
+        "scheduler_planner_v2_replacement_count": None,
+        "scheduler_planner_v2_replacement_fraction_realized": None,
+        "scheduler_planner_v2_reference_score_sum": None,
+        "scheduler_planner_v2_selected_score_sum": None,
+        "scheduler_planner_v2_selected_score_ratio": None,
+        "scheduler_planner_v2_reference_group_count": None,
+        "scheduler_planner_v2_selected_group_count": None,
+        "scheduler_planner_v2_group_count_delta": None,
+        "scheduler_planner_v2_rank_displacement_sum": None,
+    }
+
+
+def _build_phase4_planner_v2_candidate_window(
+    unvisited_feature_rank: torch.Tensor,
+    *,
+    reference_frontier: torch.Tensor,
+    reference_frontier_size: int,
+    candidate_scores: torch.Tensor,
+    window_multiplier: float = _PHASE4_PLANNER_V2_CANDIDATE_WINDOW_MULTIPLIER,
+    locked_prefix_fraction: float = _PHASE4_PLANNER_V2_LOCKED_PREFIX_FRACTION,
+    max_replacement_fraction: float = _PHASE4_PLANNER_V2_MAX_REPLACEMENT_FRACTION,
+    min_score_ratio: float = _PHASE4_PLANNER_V2_MIN_SCORE_RATIO,
+    max_window_size: int | None = None,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    if reference_frontier_size < 0:
+        raise ValueError("reference_frontier_size must be >= 0")
+
+    ranked = unvisited_feature_rank.detach().to(device="cpu", dtype=torch.long)
+    reference = reference_frontier.detach().to(device="cpu", dtype=torch.long)
+    scores = candidate_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+
+    available_count = int(ranked.numel())
+    reference_size = min(
+        int(reference_frontier_size),
+        int(reference.numel()),
+        available_count,
+    )
+
+    multiplier = max(1.0, float(window_multiplier))
+    locked_fraction = min(max(0.0, float(locked_prefix_fraction)), 1.0)
+    replacement_fraction = max(0.0, float(max_replacement_fraction))
+    score_ratio = min(max(0.0, float(min_score_ratio)), 1.0)
+
+    locked_prefix_size = min(reference_size, int(math.floor(reference_size * locked_fraction)))
+    max_replacement_count = int(math.ceil(reference_size * replacement_fraction))
+
+    multiplier_target_size = (
+        max(reference_size, int(math.ceil(reference_size * multiplier)))
+        if reference_size > 0
+        else 0
+    )
+    replacement_target_size = reference_size + max_replacement_count
+    bounded_target_size = max(
+        reference_size,
+        min(multiplier_target_size, replacement_target_size),
+    )
+    if max_window_size is not None:
+        bounded_target_size = min(bounded_target_size, int(max_window_size))
+    bounded_target_size = min(bounded_target_size, available_count)
+
+    score_cutoff = None
+    score_threshold = None
+    score_threshold_applied = False
+    if (
+        reference_size > 0
+        and scores.numel() >= reference_size
+        and scores.numel() >= available_count
+    ):
+        score_cutoff_value = float(scores[reference_size - 1].item())
+        score_cutoff = score_cutoff_value
+        if math.isfinite(score_cutoff_value) and score_cutoff_value > 0.0:
+            score_threshold = float(score_cutoff_value * score_ratio)
+            score_threshold_applied = True
+            ratio_eligible_size = int((scores[:available_count] >= score_threshold).sum().item())
+            bounded_target_size = min(
+                bounded_target_size,
+                max(reference_size, ratio_eligible_size),
+            )
+
+    window_size = bounded_target_size
+
+    missing_reference_nodes: set[int] = set()
+    if reference_size > 0:
+        reference_nodes = reference[:reference_size]
+        if window_size > 0:
+            in_window = torch.isin(reference_nodes, ranked[:window_size])
+        else:
+            in_window = torch.zeros(reference_nodes.shape, dtype=torch.bool)
+        missing_reference_nodes = {int(value) for value in reference_nodes[~in_window].tolist()}
+        if missing_reference_nodes:
+            max_reference_rank = window_size - 1
+            for rank_idx, node_idx in enumerate(ranked.tolist()):
+                if int(node_idx) in missing_reference_nodes:
+                    max_reference_rank = max(max_reference_rank, rank_idx)
+                    missing_reference_nodes.remove(int(node_idx))
+                    if not missing_reference_nodes:
+                        break
+            if missing_reference_nodes:
+                raise RuntimeError(
+                    "Planner v2 candidate window missing reference frontier nodes "
+                    "outside unvisited rank ordering"
+                )
+            window_size = max(window_size, max_reference_rank + 1)
+
+    candidate_window = ranked[:window_size]
+    candidate_window_sorted = (
+        torch.sort(candidate_window).values if candidate_window.numel() > 0 else candidate_window
+    )
+
+    includes_reference = True
+    if reference_size > 0:
+        includes_reference = bool(
+            torch.isin(reference[:reference_size], candidate_window).all().item()
+        )
+
+    telemetry: dict[str, object] = {
+        "scheduler_planner_v2_enabled": True,
+        "scheduler_planner_v2_policy_version": _PHASE4_PLANNER_V2_POLICY_VERSION,
+        "scheduler_planner_v2_reference_frontier_size": int(reference_size),
+        "scheduler_planner_v2_candidate_window_size": int(candidate_window.numel()),
+        "scheduler_planner_v2_candidate_window_multiplier": float(multiplier),
+        "scheduler_planner_v2_locked_prefix_fraction": float(locked_fraction),
+        "scheduler_planner_v2_locked_prefix_size": int(locked_prefix_size),
+        "scheduler_planner_v2_max_replacement_fraction": float(replacement_fraction),
+        "scheduler_planner_v2_max_replacement_count": int(max_replacement_count),
+        "scheduler_planner_v2_min_score_ratio": float(score_ratio),
+        "scheduler_planner_v2_score_cutoff": score_cutoff,
+        "scheduler_planner_v2_score_threshold": score_threshold,
+        "scheduler_planner_v2_score_threshold_applied": bool(score_threshold_applied),
+        "scheduler_planner_v2_candidate_window_order_hash": (
+            _hash_index_tensor(candidate_window) if candidate_window.numel() > 0 else None
+        ),
+        "scheduler_planner_v2_candidate_window_membership_hash": (
+            _hash_index_tensor(candidate_window_sorted) if candidate_window.numel() > 0 else None
+        ),
+        "scheduler_planner_v2_candidate_window_includes_reference": bool(includes_reference),
+    }
+    return candidate_window, telemetry
+
+
+def _phase4_planner_v2_group_key(
+    feature_idx: int,
+    *,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> tuple[int, int]:
+    layer_value = int(feat_layers[feature_idx].item())
+    use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
+    if use_chunk_key:
+        chunk_value = int(feat_ids[feature_idx].item()) // int(decoder_chunk_size)
+    else:
+        chunk_value = -1
+    return layer_value, chunk_value
+
+
+def _select_phase4_planner_v2_membership(
+    *,
+    unvisited_feature_rank: torch.Tensor,
+    reference_frontier: torch.Tensor,
+    reference_frontier_size: int,
+    candidate_window: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    visited: torch.Tensor,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+    locked_prefix_fraction: float = _PHASE4_PLANNER_V2_LOCKED_PREFIX_FRACTION,
+    max_replacement_fraction: float = _PHASE4_PLANNER_V2_MAX_REPLACEMENT_FRACTION,
+    min_score_ratio: float = _PHASE4_PLANNER_V2_MIN_SCORE_RATIO,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    ranked = unvisited_feature_rank.detach().to(device="cpu", dtype=torch.long)
+    reference = reference_frontier.detach().to(device="cpu", dtype=torch.long)
+    window = candidate_window.detach().to(device="cpu", dtype=torch.long)
+    scores = candidate_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+    visited_cpu = visited.detach().to(device="cpu", dtype=torch.bool).flatten()
+
+    available_count = int(ranked.numel())
+    reference_size = min(
+        int(reference_frontier_size),
+        int(reference.numel()),
+        available_count,
+    )
+    locked_fraction = min(max(0.0, float(locked_prefix_fraction)), 1.0)
+    replacement_fraction = max(0.0, float(max_replacement_fraction))
+    required_score_ratio = min(max(0.0, float(min_score_ratio)), 1.0)
+    locked_prefix_size = min(reference_size, int(math.floor(reference_size * locked_fraction)))
+    max_replacement_count = int(math.ceil(reference_size * replacement_fraction))
+
+    telemetry: dict[str, object] = {
+        "scheduler_planner_v2_selection_attempted": True,
+        "scheduler_planner_v2_selection_applied": True,
+        "scheduler_planner_v2_selection_changed_membership": False,
+        "scheduler_planner_v2_fallback_to_reference": False,
+        "scheduler_planner_v2_fallback_reason": None,
+        "scheduler_planner_v2_reference_membership_hash": None,
+        "scheduler_planner_v2_selected_membership_hash": None,
+        "scheduler_planner_v2_locked_prefix_membership_hash": None,
+        "scheduler_planner_v2_replacement_count": 0,
+        "scheduler_planner_v2_replacement_fraction_realized": 0.0,
+        "scheduler_planner_v2_reference_score_sum": None,
+        "scheduler_planner_v2_selected_score_sum": None,
+        "scheduler_planner_v2_selected_score_ratio": None,
+        "scheduler_planner_v2_reference_group_count": 0,
+        "scheduler_planner_v2_selected_group_count": 0,
+        "scheduler_planner_v2_group_count_delta": 0,
+        "scheduler_planner_v2_rank_displacement_sum": 0,
+    }
+
+    def _fallback(reason: str) -> tuple[torch.Tensor, dict[str, object]]:
+        telemetry["scheduler_planner_v2_selection_applied"] = False
+        telemetry["scheduler_planner_v2_selection_changed_membership"] = False
+        telemetry["scheduler_planner_v2_fallback_to_reference"] = True
+        telemetry["scheduler_planner_v2_fallback_reason"] = reason
+        telemetry["scheduler_planner_v2_replacement_count"] = 0
+        telemetry["scheduler_planner_v2_replacement_fraction_realized"] = 0.0
+        reference_ranked = reference[:reference_size]
+        reference_ranked_sorted = (
+            torch.sort(reference_ranked).values
+            if reference_ranked.numel() > 0
+            else reference_ranked
+        )
+        telemetry["scheduler_planner_v2_selected_membership_hash"] = (
+            _hash_index_tensor(reference_ranked_sorted)
+            if reference_ranked_sorted.numel() > 0
+            else None
+        )
+        return reference_ranked, telemetry
+
+    if reference_size <= 0:
+        return torch.empty(0, dtype=torch.long), telemetry
+
+    if scores.numel() < available_count:
+        return _fallback("score_metrics_unavailable")
+
+    rank_lookup: dict[int, int] = {}
+    score_lookup: dict[int, float] = {}
+    for rank_idx, node_idx in enumerate(ranked.tolist()):
+        node_int = int(node_idx)
+        rank_lookup[node_int] = int(rank_idx)
+        score_value = float(scores[rank_idx].item())
+        if math.isfinite(score_value):
+            score_lookup[node_int] = score_value
+
+    reference_nodes = [int(value) for value in reference[:reference_size].tolist()]
+    if len(reference_nodes) != len(set(reference_nodes)):
+        return _fallback("reference_contains_duplicates")
+
+    for node_idx in reference_nodes:
+        if node_idx >= int(visited_cpu.numel()):
+            return _fallback("reference_index_out_of_range")
+        if bool(visited_cpu[node_idx].item()):
+            return _fallback("reference_contains_visited_feature")
+        if node_idx not in rank_lookup or node_idx not in score_lookup:
+            return _fallback("score_metrics_unavailable")
+
+    reference_ranked_nodes = sorted(reference_nodes, key=lambda node: (rank_lookup[node], node))
+    locked_nodes = reference_ranked_nodes[:locked_prefix_size]
+    locked_node_set = set(locked_nodes)
+    unlocked_reference_nodes = [
+        node for node in reference_ranked_nodes if node not in locked_node_set
+    ]
+    reference_set = set(reference_ranked_nodes)
+
+    reference_score_sum = float(sum(score_lookup[node] for node in reference_ranked_nodes))
+    if not math.isfinite(reference_score_sum) or reference_score_sum <= 0.0:
+        return _fallback("score_metrics_unavailable")
+
+    telemetry["scheduler_planner_v2_reference_score_sum"] = reference_score_sum
+    telemetry["scheduler_planner_v2_reference_membership_hash"] = _hash_index_tensor(
+        torch.sort(torch.tensor(reference_ranked_nodes, dtype=torch.long)).values
+    )
+    telemetry["scheduler_planner_v2_locked_prefix_membership_hash"] = (
+        _hash_index_tensor(torch.sort(torch.tensor(locked_nodes, dtype=torch.long)).values)
+        if locked_nodes
+        else None
+    )
+
+    reference_group_counts: dict[tuple[int, int], int] = {}
+    for node in reference_ranked_nodes:
+        group_key = _phase4_planner_v2_group_key(
+            node,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        reference_group_counts[group_key] = reference_group_counts.get(group_key, 0) + 1
+
+    telemetry["scheduler_planner_v2_reference_group_count"] = int(len(reference_group_counts))
+    locked_group_set = {
+        _phase4_planner_v2_group_key(
+            node,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        for node in locked_nodes
+    }
+
+    outsider_entries: list[dict[str, object]] = []
+    seen_outsiders: set[int] = set()
+    for node_idx in window.tolist():
+        node = int(node_idx)
+        if node in reference_set or node in seen_outsiders:
+            continue
+        seen_outsiders.add(node)
+        if node >= int(visited_cpu.numel()):
+            return _fallback("candidate_window_index_out_of_range")
+        if bool(visited_cpu[node].item()):
+            return _fallback("candidate_window_contains_visited_feature")
+        rank_value = rank_lookup.get(node)
+        score_value = score_lookup.get(node)
+        if rank_value is None or score_value is None:
+            continue
+        group_key = _phase4_planner_v2_group_key(
+            node,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        outsider_entries.append(
+            {
+                "node": node,
+                "rank": rank_value,
+                "score": score_value,
+                "group": group_key,
+                "locked_group": int(group_key in locked_group_set),
+                "reference_group_count": int(reference_group_counts.get(group_key, 0)),
+            }
+        )
+
+    outsider_entries.sort(
+        key=lambda item: (
+            int(item["locked_group"]),
+            int((item["reference_group_count"] or 0) > 0),
+            int(item["reference_group_count"]),
+            float(item["score"]),
+            -int(item["rank"]),
+            -int(item["node"]),
+        ),
+        reverse=True,
+    )
+
+    removable_entries: list[dict[str, object]] = []
+    for node in unlocked_reference_nodes:
+        group_key = _phase4_planner_v2_group_key(
+            node,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        removable_entries.append(
+            {
+                "node": node,
+                "rank": int(rank_lookup[node]),
+                "score": float(score_lookup[node]),
+                "group": group_key,
+                "reference_group_count": int(reference_group_counts.get(group_key, 0)),
+            }
+        )
+
+    removable_entries.sort(
+        key=lambda item: (
+            int(item["reference_group_count"]),
+            float(item["score"]),
+            -int(item["rank"]),
+            int(item["node"]),
+        )
+    )
+
+    max_k = min(max_replacement_count, len(outsider_entries), len(removable_entries))
+    score_ratio_rejected = False
+    best_candidate: dict[str, object] | None = None
+    reference_rank_sum = int(sum(rank_lookup[node] for node in reference_ranked_nodes))
+
+    for replacement_count in range(1, max_k + 1):
+        dropped_nodes = {int(item["node"]) for item in removable_entries[:replacement_count]}
+        added_nodes = [int(item["node"]) for item in outsider_entries[:replacement_count]]
+        candidate_nodes = [
+            node for node in reference_ranked_nodes if node not in dropped_nodes
+        ] + added_nodes
+
+        if len(candidate_nodes) != reference_size:
+            continue
+        if len(set(candidate_nodes)) != reference_size:
+            continue
+
+        candidate_ranked_nodes = sorted(candidate_nodes, key=lambda node: (rank_lookup[node], node))
+        candidate_score_sum = float(sum(score_lookup[node] for node in candidate_ranked_nodes))
+        score_ratio = candidate_score_sum / reference_score_sum
+        if (not math.isfinite(score_ratio)) or score_ratio < required_score_ratio:
+            score_ratio_rejected = True
+            continue
+
+        candidate_group_count = len(
+            {
+                _phase4_planner_v2_group_key(
+                    node,
+                    feat_layers=feat_layers,
+                    feat_ids=feat_ids,
+                    exact_chunked_decoder=exact_chunked_decoder,
+                    decoder_chunk_size=decoder_chunk_size,
+                )
+                for node in candidate_ranked_nodes
+            }
+        )
+        group_delta = int(len(reference_group_counts) - candidate_group_count)
+        if group_delta <= 0:
+            continue
+
+        candidate_rank_sum = int(sum(rank_lookup[node] for node in candidate_ranked_nodes))
+        rank_displacement_sum = int(candidate_rank_sum - reference_rank_sum)
+        objective = (
+            int(group_delta),
+            int(-rank_displacement_sum),
+            float(score_ratio),
+            int(replacement_count),
+        )
+        if best_candidate is None or objective > cast(
+            tuple[int, int, float, int], best_candidate["objective"]
+        ):
+            best_candidate = {
+                "nodes": candidate_ranked_nodes,
+                "score_sum": candidate_score_sum,
+                "score_ratio": float(score_ratio),
+                "group_count": int(candidate_group_count),
+                "group_delta": int(group_delta),
+                "replacement_count": int(replacement_count),
+                "rank_displacement_sum": int(rank_displacement_sum),
+                "objective": objective,
+            }
+
+    if best_candidate is None:
+        reference_ranked_tensor = torch.tensor(reference_ranked_nodes, dtype=torch.long)
+        reference_sorted_tensor = torch.sort(reference_ranked_tensor).values
+        telemetry["scheduler_planner_v2_selected_membership_hash"] = _hash_index_tensor(
+            reference_sorted_tensor
+        )
+        telemetry["scheduler_planner_v2_selected_score_sum"] = reference_score_sum
+        telemetry["scheduler_planner_v2_selected_score_ratio"] = 1.0
+        telemetry["scheduler_planner_v2_selected_group_count"] = int(len(reference_group_counts))
+        telemetry["scheduler_planner_v2_group_count_delta"] = 0
+        telemetry["scheduler_planner_v2_rank_displacement_sum"] = 0
+        if max_k > 0 and score_ratio_rejected:
+            return _fallback("score_ratio_below_threshold")
+        return reference_ranked_tensor, telemetry
+
+    selected_nodes = cast(list[int], best_candidate["nodes"])
+    selected_tensor = torch.tensor(selected_nodes, dtype=torch.long)
+    selected_sorted = torch.sort(selected_tensor).values
+
+    if selected_tensor.numel() != reference_size:
+        return _fallback("selected_count_mismatch")
+    if int(torch.unique(selected_tensor).numel()) != reference_size:
+        return _fallback("selected_membership_not_unique")
+    if not set(locked_nodes).issubset(set(selected_nodes)):
+        return _fallback("locked_prefix_not_preserved")
+    if bool(visited_cpu[selected_tensor].any().item()):
+        return _fallback("selected_membership_contains_visited_feature")
+
+    selected_score_ratio = float(best_candidate["score_ratio"])
+    if (not math.isfinite(selected_score_ratio)) or selected_score_ratio < required_score_ratio:
+        return _fallback("score_ratio_below_threshold")
+
+    replacement_count = int(best_candidate["replacement_count"])
+    if replacement_count > max_replacement_count:
+        return _fallback("replacement_fraction_exceeded")
+
+    telemetry["scheduler_planner_v2_selection_changed_membership"] = True
+    telemetry["scheduler_planner_v2_selected_membership_hash"] = _hash_index_tensor(selected_sorted)
+    telemetry["scheduler_planner_v2_replacement_count"] = replacement_count
+    telemetry["scheduler_planner_v2_replacement_fraction_realized"] = (
+        float(replacement_count / reference_size) if reference_size > 0 else 0.0
+    )
+    telemetry["scheduler_planner_v2_selected_score_sum"] = float(best_candidate["score_sum"])
+    telemetry["scheduler_planner_v2_selected_score_ratio"] = selected_score_ratio
+    telemetry["scheduler_planner_v2_selected_group_count"] = int(best_candidate["group_count"])
+    telemetry["scheduler_planner_v2_group_count_delta"] = int(best_candidate["group_delta"])
+    telemetry["scheduler_planner_v2_rank_displacement_sum"] = int(
+        best_candidate["rank_displacement_sum"]
+    )
+
+    return selected_tensor, telemetry
+
+
+def _apply_phase4_planner_v2_refresh_plan(
+    *,
+    reference_plan: _Phase4FrontierPlan,
+    unvisited_feature_rank: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    visited: torch.Tensor,
+    max_batch_size: int,
+    max_batches: int | None,
+    feat_layers: torch.Tensor,
+    feat_positions: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> tuple[_Phase4FrontierPlan, torch.Tensor, dict[str, object]]:
+    reference_frontier = reference_plan.selected_frontier
+    reference_size = int(reference_frontier.numel())
+
+    candidate_window = torch.empty(0, dtype=torch.long)
+    telemetry = _build_phase4_planner_v2_refresh_telemetry_disabled()
+    selected_membership = reference_frontier.detach().to(device="cpu", dtype=torch.long)
+    try:
+        candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+            unvisited_feature_rank,
+            reference_frontier=reference_frontier,
+            reference_frontier_size=reference_size,
+            candidate_scores=candidate_scores,
+        )
+        selected_membership, selection_telemetry = _select_phase4_planner_v2_membership(
+            unvisited_feature_rank=unvisited_feature_rank,
+            reference_frontier=reference_frontier,
+            reference_frontier_size=reference_size,
+            candidate_window=candidate_window,
+            candidate_scores=candidate_scores,
+            visited=visited,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        telemetry.update(selection_telemetry)
+    except Exception as exc:  # pragma: no cover - defensive fail-closed path
+        reference_sorted = (
+            torch.sort(selected_membership).values
+            if selected_membership.numel() > 0
+            else selected_membership
+        )
+        telemetry.update(
+            {
+                "scheduler_planner_v2_enabled": True,
+                "scheduler_planner_v2_policy_version": _PHASE4_PLANNER_V2_POLICY_VERSION,
+                "scheduler_planner_v2_reference_frontier_size": int(reference_size),
+                "scheduler_planner_v2_selection_attempted": False,
+                "scheduler_planner_v2_selection_applied": False,
+                "scheduler_planner_v2_selection_changed_membership": False,
+                "scheduler_planner_v2_fallback_to_reference": True,
+                "scheduler_planner_v2_fallback_reason": (
+                    f"planner_v2_selection_error:{type(exc).__name__}"
+                ),
+                "scheduler_planner_v2_reference_membership_hash": (
+                    _hash_index_tensor(reference_sorted) if reference_sorted.numel() > 0 else None
+                ),
+                "scheduler_planner_v2_selected_membership_hash": (
+                    _hash_index_tensor(reference_sorted) if reference_sorted.numel() > 0 else None
+                ),
+                "scheduler_planner_v2_replacement_count": 0,
+                "scheduler_planner_v2_replacement_fraction_realized": 0.0,
+                "scheduler_planner_v2_selected_score_ratio": 1.0,
+                "scheduler_planner_v2_group_count_delta": 0,
+                "scheduler_planner_v2_rank_displacement_sum": 0,
+            }
+        )
+
+    fallback_to_reference = bool(telemetry.get("scheduler_planner_v2_fallback_to_reference", False))
+    fallback_reason = cast(str | None, telemetry.get("scheduler_planner_v2_fallback_reason"))
+    changed_membership = bool(
+        telemetry.get("scheduler_planner_v2_selection_changed_membership", False)
+    )
+
+    selected_plan = reference_plan
+    if (not fallback_to_reference) and changed_membership:
+        try:
+            candidate_plan = _plan_phase4_frontier_membership_preserving_v1(
+                selected_membership,
+                max_batch_size=max_batch_size,
+                max_batches=max_batches,
+                feat_layers=feat_layers,
+                feat_positions=feat_positions,
+                feat_ids=feat_ids,
+                exact_chunked_decoder=exact_chunked_decoder,
+                decoder_chunk_size=decoder_chunk_size,
+                apply_locality_reorder=True,
+            )
+            candidate_sorted = torch.sort(
+                candidate_plan.selected_frontier.detach().to(device="cpu", dtype=torch.long)
+            ).values
+            expected_sorted = torch.sort(
+                selected_membership.detach().to(device="cpu", dtype=torch.long)
+            ).values
+            if (
+                candidate_plan.selected_frontier.numel() != reference_size
+                or candidate_sorted.numel() != expected_sorted.numel()
+                or not torch.equal(candidate_sorted, expected_sorted)
+            ):
+                fallback_to_reference = True
+                fallback_reason = "planner_v1_execution_membership_mismatch"
+            elif bool(
+                visited.detach()
+                .to(device="cpu", dtype=torch.bool)
+                .flatten()[
+                    candidate_plan.selected_frontier.detach().to(device="cpu", dtype=torch.long)
+                ]
+                .any()
+                .item()
+            ):
+                fallback_to_reference = True
+                fallback_reason = "planner_v1_execution_contains_visited_feature"
+            else:
+                selected_plan = candidate_plan
+        except Exception as exc:  # pragma: no cover - defensive fail-closed path
+            fallback_to_reference = True
+            fallback_reason = f"planner_v1_execution_error:{type(exc).__name__}"
+
+    if fallback_to_reference:
+        selected_plan = reference_plan
+        telemetry["scheduler_planner_v2_selection_applied"] = False
+        telemetry["scheduler_planner_v2_selection_changed_membership"] = False
+        telemetry["scheduler_planner_v2_fallback_to_reference"] = True
+        telemetry["scheduler_planner_v2_fallback_reason"] = fallback_reason
+
+    planner_v2_invariants: dict[str, object] = {
+        "planner_v2_attempted": True,
+        "planner_v2_selection_applied": bool(
+            telemetry.get("scheduler_planner_v2_selection_applied", False)
+        ),
+        "planner_v2_changed_membership": bool(
+            telemetry.get("scheduler_planner_v2_selection_changed_membership", False)
+        ),
+        "planner_v2_fallback_to_reference": bool(
+            telemetry.get("scheduler_planner_v2_fallback_to_reference", False)
+        ),
+        "planner_v2_fallback_reason": telemetry.get("scheduler_planner_v2_fallback_reason"),
+        "planner_v2_replacement_count": int(
+            telemetry.get("scheduler_planner_v2_replacement_count", 0)
+        ),
+        "planner_v2_selected_score_ratio": _safe_float(
+            telemetry.get("scheduler_planner_v2_selected_score_ratio")
+        ),
+        "planner_v2_group_count_delta": int(
+            telemetry.get("scheduler_planner_v2_group_count_delta", 0)
+        ),
+    }
+
+    selected_plan = _Phase4FrontierPlan(
+        selected_frontier=selected_plan.selected_frontier,
+        batch_boundaries=selected_plan.batch_boundaries,
+        selected_membership_hash=selected_plan.selected_membership_hash,
+        selected_order_hash=selected_plan.selected_order_hash,
+        locality_fragmentation_summary=selected_plan.locality_fragmentation_summary,
+        boundary_reason_counts=selected_plan.boundary_reason_counts,
+        invariant_summary={**selected_plan.invariant_summary, **planner_v2_invariants},
+    )
+
+    return selected_plan, candidate_window, telemetry
+
+
+def _build_phase4_batch_locality_summary(
+    idx_batch: torch.Tensor,
+    *,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+) -> dict[str, object]:
+    if idx_batch.numel() <= 0:
+        return {
+            "scheduler_batch_hash": None,
+            "scheduler_batch_distinct_source_layer_count": 0,
+            "scheduler_batch_source_layer_min": None,
+            "scheduler_batch_source_layer_max": None,
+            "scheduler_batch_distinct_decoder_chunk_count": None,
+            "scheduler_batch_decoder_chunk_min": None,
+            "scheduler_batch_decoder_chunk_max": None,
+            "scheduler_batch_monotonic_chunk_order": None,
+        }
+
+    layer_values = feat_layers[idx_batch].detach().to(device="cpu", dtype=torch.long)
+    distinct_layers = torch.unique(layer_values)
+    batch_hash = _hash_index_tensor(idx_batch)
+
+    use_decoder_chunks = bool(
+        exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0
+    )
+    if use_decoder_chunks:
+        chunk_values = (
+            torch.div(
+                feat_ids[idx_batch],
+                int(decoder_chunk_size),
+                rounding_mode="floor",
+            )
+            .detach()
+            .to(device="cpu", dtype=torch.long)
+        )
+        distinct_chunks = torch.unique(chunk_values)
+        if chunk_values.numel() > 1:
+            next_layers = layer_values[1:]
+            prev_layers = layer_values[:-1]
+            next_chunks = chunk_values[1:]
+            prev_chunks = chunk_values[:-1]
+            monotonic_chunk_order = bool(
+                torch.all(
+                    (next_layers > prev_layers)
+                    | ((next_layers == prev_layers) & (next_chunks >= prev_chunks))
+                ).item()
+            )
+        else:
+            monotonic_chunk_order = True
+        distinct_chunk_count = int(distinct_chunks.numel())
+        chunk_min = int(chunk_values.min().item())
+        chunk_max = int(chunk_values.max().item())
+    else:
+        monotonic_chunk_order = None
+        distinct_chunk_count = None
+        chunk_min = None
+        chunk_max = None
+
+    return {
+        "scheduler_batch_hash": batch_hash,
+        "scheduler_batch_distinct_source_layer_count": int(distinct_layers.numel()),
+        "scheduler_batch_source_layer_min": int(layer_values.min().item()),
+        "scheduler_batch_source_layer_max": int(layer_values.max().item()),
+        "scheduler_batch_distinct_decoder_chunk_count": distinct_chunk_count,
+        "scheduler_batch_decoder_chunk_min": chunk_min,
+        "scheduler_batch_decoder_chunk_max": chunk_max,
+        "scheduler_batch_monotonic_chunk_order": monotonic_chunk_order,
+    }
+
+
+def _build_phase4_frontier_locality_fragmentation_summary(
+    selected_frontier: torch.Tensor,
+    *,
+    feat_layers: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+    batch_count: int,
+) -> dict[str, object]:
+    selected_count = int(selected_frontier.numel())
+    if selected_count <= 0:
+        return {
+            "selected_count": 0,
+            "layer_chunk_run_count": 0,
+            "layer_chunk_transition_count": 0,
+            "layer_chunk_fragmentation_ratio": 0.0,
+            "batch_count": int(batch_count),
+            "batch_fragmentation_ratio": 0.0,
+        }
+
+    layers = feat_layers[selected_frontier]
+    use_chunk_key = bool(exact_chunked_decoder and decoder_chunk_size and decoder_chunk_size > 0)
+    if use_chunk_key:
+        chunks = torch.div(
+            feat_ids[selected_frontier],
+            int(decoder_chunk_size),
+            rounding_mode="floor",
+        )
+    else:
+        chunks = torch.zeros_like(layers)
+
+    transitions = (layers[1:] != layers[:-1]) | (chunks[1:] != chunks[:-1])
+    transition_count = int(transitions.sum().item()) if transitions.numel() > 0 else 0
+    run_count = 1 + transition_count
+
+    return {
+        "selected_count": selected_count,
+        "layer_chunk_run_count": int(run_count),
+        "layer_chunk_transition_count": int(transition_count),
+        "layer_chunk_fragmentation_ratio": float(transition_count / max(1, selected_count - 1)),
+        "batch_count": int(batch_count),
+        "batch_fragmentation_ratio": float(batch_count / max(1, run_count)),
+    }
+
+
+def _plan_phase4_frontier_membership_preserving_v1(
+    pending_candidates: torch.Tensor,
+    *,
+    max_batch_size: int,
+    max_batches: int | None,
+    feat_layers: torch.Tensor,
+    feat_positions: torch.Tensor,
+    feat_ids: torch.Tensor,
+    exact_chunked_decoder: bool,
+    decoder_chunk_size: int | None,
+    apply_locality_reorder: bool = True,
+) -> _Phase4FrontierPlan:
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be > 0")
+    if max_batches is not None and max_batches <= 0:
+        raise ValueError("max_batches must be > 0 when provided")
+
+    if apply_locality_reorder:
+        planned_candidates = _reorder_pending_for_phase4_locality(
+            pending_candidates,
+            feat_layers=feat_layers,
+            feat_positions=feat_positions,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+    else:
+        planned_candidates = pending_candidates
+
+    if max_batches is None:
+        selected_count = int(planned_candidates.numel())
+    else:
+        selected_count = _compute_phase4_locality_shaped_frontier_size(
+            planned_candidates,
+            max_batch_size=max_batch_size,
+            max_batches=max_batches,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+    selected_frontier = planned_candidates[:selected_count]
+
+    if apply_locality_reorder:
+        expected_candidates = _reorder_pending_for_phase4_locality(
+            pending_candidates,
+            feat_layers=feat_layers,
+            feat_positions=feat_positions,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+    else:
+        expected_candidates = pending_candidates
+    if max_batches is None:
+        expected_selected = expected_candidates
+    else:
+        expected_count = _compute_phase4_locality_shaped_frontier_size(
+            expected_candidates,
+            max_batch_size=max_batch_size,
+            max_batches=max_batches,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        expected_selected = expected_candidates[:expected_count]
+    expected_sorted = torch.sort(
+        expected_selected.detach().to(device="cpu", dtype=torch.long)
+    ).values
+    selected_sorted = torch.sort(
+        selected_frontier.detach().to(device="cpu", dtype=torch.long)
+    ).values
+    expected_set = set(expected_sorted.tolist())
+    selected_set = set(selected_sorted.tolist())
+    missing_count = int(len(expected_set - selected_set))
+    unexpected_count = int(len(selected_set - expected_set))
+    duplicate_count = int(selected_frontier.numel() - torch.unique(selected_frontier).numel())
+    if duplicate_count > 0:
+        raise RuntimeError(
+            "Planner v1 selected frontier contains duplicate nodes "
+            f"(duplicate_count={duplicate_count})"
+        )
+    if selected_frontier.numel() != expected_selected.numel() or not torch.equal(
+        selected_sorted,
+        expected_sorted,
+    ):
+        raise RuntimeError(
+            "Planner v1 selected frontier membership mismatch against locality semantics "
+            f"(missing={missing_count}, unexpected={unexpected_count})"
+        )
+
+    batch_boundaries: list[tuple[int, int]] = []
+    boundary_reason_counts: dict[str, int] = {}
+    pending_offset = 0
+    while pending_offset < int(selected_frontier.numel()):
+        batch_end, boundary_reason = _compute_phase4_locality_shaped_batch_end_with_reason(
+            selected_frontier,
+            pending_offset=pending_offset,
+            max_batch_size=max_batch_size,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        boundary_reason_counts[boundary_reason] = boundary_reason_counts.get(boundary_reason, 0) + 1
+        if batch_end <= pending_offset:
+            raise RuntimeError(
+                "Planner v1 produced a non-advancing batch boundary "
+                f"(offset={pending_offset}, batch_end={batch_end})"
+            )
+        batch_boundaries.append((pending_offset, batch_end))
+        pending_offset = batch_end
+
+    selected_membership_hash = (
+        _hash_index_tensor(selected_sorted) if selected_frontier.numel() > 0 else None
+    )
+    selected_order_hash = (
+        _hash_index_tensor(selected_frontier) if selected_frontier.numel() > 0 else None
+    )
+    membership_preserved = bool(
+        duplicate_count == 0
+        and missing_count == 0
+        and unexpected_count == 0
+        and selected_frontier.numel() == expected_selected.numel()
+    )
+    invariant_summary: dict[str, object] = {
+        "candidate_count": int(pending_candidates.numel()),
+        "selected_count": int(selected_frontier.numel()),
+        "batch_count": int(len(batch_boundaries)),
+        "membership_preserved": membership_preserved,
+        "duplicate_count": int(duplicate_count),
+        "missing_count": int(missing_count),
+        "unexpected_count": int(unexpected_count),
+        "non_advancing_boundary_count": 0,
+    }
+
+    return _Phase4FrontierPlan(
+        selected_frontier=selected_frontier,
+        batch_boundaries=batch_boundaries,
+        selected_membership_hash=selected_membership_hash,
+        selected_order_hash=selected_order_hash,
+        locality_fragmentation_summary=_build_phase4_frontier_locality_fragmentation_summary(
+            selected_frontier,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
+            batch_count=len(batch_boundaries),
+        ),
+        boundary_reason_counts=boundary_reason_counts,
+        invariant_summary=invariant_summary,
+    )
 
 
 def _resolve_phase4_feature_batch_planner_enabled(
@@ -900,13 +3406,109 @@ def _build_vector_stats(
     }
 
 
+def _compute_row_denominator_scaled_l1(
+    row_values: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build stable row-L1 denominator representation.
+
+    Returns ``(row_abs_max, row_l1_scaled)`` where
+    ``row_l1 = row_abs_max * row_l1_scaled`` for each row.
+    """
+
+    resolved_dtype = _resolve_exact_trace_internal_dtype(dtype)
+    row_values_cpu = row_values.detach()
+    if row_values_cpu.ndim != 2:
+        raise ValueError("row_values must be rank-2")
+    if row_values_cpu.device.type != "cpu" or row_values_cpu.dtype != resolved_dtype:
+        row_values_cpu = row_values_cpu.to(device="cpu", dtype=resolved_dtype)
+
+    n_rows = int(row_values_cpu.shape[0])
+    n_cols = int(row_values_cpu.shape[1])
+    if n_cols == 0:
+        row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
+        row_l1_scaled = torch.zeros(n_rows, dtype=resolved_dtype)
+        return row_abs_max, row_l1_scaled
+
+    # Two-pass chunked reduction to avoid materializing a full abs() matrix copy.
+    col_chunk_size = min(max(n_cols, 1), 4096)
+    row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
+    for col_start in range(0, n_cols, col_chunk_size):
+        col_end = min(col_start + col_chunk_size, n_cols)
+        chunk_abs_max = row_values_cpu[:, col_start:col_end].abs().amax(dim=1)
+        row_abs_max = torch.maximum(row_abs_max, chunk_abs_max)
+
+    row_l1_scaled = torch.zeros_like(row_abs_max)
+    nonzero_rows = (row_abs_max > 0) & torch.isfinite(row_abs_max)
+    if bool(nonzero_rows.any()):
+        nonzero_denom = row_abs_max[nonzero_rows].unsqueeze(1)
+        nonzero_scaled_sum = torch.zeros(nonzero_denom.shape[0], dtype=resolved_dtype)
+        for col_start in range(0, n_cols, col_chunk_size):
+            col_end = min(col_start + col_chunk_size, n_cols)
+            chunk = row_values_cpu[nonzero_rows, col_start:col_end].abs()
+            nonzero_scaled_sum += (chunk / nonzero_denom).sum(dim=1)
+        row_l1_scaled[nonzero_rows] = nonzero_scaled_sum
+
+    infinite_rows = torch.isinf(row_abs_max)
+    if bool(infinite_rows.any()):
+        row_l1_scaled[infinite_rows] = 1
+    return row_abs_max, row_l1_scaled
+
+
 def _compute_row_abs_sums(
     row_values: torch.Tensor,
     *,
     dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
-    resolved_dtype = _resolve_exact_trace_internal_dtype(dtype)
-    return row_values.detach().to(device="cpu", dtype=resolved_dtype).abs().sum(dim=1)
+    """Backward-compatible helper for non-hot-path diagnostics/tests."""
+
+    row_abs_max, row_l1_scaled = _compute_row_denominator_scaled_l1(row_values, dtype=dtype)
+    return row_abs_max * row_l1_scaled
+
+
+def _copy_rows_to_cpu_staging(
+    rows: torch.Tensor,
+    *,
+    staging_buffer: torch.Tensor | None,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Copy a row block into a reusable CPU tensor and return a row-aligned view."""
+
+    target_dtype = rows.dtype if dtype is None else dtype
+    if rows.ndim != 2:
+        raise ValueError("rows must be rank-2")
+
+    if rows.device.type == "cpu" and rows.dtype == target_dtype:
+        return rows, staging_buffer
+
+    source = rows.detach()
+
+    n_rows = int(rows.shape[0])
+    n_cols = int(rows.shape[1])
+    needs_new_buffer = (
+        staging_buffer is None
+        or staging_buffer.device.type != "cpu"
+        or staging_buffer.dtype != target_dtype
+        or int(staging_buffer.shape[0]) < n_rows
+        or int(staging_buffer.shape[1]) < n_cols
+    )
+    if needs_new_buffer:
+        staging_buffer = torch.empty((n_rows, n_cols), dtype=target_dtype, device="cpu")
+
+    rows_cpu = staging_buffer[:n_rows, :n_cols]
+    rows_cpu.copy_(source, non_blocking=False)
+    return rows_cpu, staging_buffer
+
+
+def _row_denominator_to_row_abs_sums(
+    row_denominator: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    if isinstance(row_denominator, torch.Tensor):
+        return row_denominator
+
+    row_abs_max, row_l1_scaled = row_denominator
+    return row_abs_max * row_l1_scaled
 
 
 def _build_matrix_abs_stats(
@@ -981,10 +3583,42 @@ def _build_matrix_abs_stats(
 
 
 def _build_phase4_normalization_stats(
-    row_abs_sums: torch.Tensor,
+    row_abs_sums: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     *,
     clamp_epsilon: float = 1e-8,
 ) -> dict[str, object]:
+    if isinstance(row_abs_sums, tuple):
+        row_abs_max, row_l1_scaled = row_abs_sums
+        row_abs_max_cpu = row_abs_max.detach().to(device="cpu", dtype=torch.float64).flatten()
+        row_l1_scaled_cpu = row_l1_scaled.detach().to(device="cpu", dtype=torch.float64).flatten()
+        materialized_row_l1 = row_abs_max_cpu * row_l1_scaled_cpu
+        stats = _build_vector_stats(materialized_row_l1, epsilon=clamp_epsilon)
+        count = int(row_abs_max_cpu.numel())
+        scaled_threshold = torch.where(
+            row_abs_max_cpu > 0,
+            torch.full_like(row_abs_max_cpu, clamp_epsilon) / row_abs_max_cpu,
+            torch.full_like(row_abs_max_cpu, float("inf")),
+        )
+        clamped_mask = (
+            ~torch.isfinite(row_abs_max_cpu)
+            | ~torch.isfinite(row_l1_scaled_cpu)
+            | (row_abs_max_cpu <= 0)
+            | (row_l1_scaled_cpu <= 0)
+            | (row_l1_scaled_cpu < scaled_threshold)
+        )
+        clamped_row_count = int(clamped_mask.sum().item())
+        clamped_fraction = (clamped_row_count / count) if count else 0.0
+        stats["representation"] = "scaled_row_l1"
+        stats["effective_zero_count"] = clamped_row_count
+        stats["effective_nonzero_count"] = int(count - clamped_row_count)
+        stats["effectively_all_zero"] = bool(count == 0 or clamped_row_count == count)
+        stats["clamp_epsilon"] = float(clamp_epsilon)
+        stats["clamped_row_count"] = clamped_row_count
+        stats["clamped_row_fraction"] = float(clamped_fraction)
+        stats["row_abs_max_stats"] = _build_vector_stats(row_abs_max_cpu, epsilon=clamp_epsilon)
+        stats["row_l1_scaled_stats"] = _build_vector_stats(row_l1_scaled_cpu, epsilon=clamp_epsilon)
+        return stats
+
     stats = _build_vector_stats(row_abs_sums, epsilon=clamp_epsilon)
     count = int(stats.get("count", 0) or 0)
     effective_zero_count = int(stats.get("effective_zero_count", 0) or 0)
@@ -992,6 +3626,7 @@ def _build_phase4_normalization_stats(
     stats["clamp_epsilon"] = float(clamp_epsilon)
     stats["clamped_row_count"] = effective_zero_count
     stats["clamped_row_fraction"] = float(clamped_fraction)
+    stats["representation"] = "raw_l1"
     return stats
 
 
@@ -1003,6 +3638,129 @@ def _safe_float(value: torch.Tensor | float | int | None) -> float | None:
             return None
         return float(value.item())
     return float(value)
+
+
+def _safe_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return int(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return _safe_int(value.item())
+    return None
+
+
+def _build_phase4_refresh_substage_telemetry(
+    *,
+    telemetry_detail: Literal["summary", "normal", "debug"],
+    partial_influence_elapsed_ms: float,
+    rank_topk_elapsed_ms: float,
+    frontier_plan_elapsed_ms: float,
+    row_store_read_elapsed_ms: float | None,
+    influence_normalization_elapsed_ms: float | None,
+    influence_matmul_elapsed_ms: float | None,
+    chunk_request_count: int | None,
+    active_row_chunk_count: int | None,
+    row_reader_row_count: int | None,
+    solver_iteration_count: int | None,
+    row_chunk_strategy: str | None = None,
+    row_weight_nonzero_row_count: int | None = None,
+    row_weight_zero_row_count: int | None = None,
+    row_reader_overread_zero_row_count: int | None = None,
+    active_row_range_count: int | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "refresh_partial_influence_elapsed_ms": float(partial_influence_elapsed_ms),
+        "refresh_rank_topk_elapsed_ms": float(rank_topk_elapsed_ms),
+        "refresh_frontier_plan_elapsed_ms": float(frontier_plan_elapsed_ms),
+    }
+    if telemetry_detail in {"normal", "debug"}:
+        payload.update(
+            {
+                "refresh_row_store_read_elapsed_ms": _safe_float(row_store_read_elapsed_ms),
+                "refresh_influence_normalization_elapsed_ms": _safe_float(
+                    influence_normalization_elapsed_ms
+                ),
+                "refresh_influence_matmul_elapsed_ms": _safe_float(influence_matmul_elapsed_ms),
+                "refresh_chunk_request_count": _safe_int(chunk_request_count),
+                "refresh_active_row_chunk_count": _safe_int(active_row_chunk_count),
+                "refresh_rows_touched": _safe_int(row_reader_row_count),
+                "refresh_solver_iteration_count": _safe_int(solver_iteration_count),
+                "refresh_row_chunk_strategy": row_chunk_strategy,
+                "refresh_row_weight_nonzero_rows": _safe_int(row_weight_nonzero_row_count),
+                "refresh_row_weight_zero_rows": _safe_int(row_weight_zero_row_count),
+                "refresh_row_reader_overread_zero_rows": _safe_int(
+                    row_reader_overread_zero_row_count
+                ),
+                "refresh_active_row_range_count": _safe_int(active_row_range_count),
+            }
+        )
+    return payload
+
+
+def _build_phase4_executor_substage_telemetry(
+    *,
+    telemetry_detail: Literal["summary", "normal", "debug"],
+    compute_batch_elapsed_ms: float,
+    cpu_staging_elapsed_ms: float,
+    denominator_elapsed_ms: float,
+    row_store_write_elapsed_ms: float,
+    batch_elapsed_ms: float,
+) -> dict[str, object]:
+    accounted_elapsed_ms = (
+        compute_batch_elapsed_ms
+        + cpu_staging_elapsed_ms
+        + denominator_elapsed_ms
+        + row_store_write_elapsed_ms
+    )
+    payload: dict[str, object] = {
+        "executor_compute_batch_elapsed_ms": float(compute_batch_elapsed_ms),
+        "executor_accounted_elapsed_ms": float(accounted_elapsed_ms),
+        "executor_overhead_elapsed_ms": float(max(0.0, batch_elapsed_ms - accounted_elapsed_ms)),
+    }
+    if telemetry_detail in {"normal", "debug"}:
+        payload.update(
+            {
+                "executor_cpu_staging_elapsed_ms": float(cpu_staging_elapsed_ms),
+                "executor_denominator_elapsed_ms": float(denominator_elapsed_ms),
+                "executor_row_store_write_elapsed_ms": float(row_store_write_elapsed_ms),
+            }
+        )
+    return payload
+
+
+def _build_phase4_executor_batch_telemetry(
+    *,
+    scheduler_reference_batch_index: int,
+    scheduler_reference_batch_count: int,
+    scheduler_reference_batch_rows: int,
+    executor_microbatch_index: int,
+    executor_microbatch_count: int,
+    executor_configured_reference_batch_size: int,
+    executor_microbatch_rows: int,
+    executor_microbatch_size: int,
+) -> dict[str, object]:
+    return {
+        "phase4_batch_count": int(scheduler_reference_batch_count),
+        "phase4_batches": int(scheduler_reference_batch_count),
+        "phase4_executor_microbatch_count": int(executor_microbatch_count),
+        "phase4_executor_microbatches": int(executor_microbatch_count),
+        "scheduler_reference_batch_index": int(scheduler_reference_batch_index),
+        "scheduler_reference_batch_rows": int(scheduler_reference_batch_rows),
+        "executor_microbatch_index": int(executor_microbatch_index),
+        "executor_microbatch_rows": int(executor_microbatch_rows),
+        "executor_configured_reference_batch_size": int(executor_configured_reference_batch_size),
+        "executor_reference_batch_size": int(scheduler_reference_batch_rows),
+        "executor_microbatch_size": int(executor_microbatch_size),
+    }
 
 
 def _record_cross_cluster_checkpoint(
@@ -1079,6 +3837,7 @@ def _build_cross_cluster_runtime_snapshot(
         ),
     }
     stream_payload: dict[str, object] = {
+        "rss_current_gib": memory_snapshot.get("rss_current_gib"),
         "rss_gib": memory_snapshot.get("rss_gib"),
         "cuda_allocated_gib": memory_snapshot.get("cuda_allocated_gib"),
         "cuda_reserved_gib": memory_snapshot.get("cuda_reserved_gib"),
@@ -2829,11 +5588,16 @@ def _build_phase4_probe_pending_frontier(
 
     if feature_influences is None or actual_max_feature_nodes == total_active_feats:
         pending = torch.arange(total_active_feats)
-        max_probe_candidates = min(
-            int(pending.numel()),
-            initial_feature_batch_size * feature_batch_probe_batches,
+        probe_frontier_size = _compute_phase4_locality_shaped_frontier_size(
+            pending,
+            max_batch_size=initial_feature_batch_size,
+            max_batches=feature_batch_probe_batches,
+            feat_layers=feat_layers,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
         )
-        return pending[:max_probe_candidates]
+        return pending[:probe_frontier_size]
 
     feature_rank = torch.argsort(feature_influences, descending=True).cpu()
     queue_size = min(update_interval * initial_feature_batch_size, actual_max_feature_nodes)
@@ -2848,11 +5612,16 @@ def _build_phase4_probe_pending_frontier(
         decoder_chunk_size=decoder_chunk_size,
     )
 
-    max_probe_candidates = min(
-        int(pending.numel()),
-        initial_feature_batch_size * feature_batch_probe_batches,
+    probe_frontier_size = _compute_phase4_locality_shaped_frontier_size(
+        pending,
+        max_batch_size=initial_feature_batch_size,
+        max_batches=feature_batch_probe_batches,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=exact_chunked_decoder,
+        decoder_chunk_size=decoder_chunk_size,
     )
-    return pending[:max_probe_candidates]
+    return pending[:probe_frontier_size]
 
 
 def _plan_phase4_feature_batch_size_preflight(
@@ -2876,6 +5645,7 @@ def _plan_phase4_feature_batch_size_preflight(
     stage_encoder_vecs_on_cpu: bool | None = None,
     stage_error_vectors_on_cpu: bool | None = None,
     row_subchunk_size: int | None = None,
+    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     diagnostic_feature_cap: int | None = None,
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
@@ -2952,6 +5722,7 @@ def _plan_phase4_feature_batch_size_preflight(
             stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
+            exact_encoder_residency=exact_encoder_residency,
             internal_precision_requested=internal_precision_requested,
             resolved_dtype_map=resolved_dtype_map,
         )
@@ -3010,8 +5781,10 @@ def _plan_phase4_feature_batch_size_preflight(
                 (n_logits, total_active_feats),
                 dtype=exact_trace_internal_dtype,
             )
-            logit_row_abs_sums = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
+            logit_row_abs_max = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
+            logit_row_l1_scaled = torch.zeros(n_logits, dtype=exact_trace_internal_dtype)
             row_to_node_index = torch.arange(n_logits, dtype=torch.long) + int(logit_offset)
+            rows_cpu_staging: torch.Tensor | None = None
             for i in range(0, n_logits, effective_logit_batch_size):
                 batch = targets.logit_vectors[i : i + effective_logit_batch_size]
                 rows = ctx.compute_batch(
@@ -3021,17 +5794,23 @@ def _plan_phase4_feature_batch_size_preflight(
                     retain_graph=True,
                     phase_label="phase3_logits_probe",
                 )
-                rows_cpu = rows.to(device="cpu", dtype=exact_trace_internal_dtype)
+                rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                    rows,
+                    staging_buffer=rows_cpu_staging,
+                    dtype=exact_trace_internal_dtype,
+                )
                 end = i + batch.shape[0]
                 logit_feature_rows[i:end] = rows_cpu[:, :total_active_feats]
-                logit_row_abs_sums[i:end] = _compute_row_abs_sums(
+                row_abs_max_chunk, row_l1_scaled_chunk = _compute_row_denominator_scaled_l1(
                     rows_cpu[:, :logit_offset],
                     dtype=exact_trace_internal_dtype,
                 )
+                logit_row_abs_max[i:end] = row_abs_max_chunk
+                logit_row_l1_scaled[i:end] = row_l1_scaled_chunk
 
             feature_influences = compute_partial_feature_influences(
                 logit_feature_rows,
-                logit_row_abs_sums,
+                (logit_row_abs_max, logit_row_l1_scaled),
                 targets.logit_probabilities.detach().cpu().to(dtype=exact_trace_internal_dtype),
                 row_to_node_index,
                 n_feature_nodes=total_active_feats,
@@ -3207,7 +5986,19 @@ def attribute(
     phase3_row_donor_bundle: str | os.PathLike[str] | None = None,
     phase3_row_replay_mode: Literal["disabled", "donor"] = "disabled",
     phase3_replay_validation_policy: Literal["strict"] = "strict",
-    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
+    phase4_scheduler_debug: bool = False,
+    phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
+    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
+    phase1_trace_batch_size_max: int | None = None,
+    phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
+    phase4_refresh_interval_multiplier: int = 1,
+    phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
+    row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
@@ -3302,6 +6093,60 @@ def attribute(
         phase0_activation_threshold_compare_mode: Phase-0-only activation/
             threshold compare mode for JumpReLU membership decisions.
             ``"baseline"`` preserves default compare behavior.
+        phase4_scheduler_mode: Phase-4 frontier scheduler mode. ``"locality"``
+            keeps current behavior. ``"planner_v1"`` routes frontier selection and
+            intra-frontier batching through the membership-preserving planner core.
+            ``"planner_v2"`` enables bounded-membership selection (with explicit
+            per-refresh fallback telemetry when the planner-v1 reference plan is
+            reused). ``"legacy"`` is accepted as an alias for ``"locality"``.
+        phase4_scheduler_debug: Emit additional planner-v1 scheduler diagnostics in
+            Phase 4 logs.
+        phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
+            Phase-4 refresh/batch events. ``"summary"`` keeps compact planner
+            metadata, ``"normal"`` adds full plan aggregates, and ``"debug"``
+            additionally includes bounded samples.
+        phase4_refresh_optimization: Requested Phase-4 refresh optimization mode.
+            ``"off"`` keeps current behavior. ``"v1"`` enables the compact
+            refresh row-range reader optimization while preserving exact math.
+        phase4_row_executor: Requested Phase-4 row execution mode.
+            ``"batched"`` keeps current behavior. ``"streaming_v1"`` executes
+            compact exact-trace Phase-4 feature rows in smaller compute micro-batches
+            while preserving scheduler frontier membership/order semantics.
+        phase1_trace_batch_policy: Requested Phase-1 trace-batch sizing policy.
+            ``"legacy"`` keeps current behavior. ``"cap_effective_batches"``
+            caps only the effective Phase-1 source/invoke trace batch size to
+            ``phase1_trace_batch_size_max``.
+        phase1_trace_batch_size_max: Optional cap paired with
+            ``phase1_trace_batch_policy``. Required to activate
+            ``"cap_effective_batches"``; when omitted under that policy, execution
+            falls back to ``"legacy"`` with explicit metadata.
+        phase4_refresh_policy: Requested Phase-4 refresh cadence policy.
+            ``"standard"`` keeps current behavior; ``"deferred_v1"`` expands
+            the per-refresh pending/frontier queue for compact exact-trace Phase 4
+            (``compact_output=True`` + exact chunked decoder). Outside that path,
+            execution falls back to ``"standard"`` with explicit metadata.
+        phase4_refresh_interval_multiplier: Positive integer cadence multiplier
+            used by ``"deferred_v1"`` to scale the Phase-4 pending/frontier
+            queue window while keeping executor microbatch sizing unchanged.
+        phase4_ranker: Requested Phase-4 ranking implementation.
+            ``"argsort"`` keeps current behavior; ``"topk_v1"`` uses
+            ``torch.topk`` for Phase-4 frontier membership selection (next-K
+            pending window), then orders selected entries by descending score.
+            For equal scores at the cutoff, membership may differ from argsort.
+        row_store_cache_control: Requested compact row-store cache control mode.
+            ``"off"`` keeps current behavior;
+            ``"fadvise_dontneed_after_append_v1"`` is currently validated/
+            plumbed only and falls back to ``"off"`` execution.
+        exact_encoder_residency: Requested exact encoder residency mode.
+            ``"lazy"`` keeps current behavior. ``"active_cpu"`` and
+            ``"active_pinned_cpu"`` materialize active encoder rows during
+            Phase 0 and stage them on CPU for exact chunked decoder runs.
+            Outside exact chunked decoder execution, active modes fall back to
+            ``"lazy"`` with explicit metadata.
+        exact_trace_internal_dtype: Internal dtype for compact exact-trace
+            normalization/influence ranking path. ``"fp32"`` uses float32
+            internals and is the post-fix default; ``"fp64"`` uses float64
+            internals.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -3370,6 +6215,18 @@ def attribute(
             phase3_row_donor_bundle=phase3_row_donor_bundle,
             phase3_row_replay_mode=phase3_row_replay_mode,
             phase3_replay_validation_policy=phase3_replay_validation_policy,
+            phase4_scheduler_mode=phase4_scheduler_mode,
+            phase4_scheduler_debug=phase4_scheduler_debug,
+            phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
+            phase4_refresh_optimization=phase4_refresh_optimization,
+            phase4_row_executor=phase4_row_executor,
+            phase1_trace_batch_policy=phase1_trace_batch_policy,
+            phase1_trace_batch_size_max=phase1_trace_batch_size_max,
+            phase4_refresh_policy=phase4_refresh_policy,
+            phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
+            phase4_ranker=phase4_ranker,
+            row_store_cache_control=row_store_cache_control,
+            exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
             logger=logger,
@@ -3432,7 +6289,19 @@ def _run_attribution(
     phase3_row_donor_bundle: str | os.PathLike[str] | None = None,
     phase3_row_replay_mode: Literal["disabled", "donor"] = "disabled",
     phase3_replay_validation_policy: Literal["strict"] = "strict",
-    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
+    phase4_scheduler_debug: bool = False,
+    phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
+    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
+    phase1_trace_batch_size_max: int | None = None,
+    phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
+    phase4_refresh_interval_multiplier: int = 1,
+    phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
+    row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
@@ -3514,6 +6383,8 @@ def _run_attribution(
         internal_precision_requested=internal_precision_requested,
         phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,
     )
+    exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+    use_compact_feature_row_store = compact_output and exact_chunked_decoder
     feature_row_storage_dtype = _dtype_from_name(resolved_dtype_map["feature_row_storage_dtype"])
     row_abs_sum_dtype = _dtype_from_name(resolved_dtype_map["row_abs_sum_dtype"])
     influence_compute_dtype = _dtype_from_name(resolved_dtype_map["influence_compute_dtype"])
@@ -3531,10 +6402,87 @@ def _run_attribution(
         raise ValueError("semantic_descriptor_top_k must be > 0")
     if semantic_descriptor_dim <= 0:
         raise ValueError("semantic_descriptor_dim must be > 0")
+    phase4_scheduler_config = _resolve_phase4_scheduler_config(
+        phase4_scheduler_mode=phase4_scheduler_mode,
+        phase4_scheduler_debug=phase4_scheduler_debug,
+        phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
+    )
+    phase4_scheduler_metadata = _build_phase4_scheduler_metadata(phase4_scheduler_config)
+    phase4_refresh_optimization_config = _resolve_phase4_refresh_optimization_config(
+        phase4_refresh_optimization,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
+    )
+    phase4_refresh_optimization_metadata = _build_phase4_refresh_optimization_metadata(
+        phase4_refresh_optimization_config
+    )
+    phase4_row_executor_config = _resolve_phase4_row_executor_config(
+        phase4_row_executor,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
+    )
+    phase4_row_executor_metadata = _build_phase4_row_executor_metadata(phase4_row_executor_config)
+    phase1_trace_batch_config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy=phase1_trace_batch_policy,
+        phase1_trace_batch_size_max=phase1_trace_batch_size_max,
+    )
+    phase1_trace_batch_metadata = _build_phase1_trace_batch_metadata(phase1_trace_batch_config)
+    phase1_trace_batch_sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=batch_size,
+        feature_batch_size=feature_batch_size,
+        logit_batch_size=logit_batch_size,
+        feature_batch_size_max=feature_batch_size_max,
+        phase1_trace_batch_config=phase1_trace_batch_config,
+    )
+    phase1_trace_batch_metadata.update(
+        _build_phase1_trace_batch_sizing_metadata(phase1_trace_batch_sizing)
+    )
+    effective_source_batch_size = phase1_trace_batch_sizing.effective_source_batch_size
+    effective_feature_batch_size = phase1_trace_batch_sizing.effective_feature_batch_size
+    effective_logit_batch_size = phase1_trace_batch_sizing.effective_logit_batch_size
+    max_phase4_feature_batch_size = (
+        phase1_trace_batch_sizing.effective_phase4_max_feature_batch_size
+    )
+    phase4_refresh_policy_config = _resolve_phase4_refresh_policy_config(
+        phase4_refresh_policy=phase4_refresh_policy,
+        phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
+    )
+    phase4_refresh_policy_metadata = _build_phase4_refresh_policy_metadata(
+        phase4_refresh_policy_config
+    )
+    phase4_ranker_config = _resolve_phase4_ranker_config(phase4_ranker)
+    phase4_ranker_metadata = _build_phase4_ranker_metadata(phase4_ranker_config)
+    row_store_cache_control_config = _resolve_row_store_cache_control_config(
+        row_store_cache_control,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
+    )
+    row_store_cache_control_metadata = _build_row_store_cache_control_metadata(
+        row_store_cache_control_config
+    )
+    exact_encoder_residency_config = _resolve_exact_encoder_residency_config(
+        exact_encoder_residency,
+        exact_chunked_decoder=exact_chunked_decoder,
+    )
+    exact_encoder_residency_metadata = _build_exact_encoder_residency_metadata(
+        exact_encoder_residency_config
+    )
+    phase4_execution_metadata: dict[str, object] = {
+        **phase4_scheduler_metadata,
+        **phase4_refresh_optimization_metadata,
+        **phase4_row_executor_metadata,
+        **phase4_refresh_policy_metadata,
+        **phase4_ranker_metadata,
+        **row_store_cache_control_metadata,
+        **exact_encoder_residency_metadata,
+    }
+    phase4_debug_summary_enabled = phase4_anomaly_debug_enabled or cross_cluster_debug_enabled
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
         compact_output=compact_output,
-        exact_chunked_decoder=bool(getattr(model.transcoders, "exact_chunked_decoder", False)),
+        exact_chunked_decoder=exact_chunked_decoder,
         profile=profile,
         phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,
     )
@@ -3580,13 +6528,11 @@ def _run_attribution(
             "phase0_donor_bundle_replay_kind": "phase0_active_features_v1",
             "semantic_descriptor_top_k": semantic_descriptor_top_k,
             "semantic_descriptor_dim": semantic_descriptor_dim,
+            **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
+            **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
         },
     )
 
-    effective_feature_batch_size = batch_size if feature_batch_size is None else feature_batch_size
-    max_phase4_feature_batch_size = (
-        effective_feature_batch_size if feature_batch_size_max is None else feature_batch_size_max
-    )
     planner_enabled = _resolve_phase4_feature_batch_planner_enabled(
         plan_feature_batch_size=plan_feature_batch_size,
         auto_scale_feature_batch_size=auto_scale_feature_batch_size,
@@ -3599,7 +6545,6 @@ def _run_attribution(
         )
     if (not planner_enabled) and max_phase4_feature_batch_size < effective_feature_batch_size:
         raise ValueError("feature_batch_size_max must be >= the effective feature batch size")
-    effective_logit_batch_size = batch_size if logit_batch_size is None else logit_batch_size
 
     exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
     planner_status, planner_skip_reason = _resolve_phase4_feature_batch_planner_status(
@@ -3703,6 +6648,9 @@ def _run_attribution(
             ),
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
+            "phase1_trace_batch": phase1_trace_batch_metadata,
+            "phase4_scheduler": phase4_scheduler_metadata,
+            "phase4_execution": phase4_execution_metadata,
             "environment": _build_phase4_environment_fingerprint(),
             "checkpoints": {},
         }
@@ -3740,7 +6688,7 @@ def _run_attribution(
                 model=model,
                 prompt=prompt,
                 attribution_targets=attribution_targets,
-                batch_size=batch_size,
+                batch_size=effective_source_batch_size,
                 initial_feature_batch_size=planner_probe_feature_batch_size,
                 effective_logit_batch_size=effective_logit_batch_size,
                 max_feature_batch_size=max_phase4_feature_batch_size,
@@ -3755,6 +6703,7 @@ def _run_attribution(
                 stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
                 stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
                 row_subchunk_size=row_subchunk_size,
+                exact_encoder_residency=exact_encoder_residency_config.requested_mode,
                 diagnostic_feature_cap=diagnostic_feature_cap,
                 feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
                 feature_batch_min_free_fraction=feature_batch_min_free_fraction,
@@ -3769,9 +6718,13 @@ def _run_attribution(
             planner_status = "executed"
 
     trace_batch_size = max(
-        batch_size,
+        effective_source_batch_size,
         effective_feature_batch_size,
         effective_logit_batch_size,
+    )
+    phase1_trace_batch_metadata.update(
+        trace_batch_size_legacy=int(phase1_trace_batch_sizing.trace_batch_size_legacy),
+        trace_batch_size_effective=int(trace_batch_size),
     )
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
@@ -3851,9 +6804,27 @@ def _run_attribution(
             f"row_subchunk_size={row_subchunk_size} | "
             f"planner_enabled={planner_enabled} | "
             f"feature_batch_size_max={max_phase4_feature_batch_size} | "
+            f"phase1_trace_batch_policy={phase1_trace_batch_config.requested_policy} "
+            f"(effective={phase1_trace_batch_config.effective_policy}, "
+            f"size_max={phase1_trace_batch_config.requested_batch_size_max}, "
+            f"size_max_effective={phase1_trace_batch_config.effective_batch_size_max}) | "
+            f"phase4_refresh_policy={phase4_refresh_policy_config.requested_policy} "
+            f"(effective={phase4_refresh_policy_config.effective_policy}, "
+            f"interval_multiplier={phase4_refresh_policy_config.requested_interval_multiplier}, "
+            f"interval_multiplier_effective={phase4_refresh_policy_config.effective_interval_multiplier}, "
+            f"queue_multiplier_effective={phase4_refresh_policy_config.effective_queue_multiplier}) | "
+            f"phase4_ranker={phase4_ranker_config.requested_mode} "
+            f"(effective={phase4_ranker_config.effective_mode}) | "
+            f"row_store_cache_control={row_store_cache_control_config.requested_mode} "
+            f"(effective={row_store_cache_control_config.effective_mode}) | "
+            f"exact_encoder_residency={exact_encoder_residency_config.requested_mode} "
+            f"(effective={exact_encoder_residency_config.effective_mode}) | "
             f"exact_trace_internal_dtype={exact_trace_internal_dtype_name} | "
-            f"prompt_tokens={input_ids.shape[-1]} | feature_batch_size={effective_feature_batch_size} | "
-            f"logit_batch_size={effective_logit_batch_size}"
+            f"prompt_tokens={input_ids.shape[-1]} | "
+            f"source_batch_size={effective_source_batch_size} | "
+            f"feature_batch_size={effective_feature_batch_size} | "
+            f"logit_batch_size={effective_logit_batch_size} | "
+            f"trace_batch_cap_reason={phase1_trace_batch_metadata.get('trace_batch_cap_reason')}"
         )
 
     ctx = model.setup_attribution(
@@ -3865,9 +6836,31 @@ def _run_attribution(
         stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
         stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
         row_subchunk_size=row_subchunk_size,
+        exact_encoder_residency=exact_encoder_residency_config.requested_mode,
         internal_precision_requested=internal_precision_requested,
         resolved_dtype_map=resolved_dtype_map,
     )
+    exact_encoder_runtime_metadata = {
+        "exact_encoder_staging_destination": getattr(
+            ctx, "exact_encoder_staging_destination", "none"
+        ),
+        "exact_encoder_materialized_during_phase0": bool(
+            getattr(ctx, "exact_encoder_materialized_during_phase0", False)
+        ),
+        "active_encoder_shape": tuple(getattr(ctx, "encoder_vecs").shape),
+        "active_encoder_bytes": int(
+            getattr(ctx, "encoder_vecs").numel() * getattr(ctx, "encoder_vecs").element_size()
+        ),
+        "exact_encoder_pinned_effective": bool(
+            getattr(ctx, "exact_encoder_pinned_effective", False)
+        ),
+        "exact_encoder_pinning_success": getattr(ctx, "exact_encoder_pinning_success", None),
+        "exact_encoder_pinning_failure_reason": getattr(
+            ctx, "exact_encoder_pinning_failure_reason", None
+        ),
+    }
+    exact_encoder_residency_metadata.update(exact_encoder_runtime_metadata)
+    phase4_execution_metadata.update(exact_encoder_runtime_metadata)
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
     if capture_phase3_gradient_bundle_enabled:
@@ -3877,6 +6870,13 @@ def _run_attribution(
         configure_ctx_trace_logging(
             logger.info if profile else None,
             telemetry_recorder=telemetry_recorder,
+        )
+    if isinstance(getattr(ctx, "setup_diagnostic_stats", None), dict):
+        ctx.setup_diagnostic_stats.update(
+            {
+                "phase1_trace_batch": dict(phase1_trace_batch_metadata),
+                "phase4_execution": dict(phase4_execution_metadata),
+            }
         )
 
     if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
@@ -4120,6 +7120,19 @@ def _run_attribution(
 
         # Phase 1: forward pass
         logger.info("Phase 1: Running forward pass")
+        logger.info(
+            "Phase 1 trace-batch policy | "
+            f"requested_policy={phase1_trace_batch_config.requested_policy} | "
+            f"effective_policy={phase1_trace_batch_config.effective_policy} | "
+            f"requested_size_max={phase1_trace_batch_config.requested_batch_size_max} | "
+            f"effective_size_max={phase1_trace_batch_config.effective_batch_size_max} | "
+            f"effective_behavior={phase1_trace_batch_config.effective_behavior} | "
+            f"source_batch_size={effective_source_batch_size} | "
+            f"feature_batch_size={effective_feature_batch_size} | "
+            f"logit_batch_size={effective_logit_batch_size} | "
+            f"cap_reason={phase1_trace_batch_metadata.get('trace_batch_cap_reason')} | "
+            f"trace_batch_size={trace_batch_size}"
+        )
         phase_start = time.perf_counter()
         _log_memory_boundary(logger, "Phase 1 start", model.device)
         with model.trace() as tracer:
@@ -4139,6 +7152,10 @@ def _run_attribution(
             name="phase1.forward_pass",
             phase="phase1",
             elapsed_ms=phase1_elapsed_ms,
+            attrs={
+                "trace_batch_size": int(trace_batch_size),
+                **phase1_trace_batch_metadata,
+            },
         )
         telemetry_recorder.record_wall_clock_duration(
             scope="phase",
@@ -4428,20 +7445,18 @@ def _run_attribution(
             f"Will include {actual_max_feature_nodes} of {total_active_feats} feature nodes"
         )
 
-        use_compact_feature_row_store = compact_output and bool(
-            getattr(model.transcoders, "exact_chunked_decoder", False)
-        )
         if use_compact_feature_row_store:
             # Benchmark-critical path only: exact chunked decoder + compact output.
             # Keep dense full-row behavior unchanged for non-compact Graph outputs.
             assert compact_output
-            assert bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+            assert exact_chunked_decoder
             feature_row_store = _FileBackedFeatureRowStore(
                 n_rows=actual_max_feature_nodes + n_logits,
                 n_feature_columns=total_active_feats,
                 dtype=exact_trace_internal_dtype_resolved,
                 row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
                 read_chunk_cache_bytes=256 * 1024 * 1024,
+                row_store_cache_control_mode=row_store_cache_control_config.effective_mode,
                 telemetry_recorder=telemetry_recorder,
             )
         else:
@@ -4468,7 +7483,9 @@ def _run_attribution(
             phase2_extra.update(
                 feature_row_store="dense_memmap",
                 feature_row_store_path=feature_row_store.path,
-                row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_sums.shape)}",
+                row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
+                row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
+                row_l1_scaled_shape=f"{tuple(feature_row_store.row_l1_scaled.shape)}",
                 feature_edge_columns=total_active_feats,
             )
         else:
@@ -4514,6 +7531,7 @@ def _run_attribution(
                 if use_compact_feature_row_store
                 else row_abs_sum_dtype
             )
+            row_denominator_component_count = 2 if use_compact_feature_row_store else 1
             row_count = int(actual_max_feature_nodes + n_logits)
             row_store_expected_bytes = (
                 row_count
@@ -4521,7 +7539,9 @@ def _run_attribution(
                 * torch.empty((), dtype=row_store_dtype_for_metrics).element_size()
             )
             row_abs_sums_expected_bytes = (
-                row_count * torch.empty((), dtype=row_abs_sum_dtype_for_metrics).element_size()
+                row_denominator_component_count
+                * row_count
+                * torch.empty((), dtype=row_abs_sum_dtype_for_metrics).element_size()
             )
             phase2_summary_checkpoint = {
                 "feat_layers_hash": _hash_index_tensor(feat_layers),
@@ -4539,8 +7559,10 @@ def _run_attribution(
                     else None
                 ),
                 "row_store_mode": phase2_extra.get("row_store_mode"),
+                "row_denominator_component_count": int(row_denominator_component_count),
                 "row_store_expected_bytes": int(row_store_expected_bytes),
                 "row_abs_sums_expected_bytes": int(row_abs_sums_expected_bytes),
+                "row_denominator_expected_bytes": int(row_abs_sums_expected_bytes),
                 "phase4_feature_batch_size_initial": int(effective_feature_batch_size),
                 **phase2_runtime_summary,
             }
@@ -4556,8 +7578,10 @@ def _run_attribution(
                 ),
                 "decoder_chunk_size": phase2_summary_checkpoint["decoder_chunk_size"],
                 "row_store_mode": phase2_summary_checkpoint["row_store_mode"],
+                "row_denominator_component_count": int(row_denominator_component_count),
                 "row_store_expected_bytes": int(row_store_expected_bytes),
                 "row_abs_sums_expected_bytes": int(row_abs_sums_expected_bytes),
+                "row_denominator_expected_bytes": int(row_abs_sums_expected_bytes),
                 "phase4_feature_batch_size_initial": int(effective_feature_batch_size),
                 **phase2_runtime_stream,
             }
@@ -4670,6 +7694,7 @@ def _run_attribution(
         phase3_feature_abs_sum_batches: list[torch.Tensor] = []
         phase3_error_abs_sum_batches: list[torch.Tensor] = []
         phase3_token_abs_sum_batches: list[torch.Tensor] = []
+        rows_cpu_staging: torch.Tensor | None = None
         for i in range(0, len(targets), effective_logit_batch_size):
             batch = targets.logit_vectors[i : i + effective_logit_batch_size]
             ctx_before = _snapshot_diagnostics(ctx) if profile else None
@@ -4683,9 +7708,13 @@ def _run_attribution(
                 inject_values=batch,
                 phase_label="phase3_logits",
             )
-            rows_cpu = rows.cpu()
+            rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                rows,
+                staging_buffer=rows_cpu_staging,
+            )
             row_input_slice = rows_cpu[:, :logit_offset]
-            row_abs_sums_cpu = _compute_row_abs_sums(
+            feature_row_slice = rows_cpu[:, :total_active_feats]
+            row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                 row_input_slice,
                 dtype=exact_trace_internal_dtype_resolved,
             )
@@ -4767,10 +7796,9 @@ def _run_attribution(
                             epsilon=1e-12,
                             top_k=8,
                         ),
-                        "row_abs_sum_stats": _build_vector_stats(
-                            row_abs_sums_cpu,
-                            epsilon=1e-8,
-                            top_k=8,
+                        "row_abs_sum_stats": _build_phase4_normalization_stats(
+                            (row_abs_max_cpu, row_l1_scaled_cpu),
+                            clamp_epsilon=1e-8,
                         ),
                     }
                 )
@@ -4779,8 +7807,8 @@ def _run_attribution(
                 end = i + batch.shape[0]
                 feature_row_store.append_rows(
                     row_start=i,
-                    feature_rows=rows_cpu[:, :total_active_feats],
-                    full_row_abs_sums=row_abs_sums_cpu,
+                    feature_rows=feature_row_slice,
+                    row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                     phase="phase3",
                 )
             else:
@@ -4812,10 +7840,9 @@ def _run_attribution(
                     epsilon=1e-12,
                     top_k=0,
                 )
-                row_abs_sum_stats = _build_vector_stats(
-                    row_abs_sums_cpu,
-                    epsilon=1e-8,
-                    top_k=0,
+                row_abs_sum_stats = _build_phase4_normalization_stats(
+                    (row_abs_max_cpu, row_l1_scaled_cpu),
+                    clamp_epsilon=1e-8,
                 )
                 _record_cross_cluster_batch_event(
                     cross_cluster_debug_batches=cross_cluster_debug_batches,
@@ -4951,23 +7978,30 @@ def _run_attribution(
                 row_store_snapshot: dict[str, float | int | None] | None = None
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
+                    row_denominator_prefix = (
+                        feature_row_store.row_abs_max[:pre_phase4_st],
+                        feature_row_store.row_l1_scaled[:pre_phase4_st],
+                    )
                     seed_feature_influences = compute_partial_feature_influences_streaming(
                         lambda row_start, row_end: feature_row_store.read_feature_rows(
                             row_start,
                             row_end,
                             phase="phase3_seed_ranking",
                         ),
-                        feature_row_store.row_abs_sums[:pre_phase4_st],
+                        row_denominator_prefix,
                         targets.logit_probabilities,
                         row_to_node_index[:pre_phase4_st],
                         n_feature_nodes=total_active_feats,
                         n_logits=n_logits,
-                        device=feature_row_store.row_abs_sums.device,
+                        device=feature_row_store.row_abs_max.device,
                         compute_dtype=planner_compute_dtype,
                     )
                     if cross_cluster_debug_summary is not None:
                         normalization_input_stats = _build_phase4_normalization_stats(
-                            feature_row_store.row_abs_sums[:pre_phase4_st].detach().cpu(),
+                            (
+                                row_denominator_prefix[0].detach().cpu(),
+                                row_denominator_prefix[1].detach().cpu(),
+                            ),
                         )
                         row_store_snapshot = feature_row_store.get_diagnostic_snapshot()
                 else:
@@ -4993,8 +8027,12 @@ def _run_attribution(
                 ).cpu()
                 candidate_scores = seed_feature_influences[unvisited_feature_rank].detach().cpu()
                 queue_size = min(
-                    update_interval * effective_feature_batch_size,
-                    actual_max_feature_nodes,
+                    _compute_phase4_refresh_queue_window_size(
+                        update_interval=update_interval,
+                        phase4_feature_batch_size=effective_feature_batch_size,
+                        queue_multiplier=phase4_refresh_policy_config.effective_queue_multiplier,
+                    ),
+                    int(actual_max_feature_nodes),
                 )
                 pre_locality_pending = unvisited_feature_rank[:queue_size]
                 post_locality_pending = _reorder_pending_for_phase4_locality(
@@ -5108,7 +8146,10 @@ def _run_attribution(
                                         row_end,
                                         phase="phase3_seed_ranking_shadow",
                                     ),
-                                    feature_row_store.row_abs_sums[:pre_phase4_st],
+                                    (
+                                        feature_row_store.row_abs_max[:pre_phase4_st],
+                                        feature_row_store.row_l1_scaled[:pre_phase4_st],
+                                    ),
                                     targets.logit_probabilities,
                                     row_to_node_index[:pre_phase4_st],
                                     n_feature_nodes=total_active_feats,
@@ -5274,9 +8315,58 @@ def _run_attribution(
         _log_memory_boundary(logger, "Phase 4 start", model.device)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
         phase4_feature_batch_size = effective_feature_batch_size
+        phase4_refresh_queue_multiplier = int(
+            phase4_refresh_policy_config.effective_queue_multiplier
+        )
+        phase4_refresh_cycle_batches = _compute_phase4_refresh_cycle_batches(
+            update_interval=update_interval,
+            queue_multiplier=phase4_refresh_queue_multiplier,
+        )
+        phase4_refresh_reference_cycle_batches = _compute_phase4_refresh_cycle_batches(
+            update_interval=update_interval,
+            queue_multiplier=1,
+        )
+        phase4_refresh_reference_queue_size = _compute_phase4_refresh_queue_window_size(
+            update_interval=update_interval,
+            phase4_feature_batch_size=phase4_feature_batch_size,
+            queue_multiplier=1,
+        )
+        phase4_refresh_effective_queue_size = _compute_phase4_refresh_queue_window_size(
+            update_interval=update_interval,
+            phase4_feature_batch_size=phase4_feature_batch_size,
+            queue_multiplier=phase4_refresh_queue_multiplier,
+        )
+        phase4_row_executor_effective_mode = phase4_row_executor_config.effective_mode
+        phase4_executor_reference_batch_size = int(phase4_feature_batch_size)
+        phase4_executor_microbatch_size = phase4_executor_reference_batch_size
+        if phase4_row_executor_effective_mode == "streaming_v1":
+            phase4_executor_microbatch_size = _resolve_phase4_streaming_v1_microbatch_size(
+                phase4_executor_reference_batch_size
+            )
+        phase4_execution_metadata.update(
+            {
+                "executor_configured_reference_batch_size": int(
+                    phase4_executor_reference_batch_size
+                ),
+                "executor_reference_batch_size": int(phase4_executor_reference_batch_size),
+                "executor_microbatch_size": int(phase4_executor_microbatch_size),
+                "refresh_cycle_batches_reference": int(phase4_refresh_reference_cycle_batches),
+                "refresh_cycle_batches_effective": int(phase4_refresh_cycle_batches),
+                "refresh_queue_size_reference": int(phase4_refresh_reference_queue_size),
+                "refresh_queue_size_effective": int(phase4_refresh_effective_queue_size),
+            }
+        )
         logger.info(
-            "Phase 4 frontier order | "
-            "mode=fixed_frontier_locality | "
+            "Phase 4 frontier scheduler | "
+            f"mode={phase4_scheduler_config.requested_mode} | "
+            f"version={phase4_scheduler_config.version} | "
+            f"policy={phase4_scheduler_config.policy} | "
+            f"effective_mode={phase4_scheduler_config.effective_mode} | "
+            f"effective_version={phase4_scheduler_config.effective_version} | "
+            f"effective_policy={phase4_scheduler_config.effective_policy} | "
+            f"effective_behavior={phase4_scheduler_config.effective_behavior} | "
+            f"debug={phase4_scheduler_config.debug} | "
+            f"telemetry_detail={phase4_scheduler_config.telemetry_detail} | "
             f"exact_chunked_decoder={exact_chunked_decoder} | "
             f"decoder_chunk_size={decoder_chunk_size}"
         )
@@ -5292,6 +8382,38 @@ def _run_attribution(
                 else ""
             )
         )
+        logger.info(
+            "Phase 4 execution flags | "
+            f"refresh_optimization={phase4_refresh_optimization_config.requested_mode}"
+            f" (effective={phase4_refresh_optimization_config.effective_mode}, "
+            f"behavior={phase4_refresh_optimization_config.effective_behavior}) | "
+            f"refresh_policy={phase4_refresh_policy_config.requested_policy}"
+            f" (effective={phase4_refresh_policy_config.effective_policy}, "
+            f"interval_multiplier={phase4_refresh_policy_config.requested_interval_multiplier}, "
+            f"interval_multiplier_effective={phase4_refresh_policy_config.effective_interval_multiplier}, "
+            f"queue_multiplier_effective={phase4_refresh_policy_config.effective_queue_multiplier}, "
+            f"queue_size_reference={phase4_refresh_reference_queue_size}, "
+            f"queue_size_effective={phase4_refresh_effective_queue_size}, "
+            f"behavior={phase4_refresh_policy_config.effective_behavior}) | "
+            f"ranker={phase4_ranker_config.requested_mode}"
+            f" (effective={phase4_ranker_config.effective_mode}, "
+            f"behavior={phase4_ranker_config.effective_behavior}) | "
+            f"row_executor={phase4_row_executor_config.requested_mode}"
+            f" (effective={phase4_row_executor_config.effective_mode}, "
+            f"behavior={phase4_row_executor_config.effective_behavior}) | "
+            f"row_store_cache_control={row_store_cache_control_config.requested_mode}"
+            f" (effective={row_store_cache_control_config.effective_mode}, "
+            f"behavior={row_store_cache_control_config.effective_behavior}) | "
+            f"exact_encoder_residency={exact_encoder_residency_config.requested_mode}"
+            f" (effective={exact_encoder_residency_config.effective_mode}, "
+            f"behavior={exact_encoder_residency_config.effective_behavior}) | "
+            f"executor_reference_batch_size={phase4_executor_reference_batch_size} | "
+            f"executor_microbatch_size={phase4_executor_microbatch_size}"
+        )
+        scheduler_uses_reference_planner = phase4_scheduler_config.effective_mode in {
+            "planner_v1",
+            "planner_v2",
+        }
         if cross_cluster_debug_summary is not None:
             _record_cross_cluster_checkpoint(
                 cross_cluster_debug_summary=cross_cluster_debug_summary,
@@ -5305,6 +8427,7 @@ def _run_attribution(
                     "planner_enabled": bool(planner_enabled),
                     "planner_status": planner_status,
                     "planner_skip_reason": planner_skip_reason,
+                    **phase4_execution_metadata,
                     "actual_max_feature_nodes": int(actual_max_feature_nodes),
                     "total_active_features": int(total_active_feats),
                     "update_interval": int(update_interval),
@@ -5313,24 +8436,31 @@ def _run_attribution(
         st = n_logits
         visited = torch.zeros(total_active_feats, dtype=torch.bool)
         n_visited = 0
-        phase4_batch_count = 0
+        phase4_scheduler_reference_batch_count = 0
+        phase4_executor_microbatch_count = 0
         phase4_refresh_count = 0
         phase4_refresh_elapsed_ms_total = 0.0
+        phase4_feature_batch_elapsed_ms_total = 0.0
+        phase4_refresh_partial_influence_elapsed_ms_total = 0.0
+        phase4_refresh_row_store_read_elapsed_ms_total = 0.0
+        phase4_refresh_rank_topk_elapsed_ms_total = 0.0
+        phase4_refresh_frontier_plan_elapsed_ms_total = 0.0
+        phase4_refresh_influence_normalization_elapsed_ms_total = 0.0
+        phase4_refresh_influence_matmul_elapsed_ms_total = 0.0
+        phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
         previous_phase4_pending: torch.Tensor | None = None
         first_phase4_pending: torch.Tensor | None = None
-        phase4_logit_probability_stats = _build_vector_stats(
-            targets.logit_probabilities.detach().to(
-                device="cpu",
-                dtype=exact_trace_internal_dtype_resolved,
-            ),
-            epsilon=1e-12,
-            top_k=8,
-        )
+        phase4_logit_probability_stats: dict[str, object] | None = None
         phase4_logit_probabilities = targets.logit_probabilities.detach().to(
             device="cpu",
             dtype=exact_trace_internal_dtype_resolved,
         )
         if anomaly_debug_result is not None:
+            phase4_logit_probability_stats = _build_vector_stats(
+                phase4_logit_probabilities,
+                epsilon=1e-12,
+                top_k=8,
+            )
             anomaly_debug_result["logit_probability_stats"] = phase4_logit_probability_stats
 
         pbar = tqdm(
@@ -5340,33 +8470,119 @@ def _run_attribution(
         )
 
         while n_visited < actual_max_feature_nodes:
+            phase4_frontier_plan: _Phase4FrontierPlan | None = None
+            pending_refresh_index: int | None = None
             if actual_max_feature_nodes == total_active_feats:
                 pending = torch.arange(total_active_feats)
+                if scheduler_uses_reference_planner:
+                    phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
+                        pending,
+                        max_batch_size=phase4_feature_batch_size,
+                        max_batches=None,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                        apply_locality_reorder=False,
+                    )
+                    pending = phase4_frontier_plan.selected_frontier
+                    phase4_no_refresh_plan_telemetry = _build_phase4_scheduler_plan_telemetry(
+                        phase4_frontier_plan=phase4_frontier_plan,
+                        telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                    )
+                    if phase4_scheduler_config.debug:
+                        logger.info(
+                            "Phase 4 scheduler plan | "
+                            f"selected_count={phase4_frontier_plan.invariant_summary.get('selected_count')} | "
+                            f"batch_count={phase4_frontier_plan.invariant_summary.get('batch_count')} | "
+                            f"boundary_reasons={phase4_frontier_plan.boundary_reason_counts}"
+                        )
             else:
+                refresh_index = int(phase4_refresh_count)
+                pending_refresh_index = refresh_index
                 refresh_start = time.perf_counter()
+                refresh_memory_before = get_memory_snapshot(model.device)
                 feature_row_store_snapshot_before = (
                     feature_row_store.get_diagnostic_snapshot()
                     if use_compact_feature_row_store and feature_row_store is not None
                     else None
                 )
-                streaming_chunk_reuse_stats: dict[str, int] | None = None
+                streaming_chunk_reuse_stats: dict[str, int | float | str] | None = None
+                refresh_row_store_read_elapsed_ms: float | None = None
+                refresh_influence_normalization_elapsed_ms: float | None = None
+                refresh_influence_matmul_elapsed_ms: float | None = None
+                refresh_chunk_request_count: int | None = None
+                refresh_active_row_chunk_count: int | None = None
+                refresh_rows_touched: int | None = None
+                refresh_solver_iteration_count: int | None = None
+                refresh_row_chunk_strategy: str | None = None
+                refresh_row_weight_nonzero_rows: int | None = None
+                refresh_row_weight_zero_rows: int | None = None
+                refresh_row_reader_overread_zero_rows: int | None = None
+                refresh_active_row_range_count: int | None = None
+                partial_influence_start = time.perf_counter()
                 if use_compact_feature_row_store:
                     assert feature_row_store is not None
                     streaming_chunk_reuse_stats = {}
+                    refresh_active_row_only_chunks = (
+                        phase4_refresh_optimization_config.effective_mode == "v1"
+                    )
+                    row_denominator_prefix = (
+                        feature_row_store.row_abs_max[:st],
+                        feature_row_store.row_l1_scaled[:st],
+                    )
                     feature_influences = compute_partial_feature_influences_streaming(
                         lambda row_start, row_end: feature_row_store.read_feature_rows(
                             row_start,
                             row_end,
                             phase="phase4",
                         ),
-                        feature_row_store.row_abs_sums[:st],
+                        row_denominator_prefix,
                         phase4_logit_probabilities,
                         row_to_node_index[:st],
                         n_feature_nodes=total_active_feats,
                         n_logits=n_logits,
-                        device=feature_row_store.row_abs_sums.device,
+                        device=feature_row_store.row_abs_max.device,
                         chunk_reuse_stats=streaming_chunk_reuse_stats,
                         compute_dtype=influence_compute_dtype,
+                        active_row_only_chunks=refresh_active_row_only_chunks,
+                    )
+                    refresh_row_store_read_elapsed_ms = _safe_float(
+                        streaming_chunk_reuse_stats.get("row_reader_elapsed_ms_total")
+                    )
+                    refresh_influence_normalization_elapsed_ms = _safe_float(
+                        streaming_chunk_reuse_stats.get("normalization_elapsed_ms_total")
+                    )
+                    refresh_influence_matmul_elapsed_ms = _safe_float(
+                        streaming_chunk_reuse_stats.get("matmul_elapsed_ms_total")
+                    )
+                    refresh_chunk_request_count = _safe_int(
+                        streaming_chunk_reuse_stats.get("chunk_request_count")
+                    )
+                    refresh_active_row_chunk_count = _safe_int(
+                        streaming_chunk_reuse_stats.get("active_row_chunk_count")
+                    )
+                    refresh_rows_touched = _safe_int(
+                        streaming_chunk_reuse_stats.get("row_reader_row_count")
+                    )
+                    refresh_solver_iteration_count = _safe_int(
+                        streaming_chunk_reuse_stats.get("iteration_count")
+                    )
+                    row_chunk_strategy_value = streaming_chunk_reuse_stats.get("row_chunk_strategy")
+                    if isinstance(row_chunk_strategy_value, str):
+                        refresh_row_chunk_strategy = row_chunk_strategy_value
+                    refresh_row_weight_nonzero_rows = _safe_int(
+                        streaming_chunk_reuse_stats.get("row_weight_nonzero_row_count")
+                    )
+                    refresh_row_weight_zero_rows = _safe_int(
+                        streaming_chunk_reuse_stats.get("row_weight_zero_row_count")
+                    )
+                    refresh_row_reader_overread_zero_rows = _safe_int(
+                        streaming_chunk_reuse_stats.get("row_reader_overread_zero_row_count")
+                    )
+                    refresh_active_row_range_count = _safe_int(
+                        streaming_chunk_reuse_stats.get("active_row_range_count")
                     )
                 else:
                     influences = compute_partial_influences(
@@ -5377,23 +8593,90 @@ def _run_attribution(
                     )
                     feature_influences = influences[:total_active_feats]
 
-                feature_rank = torch.argsort(feature_influences, descending=True).cpu()
-                unvisited_feature_rank = feature_rank[~visited[feature_rank]]
-                candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
-                rank_signal_stats = _build_vector_stats(
-                    candidate_scores,
-                    epsilon=1e-12,
-                    top_k=8,
+                refresh_partial_influence_elapsed_ms = (
+                    time.perf_counter() - partial_influence_start
+                ) * 1000.0
+                phase4_refresh_partial_influence_elapsed_ms_total += (
+                    refresh_partial_influence_elapsed_ms
                 )
-                if use_compact_feature_row_store:
-                    assert feature_row_store is not None
-                    normalization_input_stats = _build_phase4_normalization_stats(
-                        feature_row_store.row_abs_sums[:st].detach().cpu(),
+                if refresh_row_store_read_elapsed_ms is not None:
+                    phase4_refresh_row_store_read_elapsed_ms_total += (
+                        refresh_row_store_read_elapsed_ms
                     )
-                else:
-                    normalization_input_stats = _build_phase4_normalization_stats(
-                        edge_matrix[:st, :logit_offset].abs().sum(dim=1).detach().cpu(),
+                if refresh_influence_normalization_elapsed_ms is not None:
+                    phase4_refresh_influence_normalization_elapsed_ms_total += (
+                        refresh_influence_normalization_elapsed_ms
                     )
+                if refresh_influence_matmul_elapsed_ms is not None:
+                    phase4_refresh_influence_matmul_elapsed_ms_total += (
+                        refresh_influence_matmul_elapsed_ms
+                    )
+
+                max_frontier_size = min(
+                    _compute_phase4_refresh_queue_window_size(
+                        update_interval=update_interval,
+                        phase4_feature_batch_size=phase4_feature_batch_size,
+                        queue_multiplier=phase4_refresh_queue_multiplier,
+                    ),
+                    int(actual_max_feature_nodes - n_visited),
+                )
+
+                rank_topk_start = time.perf_counter()
+                rank_selection = _select_phase4_frontier_rank_selection(
+                    feature_influences=feature_influences,
+                    visited=visited,
+                    frontier_size=max_frontier_size,
+                    ranker_mode=phase4_ranker_config.effective_mode,
+                )
+                pending_candidates = rank_selection.selected_frontier
+                unvisited_feature_rank: torch.Tensor | None = None
+                if (
+                    phase4_scheduler_config.requested_mode == "planner_v2"
+                    or phase4_debug_summary_enabled
+                ):
+                    unvisited_feature_rank = _rank_phase4_unvisited_features_argsort(
+                        feature_influences,
+                        visited,
+                    )
+
+                ranker_refresh_telemetry = {
+                    "ranker_frontier_candidate_count": int(rank_selection.candidate_count),
+                    "ranker_frontier_selected_count": int(rank_selection.selected_count),
+                    "ranker_frontier_selected_hash": rank_selection.selected_order_hash,
+                    "ranker_frontier_selected_order_hash": rank_selection.selected_order_hash,
+                    "ranker_frontier_selected_membership_hash": (
+                        rank_selection.selected_membership_hash
+                    ),
+                    "ranker_frontier_cutoff_score": rank_selection.cutoff_score,
+                    "ranker_frontier_tie_count_at_cutoff": int(rank_selection.tie_count_at_cutoff),
+                    "ranker_frontier_tie_at_cutoff": bool(rank_selection.tie_at_cutoff),
+                    "ranker_frontier_tie_behavior": rank_selection.tie_behavior,
+                }
+                candidate_scores: torch.Tensor | None = None
+                rank_signal_stats: dict[str, object] | None = None
+                normalization_input_stats: dict[str, object] | None = None
+                if phase4_debug_summary_enabled:
+                    if unvisited_feature_rank is not None:
+                        candidate_scores = feature_influences[unvisited_feature_rank].detach().cpu()
+                    else:
+                        candidate_scores = rank_selection.selected_scores
+                    rank_signal_stats = _build_vector_stats(
+                        candidate_scores,
+                        epsilon=1e-12,
+                        top_k=8,
+                    )
+                    if use_compact_feature_row_store:
+                        assert feature_row_store is not None
+                        normalization_input_stats = _build_phase4_normalization_stats(
+                            (
+                                feature_row_store.row_abs_max[:st].detach().cpu(),
+                                feature_row_store.row_l1_scaled[:st].detach().cpu(),
+                            ),
+                        )
+                    else:
+                        normalization_input_stats = _build_phase4_normalization_stats(
+                            edge_matrix[:st, :logit_offset].abs().sum(dim=1).detach().cpu(),
+                        )
                 feature_row_store_snapshot_after = (
                     feature_row_store.get_diagnostic_snapshot()
                     if use_compact_feature_row_store and feature_row_store is not None
@@ -5407,19 +8690,116 @@ def _run_attribution(
                     if feature_row_store_snapshot_after is not None
                     else None
                 )
-                queue_size = min(
-                    update_interval * phase4_feature_batch_size,
-                    actual_max_feature_nodes - n_visited,
+                refresh_rank_topk_elapsed_ms = (time.perf_counter() - rank_topk_start) * 1000.0
+                phase4_refresh_rank_topk_elapsed_ms_total += refresh_rank_topk_elapsed_ms
+
+                frontier_plan_start = time.perf_counter()
+                if scheduler_uses_reference_planner:
+                    phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
+                        pending_candidates,
+                        max_batch_size=phase4_feature_batch_size,
+                        max_batches=phase4_refresh_cycle_batches,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                        apply_locality_reorder=True,
+                    )
+                    pending = phase4_frontier_plan.selected_frontier
+                    queue_size = int(pending.numel())
+                    if phase4_scheduler_config.debug:
+                        logger.info(
+                            "Phase 4 scheduler plan | "
+                            f"membership_hash={phase4_frontier_plan.selected_membership_hash} | "
+                            f"order_hash={phase4_frontier_plan.selected_order_hash} | "
+                            f"fragmentation={phase4_frontier_plan.locality_fragmentation_summary} | "
+                            f"boundary_reasons={phase4_frontier_plan.boundary_reason_counts} | "
+                            f"invariants={phase4_frontier_plan.invariant_summary}"
+                        )
+                else:
+                    pending = _reorder_pending_for_phase4_locality(
+                        pending_candidates,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                    queue_size = _compute_phase4_locality_shaped_frontier_size(
+                        pending,
+                        max_batch_size=phase4_feature_batch_size,
+                        max_batches=phase4_refresh_cycle_batches,
+                        feat_layers=feat_layers,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                    pending = pending[:queue_size]
+
+                planner_v2_candidate_window = torch.empty(0, dtype=torch.long)
+                planner_v2_refresh_telemetry = _build_phase4_planner_v2_refresh_telemetry_disabled()
+                if (
+                    phase4_scheduler_config.requested_mode == "planner_v2"
+                    and phase4_frontier_plan is not None
+                ):
+                    assert unvisited_feature_rank is not None
+                    planner_v2_candidate_scores = feature_influences[unvisited_feature_rank]
+                    (
+                        phase4_frontier_plan,
+                        planner_v2_candidate_window,
+                        planner_v2_refresh_telemetry,
+                    ) = _apply_phase4_planner_v2_refresh_plan(
+                        reference_plan=phase4_frontier_plan,
+                        unvisited_feature_rank=unvisited_feature_rank,
+                        candidate_scores=planner_v2_candidate_scores,
+                        visited=visited,
+                        max_batch_size=phase4_feature_batch_size,
+                        max_batches=phase4_refresh_cycle_batches,
+                        feat_layers=feat_layers,
+                        feat_positions=feat_pos,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                    pending = phase4_frontier_plan.selected_frontier
+                    queue_size = int(pending.numel())
+                    if phase4_scheduler_config.debug:
+                        logger.info(
+                            "Phase 4 planner_v2 refresh | "
+                            f"reference_frontier_size={planner_v2_refresh_telemetry.get('scheduler_planner_v2_reference_frontier_size')} | "
+                            f"candidate_window_size={planner_v2_refresh_telemetry.get('scheduler_planner_v2_candidate_window_size')} | "
+                            f"changed_membership={planner_v2_refresh_telemetry.get('scheduler_planner_v2_selection_changed_membership')} | "
+                            f"fallback={planner_v2_refresh_telemetry.get('scheduler_planner_v2_fallback_to_reference')} | "
+                            f"fallback_reason={planner_v2_refresh_telemetry.get('scheduler_planner_v2_fallback_reason')}"
+                        )
+                phase4_plan_telemetry = _build_phase4_scheduler_plan_telemetry(
+                    phase4_frontier_plan=phase4_frontier_plan,
+                    telemetry_detail=phase4_scheduler_config.telemetry_detail,
                 )
-                pending = unvisited_feature_rank[:queue_size]
-                pending = _reorder_pending_for_phase4_locality(
-                    pending,
-                    feat_layers=feat_layers,
-                    feat_positions=feat_pos,
-                    feat_ids=feat_ids,
-                    exact_chunked_decoder=exact_chunked_decoder,
-                    decoder_chunk_size=decoder_chunk_size,
+                refresh_frontier_plan_elapsed_ms = (
+                    time.perf_counter() - frontier_plan_start
+                ) * 1000.0
+                phase4_refresh_frontier_plan_elapsed_ms_total += refresh_frontier_plan_elapsed_ms
+                refresh_substage_telemetry = _build_phase4_refresh_substage_telemetry(
+                    telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                    partial_influence_elapsed_ms=refresh_partial_influence_elapsed_ms,
+                    rank_topk_elapsed_ms=refresh_rank_topk_elapsed_ms,
+                    frontier_plan_elapsed_ms=refresh_frontier_plan_elapsed_ms,
+                    row_store_read_elapsed_ms=refresh_row_store_read_elapsed_ms,
+                    influence_normalization_elapsed_ms=refresh_influence_normalization_elapsed_ms,
+                    influence_matmul_elapsed_ms=refresh_influence_matmul_elapsed_ms,
+                    chunk_request_count=refresh_chunk_request_count,
+                    active_row_chunk_count=refresh_active_row_chunk_count,
+                    row_reader_row_count=refresh_rows_touched,
+                    solver_iteration_count=refresh_solver_iteration_count,
+                    row_chunk_strategy=refresh_row_chunk_strategy,
+                    row_weight_nonzero_row_count=refresh_row_weight_nonzero_rows,
+                    row_weight_zero_row_count=refresh_row_weight_zero_rows,
+                    row_reader_overread_zero_row_count=refresh_row_reader_overread_zero_rows,
+                    active_row_range_count=refresh_active_row_range_count,
                 )
+                refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
                 phase4_refresh_elapsed_ms_total += refresh_elapsed_ms
                 telemetry_recorder.record_event(
@@ -5429,26 +8809,59 @@ def _run_attribution(
                     batch_index=phase4_refresh_count + 1,
                     elapsed_ms=refresh_elapsed_ms,
                     attrs={
-                        "refresh_index": int(phase4_refresh_count),
+                        "refresh_index": refresh_index,
                         "stored_rows": int(st),
                         "visited_features": int(n_visited),
-                        "frontier_candidate_count": int(candidate_scores.numel()),
+                        "frontier_candidate_count": int(rank_selection.candidate_count),
                         "queue_size": int(queue_size),
-                        "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
-                        "rank_effective_nonzero_count": int(
-                            rank_signal_stats["effective_nonzero_count"]
+                        "pending_count": int(pending.numel()),
+                        "pending_hash": _hash_index_tensor(pending)
+                        if pending.numel() > 0
+                        else None,
+                        **phase4_execution_metadata,
+                        **ranker_refresh_telemetry,
+                        **planner_v2_refresh_telemetry,
+                        **phase4_plan_telemetry,
+                        **refresh_substage_telemetry,
+                        "rank_nonzero_count": (
+                            int(rank_signal_stats["nonzero_count"])
+                            if rank_signal_stats is not None
+                            else None
                         ),
-                        "rank_max": _safe_float(rank_signal_stats.get("max")),
-                        "rank_abs_sum": _safe_float(rank_signal_stats.get("abs_sum")),
-                        "rank_all_zero": bool(rank_signal_stats["all_zero"]),
-                        "rank_effectively_all_zero": bool(
-                            rank_signal_stats["effectively_all_zero"]
+                        "rank_effective_nonzero_count": (
+                            int(rank_signal_stats["effective_nonzero_count"])
+                            if rank_signal_stats is not None
+                            else None
                         ),
-                        "normalization_clamped_row_count": int(
-                            normalization_input_stats["clamped_row_count"]
+                        "rank_max": (
+                            _safe_float(rank_signal_stats.get("max"))
+                            if rank_signal_stats is not None
+                            else None
                         ),
-                        "normalization_clamped_row_fraction": _safe_float(
-                            normalization_input_stats.get("clamped_row_fraction")
+                        "rank_abs_sum": (
+                            _safe_float(rank_signal_stats.get("abs_sum"))
+                            if rank_signal_stats is not None
+                            else None
+                        ),
+                        "rank_all_zero": (
+                            bool(rank_signal_stats["all_zero"])
+                            if rank_signal_stats is not None
+                            else None
+                        ),
+                        "rank_effectively_all_zero": (
+                            bool(rank_signal_stats["effectively_all_zero"])
+                            if rank_signal_stats is not None
+                            else None
+                        ),
+                        "normalization_clamped_row_count": (
+                            int(normalization_input_stats["clamped_row_count"])
+                            if normalization_input_stats is not None
+                            else None
+                        ),
+                        "normalization_clamped_row_fraction": (
+                            _safe_float(normalization_input_stats.get("clamped_row_fraction"))
+                            if normalization_input_stats is not None
+                            else None
                         ),
                         "feature_row_store_read_calls": _safe_float(
                             (feature_row_store_read_stats or {}).get("read_call_count")
@@ -5507,6 +8920,20 @@ def _run_attribution(
                                 "chunk_cache_store_skip_too_large_count"
                             )
                         ),
+                        "feature_row_store_materialize_calls": _safe_float(
+                            (feature_row_store_read_stats or {}).get("materialize_call_count")
+                        ),
+                        "feature_row_store_materialize_rows": _safe_float(
+                            (feature_row_store_read_stats or {}).get("materialize_row_count")
+                        ),
+                        "feature_row_store_materialize_columns": _safe_float(
+                            (feature_row_store_read_stats or {}).get("materialize_column_count")
+                        ),
+                        **build_memory_before_after_attrs(
+                            before=refresh_memory_before,
+                            after=refresh_memory_after,
+                            keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
+                        ),
                     },
                 )
                 telemetry_recorder.record_wall_clock_duration(
@@ -5515,21 +8942,36 @@ def _run_attribution(
                     elapsed_ms=refresh_elapsed_ms,
                 )
                 if cross_cluster_debug_batches is not None:
+                    assert rank_signal_stats is not None
+                    assert normalization_input_stats is not None
                     _record_cross_cluster_batch_event(
                         cross_cluster_debug_batches=cross_cluster_debug_batches,
                         event_name="phase4.refresh",
                         phase="phase4",
                         event_index=phase4_refresh_count + 1,
                         payload={
-                            "refresh_index": int(phase4_refresh_count),
+                            "refresh_index": refresh_index,
                             "stored_rows": int(st),
                             "visited_features": int(n_visited),
-                            "frontier_candidate_count": int(candidate_scores.numel()),
+                            "frontier_candidate_count": int(rank_selection.candidate_count),
                             "queue_size": int(queue_size),
                             "pending_count": int(pending.numel()),
                             "pending_hash": (
                                 _hash_index_tensor(pending) if pending.numel() > 0 else None
                             ),
+                            "planner_v2_candidate_window_size": int(
+                                planner_v2_candidate_window.numel()
+                            ),
+                            "planner_v2_candidate_window_hash": (
+                                _hash_index_tensor(planner_v2_candidate_window)
+                                if planner_v2_candidate_window.numel() > 0
+                                else None
+                            ),
+                            **phase4_execution_metadata,
+                            **ranker_refresh_telemetry,
+                            **planner_v2_refresh_telemetry,
+                            **phase4_plan_telemetry,
+                            **refresh_substage_telemetry,
                             "rank_nonzero_count": int(rank_signal_stats["nonzero_count"]),
                             "rank_effective_nonzero_count": int(
                                 rank_signal_stats["effective_nonzero_count"]
@@ -5557,9 +8999,11 @@ def _run_attribution(
                         },
                     )
                 if anomaly_debug_result is not None:
+                    assert candidate_scores is not None
+                    assert phase4_logit_probability_stats is not None
                     _record_phase4_refresh_debug(
                         anomaly_debug_result,
-                        refresh_index=phase4_refresh_count,
+                        refresh_index=refresh_index,
                         n_visited=n_visited,
                         queue_size=queue_size,
                         pending=pending,
@@ -5577,6 +9021,7 @@ def _run_attribution(
                     assert isinstance(debug_records, list) and debug_records
                     current_debug_record = debug_records[-1]
                     assert isinstance(current_debug_record, dict)
+                    assert unvisited_feature_rank is not None
                     deterministic_pending = _build_phase4_deterministic_shadow_pending(
                         unvisited_feature_rank,
                         feature_influences.detach().cpu(),
@@ -5594,6 +9039,14 @@ def _run_attribution(
                     if phase4_refresh_count == 0:
                         if use_compact_feature_row_store:
                             assert feature_row_store is not None
+                            shadow_row_denominator = (
+                                feature_row_store.row_abs_max[:st].to(
+                                    dtype=shadow_debug_compute_dtype
+                                ),
+                                feature_row_store.row_l1_scaled[:st].to(
+                                    dtype=shadow_debug_compute_dtype
+                                ),
+                            )
                             float64_feature_influences = (
                                 compute_partial_feature_influences_streaming(
                                     lambda row_start, row_end: feature_row_store.read_feature_rows(
@@ -5601,9 +9054,7 @@ def _run_attribution(
                                         row_end,
                                         phase="phase4_anomaly_debug",
                                     ),
-                                    feature_row_store.row_abs_sums[:st].to(
-                                        dtype=shadow_debug_compute_dtype
-                                    ),
+                                    shadow_row_denominator,
                                     phase4_logit_probabilities.to(dtype=shadow_debug_compute_dtype),
                                     row_to_node_index[:st],
                                     n_feature_nodes=total_active_feats,
@@ -5624,6 +9075,10 @@ def _run_attribution(
                             float32_feature_influences = feature_influences
                         elif use_compact_feature_row_store:
                             assert feature_row_store is not None
+                            float32_row_denominator = (
+                                feature_row_store.row_abs_max[:st].to(dtype=torch.float32),
+                                feature_row_store.row_l1_scaled[:st].to(dtype=torch.float32),
+                            )
                             float32_feature_influences = (
                                 compute_partial_feature_influences_streaming(
                                     lambda row_start, row_end: feature_row_store.read_feature_rows(
@@ -5631,7 +9086,7 @@ def _run_attribution(
                                         row_end,
                                         phase="phase4_anomaly_debug",
                                     ),
-                                    feature_row_store.row_abs_sums[:st].to(dtype=torch.float32),
+                                    float32_row_denominator,
                                     phase4_logit_probabilities.to(dtype=torch.float32),
                                     row_to_node_index[:st],
                                     n_feature_nodes=total_active_feats,
@@ -5695,143 +9150,287 @@ def _run_attribution(
                 phase4_refresh_count += 1
 
             pending_offset = 0
+            planned_boundaries = (
+                phase4_frontier_plan.batch_boundaries
+                if scheduler_uses_reference_planner and phase4_frontier_plan is not None
+                else None
+            )
+            planned_boundary_offset = 0
             while pending_offset < len(pending):
-                idx_batch = pending[pending_offset : pending_offset + phase4_feature_batch_size]
-                pending_offset += len(idx_batch)
-                n_visited += len(idx_batch)
-                phase4_batch_count += 1
-
-                ctx_before = _snapshot_diagnostics(ctx) if profile else None
-                transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
-                batch_start = time.perf_counter()
-                rows = ctx.compute_batch(
-                    layers=feat_layers[idx_batch],
-                    positions=feat_pos[idx_batch],
-                    inject_values=ctx.materialize_encoder_vectors(idx_batch),
-                    retain_graph=n_visited < actual_max_feature_nodes,
-                    phase_label="phase4_features",
-                )
-
-                row_count = rows.shape[0]
-                end = st + row_count
-                rows_cpu = rows.cpu()
-                row_input_slice = rows_cpu[:row_count, :logit_offset]
-                row_abs_sums_cpu = _compute_row_abs_sums(
-                    row_input_slice,
-                    dtype=exact_trace_internal_dtype_resolved,
-                )
-                if anomaly_debug_result is not None and phase4_batch_count <= 2:
-                    feature_row_batches = anomaly_debug_result.setdefault(
-                        "phase4_feature_row_batches",
-                        [],
-                    )
-                    assert isinstance(feature_row_batches, list)
-                    feature_row_batches.append(
-                        {
-                            "batch_index": int(phase4_batch_count),
-                            "batch_row_count": int(row_count),
-                            "row_input_stats": _build_matrix_abs_stats(
-                                row_input_slice,
-                                epsilon=1e-12,
-                                top_k=8,
-                            ),
-                            "row_abs_sum_stats": _build_vector_stats(
-                                row_abs_sums_cpu,
-                                epsilon=1e-8,
-                                top_k=8,
-                            ),
-                        }
-                    )
-                if use_compact_feature_row_store:
-                    assert feature_row_store is not None
-                    feature_row_store.append_rows(
-                        row_start=st,
-                        feature_rows=rows_cpu[:row_count, :total_active_feats],
-                        full_row_abs_sums=row_abs_sums_cpu,
-                        phase="phase4",
-                    )
-                else:
-                    edge_matrix[st:end, :logit_offset] = rows_cpu
-                row_to_node_index[st:end] = idx_batch
-                visited[idx_batch] = True
-                st = end
-                pbar.update(len(idx_batch))
-
-                if profile:
-                    batch_number = phase4_batch_count
-                    if batch_number % profile_log_interval == 0:
-                        batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
-                        _log_batch_profile(
-                            logger,
-                            "Phase 4",
-                            batch_number,
-                            max(
-                                (actual_max_feature_nodes + phase4_feature_batch_size - 1)
-                                // phase4_feature_batch_size,
-                                1,
-                            ),
-                            batch_elapsed_ms / 1000.0,
-                            ctx_before,
-                            _snapshot_diagnostics(ctx),
-                            transcoder_before,
-                            _snapshot_diagnostics(model.transcoders),
+                if planned_boundaries is not None:
+                    if planned_boundary_offset >= len(planned_boundaries):
+                        raise RuntimeError(
+                            "Planner v1 exhausted planned boundaries before pending frontier completion"
                         )
-                batch_number = phase4_batch_count
-                batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
-                telemetry_recorder.record_event(
-                    scope="batch",
-                    name="phase4.feature_batch",
-                    phase="phase4",
-                    batch_index=batch_number,
-                    elapsed_ms=batch_elapsed_ms,
-                    attrs={
-                        "batch_rows": int(row_count),
-                        "visited_features": int(n_visited),
-                        "target_feature_count": int(actual_max_feature_nodes),
-                    },
-                )
-                telemetry_recorder.record_wall_clock_duration(
-                    scope="batch",
-                    name="phase4.feature_batch",
-                    elapsed_ms=batch_elapsed_ms,
-                )
-                if cross_cluster_debug_batches is not None:
-                    row_input_stats = _build_matrix_abs_stats(
+                    boundary_start, batch_end = planned_boundaries[planned_boundary_offset]
+                    if boundary_start != pending_offset:
+                        raise RuntimeError(
+                            "Planner v1 planned boundary start mismatch "
+                            f"(expected={pending_offset}, got={boundary_start})"
+                        )
+                    planned_boundary_offset += 1
+                else:
+                    batch_end = _compute_phase4_locality_shaped_batch_end(
+                        pending,
+                        pending_offset=pending_offset,
+                        max_batch_size=phase4_feature_batch_size,
+                        feat_layers=feat_layers,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                if batch_end <= pending_offset:
+                    raise RuntimeError(
+                        "Phase 4 scheduling produced a non-advancing batch boundary "
+                        f"(offset={pending_offset}, batch_end={batch_end})"
+                    )
+                reference_pending_start = pending_offset
+                reference_pending_end = batch_end
+                reference_idx_batch = pending[reference_pending_start:reference_pending_end]
+                pending_offset = batch_end
+                scheduler_reference_batch_index = int(phase4_scheduler_reference_batch_count)
+                phase4_scheduler_reference_batch_count += 1
+
+                if phase4_row_executor_effective_mode == "streaming_v1":
+                    executor_batches: list[torch.Tensor] = []
+                    streaming_pending_offset = 0
+                    while streaming_pending_offset < int(reference_idx_batch.numel()):
+                        streaming_end = min(
+                            streaming_pending_offset + phase4_executor_microbatch_size,
+                            int(reference_idx_batch.numel()),
+                        )
+                        executor_batches.append(
+                            reference_idx_batch[streaming_pending_offset:streaming_end]
+                        )
+                        streaming_pending_offset = streaming_end
+                else:
+                    executor_batches = [reference_idx_batch]
+
+                streaming_chunk_count = int(len(executor_batches))
+                chunk_pending_start = reference_pending_start
+                for streaming_chunk_index, idx_batch in enumerate(executor_batches, start=1):
+                    chunk_pending_end = chunk_pending_start + int(idx_batch.numel())
+                    n_visited += len(idx_batch)
+                    phase4_executor_microbatch_count += 1
+                    executor_microbatch_index = int(phase4_executor_microbatch_count)
+
+                    ctx_before = _snapshot_diagnostics(ctx) if profile else None
+                    transcoder_before = (
+                        _snapshot_diagnostics(model.transcoders) if profile else None
+                    )
+                    batch_start = time.perf_counter()
+                    compute_batch_start = time.perf_counter()
+                    rows = ctx.compute_batch(
+                        layers=feat_layers[idx_batch],
+                        positions=feat_pos[idx_batch],
+                        inject_values=ctx.materialize_encoder_vectors(idx_batch),
+                        retain_graph=n_visited < actual_max_feature_nodes,
+                        phase_label="phase4_features",
+                    )
+                    executor_compute_batch_elapsed_ms = (
+                        time.perf_counter() - compute_batch_start
+                    ) * 1000.0
+
+                    row_count = rows.shape[0]
+                    end = st + row_count
+                    cpu_staging_start = time.perf_counter()
+                    rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                        rows,
+                        staging_buffer=rows_cpu_staging,
+                    )
+                    executor_cpu_staging_elapsed_ms = (
+                        time.perf_counter() - cpu_staging_start
+                    ) * 1000.0
+                    row_input_slice = rows_cpu[:, :logit_offset]
+                    feature_row_slice = rows_cpu[:, :total_active_feats]
+                    denominator_start = time.perf_counter()
+                    row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                         row_input_slice,
-                        epsilon=1e-12,
-                        top_k=0,
+                        dtype=exact_trace_internal_dtype_resolved,
                     )
-                    row_abs_sum_stats = _build_vector_stats(
-                        row_abs_sums_cpu,
-                        epsilon=1e-8,
-                        top_k=0,
+                    executor_denominator_elapsed_ms = (
+                        time.perf_counter() - denominator_start
+                    ) * 1000.0
+                    if anomaly_debug_result is not None and phase4_executor_microbatch_count <= 2:
+                        feature_row_batches = anomaly_debug_result.setdefault(
+                            "phase4_feature_row_batches",
+                            [],
+                        )
+                        assert isinstance(feature_row_batches, list)
+                        feature_row_batches.append(
+                            {
+                                "batch_index": int(executor_microbatch_index),
+                                "batch_row_count": int(row_count),
+                                "row_input_stats": _build_matrix_abs_stats(
+                                    row_input_slice,
+                                    epsilon=1e-12,
+                                    top_k=8,
+                                ),
+                                "row_abs_sum_stats": _build_phase4_normalization_stats(
+                                    (row_abs_max_cpu, row_l1_scaled_cpu),
+                                    clamp_epsilon=1e-8,
+                                ),
+                            }
+                        )
+                    if use_compact_feature_row_store:
+                        assert feature_row_store is not None
+                        row_store_write_start = time.perf_counter()
+                        feature_row_store.append_rows(
+                            row_start=st,
+                            feature_rows=feature_row_slice,
+                            row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
+                            phase="phase4",
+                        )
+                        executor_row_store_write_elapsed_ms = (
+                            time.perf_counter() - row_store_write_start
+                        ) * 1000.0
+                    else:
+                        row_store_write_start = time.perf_counter()
+                        edge_matrix[st:end, :logit_offset] = rows_cpu
+                        executor_row_store_write_elapsed_ms = (
+                            time.perf_counter() - row_store_write_start
+                        ) * 1000.0
+                    row_to_node_index[st:end] = idx_batch
+                    visited[idx_batch] = True
+                    st = end
+                    pbar.update(len(idx_batch))
+
+                    if profile:
+                        batch_number = executor_microbatch_index
+                        if batch_number % profile_log_interval == 0:
+                            batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                            _log_batch_profile(
+                                logger,
+                                "Phase 4",
+                                batch_number,
+                                None,
+                                batch_elapsed_ms / 1000.0,
+                                ctx_before,
+                                _snapshot_diagnostics(ctx),
+                                transcoder_before,
+                                _snapshot_diagnostics(model.transcoders),
+                            )
+                    batch_number = executor_microbatch_index
+                    batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                    phase4_feature_batch_elapsed_ms_total += batch_elapsed_ms
+                    executor_batch_telemetry = _build_phase4_executor_batch_telemetry(
+                        scheduler_reference_batch_index=scheduler_reference_batch_index,
+                        scheduler_reference_batch_count=phase4_scheduler_reference_batch_count,
+                        scheduler_reference_batch_rows=int(reference_idx_batch.numel()),
+                        executor_microbatch_index=executor_microbatch_index,
+                        executor_microbatch_count=phase4_executor_microbatch_count,
+                        executor_configured_reference_batch_size=phase4_executor_reference_batch_size,
+                        executor_microbatch_rows=int(idx_batch.numel()),
+                        executor_microbatch_size=phase4_executor_microbatch_size,
                     )
-                    _record_cross_cluster_batch_event(
-                        cross_cluster_debug_batches=cross_cluster_debug_batches,
-                        event_name="phase4.feature_batch",
+                    executor_substage_telemetry = _build_phase4_executor_substage_telemetry(
+                        telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                        compute_batch_elapsed_ms=executor_compute_batch_elapsed_ms,
+                        cpu_staging_elapsed_ms=executor_cpu_staging_elapsed_ms,
+                        denominator_elapsed_ms=executor_denominator_elapsed_ms,
+                        row_store_write_elapsed_ms=executor_row_store_write_elapsed_ms,
+                        batch_elapsed_ms=batch_elapsed_ms,
+                    )
+                    executor_streaming_telemetry = {
+                        "executor_reference_batch_size": int(reference_idx_batch.numel()),
+                        "executor_microbatch_size": int(phase4_executor_microbatch_size),
+                        "executor_streaming_chunk_index": (
+                            int(streaming_chunk_index)
+                            if phase4_row_executor_effective_mode == "streaming_v1"
+                            else None
+                        ),
+                        "executor_streaming_chunk_count": (
+                            int(streaming_chunk_count)
+                            if phase4_row_executor_effective_mode == "streaming_v1"
+                            else None
+                        ),
+                        "scheduler_pending_start_index": int(chunk_pending_start),
+                        "scheduler_pending_end_index": int(chunk_pending_end),
+                        "scheduler_reference_pending_start_index": int(reference_pending_start),
+                        "scheduler_reference_pending_end_index": int(reference_pending_end),
+                    }
+                    batch_locality_summary = _build_phase4_batch_locality_summary(
+                        idx_batch,
+                        feat_layers=feat_layers,
+                        feat_ids=feat_ids,
+                        exact_chunked_decoder=exact_chunked_decoder,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+                    telemetry_recorder.record_event(
+                        scope="batch",
+                        name="phase4.feature_batch",
                         phase="phase4",
-                        event_index=batch_number,
-                        payload={
+                        batch_index=batch_number,
+                        elapsed_ms=batch_elapsed_ms,
+                        attrs={
                             "batch_rows": int(row_count),
                             "visited_features": int(n_visited),
                             "target_feature_count": int(actual_max_feature_nodes),
-                            "idx_batch_hash": (
-                                _hash_index_tensor(idx_batch) if idx_batch.numel() > 0 else None
-                            ),
-                            "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
-                            "row_input_finite_max_abs": _safe_float(
-                                row_input_stats.get("finite_max_abs")
-                            ),
-                            "row_l1_abs_sum": _safe_float(row_abs_sum_stats.get("abs_sum")),
-                            "row_l1_max": _safe_float(row_abs_sum_stats.get("max")),
-                            "row_l1_nonfinite_count": int(row_abs_sum_stats["nonfinite_count"]),
-                            "row_l1_effectively_all_zero": bool(
-                                row_abs_sum_stats["effectively_all_zero"]
-                            ),
-                            "batch_elapsed_ms": float(batch_elapsed_ms),
-                            **get_memory_snapshot(model.device),
+                            **phase4_execution_metadata,
+                            **executor_batch_telemetry,
+                            "scheduler_refresh_index": pending_refresh_index,
+                            **executor_streaming_telemetry,
+                            **batch_locality_summary,
+                            **executor_substage_telemetry,
                         },
                     )
+                    telemetry_recorder.record_wall_clock_duration(
+                        scope="batch",
+                        name="phase4.feature_batch",
+                        elapsed_ms=batch_elapsed_ms,
+                    )
+                    if cross_cluster_debug_batches is not None:
+                        row_input_stats = _build_matrix_abs_stats(
+                            row_input_slice,
+                            epsilon=1e-12,
+                            top_k=0,
+                        )
+                        row_abs_sum_stats = _build_phase4_normalization_stats(
+                            (row_abs_max_cpu, row_l1_scaled_cpu),
+                            clamp_epsilon=1e-8,
+                        )
+                        _record_cross_cluster_batch_event(
+                            cross_cluster_debug_batches=cross_cluster_debug_batches,
+                            event_name="phase4.feature_batch",
+                            phase="phase4",
+                            event_index=batch_number,
+                            payload={
+                                "batch_rows": int(row_count),
+                                "visited_features": int(n_visited),
+                                "target_feature_count": int(actual_max_feature_nodes),
+                                **phase4_execution_metadata,
+                                **executor_batch_telemetry,
+                                "scheduler_refresh_index": pending_refresh_index,
+                                **executor_streaming_telemetry,
+                                **batch_locality_summary,
+                                **executor_substage_telemetry,
+                                "idx_batch_hash": batch_locality_summary.get(
+                                    "scheduler_batch_hash"
+                                ),
+                                "row_input_nonfinite_count": int(
+                                    row_input_stats["nonfinite_count"]
+                                ),
+                                "row_input_finite_max_abs": _safe_float(
+                                    row_input_stats.get("finite_max_abs")
+                                ),
+                                "row_l1_abs_sum": _safe_float(row_abs_sum_stats.get("abs_sum")),
+                                "row_l1_max": _safe_float(row_abs_sum_stats.get("max")),
+                                "row_l1_nonfinite_count": int(row_abs_sum_stats["nonfinite_count"]),
+                                "row_l1_effectively_all_zero": bool(
+                                    row_abs_sum_stats["effectively_all_zero"]
+                                ),
+                                "batch_elapsed_ms": float(batch_elapsed_ms),
+                                **get_memory_snapshot(model.device),
+                            },
+                        )
+                    chunk_pending_start = chunk_pending_end
+            if planned_boundaries is not None and planned_boundary_offset != len(
+                planned_boundaries
+            ):
+                raise RuntimeError(
+                    "Planner v1 produced unused planned boundaries "
+                    f"(used={planned_boundary_offset}, planned={len(planned_boundaries)})"
+                )
 
         pbar.close()
         _log_phase_metrics(
@@ -5841,7 +9440,8 @@ def _run_attribution(
             model.device,
             selected_features=int(visited.sum().item()),
             final_feature_batch_size=phase4_feature_batch_size,
-            phase4_batches=phase4_batch_count,
+            phase4_batches=phase4_scheduler_reference_batch_count,
+            phase4_executor_microbatch_count=phase4_executor_microbatch_count,
         )
         phase4_elapsed_ms = (time.perf_counter() - phase4_start) * 1000.0
         telemetry_recorder.record_event(
@@ -5852,9 +9452,33 @@ def _run_attribution(
             attrs={
                 "selected_features": int(visited.sum().item()),
                 "feature_batch_size": int(phase4_feature_batch_size),
-                "phase4_batches": int(phase4_batch_count),
+                "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
                 "phase4_refreshes": int(phase4_refresh_count),
                 "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
+                "phase4_feature_batch_elapsed_ms_total": float(
+                    phase4_feature_batch_elapsed_ms_total
+                ),
+                "phase4_refresh_partial_influence_elapsed_ms_total": float(
+                    phase4_refresh_partial_influence_elapsed_ms_total
+                ),
+                "phase4_refresh_rank_topk_elapsed_ms_total": float(
+                    phase4_refresh_rank_topk_elapsed_ms_total
+                ),
+                "phase4_refresh_frontier_plan_elapsed_ms_total": float(
+                    phase4_refresh_frontier_plan_elapsed_ms_total
+                ),
+                "phase4_refresh_row_store_read_elapsed_ms_total": float(
+                    phase4_refresh_row_store_read_elapsed_ms_total
+                ),
+                "phase4_refresh_influence_normalization_elapsed_ms_total": float(
+                    phase4_refresh_influence_normalization_elapsed_ms_total
+                ),
+                "phase4_refresh_influence_matmul_elapsed_ms_total": float(
+                    phase4_refresh_influence_matmul_elapsed_ms_total
+                ),
+                **phase4_execution_metadata,
+                **(phase4_no_refresh_plan_telemetry or {}),
             },
         )
         telemetry_recorder.record_wall_clock_duration(
@@ -6256,25 +9880,32 @@ def _run_attribution(
                 feature_semantic_descriptors_payload,
                 selected_features=selected_features,
             )
+        selected_features_cpu = (
+            selected_features.detach().to(device="cpu", dtype=torch.long)
+            if compact_output
+            else None
+        )
         if compact_output:
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
+                assert selected_features_cpu is not None
                 feature_feature_edges = feature_row_store.materialize_dense_feature_slice(
                     row_start=n_logits,
                     row_end=st,
-                    selected_feature_columns=selected_features,
+                    selected_feature_columns=selected_features_cpu,
                     phase="phase5",
                 )
                 logit_feature_edges = feature_row_store.materialize_dense_feature_slice(
                     row_start=0,
                     row_end=n_logits,
-                    selected_feature_columns=selected_features,
+                    selected_feature_columns=selected_features_cpu,
                     phase="phase5",
                 )
             else:
                 feature_feature_edges = edge_matrix[n_logits:st, selected_features].detach().cpu()
                 logit_feature_edges = edge_matrix[:n_logits, selected_features].detach().cpu()
 
+            assert selected_features_cpu is not None
             compact_output_result = {
                 "input_string": model.tokenizer.decode(input_ids),
                 "input_tokens": input_ids.detach().cpu(),
@@ -6283,7 +9914,7 @@ def _run_attribution(
                 "vocab_size": targets.vocab_size,
                 "active_features": activation_matrix.indices().T.detach().cpu(),
                 "activation_values": activation_matrix.values().detach().cpu(),
-                "selected_features": selected_features.detach().cpu(),
+                "selected_features": selected_features_cpu,
                 "feature_row_node_indices": row_to_node_index[n_logits:st].detach().cpu(),
                 "logit_row_node_indices": row_to_node_index[:n_logits].detach().cpu(),
                 "feature_feature_edges": feature_feature_edges,
@@ -6296,6 +9927,59 @@ def _run_attribution(
                 "phase4_feature_batch_planner_enabled": bool(planner_enabled),
                 "phase4_feature_batch_planner_status": planner_status,
                 "phase4_feature_batch_planner_skip_reason": planner_skip_reason,
+                "phase4_scheduler_requested_mode": phase4_scheduler_config.requested_mode,
+                "phase4_scheduler_mode": phase4_scheduler_config.requested_mode,
+                "phase4_scheduler_mode_requested": phase4_scheduler_config.requested_mode,
+                "phase4_scheduler_version": phase4_scheduler_config.version,
+                "phase4_scheduler_version_requested": phase4_scheduler_config.version,
+                "phase4_scheduler_policy": phase4_scheduler_config.policy,
+                "phase4_scheduler_policy_requested": phase4_scheduler_config.policy,
+                "phase4_scheduler_effective_mode": phase4_scheduler_config.effective_mode,
+                "phase4_scheduler_mode_effective": phase4_scheduler_config.effective_mode,
+                "phase4_scheduler_effective_version": phase4_scheduler_config.effective_version,
+                "phase4_scheduler_version_effective": phase4_scheduler_config.effective_version,
+                "phase4_scheduler_effective_policy": phase4_scheduler_config.effective_policy,
+                "phase4_scheduler_policy_effective": phase4_scheduler_config.effective_policy,
+                "phase4_scheduler_effective_behavior": phase4_scheduler_config.effective_behavior,
+                "phase4_scheduler_reference_execution": bool(
+                    phase4_scheduler_config.requested_mode != phase4_scheduler_config.effective_mode
+                ),
+                "phase4_scheduler_debug": bool(phase4_scheduler_config.debug),
+                "phase4_scheduler_telemetry_detail": phase4_scheduler_config.telemetry_detail,
+                "phase4_refresh_optimization_requested": phase4_refresh_optimization_config.requested_mode,
+                "phase4_refresh_optimization": phase4_refresh_optimization_config.requested_mode,
+                "phase4_refresh_optimization_mode_requested": phase4_refresh_optimization_config.requested_mode,
+                "phase4_refresh_optimization_effective": phase4_refresh_optimization_config.effective_mode,
+                "phase4_refresh_optimization_mode_effective": phase4_refresh_optimization_config.effective_mode,
+                "phase4_refresh_optimization_version": phase4_refresh_optimization_config.version,
+                "phase4_refresh_optimization_version_requested": phase4_refresh_optimization_config.version,
+                "phase4_refresh_optimization_effective_version": phase4_refresh_optimization_config.effective_version,
+                "phase4_refresh_optimization_version_effective": phase4_refresh_optimization_config.effective_version,
+                "phase4_refresh_optimization_effective_behavior": phase4_refresh_optimization_config.effective_behavior,
+                "phase4_refresh_optimization_reference_execution": bool(
+                    phase4_refresh_optimization_config.requested_mode
+                    != phase4_refresh_optimization_config.effective_mode
+                ),
+                "phase4_row_executor_requested": phase4_row_executor_config.requested_mode,
+                "phase4_row_executor": phase4_row_executor_config.requested_mode,
+                "phase4_row_executor_mode_requested": phase4_row_executor_config.requested_mode,
+                "phase4_row_executor_effective": phase4_row_executor_config.effective_mode,
+                "phase4_row_executor_mode_effective": phase4_row_executor_config.effective_mode,
+                "phase4_row_executor_version": phase4_row_executor_config.version,
+                "phase4_row_executor_version_requested": phase4_row_executor_config.version,
+                "phase4_row_executor_effective_version": phase4_row_executor_config.effective_version,
+                "phase4_row_executor_version_effective": phase4_row_executor_config.effective_version,
+                "phase4_row_executor_effective_behavior": phase4_row_executor_config.effective_behavior,
+                "phase4_row_executor_reference_execution": bool(
+                    phase4_row_executor_config.requested_mode
+                    != phase4_row_executor_config.effective_mode
+                ),
+                **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
+                "phase4_executor_configured_reference_batch_size": int(
+                    phase4_executor_reference_batch_size
+                ),
+                "phase4_executor_reference_batch_size": int(phase4_executor_reference_batch_size),
+                "phase4_executor_microbatch_size": int(phase4_executor_microbatch_size),
                 "internal_precision_requested": internal_precision_requested,
                 "resolved_dtype_map": resolved_dtype_map,
                 "phase4_anomaly_debug_enabled": bool(phase4_anomaly_debug_enabled),
@@ -6369,9 +10053,31 @@ def _run_attribution(
                 "semantic_descriptor_top_k": int(semantic_descriptor_top_k),
                 "semantic_descriptor_dim": int(semantic_descriptor_dim),
                 "phase4_refresh_count": int(phase4_refresh_count),
-                "phase4_batch_count": int(phase4_batch_count),
+                "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
+                "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
                 "phase4_refresh_elapsed_seconds_total": round(
                     phase4_refresh_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_feature_batch_elapsed_seconds_total": round(
+                    phase4_feature_batch_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_refresh_partial_influence_elapsed_seconds_total": round(
+                    phase4_refresh_partial_influence_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_refresh_rank_topk_elapsed_seconds_total": round(
+                    phase4_refresh_rank_topk_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_refresh_frontier_plan_elapsed_seconds_total": round(
+                    phase4_refresh_frontier_plan_elapsed_ms_total / 1000.0,
+                    6,
+                ),
+                "phase4_refresh_row_store_read_elapsed_seconds_total": round(
+                    phase4_refresh_row_store_read_elapsed_ms_total / 1000.0,
                     6,
                 ),
                 "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
@@ -6410,7 +10116,10 @@ def _run_attribution(
                 )
                 phase4_entry_summary_checkpoint = {
                     "phase4_refresh_count": int(phase4_refresh_count),
-                    "phase4_batch_count": int(phase4_batch_count),
+                    "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
+                    "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                    "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
+                    **phase4_execution_metadata,
                     **phase4_runtime_summary,
                 }
                 _record_cross_cluster_checkpoint(
@@ -6422,7 +10131,10 @@ def _run_attribution(
                     stream_payload={
                         "checkpoint_stage": "post_phase4",
                         "phase4_refresh_count": int(phase4_refresh_count),
-                        "phase4_batch_count": int(phase4_batch_count),
+                        "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
+                        "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                        "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
+                        **phase4_execution_metadata,
                         **phase4_runtime_stream,
                     },
                 )
@@ -6436,9 +10148,24 @@ def _run_attribution(
                         "selected_feature_count": int(visited.sum().item()),
                         "phase4_feature_batch_size": int(phase4_feature_batch_size),
                         "phase4_refresh_count": int(phase4_refresh_count),
-                        "phase4_batch_count": int(phase4_batch_count),
+                        "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
+                        "phase4_batches": int(phase4_scheduler_reference_batch_count),
+                        "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
                         "phase4_elapsed_ms": float(phase4_elapsed_ms),
                         "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
+                        "phase4_feature_batch_elapsed_ms_total": float(
+                            phase4_feature_batch_elapsed_ms_total
+                        ),
+                        "phase4_refresh_partial_influence_elapsed_ms_total": float(
+                            phase4_refresh_partial_influence_elapsed_ms_total
+                        ),
+                        "phase4_refresh_rank_topk_elapsed_ms_total": float(
+                            phase4_refresh_rank_topk_elapsed_ms_total
+                        ),
+                        "phase4_refresh_frontier_plan_elapsed_ms_total": float(
+                            phase4_refresh_frontier_plan_elapsed_ms_total
+                        ),
+                        **phase4_execution_metadata,
                         **phase4_runtime_stream,
                     },
                 )

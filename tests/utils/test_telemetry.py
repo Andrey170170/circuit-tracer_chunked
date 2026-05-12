@@ -1,6 +1,12 @@
 import torch
 
-from circuit_tracer.utils.telemetry import TelemetryRecorder, sanitize_attrs
+import circuit_tracer.utils.telemetry as telemetry
+from circuit_tracer.utils.telemetry import (
+    TelemetryRecorder,
+    build_memory_before_after_attrs,
+    get_memory_snapshot,
+    sanitize_attrs,
+)
 
 
 def test_sanitize_attrs_scalarizes_complex_values() -> None:
@@ -87,3 +93,57 @@ def test_telemetry_timer_records_elapsed_and_error_type() -> None:
     assert event["phase"] == "phase4"
     assert event["elapsed_ms"] >= 0
     assert event["attrs"]["error_type"] == "RuntimeError"
+
+
+def test_get_memory_snapshot_reports_current_and_peak_rss_keys() -> None:
+    snapshot = get_memory_snapshot(torch.device("cpu"))
+
+    assert "rss_current_gib" in snapshot
+    assert "rss_gib" in snapshot
+    if snapshot["rss_current_gib"] is not None:
+        assert snapshot["rss_current_gib"] >= 0
+
+
+def test_get_memory_snapshot_includes_process_and_cgroup_breakdown_keys() -> None:
+    snapshot = get_memory_snapshot(torch.device("cpu"))
+
+    expected_keys = {
+        "proc_rss_gib",
+        "proc_rss_anon_gib",
+        "proc_rss_file_gib",
+        "proc_rss_shmem_gib",
+        "cgroup_memory_current_gib",
+        "cgroup_memory_peak_gib",
+        "cgroup_memory_anon_gib",
+        "cgroup_memory_file_gib",
+        "cgroup_memory_active_file_gib",
+        "cgroup_memory_inactive_file_gib",
+        "cgroup_memory_shmem_gib",
+    }
+    assert expected_keys.issubset(snapshot.keys())
+
+
+def test_get_memory_snapshot_soft_fails_when_cgroup_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(telemetry, "_resolve_cgroup_memory_dir", lambda: None)
+
+    snapshot = get_memory_snapshot(torch.device("cpu"))
+
+    assert snapshot["cgroup_memory_current_gib"] is None
+    assert snapshot["cgroup_memory_peak_gib"] is None
+    assert snapshot["cgroup_memory_anon_gib"] is None
+    assert snapshot["cgroup_memory_file_gib"] is None
+
+
+def test_build_memory_before_after_attrs_emits_prefixed_values_and_deltas() -> None:
+    attrs = build_memory_before_after_attrs(
+        before={"rss_current_gib": 1.25, "cgroup_memory_current_gib": 4.0},
+        after={"rss_current_gib": 1.5, "cgroup_memory_current_gib": 4.75},
+        keys=("rss_current_gib", "cgroup_memory_current_gib"),
+    )
+
+    assert attrs["memory_before_rss_current_gib"] == 1.25
+    assert attrs["memory_after_rss_current_gib"] == 1.5
+    assert attrs["memory_delta_rss_current_gib"] == 0.25
+    assert attrs["memory_before_cgroup_memory_current_gib"] == 4.0
+    assert attrs["memory_after_cgroup_memory_current_gib"] == 4.75
+    assert attrs["memory_delta_cgroup_memory_current_gib"] == 0.75

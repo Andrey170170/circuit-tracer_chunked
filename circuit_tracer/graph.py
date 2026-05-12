@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import NamedTuple
+import time
 import warnings
 
 import torch
@@ -181,7 +182,15 @@ class Graph:
 
 def normalize_matrix(matrix: torch.Tensor) -> torch.Tensor:
     normalized = matrix.abs()
-    return normalized / normalized.sum(dim=1, keepdim=True).clamp(min=1e-10)
+    row_denominator = _compute_row_denominator_scaled_l1(normalized, already_abs=True)
+    normalized_row_weights = _normalize_row_weights_from_denominator(
+        torch.ones(normalized.shape[0], device=normalized.device, dtype=normalized.dtype),
+        denom_mode="scaled_row_l1",
+        denom_primary=row_denominator.row_abs_max,
+        denom_secondary=row_denominator.row_l1_scaled,
+        clamp_epsilon=1e-10,
+    )
+    return normalized_row_weights.unsqueeze(1) * normalized
 
 
 def compute_influence(A: torch.Tensor, logit_weights: torch.Tensor, max_iter: int = 1000):
@@ -230,6 +239,132 @@ class PruneResult(NamedTuple):
     node_mask: torch.Tensor  # Boolean tensor indicating which nodes to keep
     edge_mask: torch.Tensor  # Boolean tensor indicating which edges to keep
     cumulative_scores: torch.Tensor  # Tensor of cumulative influence scores for each node
+
+
+class RowL1ScaledDenominator(NamedTuple):
+    """Stable row-denominator representation.
+
+    ``row_l1 = row_abs_max * row_l1_scaled`` where:
+      - ``row_abs_max = max(abs(row))``
+      - ``row_l1_scaled = sum(abs(row) / row_abs_max)`` for non-zero rows,
+        and ``0`` for all-zero rows.
+    """
+
+    row_abs_max: torch.Tensor
+    row_l1_scaled: torch.Tensor
+
+
+def _compute_row_denominator_scaled_l1(
+    row_values: torch.Tensor,
+    *,
+    already_abs: bool = False,
+) -> RowL1ScaledDenominator:
+    abs_values = row_values if already_abs else row_values.abs()
+    if abs_values.ndim != 2:
+        raise ValueError("row_values must be rank-2")
+
+    n_rows = int(abs_values.shape[0])
+    if abs_values.shape[1] == 0:
+        zeros = torch.zeros(n_rows, device=abs_values.device, dtype=abs_values.dtype)
+        return RowL1ScaledDenominator(row_abs_max=zeros, row_l1_scaled=zeros)
+
+    row_abs_max = abs_values.amax(dim=1)
+    row_l1_scaled = torch.zeros_like(row_abs_max)
+    nonzero_rows = (row_abs_max > 0) & torch.isfinite(row_abs_max)
+    if bool(nonzero_rows.any()):
+        scaled_rows = abs_values[nonzero_rows] / row_abs_max[nonzero_rows].unsqueeze(1)
+        row_l1_scaled[nonzero_rows] = scaled_rows.sum(dim=1)
+
+    infinite_rows = torch.isinf(row_abs_max)
+    if bool(infinite_rows.any()):
+        row_l1_scaled[infinite_rows] = 1
+
+    return RowL1ScaledDenominator(row_abs_max=row_abs_max, row_l1_scaled=row_l1_scaled)
+
+
+def _normalize_row_weights_from_denominator(
+    row_weights: torch.Tensor,
+    *,
+    denom_mode: str,
+    denom_primary: torch.Tensor,
+    denom_secondary: torch.Tensor | None,
+    clamp_epsilon: float = 1e-8,
+) -> torch.Tensor:
+    if denom_mode == "raw_l1":
+        return row_weights / denom_primary.clamp(min=clamp_epsilon)
+
+    if denom_secondary is None:
+        raise ValueError("scaled_row_l1 denominator requires secondary component")
+
+    row_abs_max = denom_primary
+    row_l1_scaled = denom_secondary
+    scaled_threshold = torch.where(
+        row_abs_max > 0,
+        torch.full_like(row_abs_max, clamp_epsilon) / row_abs_max,
+        torch.full_like(row_abs_max, float("inf")),
+    )
+    nan_denominator = torch.isnan(row_abs_max) | torch.isnan(row_l1_scaled)
+    infinite_denominator = ~nan_denominator & (
+        torch.isinf(row_abs_max) | torch.isinf(row_l1_scaled)
+    )
+    finite_denominator = ~(nan_denominator | infinite_denominator)
+    use_scaled_denominator = (
+        finite_denominator
+        & (row_abs_max > 0)
+        & (row_l1_scaled > 0)
+        & (row_l1_scaled >= scaled_threshold)
+    )
+    use_clamped_epsilon = finite_denominator & (
+        (row_abs_max <= 0) | (row_l1_scaled <= 0) | (row_l1_scaled < scaled_threshold)
+    )
+
+    normalized = torch.empty_like(row_weights)
+    if bool(use_scaled_denominator.any()):
+        normalized[use_scaled_denominator] = (
+            row_weights[use_scaled_denominator] / row_abs_max[use_scaled_denominator]
+        ) / row_l1_scaled[use_scaled_denominator]
+    if bool(use_clamped_epsilon.any()):
+        normalized[use_clamped_epsilon] = row_weights[use_clamped_epsilon] / clamp_epsilon
+    if bool(infinite_denominator.any()):
+        normalized[infinite_denominator] = 0
+    if bool(nan_denominator.any()):
+        normalized[nan_denominator] = torch.full_like(row_weights[nan_denominator], float("nan"))
+    return normalized
+
+
+def _resolve_row_denominator(
+    row_denominator: torch.Tensor | RowL1ScaledDenominator | tuple[torch.Tensor, torch.Tensor],
+    *,
+    expected_rows: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[str, torch.Tensor, torch.Tensor | None]:
+    if isinstance(row_denominator, torch.Tensor):
+        if row_denominator.numel() != expected_rows:
+            raise ValueError("row_abs_sums length must equal number of rows")
+        return (
+            "raw_l1",
+            row_denominator.to(device=device, dtype=dtype),
+            None,
+        )
+
+    if isinstance(row_denominator, tuple) and len(row_denominator) == 2:
+        row_abs_max, row_l1_scaled = row_denominator
+        if not isinstance(row_abs_max, torch.Tensor) or not isinstance(row_l1_scaled, torch.Tensor):
+            raise TypeError(
+                "row_abs_sums tuple form must be (row_abs_max: Tensor, row_l1_scaled: Tensor)"
+            )
+        if row_abs_max.numel() != expected_rows:
+            raise ValueError("row_abs_max length must equal number of rows")
+        if row_l1_scaled.numel() != expected_rows:
+            raise ValueError("row_l1_scaled length must equal number of rows")
+        return (
+            "scaled_row_l1",
+            row_abs_max.to(device=device, dtype=dtype),
+            row_l1_scaled.to(device=device, dtype=dtype),
+        )
+
+    raise TypeError("row_abs_sums must be a Tensor or a (row_abs_max, row_l1_scaled) tuple")
 
 
 def prune_graph(
@@ -408,8 +543,14 @@ def compute_partial_influences(
             if not row_weights.any():
                 continue
 
-            chunk /= chunk.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            next_prod += row_weights @ chunk
+            chunk_row_denominator = _compute_row_denominator_scaled_l1(chunk, already_abs=True)
+            normalized_row_weights = _normalize_row_weights_from_denominator(
+                row_weights,
+                denom_mode="scaled_row_l1",
+                denom_primary=chunk_row_denominator.row_abs_max,
+                denom_secondary=chunk_row_denominator.row_l1_scaled,
+            )
+            next_prod += normalized_row_weights @ chunk
 
         prod = next_prod
         if not prod.any():
@@ -423,7 +564,7 @@ def compute_partial_influences(
 
 def compute_partial_feature_influences(
     feature_edge_matrix: torch.Tensor,
-    row_abs_sums: torch.Tensor,
+    row_abs_sums: torch.Tensor | RowL1ScaledDenominator | tuple[torch.Tensor, torch.Tensor],
     logit_p: torch.Tensor,
     row_to_node_index: torch.Tensor,
     *,
@@ -439,14 +580,17 @@ def compute_partial_feature_influences(
     when:
       - rows correspond to logit + feature source nodes,
       - only feature-column edges are materialized, and
-      - ``row_abs_sums`` stores exact L1 row sums over *all* original columns.
+      - ``row_abs_sums`` stores exact L1 row denominators over *all* original columns.
 
     Args:
         feature_edge_matrix: Dense matrix of shape ``(n_rows, n_feature_nodes)`` containing
             feature-column edge values for each stored row.
-        row_abs_sums: Exact absolute row sums over the original full edge rows
-            (shape ``(n_rows,)``). These preserve normalization semantics even when
-            non-feature columns are not materialized.
+        row_abs_sums: Either
+            (1) exact absolute row sums over original full rows (shape ``(n_rows,)``), or
+            (2) stable scaled-row-L1 pair ``(row_abs_max, row_l1_scaled)`` where
+                ``row_l1 = row_abs_max * row_l1_scaled``.
+            Both preserve normalization semantics even when non-feature columns are
+            not materialized.
         logit_p: Logit probabilities / weights for the first ``n_logits`` rows.
         row_to_node_index: Mapping from row index to original node index.
         n_feature_nodes: Number of active feature columns in the original graph.
@@ -476,8 +620,6 @@ def compute_partial_feature_influences(
             "feature_edge_matrix second dimension must equal n_feature_nodes "
             f"({feature_cols} != {n_feature_nodes})"
         )
-    if row_abs_sums.numel() != n_rows:
-        raise ValueError("row_abs_sums length must equal number of rows")
     if row_to_node_index.numel() != n_rows:
         raise ValueError("row_to_node_index length must equal number of rows")
     if n_logits > n_rows:
@@ -491,9 +633,12 @@ def compute_partial_feature_influences(
         if feature_edge_matrix.device == device
         else feature_edge_matrix.to(device)
     )
-    working_row_abs_sums = (
-        row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
-    ).to(dtype=working_feature_matrix.dtype)
+    denom_mode, denom_primary, denom_secondary = _resolve_row_denominator(
+        row_abs_sums,
+        expected_rows=n_rows,
+        device=device,
+        dtype=working_feature_matrix.dtype,
+    )
     working_row_index = (
         row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
     ).long()
@@ -522,8 +667,15 @@ def compute_partial_feature_influences(
             if not chunk_row_weights.any():
                 continue
 
-            denom = working_row_abs_sums[start:end].clamp(min=1e-8)
-            next_feature_prod += (chunk_row_weights / denom) @ chunk
+            normalized_row_weights = _normalize_row_weights_from_denominator(
+                chunk_row_weights,
+                denom_mode=denom_mode,
+                denom_primary=denom_primary[start:end],
+                denom_secondary=(
+                    denom_secondary[start:end] if denom_secondary is not None else None
+                ),
+            )
+            next_feature_prod += normalized_row_weights @ chunk
 
         if not next_feature_prod.any():
             break
@@ -540,7 +692,7 @@ def compute_partial_feature_influences(
 
 def compute_partial_feature_influences_streaming(
     row_reader: Callable[[int, int], torch.Tensor],
-    row_abs_sums: torch.Tensor,
+    row_abs_sums: torch.Tensor | RowL1ScaledDenominator | tuple[torch.Tensor, torch.Tensor],
     logit_p: torch.Tensor,
     row_to_node_index: torch.Tensor,
     *,
@@ -550,8 +702,9 @@ def compute_partial_feature_influences_streaming(
     device=None,
     row_chunk_size: int = 4096,
     chunk_cache_max_bytes: int = 0,
-    chunk_reuse_stats: dict[str, int] | None = None,
+    chunk_reuse_stats: dict[str, int | float | str] | None = None,
     compute_dtype: torch.dtype | None = None,
+    active_row_only_chunks: bool = False,
 ) -> torch.Tensor:
     """Compute feature-only partial influences from streamed dense row chunks.
 
@@ -563,7 +716,8 @@ def compute_partial_feature_influences_streaming(
     Args:
         row_reader: Callable receiving ``(row_start, row_end)`` and returning a dense
             tensor of shape ``(row_end - row_start, n_feature_nodes)`` for that row range.
-        row_abs_sums: Exact absolute row sums over the original full rows.
+        row_abs_sums: Either exact absolute row sums over original full rows or
+            a stable scaled-row-L1 pair ``(row_abs_max, row_l1_scaled)``.
         logit_p: Logit probabilities / weights for the first ``n_logits`` rows.
         row_to_node_index: Mapping from row index to original node index.
         n_feature_nodes: Number of active feature columns in the original graph.
@@ -574,9 +728,13 @@ def compute_partial_feature_influences_streaming(
         chunk_cache_max_bytes: Strict byte budget for optional solver-local
             row-chunk reuse cache. ``0`` disables solver-local caching.
         chunk_reuse_stats: Optional output dictionary populated with lightweight
-            chunk reuse counters for diagnostics.
+            chunk reuse counters and elapsed timings for diagnostics.
         compute_dtype: Optional explicit compute dtype for influence math. When
-            omitted, defaults to ``row_abs_sums.dtype`` for backward compatibility.
+            omitted, defaults to the primary denominator dtype for backward
+            compatibility.
+        active_row_only_chunks: When ``True``, preserve fixed row-chunk windows but
+            read only contiguous non-zero subranges inside each active chunk.
+            Default ``False`` preserves legacy fixed-chunk behavior.
 
     Returns:
         Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
@@ -595,7 +753,14 @@ def compute_partial_feature_influences_streaming(
     if chunk_cache_max_bytes < 0:
         raise ValueError("chunk_cache_max_bytes must be >= 0")
 
-    n_rows = row_abs_sums.numel()
+    if isinstance(row_abs_sums, torch.Tensor):
+        n_rows = row_abs_sums.numel()
+        denominator_dtype = row_abs_sums.dtype
+    elif isinstance(row_abs_sums, tuple) and len(row_abs_sums) == 2:
+        n_rows = row_abs_sums[0].numel()
+        denominator_dtype = row_abs_sums[0].dtype
+    else:
+        raise TypeError("row_abs_sums must be a Tensor or a (row_abs_max, row_l1_scaled) tuple")
     if row_to_node_index.numel() != n_rows:
         raise ValueError("row_to_node_index length must equal row_abs_sums length")
     if n_logits > n_rows:
@@ -605,13 +770,22 @@ def compute_partial_feature_influences_streaming(
 
     if compute_dtype is not None and compute_dtype not in (torch.float32, torch.float64):
         raise ValueError("compute_dtype must be float32 or float64 when provided")
+    if not isinstance(active_row_only_chunks, bool):
+        raise ValueError("active_row_only_chunks must be a bool")
 
-    device = device or row_abs_sums.device
-    dtype = row_abs_sums.dtype if compute_dtype is None else compute_dtype
-    working_row_abs_sums = (
-        row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
+    if isinstance(row_abs_sums, torch.Tensor):
+        row_denominator_device = row_abs_sums.device
+    else:
+        row_denominator_device = row_abs_sums[0].device
+
+    device = device or row_denominator_device
+    dtype = denominator_dtype if compute_dtype is None else compute_dtype
+    denom_mode, denom_primary, denom_secondary = _resolve_row_denominator(
+        row_abs_sums,
+        expected_rows=n_rows,
+        device=device,
+        dtype=dtype,
     )
-    working_row_abs_sums = working_row_abs_sums.to(dtype=dtype)
     working_row_index = (
         row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
     ).long()
@@ -627,9 +801,11 @@ def compute_partial_feature_influences_streaming(
     influences = torch.zeros(n_feature_nodes, device=device, dtype=dtype)
     row_weights = torch.zeros(n_rows, device=device, dtype=dtype)
     row_weights[:n_logits] = working_logit_p.to(dtype=dtype)
-    denom = working_row_abs_sums.clamp(min=1e-8)
     chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
-    cache_enabled = bool(chunk_cache_max_bytes > 0)
+    # Active-row chunks are iteration-specific because the stored fixed-shape chunk
+    # contains zero-filled inactive rows that may differ on later iterations.
+    # Never reuse those chunks from the solver-local cache.
+    cache_enabled = bool(chunk_cache_max_bytes > 0) and not active_row_only_chunks
     chunk_cache_nbytes = 0
     chunk_request_count = 0
     chunk_cache_hit_count = 0
@@ -638,6 +814,49 @@ def compute_partial_feature_influences_streaming(
     chunk_cache_store_success_count = 0
     chunk_cache_store_skip_disabled_count = 0
     chunk_cache_store_skip_too_large_count = 0
+    active_row_chunk_count = 0
+    active_row_range_count = 0
+    row_reader_row_count = 0
+    row_reader_call_count = 0
+    row_weight_nonzero_row_count = 0
+    row_weight_zero_row_count = 0
+    row_reader_elapsed_ms_total = 0.0
+    normalization_elapsed_ms_total = 0.0
+    matmul_elapsed_ms_total = 0.0
+    iteration_count = 0
+    solver_start = time.perf_counter()
+    row_chunk_strategy = (
+        "active_row_contiguous_chunks" if active_row_only_chunks else "fixed_row_chunks"
+    )
+
+    def _iter_active_row_subranges(
+        chunk_start: int,
+        chunk_end: int,
+        current_row_weights: torch.Tensor,
+    ):
+        active_rows = (
+            torch.nonzero(
+                current_row_weights[chunk_start:chunk_end] != 0,
+                as_tuple=False,
+            )
+            .flatten()
+            .tolist()
+        )
+        if not active_rows:
+            return
+
+        run_start = active_rows[0]
+        run_end = run_start + 1
+        for row_offset in active_rows[1:]:
+            if row_offset == run_end:
+                run_end += 1
+                continue
+
+            yield chunk_start + run_start, chunk_start + run_end
+            run_start = row_offset
+            run_end = row_offset + 1
+
+        yield chunk_start + run_start, chunk_start + run_end
 
     def _tensor_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
@@ -650,49 +869,149 @@ def compute_partial_feature_influences_streaming(
         chunk_cache_eviction_count += 1
 
     for _ in range(max_iter):
+        iteration_count += 1
         next_feature_prod = torch.zeros_like(influences)
-        for start in range(0, n_rows, row_chunk_size):
-            end = min(start + row_chunk_size, n_rows)
-            chunk_row_weights = row_weights[start:end]
-            if not bool(chunk_row_weights.any()):
-                continue
+        iteration_nonzero_rows = int(torch.count_nonzero(row_weights).item())
+        row_weight_nonzero_row_count += iteration_nonzero_rows
+        row_weight_zero_row_count += int(max(0, n_rows - iteration_nonzero_rows))
 
-            chunk_request_count += 1
-            cache_key = (start, end)
-            cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
-            if cached_chunk is None:
-                chunk = row_reader(start, end)
-                if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
-                    raise ValueError(
-                        "row_reader must return shape "
-                        f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
-                    )
-                if chunk.device != device:
-                    chunk = chunk.to(device)
-                chunk = chunk.to(dtype=dtype).abs()
-                if not cache_enabled:
-                    chunk_cache_store_skip_disabled_count += 1
-                else:
-                    chunk_nbytes = _tensor_nbytes(chunk)
-                    if chunk_nbytes > chunk_cache_max_bytes:
-                        chunk_cache_store_skip_too_large_count += 1
+        if not active_row_only_chunks:
+            for start in range(0, n_rows, row_chunk_size):
+                end = min(start + row_chunk_size, n_rows)
+                chunk_row_weights = row_weights[start:end]
+                if not bool(chunk_row_weights.any()):
+                    continue
+
+                active_row_chunk_count += 1
+                chunk_request_count += 1
+                cache_key = (start, end)
+                cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
+                if cached_chunk is None:
+                    row_reader_start = time.perf_counter()
+                    chunk = row_reader(start, end)
+                    row_reader_elapsed_ms_total += (time.perf_counter() - row_reader_start) * 1000.0
+                    row_reader_call_count += 1
+                    row_reader_row_count += int(end - start)
+                    if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
+                        raise ValueError(
+                            "row_reader must return shape "
+                            f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
+                        )
+                    if chunk.device != device:
+                        chunk = chunk.to(device)
+                    chunk = chunk.to(dtype=dtype).abs()
+                    if not cache_enabled:
+                        chunk_cache_store_skip_disabled_count += 1
                     else:
-                        while (
-                            chunk_cache
-                            and chunk_cache_nbytes + chunk_nbytes > chunk_cache_max_bytes
-                        ):
-                            _drop_oldest_chunk()
-                        chunk_cache[cache_key] = chunk
-                        chunk_cache.move_to_end(cache_key)
-                        chunk_cache_nbytes += chunk_nbytes
-                        chunk_cache_store_success_count += 1
-                chunk_cache_miss_count += 1
-            else:
-                chunk = cached_chunk
-                chunk_cache.move_to_end(cache_key)
-                chunk_cache_hit_count += 1
+                        chunk_nbytes = _tensor_nbytes(chunk)
+                        if chunk_nbytes > chunk_cache_max_bytes:
+                            chunk_cache_store_skip_too_large_count += 1
+                        else:
+                            while (
+                                chunk_cache
+                                and chunk_cache_nbytes + chunk_nbytes > chunk_cache_max_bytes
+                            ):
+                                _drop_oldest_chunk()
+                            chunk_cache[cache_key] = chunk
+                            chunk_cache.move_to_end(cache_key)
+                            chunk_cache_nbytes += chunk_nbytes
+                            chunk_cache_store_success_count += 1
+                    chunk_cache_miss_count += 1
+                else:
+                    chunk = cached_chunk
+                    chunk_cache.move_to_end(cache_key)
+                    chunk_cache_hit_count += 1
 
-            next_feature_prod += (chunk_row_weights / denom[start:end]) @ chunk
+                normalization_start = time.perf_counter()
+                normalized_row_weights = _normalize_row_weights_from_denominator(
+                    chunk_row_weights,
+                    denom_mode=denom_mode,
+                    denom_primary=denom_primary[start:end],
+                    denom_secondary=(
+                        denom_secondary[start:end] if denom_secondary is not None else None
+                    ),
+                )
+                normalization_elapsed_ms_total += (
+                    time.perf_counter() - normalization_start
+                ) * 1000.0
+
+                matmul_start = time.perf_counter()
+                next_feature_prod += normalized_row_weights @ chunk
+                matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
+        else:
+            for start in range(0, n_rows, row_chunk_size):
+                end = min(start + row_chunk_size, n_rows)
+                chunk_row_weights = row_weights[start:end]
+                active_row_subranges = list(_iter_active_row_subranges(start, end, row_weights))
+                if not active_row_subranges:
+                    continue
+
+                active_row_chunk_count += 1
+                active_row_range_count += len(active_row_subranges)
+                chunk_request_count += 1
+                cache_key = (start, end)
+                cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
+                if cached_chunk is None:
+                    chunk = torch.zeros((end - start, n_feature_nodes), device=device, dtype=dtype)
+                    for sub_start, sub_end in active_row_subranges:
+                        row_reader_start = time.perf_counter()
+                        subchunk = row_reader(sub_start, sub_end)
+                        row_reader_elapsed_ms_total += (
+                            time.perf_counter() - row_reader_start
+                        ) * 1000.0
+                        row_reader_call_count += 1
+                        row_reader_row_count += int(sub_end - sub_start)
+                        if subchunk.ndim != 2 or subchunk.shape != (
+                            sub_end - sub_start,
+                            n_feature_nodes,
+                        ):
+                            raise ValueError(
+                                "row_reader must return shape "
+                                f"({sub_end - sub_start}, {n_feature_nodes}) for rows "
+                                f"[{sub_start}, {sub_end})"
+                            )
+                        if subchunk.device != device:
+                            subchunk = subchunk.to(device)
+                        subchunk = subchunk.to(dtype=dtype).abs()
+                        chunk[sub_start - start : sub_end - start] = subchunk
+                    if not cache_enabled:
+                        chunk_cache_store_skip_disabled_count += 1
+                    else:
+                        chunk_nbytes = _tensor_nbytes(chunk)
+                        if chunk_nbytes > chunk_cache_max_bytes:
+                            chunk_cache_store_skip_too_large_count += 1
+                        else:
+                            while (
+                                chunk_cache
+                                and chunk_cache_nbytes + chunk_nbytes > chunk_cache_max_bytes
+                            ):
+                                _drop_oldest_chunk()
+                            chunk_cache[cache_key] = chunk
+                            chunk_cache.move_to_end(cache_key)
+                            chunk_cache_nbytes += chunk_nbytes
+                            chunk_cache_store_success_count += 1
+                    chunk_cache_miss_count += 1
+                else:
+                    chunk = cached_chunk
+                    chunk_cache.move_to_end(cache_key)
+                    chunk_cache_hit_count += 1
+
+                normalization_start = time.perf_counter()
+                normalized_row_weights = _normalize_row_weights_from_denominator(
+                    chunk_row_weights,
+                    denom_mode=denom_mode,
+                    denom_primary=denom_primary[start:end],
+                    denom_secondary=(
+                        denom_secondary[start:end] if denom_secondary is not None else None
+                    ),
+                )
+                normalization_elapsed_ms_total += (
+                    time.perf_counter() - normalization_start
+                ) * 1000.0
+
+                matmul_start = time.perf_counter()
+                next_feature_prod += normalized_row_weights @ chunk
+                matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
 
         if not bool(next_feature_prod.any()):
             break
@@ -706,6 +1025,7 @@ def compute_partial_feature_influences_streaming(
 
     if chunk_reuse_stats is not None:
         chunk_reuse_stats.clear()
+        solver_elapsed_ms_total = (time.perf_counter() - solver_start) * 1000.0
         chunk_reuse_stats.update(
             {
                 "chunk_request_count": int(chunk_request_count),
@@ -713,7 +1033,7 @@ def compute_partial_feature_influences_streaming(
                 "chunk_cache_max_bytes": int(chunk_cache_max_bytes),
                 "chunk_cache_hit_count": int(chunk_cache_hit_count),
                 "chunk_cache_miss_count": int(chunk_cache_miss_count),
-                "row_reader_call_count": int(chunk_cache_miss_count),
+                "row_reader_call_count": int(row_reader_call_count),
                 "chunk_cache_eviction_count": int(chunk_cache_eviction_count),
                 "chunk_cache_store_success_count": int(chunk_cache_store_success_count),
                 "chunk_cache_store_skip_disabled_count": int(chunk_cache_store_skip_disabled_count),
@@ -722,6 +1042,21 @@ def compute_partial_feature_influences_streaming(
                 ),
                 "chunk_cache_unique_entries": int(len(chunk_cache)),
                 "chunk_cache_nbytes": int(chunk_cache_nbytes),
+                "row_chunk_strategy": row_chunk_strategy,
+                "active_row_only_chunks": int(active_row_only_chunks),
+                "active_row_chunk_count": int(active_row_chunk_count),
+                "active_row_range_count": int(active_row_range_count),
+                "row_weight_nonzero_row_count": int(row_weight_nonzero_row_count),
+                "row_weight_zero_row_count": int(row_weight_zero_row_count),
+                "row_reader_overread_zero_row_count": int(
+                    max(0, row_reader_row_count - row_weight_nonzero_row_count)
+                ),
+                "row_reader_row_count": int(row_reader_row_count),
+                "iteration_count": int(iteration_count),
+                "solver_elapsed_ms_total": float(solver_elapsed_ms_total),
+                "row_reader_elapsed_ms_total": float(row_reader_elapsed_ms_total),
+                "normalization_elapsed_ms_total": float(normalization_elapsed_ms_total),
+                "matmul_elapsed_ms_total": float(matmul_elapsed_ms_total),
             }
         )
 

@@ -86,6 +86,30 @@ def test_select_candidate_feature_indices_uses_layer_position_topk_then_global_c
     assert abs(retained_activation_mass - (12.0 / 15.5)) < 1e-6
 
 
+def test_select_candidate_feature_indices_retained_mass_avoids_float32_overflow() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor(
+            [
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+                [0, 1, 2, 3],
+            ]
+        ),
+        values=torch.tensor([1e38, 1e38, 1e38, 1e38], dtype=torch.float32),
+        size=(1, 1, 4),
+        check_invariants=True,
+    ).coalesce()
+
+    selected, stats = select_candidate_feature_indices(
+        activation_matrix,
+        SparsificationConfig(global_cap=2),
+    )
+
+    assert selected.numel() == 2
+    retained_activation_mass = cast(float, stats["retained_activation_mass"])
+    assert abs(retained_activation_mass - 0.5) < 1e-6
+
+
 def test_chunked_components_apply_sparsification_before_reconstruction(tmp_path: Path):
     torch.manual_seed(0)
     clt = load_gemma_scope_2_clt(

@@ -146,7 +146,19 @@ def attribute(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
-    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
+    phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
+    phase4_scheduler_debug: bool = False,
+    phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
+    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
+    phase1_trace_batch_size_max: int | None = None,
+    phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
+    phase4_refresh_interval_multiplier: int = 1,
+    phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
+    row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -183,8 +195,32 @@ def attribute(
         sparsification: Optional candidate-screening config. When provided, phase 0
             keeps only retained feature candidates before reconstruction, and later
             attribution phases reuse the same candidate set.
+        phase4_scheduler_mode: Phase-4 frontier scheduler mode for NNSight backend.
+            ``"locality"`` keeps default behavior. ``"planner_v1"`` enables the
+            membership-preserving planner path. ``"planner_v2"`` records distinct
+            v2 scheduler identity/policy telemetry while currently executing the
+            planner-v1 reference behavior. ``"legacy"`` is accepted as an alias
+            by the NNSight entrypoint.
+        phase4_scheduler_debug: Emit additional planner scheduler diagnostics when
+            supported by the backend.
+        phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
+            Phase-4 planning/batching metadata.
+        phase4_refresh_optimization: Requested Phase-4 refresh optimization mode
+            (``"off"`` or ``"v1"``).
+        phase4_row_executor: Requested Phase-4 row execution mode
+            (``"batched"`` or ``"streaming_v1"``).
+        phase1_trace_batch_policy: Requested Phase-1 trace-batch sizing policy.
+        phase1_trace_batch_size_max: Optional Phase-1 trace-batch cap.
+            Used by ``"cap_effective_batches"``; ignored by legacy execution.
+        phase4_refresh_policy: Requested Phase-4 refresh cadence policy.
+        phase4_refresh_interval_multiplier: Requested Phase-4 refresh interval multiplier.
+            Used by ``"deferred_v1"`` on compact exact-trace Phase 4.
+        phase4_ranker: Requested Phase-4 ranker implementation.
+        row_store_cache_control: Requested compact row-store cache-control mode.
+        exact_encoder_residency: Requested exact encoder residency mode.
         exact_trace_internal_dtype: Internal dtype used by compact exact-trace
-            normalization/ranking internals ("fp32" or "fp64").
+            normalization/ranking internals ("fp32" or "fp64"). Defaults to
+            ``"fp32"`` on the post-fix stable path.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -196,6 +232,21 @@ def attribute(
             "Phase-4 feature batch planner is unsupported via circuit_tracer.attribution.attribute(). "
             "Use the NNSight entrypoint with compact_output=True on exact_chunked_decoder paths."
         )
+
+    phase4_overrides_requested = (
+        phase4_scheduler_mode != "locality"
+        or bool(phase4_scheduler_debug)
+        or phase4_scheduler_telemetry_detail != "normal"
+        or phase4_refresh_optimization != "off"
+        or phase4_row_executor != "batched"
+        or phase1_trace_batch_policy != "legacy"
+        or phase1_trace_batch_size_max is not None
+        or phase4_refresh_policy != "standard"
+        or phase4_refresh_interval_multiplier != 1
+        or phase4_ranker != "argsort"
+        or row_store_cache_control != "off"
+        or exact_encoder_residency != "lazy"
+    )
 
     if model.backend == "nnsight":
         from .attribute_nnsight import attribute as attribute_nnsight
@@ -228,9 +279,28 @@ def attribute(
             feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
             feature_batch_min_free_fraction=feature_batch_min_free_fraction,
             feature_batch_probe_batches=feature_batch_probe_batches,
+            phase4_scheduler_mode=phase4_scheduler_mode,
+            phase4_scheduler_debug=phase4_scheduler_debug,
+            phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
+            phase4_refresh_optimization=phase4_refresh_optimization,
+            phase4_row_executor=phase4_row_executor,
+            phase1_trace_batch_policy=phase1_trace_batch_policy,
+            phase1_trace_batch_size_max=phase1_trace_batch_size_max,
+            phase4_refresh_policy=phase4_refresh_policy,
+            phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
+            phase4_ranker=phase4_ranker,
+            row_store_cache_control=row_store_cache_control,
+            exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
         )
     else:
+        if phase4_overrides_requested:
+            raise ValueError(
+                "Phase-4 execution settings are only supported for the NNSight backend via "
+                "circuit_tracer.attribution.attribute(); received non-default Phase-4 "
+                f"arguments for backend={getattr(model, 'backend', '<unknown>')!r}."
+            )
+
         from .attribute_transformerlens import attribute as attribute_transformerlens
 
         return attribute_transformerlens(

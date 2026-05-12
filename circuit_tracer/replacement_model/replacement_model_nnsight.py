@@ -19,6 +19,7 @@ from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 from circuit_tracer.utils import get_default_device
 from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
+from circuit_tracer.utils.telemetry import get_memory_snapshot
 from circuit_tracer.utils.tl_nnsight_mapping import (
     get_mapping,
     convert_nnsight_config_to_transformerlens,
@@ -615,6 +616,7 @@ class NNSightReplacementModel(LanguageModel):
         stage_encoder_vecs_on_cpu: bool | None = None,
         stage_error_vectors_on_cpu: bool | None = None,
         row_subchunk_size: int | None = None,
+        exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
         internal_precision_requested: str | None = None,
         resolved_dtype_map: dict[str, str] | None = None,
     ):
@@ -685,12 +687,41 @@ class NNSightReplacementModel(LanguageModel):
         if callable(trace_event):
             trace_event("phase0.setup.components_start", backend="nnsight")
         exact_chunked_decoder = getattr(transcoders, "exact_chunked_decoder", False)
+        exact_encoder_residency_requested = str(exact_encoder_residency).strip().lower()
+        allowed_residency_modes = {"lazy", "active_cpu", "active_pinned_cpu"}
+        if exact_encoder_residency_requested not in allowed_residency_modes:
+            allowed = ", ".join(sorted(allowed_residency_modes))
+            raise ValueError(
+                f"exact_encoder_residency must be one of: {allowed} "
+                f"(got {exact_encoder_residency!r})"
+            )
+
+        exact_encoder_residency_effective = cast(
+            Literal["lazy", "active_cpu", "active_pinned_cpu"],
+            exact_encoder_residency_requested,
+        )
+        exact_encoder_residency_fallback_reason: str | None = None
+        if exact_encoder_residency_effective != "lazy" and not exact_chunked_decoder:
+            exact_encoder_residency_effective = "lazy"
+            exact_encoder_residency_fallback_reason = (
+                "active encoder residency requires exact_chunked_decoder=True; "
+                "falling back to lazy execution"
+            )
+
+        materialize_encoder_vecs_phase0 = bool(
+            exact_chunked_decoder and exact_encoder_residency_effective != "lazy"
+        )
+
+        stage_encoder_vecs_on_cpu_effective = stage_encoder_vecs_on_cpu
+        if materialize_encoder_vecs_phase0:
+            stage_encoder_vecs_on_cpu_effective = True
+
         if exact_chunked_decoder:
             attribution_data = transcoders.compute_attribution_components(
                 mlp_in_cache,
                 self.zero_positions,
                 sparsification=sparsification,
-                materialize_encoder_vecs=False,
+                materialize_encoder_vecs=materialize_encoder_vecs_phase0,
             )  # type: ignore
         else:
             attribution_data = transcoders.compute_attribution_components(
@@ -742,6 +773,19 @@ class NNSightReplacementModel(LanguageModel):
             dict[str, torch.Tensor] | None, attribution_data.get("chunked_decoder_state")
         )
 
+        memory_device: torch.device | None
+        if isinstance(self.device, torch.device):
+            memory_device = self.device
+        else:
+            try:
+                memory_device = torch.device(str(self.device))
+            except (TypeError, RuntimeError, ValueError):
+                memory_device = None
+
+        encoder_move_memory_before = (
+            get_memory_snapshot(memory_device) if materialize_encoder_vecs_phase0 else None
+        )
+
         ctx = AttributionContext(
             activation_matrix=activation_matrix,
             logits=retained_logits,
@@ -756,12 +800,28 @@ class NNSightReplacementModel(LanguageModel):
             chunked_decoder_state=chunked_decoder_state,
             chunked_feature_replay_window=chunked_feature_replay_window,
             error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
-            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu_effective,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
+            exact_encoder_residency=cast(
+                Literal["lazy", "active_cpu", "active_pinned_cpu"],
+                exact_encoder_residency_requested,
+            ),
+            materialized_encoder_vecs_during_phase0=materialize_encoder_vecs_phase0,
             internal_precision_requested=internal_precision_requested,
             resolved_dtype_map=resolved_dtype_map,
         )
+        encoder_move_memory_after_stage = (
+            get_memory_snapshot(memory_device) if materialize_encoder_vecs_phase0 else None
+        )
+
+        if materialize_encoder_vecs_phase0:
+            attribution_data.pop("encoder_vecs", None)
+            del encoder_vecs
+        encoder_move_memory_after_free = (
+            get_memory_snapshot(memory_device) if materialize_encoder_vecs_phase0 else None
+        )
+
         del reconstruction
         del attribution_data["reconstruction"]
         del mlp_in_cache
@@ -785,8 +845,31 @@ class NNSightReplacementModel(LanguageModel):
             "chunked_feature_replay_window": chunked_feature_replay_window,
             "error_vector_prefetch_lookahead": error_vector_prefetch_lookahead,
             "stage_encoder_vecs_on_cpu": stage_encoder_vecs_on_cpu,
+            "stage_encoder_vecs_on_cpu_effective": stage_encoder_vecs_on_cpu_effective,
             "stage_error_vectors_on_cpu": stage_error_vectors_on_cpu,
             "row_subchunk_size": row_subchunk_size,
+            "exact_encoder_residency_requested": exact_encoder_residency_requested,
+            "exact_encoder_residency_effective": exact_encoder_residency_effective,
+            "exact_encoder_residency_fallback_reason": exact_encoder_residency_fallback_reason,
+            "exact_encoder_staging_destination": getattr(
+                ctx, "exact_encoder_staging_destination", "none"
+            ),
+            "exact_encoder_materialized_during_phase0": bool(materialize_encoder_vecs_phase0),
+            "active_encoder_shape": tuple(ctx.encoder_vecs.shape),
+            "active_encoder_bytes": int(ctx.encoder_vecs.numel() * ctx.encoder_vecs.element_size()),
+            "exact_encoder_pinned_requested": bool(
+                getattr(ctx, "exact_encoder_pinned_requested", False)
+            ),
+            "exact_encoder_pinned_effective": bool(
+                getattr(ctx, "exact_encoder_pinned_effective", False)
+            ),
+            "exact_encoder_pinning_success": getattr(ctx, "exact_encoder_pinning_success", None),
+            "exact_encoder_pinning_failure_reason": getattr(
+                ctx, "exact_encoder_pinning_failure_reason", None
+            ),
+            "exact_encoder_gpu_memory_before_stage": encoder_move_memory_before,
+            "exact_encoder_gpu_memory_after_stage": encoder_move_memory_after_stage,
+            "exact_encoder_gpu_memory_after_free": encoder_move_memory_after_free,
             "internal_precision_requested": internal_precision_requested,
             "resolved_dtype_map": resolved_dtype_map,
             "phase0_pre_clt_input_fingerprints": phase0_pre_clt_input_fingerprints,

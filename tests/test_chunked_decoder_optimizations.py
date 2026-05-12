@@ -16,18 +16,31 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase0_donor_bundle_payload,
     _build_phase0_replay_metadata,
     _build_phase0_replay_validation_context,
+    _build_phase4_batch_locality_summary,
+    _build_phase4_executor_batch_telemetry,
+    _build_phase4_executor_substage_telemetry,
     _build_phase4_normalization_stats,
+    _build_phase4_planner_v2_candidate_window,
+    _build_phase4_refresh_substage_telemetry,
+    _select_phase4_planner_v2_membership,
+    _apply_phase4_planner_v2_refresh_plan,
     _build_phase4_deterministic_shadow_pending,
     _build_phase4_cutoff_debug,
     _build_phase4_probe_pending_frontier,
     _build_phase3_seed_bundle_payload,
     _load_phase0_donor_bundle_npz,
+    _build_phase4_scheduler_metadata,
+    _build_phase4_scheduler_plan_telemetry,
     _record_cross_cluster_batch_event,
     _record_cross_cluster_checkpoint,
     _compute_row_abs_sums,
     _build_vector_stats,
     _compare_phase4_frontiers,
     _compute_phase4_planned_feature_batch_size,
+    _compute_phase4_locality_shaped_batch_end,
+    _compute_phase4_locality_shaped_frontier_size,
+    _compute_phase4_refresh_queue_window_size,
+    _plan_phase4_frontier_membership_preserving_v1,
     _reorder_pending_for_phase4_locality,
     _resolve_internal_dtype_map,
     _resolve_internal_precision_requested,
@@ -37,6 +50,36 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_phase4_anomaly_debug_enabled,
     _resolve_phase4_feature_batch_planner_status,
     _hash_sparse_membership_indices,
+    _resolve_phase4_refresh_optimization_mode,
+    _resolve_phase4_refresh_optimization_config,
+    _build_phase4_refresh_optimization_metadata,
+    _resolve_phase1_trace_batch_policy,
+    _resolve_phase1_trace_batch_size_max,
+    _resolve_phase1_trace_batch_config,
+    _build_phase1_trace_batch_metadata,
+    _resolve_phase1_trace_batch_sizing,
+    _build_phase1_trace_batch_sizing_metadata,
+    _resolve_phase4_refresh_policy,
+    _resolve_phase4_refresh_interval_multiplier,
+    _resolve_phase4_refresh_policy_config,
+    _build_phase4_refresh_policy_metadata,
+    _resolve_phase4_ranker,
+    _resolve_phase4_ranker_config,
+    _build_phase4_ranker_metadata,
+    _select_phase4_frontier_rank_selection,
+    _resolve_row_store_cache_control,
+    _resolve_row_store_cache_control_config,
+    _build_row_store_cache_control_metadata,
+    _resolve_exact_encoder_residency,
+    _resolve_exact_encoder_residency_config,
+    _build_exact_encoder_residency_metadata,
+    _resolve_phase4_row_executor_mode,
+    _resolve_phase4_row_executor_config,
+    _resolve_phase4_streaming_v1_microbatch_size,
+    _build_phase4_row_executor_metadata,
+    _resolve_phase4_scheduler_mode,
+    _resolve_phase4_scheduler_config,
+    _resolve_phase4_scheduler_telemetry_detail,
 )
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
@@ -579,12 +622,13 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
         check_invariants=True,
     ).coalesce()
     encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    staged_encoder_source = encoder_vecs.clone()
     ctx = NNSightAttributionContext(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(2, 2, 4),
         token_vectors=torch.zeros(2, 4),
         decoder_vecs=torch.empty((0, 4)),
-        encoder_vecs=encoder_vecs.clone(),
+        encoder_vecs=staged_encoder_source,
         encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
         decoder_locations=torch.empty((2, 0), dtype=torch.long),
         logits=torch.zeros(1, 1, 5),
@@ -598,8 +642,112 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
     )
 
     assert ctx.encoder_vecs.device.type == "cpu"
+    assert ctx.encoder_vecs.data_ptr() != staged_encoder_source.data_ptr()
     batch = ctx.materialize_encoder_vectors(torch.tensor([2, 0]), device=torch.device("cpu"))
     assert torch.equal(batch, encoder_vecs[torch.tensor([2, 0])])
+
+
+def test_exact_chunked_active_cpu_encoder_residency_stages_materialized_table() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 1], [0, 1, 1], [0, 1, 0]]),
+        values=torch.tensor([1.0, 2.0, 3.0]),
+        size=(2, 2, 2),
+        check_invariants=True,
+    ).coalesce()
+    encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 2, 4),
+        token_vectors=torch.zeros(2, 4),
+        decoder_vecs=torch.empty((0, 4)),
+        encoder_vecs=encoder_vecs,
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1, 1, 5),
+        decoder_provider=FakeDecoderProvider({0: torch.zeros(2, 2, 4), 1: torch.zeros(1, 1, 4)}),
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+        stage_encoder_vecs_on_cpu=False,
+        exact_encoder_residency="active_cpu",
+        materialized_encoder_vecs_during_phase0=True,
+    )
+
+    assert ctx.encoder_vecs.device.type == "cpu"
+    assert ctx.exact_encoder_residency_requested == "active_cpu"
+    assert ctx.exact_encoder_residency_effective == "active_cpu"
+    assert ctx.exact_encoder_staging_destination == "cpu"
+    assert ctx.exact_encoder_materialized_during_phase0 is True
+    assert ctx.exact_encoder_pinned_requested is False
+    assert ctx.exact_encoder_pinned_effective is False
+
+
+def test_exact_chunked_active_pinned_cpu_encoder_residency_falls_back_to_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 1], [0, 1, 1], [0, 1, 0]]),
+        values=torch.tensor([1.0, 2.0, 3.0]),
+        size=(2, 2, 2),
+        check_invariants=True,
+    ).coalesce()
+    encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+    def _stage_with_forced_pin_failure(tensor: torch.Tensor, *, pin_memory: bool):
+        staged = NNSightAttributionContext._stage_tensor_on_cpu(tensor)
+        assert pin_memory is True
+        return staged, False, "RuntimeError: pinning unavailable"
+
+    monkeypatch.setattr(
+        NNSightAttributionContext,
+        "_stage_encoder_tensor",
+        staticmethod(_stage_with_forced_pin_failure),
+    )
+
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 2, 4),
+        token_vectors=torch.zeros(2, 4),
+        decoder_vecs=torch.empty((0, 4)),
+        encoder_vecs=encoder_vecs,
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1, 1, 5),
+        decoder_provider=FakeDecoderProvider({0: torch.zeros(2, 2, 4), 1: torch.zeros(1, 1, 4)}),
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+        exact_encoder_residency="active_pinned_cpu",
+        materialized_encoder_vecs_during_phase0=True,
+    )
+
+    assert ctx.encoder_vecs.device.type == "cpu"
+    assert ctx.exact_encoder_residency_requested == "active_pinned_cpu"
+    assert ctx.exact_encoder_residency_effective == "active_pinned_cpu"
+    assert ctx.exact_encoder_pinned_requested is True
+    assert ctx.exact_encoder_pinned_effective is False
+    assert ctx.exact_encoder_pinning_success is False
+    assert ctx.exact_encoder_pinning_failure_reason is not None
+    assert ctx.exact_encoder_staging_destination == "cpu"
+
+
+def test_stage_tensor_on_cpu_preserves_existing_cpu_layout() -> None:
+    source = torch.arange(24, dtype=torch.float32, requires_grad=True).reshape(4, 6).transpose(0, 1)
+    assert source.device.type == "cpu"
+    assert not source.is_contiguous()
+
+    staged = NNSightAttributionContext._stage_tensor_on_cpu(source)
+
+    assert staged.device.type == "cpu"
+    assert staged.data_ptr() != source.data_ptr()
+    assert staged.stride() == source.stride()
+    assert not staged.requires_grad
 
 
 def test_exact_chunked_lazy_encoder_materialization_matches_eager_rows(tmp_path: Path) -> None:
@@ -691,6 +839,7 @@ def test_exact_chunked_error_vector_prefetch_window_stays_bounded() -> None:
         error_vector_prefetch_lookahead=2,
     )
 
+    assert ctx.error_vectors.data_ptr() != error_vectors.data_ptr()
     assert torch.equal(
         ctx.get_error_vectors_for_layer(3, device=torch.device("cpu")), error_vectors[3]
     )
@@ -718,6 +867,1023 @@ def test_reorder_pending_for_phase4_locality_groups_layer_then_chunk_then_positi
     )
 
     assert torch.equal(reordered, torch.tensor([5, 1, 3, 2, 4, 0], dtype=torch.long))
+
+
+def test_phase4_scheduler_mode_resolves_and_accepts_legacy_alias() -> None:
+    assert _resolve_phase4_scheduler_mode("locality") == "locality"
+    assert _resolve_phase4_scheduler_mode("planner_v1") == "planner_v1"
+    assert _resolve_phase4_scheduler_mode("planner_v2") == "planner_v2"
+    assert _resolve_phase4_scheduler_mode("legacy") == "locality"
+
+
+def test_phase4_scheduler_config_planner_v2_tracks_requested_and_effective_policy() -> None:
+    config = _resolve_phase4_scheduler_config(
+        phase4_scheduler_mode="planner_v2",
+        phase4_scheduler_debug=False,
+        phase4_scheduler_telemetry_detail="normal",
+    )
+    metadata = _build_phase4_scheduler_metadata(config)
+
+    assert metadata["scheduler_requested_mode"] == "planner_v2"
+    assert metadata["scheduler_mode_requested"] == "planner_v2"
+    assert metadata["scheduler_mode"] == "planner_v2"
+    assert metadata["scheduler_version"] == "planner_v2"
+    assert metadata["scheduler_version_requested"] == "planner_v2"
+    assert metadata["scheduler_policy"] == "bounded_membership_selection"
+    assert metadata["scheduler_policy_requested"] == "bounded_membership_selection"
+    assert metadata["scheduler_effective_mode"] == "planner_v2"
+    assert metadata["scheduler_mode_effective"] == "planner_v2"
+    assert metadata["scheduler_effective_version"] == "planner_v2"
+    assert metadata["scheduler_version_effective"] == "planner_v2"
+    assert metadata["scheduler_effective_policy"] == "bounded_membership_selection"
+    assert metadata["scheduler_policy_effective"] == "bounded_membership_selection"
+    assert metadata["scheduler_effective_behavior"] == "requested"
+    assert metadata["scheduler_reference_execution"] is False
+
+
+def test_phase4_scheduler_mode_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="phase4_scheduler_mode must be one of"):
+        _resolve_phase4_scheduler_mode("unsupported")
+
+
+def test_phase4_scheduler_telemetry_detail_resolves_aliases() -> None:
+    assert _resolve_phase4_scheduler_telemetry_detail("summary") == "summary"
+    assert _resolve_phase4_scheduler_telemetry_detail("normal") == "normal"
+    assert _resolve_phase4_scheduler_telemetry_detail("debug") == "debug"
+    assert _resolve_phase4_scheduler_telemetry_detail("compact") == "summary"
+    assert _resolve_phase4_scheduler_telemetry_detail("full") == "debug"
+
+
+def test_phase4_scheduler_telemetry_detail_rejects_unknown_value() -> None:
+    with pytest.raises(
+        ValueError,
+        match="phase4_scheduler_telemetry_detail must be one of",
+    ):
+        _resolve_phase4_scheduler_telemetry_detail("verbose")
+
+
+def test_phase4_refresh_optimization_mode_resolves_and_rejects_unknown() -> None:
+    assert _resolve_phase4_refresh_optimization_mode("off") == "off"
+    assert _resolve_phase4_refresh_optimization_mode("v1") == "v1"
+    with pytest.raises(ValueError, match="phase4_refresh_optimization must be one of"):
+        _resolve_phase4_refresh_optimization_mode("v2")
+
+
+def test_phase4_refresh_optimization_metadata_tracks_requested_and_effective_modes() -> None:
+    config = _resolve_phase4_refresh_optimization_config(
+        "v1",
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
+    metadata = _build_phase4_refresh_optimization_metadata(config)
+
+    assert metadata["refresh_optimization_requested"] == "v1"
+    assert metadata["refresh_optimization_mode_requested"] == "v1"
+    assert metadata["refresh_optimization"] == "v1"
+    assert metadata["refresh_optimization_effective"] == "v1"
+    assert metadata["refresh_optimization_mode_effective"] == "v1"
+    assert metadata["refresh_optimization_reference_execution"] is False
+
+
+def test_phase4_refresh_optimization_falls_back_off_when_compact_refresh_unavailable() -> None:
+    config = _resolve_phase4_refresh_optimization_config(
+        "v1",
+        compact_output=False,
+        exact_chunked_decoder=False,
+    )
+    metadata = _build_phase4_refresh_optimization_metadata(config)
+
+    assert metadata["refresh_optimization_requested"] == "v1"
+    assert metadata["refresh_optimization"] == "v1"
+    assert metadata["refresh_optimization_effective"] == "off"
+    assert metadata["refresh_optimization_mode_effective"] == "off"
+    assert metadata["refresh_optimization_effective_version"] == "off_v1"
+    assert metadata["refresh_optimization_reference_execution"] is True
+    assert metadata["refresh_optimization_effective_behavior"] == "off_reference_execution"
+
+
+def test_phase1_trace_batch_policy_config_validates_and_tracks_effective_behavior() -> None:
+    assert _resolve_phase1_trace_batch_policy("legacy") == "legacy"
+    assert _resolve_phase1_trace_batch_policy("cap_effective_batches") == "cap_effective_batches"
+    assert _resolve_phase1_trace_batch_size_max(None) is None
+    assert _resolve_phase1_trace_batch_size_max(64) == 64
+    with pytest.raises(ValueError, match="phase1_trace_batch_policy must be one of"):
+        _resolve_phase1_trace_batch_policy("cap")
+    with pytest.raises(ValueError, match="phase1_trace_batch_size_max must be > 0"):
+        _resolve_phase1_trace_batch_size_max(0)
+
+    config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=64,
+    )
+    metadata = _build_phase1_trace_batch_metadata(config)
+    assert metadata["trace_batch_policy_requested"] == "cap_effective_batches"
+    assert metadata["trace_batch_policy_effective"] == "cap_effective_batches"
+    assert metadata["trace_batch_policy_default"] == "legacy"
+    assert metadata["trace_batch_policy_reference_execution"] is False
+    assert metadata["trace_batch_size_max_requested"] == 64
+    assert metadata["trace_batch_size_max_effective"] == 64
+    assert metadata["trace_batch_size_max_default"] is None
+    assert metadata["trace_batch_size_max_reference_execution"] is False
+    assert metadata["trace_batch_policy_fallback_reason"] is None
+
+    cap_missing_max = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=None,
+    )
+    cap_missing_max_metadata = _build_phase1_trace_batch_metadata(cap_missing_max)
+    assert cap_missing_max_metadata["trace_batch_policy_effective"] == "legacy"
+    assert cap_missing_max_metadata["trace_batch_policy_reference_execution"] is True
+    assert (
+        cap_missing_max_metadata["trace_batch_policy_effective_behavior"]
+        == "legacy_fallback_missing_batch_size_max"
+    )
+    assert (
+        cap_missing_max_metadata["trace_batch_policy_fallback_reason"]
+        == "cap_effective_batches requested without phase1_trace_batch_size_max; "
+        "falling back to legacy execution"
+    )
+    cap_missing_max_sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=128,
+        feature_batch_size=None,
+        logit_batch_size=None,
+        feature_batch_size_max=None,
+        phase1_trace_batch_config=cap_missing_max,
+    )
+    cap_missing_max_sizing_metadata = _build_phase1_trace_batch_sizing_metadata(
+        cap_missing_max_sizing
+    )
+    assert cap_missing_max_sizing_metadata["trace_batch_cap_applied"] is False
+    assert (
+        cap_missing_max_sizing_metadata["trace_batch_cap_reason"]
+        == "cap_effective_batches_fallback_missing_batch_size_max"
+    )
+
+    legacy_with_cap = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="legacy",
+        phase1_trace_batch_size_max=64,
+    )
+    legacy_with_cap_metadata = _build_phase1_trace_batch_metadata(legacy_with_cap)
+    assert legacy_with_cap_metadata["trace_batch_policy_effective"] == "legacy"
+    assert legacy_with_cap_metadata["trace_batch_size_max_effective"] is None
+    assert legacy_with_cap_metadata["trace_batch_size_max_reference_execution"] is True
+
+
+def test_phase1_trace_batch_sizing_caps_source_batch_only() -> None:
+    config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=64,
+    )
+    sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=128,
+        feature_batch_size=None,
+        logit_batch_size=96,
+        feature_batch_size_max=200,
+        phase1_trace_batch_config=config,
+    )
+    metadata = _build_phase1_trace_batch_sizing_metadata(sizing)
+
+    assert metadata["source_batch_size_requested"] == 128
+    assert metadata["source_batch_size_effective"] == 64
+    assert metadata["source_batch_size_cap_applied"] is True
+    assert metadata["feature_batch_size_requested"] == 128
+    assert metadata["feature_batch_size_defaulted"] is True
+    assert metadata["feature_batch_size_effective"] == 128
+    assert metadata["feature_batch_size_cap_applied"] is False
+    assert metadata["logit_batch_size_requested"] == 96
+    assert metadata["logit_batch_size_effective"] == 96
+    assert metadata["logit_batch_size_cap_applied"] is False
+    assert metadata["phase4_feature_batch_size_max_requested"] == 200
+    assert metadata["phase4_feature_batch_size_max_effective"] == 200
+    assert metadata["phase4_feature_batch_size_max_cap_applied"] is False
+    assert metadata["trace_batch_size_legacy"] == 128
+    assert metadata["trace_batch_size_effective_pre_planner"] == 64
+    assert metadata["trace_batch_size_cap_applied"] is True
+    assert metadata["trace_batch_cap_applied"] is True
+    assert metadata["trace_batch_cap_reason"] == "cap_effective_batches_applied"
+
+
+def test_phase1_trace_batch_sizing_cap_does_not_reduce_later_phase_batches() -> None:
+    config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=64,
+    )
+    sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=128,
+        feature_batch_size=192,
+        logit_batch_size=160,
+        feature_batch_size_max=256,
+        phase1_trace_batch_config=config,
+    )
+
+    assert sizing.effective_source_batch_size == 64
+    assert sizing.effective_feature_batch_size == 192
+    assert sizing.effective_logit_batch_size == 160
+    assert sizing.effective_phase4_max_feature_batch_size == 256
+
+
+def test_phase1_trace_batch_sizing_legacy_policy_ignores_requested_cap() -> None:
+    config = _resolve_phase1_trace_batch_config(
+        phase1_trace_batch_policy="legacy",
+        phase1_trace_batch_size_max=64,
+    )
+    sizing = _resolve_phase1_trace_batch_sizing(
+        batch_size=128,
+        feature_batch_size=80,
+        logit_batch_size=None,
+        feature_batch_size_max=256,
+        phase1_trace_batch_config=config,
+    )
+    metadata = _build_phase1_trace_batch_sizing_metadata(sizing)
+
+    assert metadata["source_batch_size_effective"] == 128
+    assert metadata["feature_batch_size_effective"] == 80
+    assert metadata["logit_batch_size_effective"] == 128
+    assert metadata["phase4_feature_batch_size_max_effective"] == 256
+    assert metadata["trace_batch_cap_applied"] is False
+    assert metadata["trace_batch_cap_reason"] == "legacy_policy_ignores_phase1_trace_batch_size_max"
+
+
+def test_phase4_refresh_policy_config_validates_and_activates_deferred_when_applicable() -> None:
+    assert _resolve_phase4_refresh_policy("standard") == "standard"
+    assert _resolve_phase4_refresh_policy("deferred_v1") == "deferred_v1"
+    assert _resolve_phase4_refresh_interval_multiplier(3) == 3
+    with pytest.raises(ValueError, match="phase4_refresh_policy must be one of"):
+        _resolve_phase4_refresh_policy("deferred")
+    with pytest.raises(ValueError, match="phase4_refresh_interval_multiplier must be > 0"):
+        _resolve_phase4_refresh_interval_multiplier(0)
+
+    config = _resolve_phase4_refresh_policy_config(
+        phase4_refresh_policy="deferred_v1",
+        phase4_refresh_interval_multiplier=3,
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
+    metadata = _build_phase4_refresh_policy_metadata(config)
+    assert metadata["refresh_policy_requested"] == "deferred_v1"
+    assert metadata["refresh_policy_effective"] == "deferred_v1"
+    assert metadata["refresh_policy_default"] == "standard"
+    assert metadata["refresh_policy_reference_execution"] is False
+    assert metadata["refresh_policy_applicable"] is True
+    assert metadata["refresh_policy_fallback_reason"] is None
+    assert metadata["refresh_interval_multiplier_requested"] == 3
+    assert metadata["refresh_interval_multiplier_effective"] == 3
+    assert metadata["refresh_interval_multiplier_default"] == 1
+    assert metadata["refresh_interval_multiplier_reference_execution"] is False
+    assert metadata["refresh_queue_multiplier_effective"] == 3
+
+
+def test_phase4_refresh_policy_config_falls_back_when_deferred_path_unavailable() -> None:
+    config = _resolve_phase4_refresh_policy_config(
+        phase4_refresh_policy="deferred_v1",
+        phase4_refresh_interval_multiplier=3,
+        compact_output=False,
+        exact_chunked_decoder=False,
+    )
+    metadata = _build_phase4_refresh_policy_metadata(config)
+
+    assert metadata["refresh_policy_requested"] == "deferred_v1"
+    assert metadata["refresh_policy_effective"] == "standard"
+    assert metadata["refresh_policy_reference_execution"] is True
+    assert metadata["refresh_policy_applicable"] is False
+    assert metadata["refresh_policy_fallback_reason"] is not None
+    assert metadata["refresh_interval_multiplier_requested"] == 3
+    assert metadata["refresh_interval_multiplier_effective"] == 1
+    assert metadata["refresh_queue_multiplier_effective"] == 1
+    assert metadata["refresh_interval_multiplier_reference_execution"] is True
+
+    standard_nondefault = _resolve_phase4_refresh_policy_config(
+        phase4_refresh_policy="standard",
+        phase4_refresh_interval_multiplier=3,
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
+    standard_nondefault_metadata = _build_phase4_refresh_policy_metadata(standard_nondefault)
+    assert standard_nondefault_metadata["refresh_policy_effective"] == "standard"
+    assert standard_nondefault_metadata["refresh_interval_multiplier_effective"] == 1
+    assert standard_nondefault_metadata["refresh_queue_multiplier_effective"] == 1
+    assert standard_nondefault_metadata["refresh_interval_multiplier_reference_execution"] is True
+
+
+def test_phase4_refresh_queue_window_size_scales_with_multiplier_and_reduces_refreshes() -> None:
+    feature_count = 100
+    standard_queue = _compute_phase4_refresh_queue_window_size(
+        update_interval=2,
+        phase4_feature_batch_size=8,
+        queue_multiplier=1,
+    )
+    deferred_queue = _compute_phase4_refresh_queue_window_size(
+        update_interval=2,
+        phase4_feature_batch_size=8,
+        queue_multiplier=3,
+    )
+
+    assert standard_queue == 16
+    assert deferred_queue == 48
+
+    standard_refreshes = (feature_count + standard_queue - 1) // standard_queue
+    deferred_refreshes = (feature_count + deferred_queue - 1) // deferred_queue
+    assert deferred_refreshes < standard_refreshes
+
+
+def test_phase4_ranker_config_validates_and_tracks_effective_mode() -> None:
+    assert _resolve_phase4_ranker("argsort") == "argsort"
+    assert _resolve_phase4_ranker("topk_v1") == "topk_v1"
+    with pytest.raises(ValueError, match="phase4_ranker must be one of"):
+        _resolve_phase4_ranker("topk")
+
+    config = _resolve_phase4_ranker_config("topk_v1")
+    metadata = _build_phase4_ranker_metadata(config)
+    assert metadata["ranker_requested"] == "topk_v1"
+    assert metadata["ranker_effective"] == "topk_v1"
+    assert metadata["ranker_default"] == "argsort"
+    assert metadata["ranker_reference_execution"] is False
+
+
+def test_phase4_ranker_topk_matches_argsort_frontier_without_ties() -> None:
+    feature_influences = torch.tensor([0.9, 0.2, 0.8, 0.7, 0.1, 0.6], dtype=torch.float64)
+    visited = torch.tensor([False, True, False, False, False, False], dtype=torch.bool)
+
+    argsort_selection = _select_phase4_frontier_rank_selection(
+        feature_influences=feature_influences,
+        visited=visited,
+        frontier_size=3,
+        ranker_mode="argsort",
+    )
+    topk_selection = _select_phase4_frontier_rank_selection(
+        feature_influences=feature_influences,
+        visited=visited,
+        frontier_size=3,
+        ranker_mode="topk_v1",
+    )
+
+    assert torch.equal(topk_selection.selected_frontier, argsort_selection.selected_frontier)
+    assert topk_selection.selected_order_hash == argsort_selection.selected_order_hash
+    assert topk_selection.tie_at_cutoff is False
+
+
+def test_phase4_ranker_topk_tie_metadata_documents_cutoff_membership_behavior() -> None:
+    feature_influences = torch.tensor([1.0, 0.5, 0.5, 0.1], dtype=torch.float64)
+    visited = torch.zeros(4, dtype=torch.bool)
+
+    argsort_selection = _select_phase4_frontier_rank_selection(
+        feature_influences=feature_influences,
+        visited=visited,
+        frontier_size=2,
+        ranker_mode="argsort",
+    )
+    topk_selection = _select_phase4_frontier_rank_selection(
+        feature_influences=feature_influences,
+        visited=visited,
+        frontier_size=2,
+        ranker_mode="topk_v1",
+    )
+
+    topk_set = set(topk_selection.selected_frontier.tolist())
+    assert topk_selection.selected_count == 2
+    assert 0 in topk_set
+    assert topk_set.issubset({0, 1, 2})
+    assert topk_selection.tie_count_at_cutoff >= 2
+    assert topk_selection.tie_at_cutoff is True
+    assert "ties at the cutoff" in topk_selection.tie_behavior
+    assert "argsort" in argsort_selection.tie_behavior
+
+
+def test_row_store_cache_control_config_validates_and_tracks_effective_mode() -> None:
+    assert _resolve_row_store_cache_control("off") == "off"
+    assert (
+        _resolve_row_store_cache_control("fadvise_dontneed_after_append_v1")
+        == "fadvise_dontneed_after_append_v1"
+    )
+    with pytest.raises(ValueError, match="row_store_cache_control must be one of"):
+        _resolve_row_store_cache_control("fadvise")
+
+    config = _resolve_row_store_cache_control_config(
+        "fadvise_dontneed_after_append_v1",
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
+    metadata = _build_row_store_cache_control_metadata(config)
+    assert metadata["row_store_cache_control_requested"] == "fadvise_dontneed_after_append_v1"
+    assert metadata["row_store_cache_control_effective"] == "fadvise_dontneed_after_append_v1"
+    assert metadata["row_store_cache_control_default"] == "off"
+    assert metadata["row_store_cache_control_reference_execution"] is False
+    assert metadata["row_store_cache_control_applicable"] is True
+    assert metadata["row_store_cache_control_fallback_reason"] is None
+
+    fallback_config = _resolve_row_store_cache_control_config(
+        "fadvise_dontneed_after_append_v1",
+        compact_output=False,
+        exact_chunked_decoder=False,
+    )
+    fallback_metadata = _build_row_store_cache_control_metadata(fallback_config)
+    assert fallback_metadata["row_store_cache_control_effective"] == "off"
+    assert fallback_metadata["row_store_cache_control_reference_execution"] is True
+    assert fallback_metadata["row_store_cache_control_applicable"] is False
+    assert fallback_metadata["row_store_cache_control_fallback_reason"] is not None
+
+
+def test_exact_encoder_residency_config_validates_tracks_effective_mode_and_fallback() -> None:
+    assert _resolve_exact_encoder_residency("lazy") == "lazy"
+    assert _resolve_exact_encoder_residency("active_cpu") == "active_cpu"
+    assert _resolve_exact_encoder_residency("active_pinned_cpu") == "active_pinned_cpu"
+    with pytest.raises(ValueError, match="exact_encoder_residency must be one of"):
+        _resolve_exact_encoder_residency("active")
+
+    config = _resolve_exact_encoder_residency_config(
+        "active_pinned_cpu",
+        exact_chunked_decoder=True,
+    )
+    metadata = _build_exact_encoder_residency_metadata(config)
+    assert metadata["exact_encoder_residency_requested"] == "active_pinned_cpu"
+    assert metadata["exact_encoder_residency_effective"] == "active_pinned_cpu"
+    assert metadata["exact_encoder_residency_applicable"] is True
+    assert metadata["exact_encoder_residency_fallback_reason"] is None
+    assert metadata["exact_encoder_materialize_phase0"] is True
+    assert metadata["exact_encoder_staging_destination_planned"] == "pinned_cpu"
+    assert metadata["exact_encoder_pinned_requested"] is True
+    assert metadata["exact_encoder_pinned_planned"] is True
+    assert metadata["exact_encoder_pinned_effective"] is None
+    assert metadata["exact_encoder_pinning_success"] is None
+    assert metadata["exact_encoder_residency_default"] == "lazy"
+    assert metadata["exact_encoder_residency_reference_execution"] is False
+
+    fallback_config = _resolve_exact_encoder_residency_config(
+        "active_pinned_cpu",
+        exact_chunked_decoder=False,
+    )
+    fallback_metadata = _build_exact_encoder_residency_metadata(fallback_config)
+    assert fallback_metadata["exact_encoder_residency_effective"] == "lazy"
+    assert fallback_metadata["exact_encoder_residency_applicable"] is False
+    assert fallback_metadata["exact_encoder_residency_fallback_reason"] is not None
+    assert fallback_metadata["exact_encoder_materialize_phase0"] is False
+    assert fallback_metadata["exact_encoder_pinned_requested"] is True
+    assert fallback_metadata["exact_encoder_pinned_planned"] is False
+    assert fallback_metadata["exact_encoder_pinned_effective"] is None
+    assert fallback_metadata["exact_encoder_residency_reference_execution"] is True
+
+
+def test_phase4_row_executor_mode_resolves_and_rejects_unknown() -> None:
+    assert _resolve_phase4_row_executor_mode("batched") == "batched"
+    assert _resolve_phase4_row_executor_mode("streaming_v1") == "streaming_v1"
+    with pytest.raises(ValueError, match="phase4_row_executor must be one of"):
+        _resolve_phase4_row_executor_mode("streaming_v2")
+
+
+def test_phase4_row_executor_metadata_tracks_requested_and_effective_modes() -> None:
+    config = _resolve_phase4_row_executor_config(
+        "streaming_v1",
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
+    metadata = _build_phase4_row_executor_metadata(config)
+
+    assert metadata["row_executor_requested"] == "streaming_v1"
+    assert metadata["row_executor_mode_requested"] == "streaming_v1"
+    assert metadata["row_executor"] == "streaming_v1"
+    assert metadata["row_executor_effective"] == "streaming_v1"
+    assert metadata["row_executor_mode_effective"] == "streaming_v1"
+    assert metadata["row_executor_reference_execution"] is False
+
+
+def test_phase4_row_executor_falls_back_to_batched_when_streaming_path_unavailable() -> None:
+    config = _resolve_phase4_row_executor_config(
+        "streaming_v1",
+        compact_output=False,
+        exact_chunked_decoder=False,
+    )
+    metadata = _build_phase4_row_executor_metadata(config)
+
+    assert metadata["row_executor_requested"] == "streaming_v1"
+    assert metadata["row_executor_effective"] == "batched"
+    assert metadata["row_executor_mode_effective"] == "batched"
+    assert metadata["row_executor_effective_version"] == "batched_v1"
+    assert metadata["row_executor_reference_execution"] is True
+    assert metadata["row_executor_effective_behavior"] == "batched_reference_execution"
+
+
+def test_phase4_streaming_v1_microbatch_size_is_capped() -> None:
+    assert _resolve_phase4_streaming_v1_microbatch_size(1) == 1
+    assert _resolve_phase4_streaming_v1_microbatch_size(64) == 64
+    assert _resolve_phase4_streaming_v1_microbatch_size(256) == 64
+
+
+def test_phase4_executor_batch_telemetry_separates_scheduler_and_microbatch_counts() -> None:
+    telemetry = _build_phase4_executor_batch_telemetry(
+        scheduler_reference_batch_index=2,
+        scheduler_reference_batch_count=4,
+        scheduler_reference_batch_rows=128,
+        executor_microbatch_index=9,
+        executor_microbatch_count=12,
+        executor_configured_reference_batch_size=128,
+        executor_microbatch_rows=32,
+        executor_microbatch_size=32,
+    )
+
+    assert telemetry["phase4_batch_count"] == 4
+    assert telemetry["phase4_batches"] == 4
+    assert telemetry["phase4_executor_microbatch_count"] == 12
+    assert telemetry["scheduler_reference_batch_index"] == 2
+    assert telemetry["scheduler_reference_batch_rows"] == 128
+    assert telemetry["executor_microbatch_index"] == 9
+    assert telemetry["executor_microbatch_rows"] == 32
+    assert telemetry["executor_configured_reference_batch_size"] == 128
+    assert telemetry["executor_reference_batch_size"] == 128
+    assert telemetry["executor_microbatch_size"] == 32
+
+
+def test_phase4_executor_batch_telemetry_keeps_reference_and_microbatch_indices_separate() -> None:
+    first = _build_phase4_executor_batch_telemetry(
+        scheduler_reference_batch_index=0,
+        scheduler_reference_batch_count=1,
+        scheduler_reference_batch_rows=64,
+        executor_microbatch_index=1,
+        executor_microbatch_count=1,
+        executor_configured_reference_batch_size=64,
+        executor_microbatch_rows=32,
+        executor_microbatch_size=32,
+    )
+    second = _build_phase4_executor_batch_telemetry(
+        scheduler_reference_batch_index=1,
+        scheduler_reference_batch_count=2,
+        scheduler_reference_batch_rows=64,
+        executor_microbatch_index=2,
+        executor_microbatch_count=2,
+        executor_configured_reference_batch_size=64,
+        executor_microbatch_rows=32,
+        executor_microbatch_size=32,
+    )
+
+    assert first["phase4_batch_count"] == 1
+    assert second["phase4_batch_count"] == 2
+    assert first["scheduler_reference_batch_index"] == 0
+    assert second["scheduler_reference_batch_index"] == 1
+    assert first["executor_microbatch_index"] == 1
+    assert second["executor_microbatch_index"] == 2
+
+
+def test_phase4_batch_locality_summary_reports_layer_and_chunk_ranges() -> None:
+    summary = _build_phase4_batch_locality_summary(
+        torch.tensor([3, 1, 2], dtype=torch.long),
+        feat_layers=torch.tensor([2, 1, 1, 3], dtype=torch.long),
+        feat_ids=torch.tensor([0, 4, 6, 7], dtype=torch.long),
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert summary["scheduler_batch_hash"] is not None
+    assert summary["scheduler_batch_distinct_source_layer_count"] == 2
+    assert summary["scheduler_batch_source_layer_min"] == 1
+    assert summary["scheduler_batch_source_layer_max"] == 3
+    assert summary["scheduler_batch_distinct_decoder_chunk_count"] == 2
+    assert summary["scheduler_batch_decoder_chunk_min"] == 2
+    assert summary["scheduler_batch_decoder_chunk_max"] == 3
+    assert summary["scheduler_batch_monotonic_chunk_order"] is False
+
+
+def test_phase4_batch_locality_summary_treats_cross_layer_chunk_resets_as_monotonic() -> None:
+    summary = _build_phase4_batch_locality_summary(
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        feat_layers=torch.tensor([0, 0, 1, 1], dtype=torch.long),
+        feat_ids=torch.tensor([4, 6, 0, 2], dtype=torch.long),
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert summary["scheduler_batch_distinct_source_layer_count"] == 2
+    assert summary["scheduler_batch_decoder_chunk_min"] == 0
+    assert summary["scheduler_batch_decoder_chunk_max"] == 3
+    assert summary["scheduler_batch_monotonic_chunk_order"] is True
+
+
+def test_phase4_planner_v1_preserves_membership_and_boundaries() -> None:
+    pending_candidates = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+    feat_layers = torch.zeros(6, dtype=torch.long)
+    feat_positions = torch.arange(6, dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+
+    plan = _plan_phase4_frontier_membership_preserving_v1(
+        pending_candidates,
+        max_batch_size=3,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert torch.equal(plan.selected_frontier, torch.tensor([0, 1, 2, 3], dtype=torch.long))
+    assert plan.batch_boundaries == [(0, 2), (2, 4)]
+    assert plan.boundary_reason_counts == {"split_at_last_boundary": 1, "tail_complete": 1}
+    assert plan.selected_membership_hash is not None
+    assert plan.selected_order_hash is not None
+    assert plan.invariant_summary["membership_preserved"] is True
+    assert plan.locality_fragmentation_summary["selected_count"] == 4
+    assert plan.locality_fragmentation_summary["batch_count"] == 2
+
+
+def test_phase4_planner_v1_rejects_invalid_parameters_and_duplicates() -> None:
+    feat_layers = torch.zeros(4, dtype=torch.long)
+    feat_positions = torch.arange(4, dtype=torch.long)
+    feat_ids = torch.arange(4, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="max_batch_size must be > 0"):
+        _plan_phase4_frontier_membership_preserving_v1(
+            torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            max_batch_size=0,
+            max_batches=1,
+            feat_layers=feat_layers,
+            feat_positions=feat_positions,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=False,
+            decoder_chunk_size=None,
+        )
+
+    with pytest.raises(RuntimeError, match="duplicate"):
+        _plan_phase4_frontier_membership_preserving_v1(
+            torch.tensor([0, 1, 1, 2], dtype=torch.long),
+            max_batch_size=2,
+            max_batches=2,
+            feat_layers=feat_layers,
+            feat_positions=feat_positions,
+            feat_ids=feat_ids,
+            exact_chunked_decoder=False,
+            decoder_chunk_size=None,
+        )
+
+
+def test_phase4_planner_v2_candidate_window_includes_reference_frontier() -> None:
+    unvisited_feature_rank = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.long)
+    candidate_scores = torch.tensor([1.0, 0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92])
+    reference_frontier = torch.tensor([0, 4, 7], dtype=torch.long)
+
+    candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+        unvisited_feature_rank,
+        reference_frontier=reference_frontier,
+        reference_frontier_size=3,
+        candidate_scores=candidate_scores,
+    )
+
+    assert torch.equal(candidate_window, torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.long))
+    assert telemetry["scheduler_planner_v2_enabled"] is True
+    assert telemetry["scheduler_planner_v2_reference_frontier_size"] == 3
+    assert telemetry["scheduler_planner_v2_candidate_window_size"] == 8
+    assert telemetry["scheduler_planner_v2_candidate_window_includes_reference"] is True
+    assert telemetry["scheduler_planner_v2_candidate_window_order_hash"] is not None
+
+
+def test_phase4_planner_v2_candidate_window_respects_min_score_ratio_near_cutoff() -> None:
+    unvisited_feature_rank = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    candidate_scores = torch.tensor([1.0, 0.99, 0.80, 0.79])
+    reference_frontier = torch.tensor([0, 1], dtype=torch.long)
+
+    candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+        unvisited_feature_rank,
+        reference_frontier=reference_frontier,
+        reference_frontier_size=2,
+        candidate_scores=candidate_scores,
+    )
+
+    assert torch.equal(candidate_window, torch.tensor([0, 1], dtype=torch.long))
+    assert telemetry["scheduler_planner_v2_candidate_window_size"] == 2
+    assert telemetry["scheduler_planner_v2_score_threshold_applied"] is True
+    assert telemetry["scheduler_planner_v2_score_threshold"] == pytest.approx(0.99 * 0.995)
+
+
+def test_phase4_planner_v2_candidate_window_handles_empty_reference_and_short_unvisited() -> None:
+    candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
+        torch.tensor([9], dtype=torch.long),
+        reference_frontier=torch.tensor([], dtype=torch.long),
+        reference_frontier_size=0,
+        candidate_scores=torch.tensor([0.5]),
+    )
+
+    assert candidate_window.numel() == 0
+    assert telemetry["scheduler_planner_v2_reference_frontier_size"] == 0
+    assert telemetry["scheduler_planner_v2_candidate_window_size"] == 0
+    assert telemetry["scheduler_planner_v2_candidate_window_order_hash"] is None
+    assert telemetry["scheduler_planner_v2_candidate_window_includes_reference"] is True
+
+
+def test_phase4_planner_v2_selection_preserves_locked_prefix_and_bounds() -> None:
+    selected_membership, telemetry = _select_phase4_planner_v2_membership(
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.long),
+        reference_frontier=torch.tensor([0, 4, 5, 6], dtype=torch.long),
+        reference_frontier_size=4,
+        candidate_window=torch.tensor([0, 1, 2, 3, 4, 5, 6], dtype=torch.long),
+        candidate_scores=torch.tensor(
+            [1.0, 0.9995, 0.999, 0.9985, 0.998, 0.9975, 0.997, 0.9965],
+            dtype=torch.float64,
+        ),
+        visited=torch.zeros(8, dtype=torch.bool),
+        feat_layers=torch.tensor([0, 0, 1, 0, 1, 2, 3, 1], dtype=torch.long),
+        feat_ids=torch.zeros(8, dtype=torch.long),
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert telemetry["scheduler_planner_v2_selection_applied"] is True
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is False
+    assert selected_membership.numel() == 4
+    assert torch.unique(selected_membership).numel() == 4
+    assert {0, 4}.issubset(set(selected_membership.tolist()))
+    assert int(telemetry["scheduler_planner_v2_replacement_count"]) <= 1
+    assert float(telemetry["scheduler_planner_v2_selected_score_ratio"]) >= 0.995
+
+
+def test_phase4_planner_v2_selection_falls_back_when_score_ratio_fails() -> None:
+    selected_membership, telemetry = _select_phase4_planner_v2_membership(
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long),
+        reference_frontier=torch.tensor([0, 3, 4, 5], dtype=torch.long),
+        reference_frontier_size=4,
+        candidate_window=torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long),
+        candidate_scores=torch.tensor([1.0, 0.5, 0.49, 0.99, 0.98, 0.97], dtype=torch.float64),
+        visited=torch.zeros(6, dtype=torch.bool),
+        feat_layers=torch.tensor([0, 0, 0, 1, 2, 3], dtype=torch.long),
+        feat_ids=torch.zeros(6, dtype=torch.long),
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert telemetry["scheduler_planner_v2_selection_applied"] is False
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is True
+    assert telemetry["scheduler_planner_v2_fallback_reason"] == "score_ratio_below_threshold"
+    assert torch.equal(selected_membership, torch.tensor([0, 3, 4, 5], dtype=torch.long))
+
+
+def test_phase4_planner_v2_refresh_fallback_reuses_reference_plan_when_invalid() -> None:
+    feat_layers = torch.tensor([0, 0, 1, 0, 1, 2, 3, 1], dtype=torch.long)
+    feat_positions = torch.arange(8, dtype=torch.long)
+    feat_ids = torch.zeros(8, dtype=torch.long)
+    reference_plan = _plan_phase4_frontier_membership_preserving_v1(
+        torch.tensor([0, 4, 5, 6], dtype=torch.long),
+        max_batch_size=2,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+        apply_locality_reorder=False,
+    )
+    visited = torch.zeros(8, dtype=torch.bool)
+    visited[4] = True
+
+    selected_plan, _candidate_window, telemetry = _apply_phase4_planner_v2_refresh_plan(
+        reference_plan=reference_plan,
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.long),
+        candidate_scores=torch.tensor(
+            [1.0, 0.9995, 0.999, 0.9985, 0.998, 0.9975, 0.997, 0.9965],
+            dtype=torch.float64,
+        ),
+        visited=visited,
+        max_batch_size=2,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is True
+    assert telemetry["scheduler_planner_v2_fallback_reason"] == "reference_contains_visited_feature"
+    assert torch.equal(selected_plan.selected_frontier, reference_plan.selected_frontier)
+    assert selected_plan.batch_boundaries == reference_plan.batch_boundaries
+    assert selected_plan.invariant_summary["planner_v2_fallback_to_reference"] is True
+
+
+def test_phase4_planner_v2_refresh_can_change_membership_for_better_grouping() -> None:
+    feat_layers = torch.tensor([0, 0, 1, 0, 1, 2, 3, 1], dtype=torch.long)
+    feat_positions = torch.arange(8, dtype=torch.long)
+    feat_ids = torch.zeros(8, dtype=torch.long)
+    reference_plan = _plan_phase4_frontier_membership_preserving_v1(
+        torch.tensor([0, 4, 5, 6], dtype=torch.long),
+        max_batch_size=2,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+        apply_locality_reorder=False,
+    )
+
+    selected_plan, _candidate_window, telemetry = _apply_phase4_planner_v2_refresh_plan(
+        reference_plan=reference_plan,
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.long),
+        candidate_scores=torch.tensor(
+            [1.0, 0.9995, 0.999, 0.9985, 0.998, 0.9975, 0.997, 0.9965],
+            dtype=torch.float64,
+        ),
+        visited=torch.zeros(8, dtype=torch.bool),
+        max_batch_size=2,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert telemetry["scheduler_planner_v2_selection_applied"] is True
+    assert telemetry["scheduler_planner_v2_selection_changed_membership"] is True
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is False
+    assert int(telemetry["scheduler_planner_v2_replacement_count"]) == 1
+    assert int(telemetry["scheduler_planner_v2_group_count_delta"]) >= 1
+    assert selected_plan.selected_membership_hash != reference_plan.selected_membership_hash
+    assert selected_plan.invariant_summary["planner_v2_changed_membership"] is True
+
+
+def test_phase4_planner_v2_refresh_fails_closed_when_candidate_window_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feat_layers = torch.tensor([0, 0, 1, 0], dtype=torch.long)
+    feat_positions = torch.arange(4, dtype=torch.long)
+    feat_ids = torch.zeros(4, dtype=torch.long)
+    reference_plan = _plan_phase4_frontier_membership_preserving_v1(
+        torch.tensor([0, 1], dtype=torch.long),
+        max_batch_size=2,
+        max_batches=1,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+        apply_locality_reorder=False,
+    )
+
+    def _raise_candidate_window(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.attribute_nnsight._build_phase4_planner_v2_candidate_window",
+        _raise_candidate_window,
+    )
+
+    selected_plan, candidate_window, telemetry = _apply_phase4_planner_v2_refresh_plan(
+        reference_plan=reference_plan,
+        unvisited_feature_rank=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        candidate_scores=torch.tensor([1.0, 0.9, 0.8, 0.7], dtype=torch.float64),
+        visited=torch.zeros(4, dtype=torch.bool),
+        max_batch_size=2,
+        max_batches=1,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert candidate_window.numel() == 0
+    assert torch.equal(selected_plan.selected_frontier, reference_plan.selected_frontier)
+    assert telemetry["scheduler_planner_v2_fallback_to_reference"] is True
+    assert telemetry["scheduler_planner_v2_selection_applied"] is False
+    assert (
+        telemetry["scheduler_planner_v2_fallback_reason"]
+        == "planner_v2_selection_error:RuntimeError"
+    )
+
+
+def test_phase4_scheduler_plan_telemetry_reports_full_frontier_planner_metadata() -> None:
+    pending_candidates = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    feat_layers = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    feat_positions = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+
+    plan = _plan_phase4_frontier_membership_preserving_v1(
+        pending_candidates,
+        max_batch_size=2,
+        max_batches=None,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+        apply_locality_reorder=False,
+    )
+    telemetry = _build_phase4_scheduler_plan_telemetry(
+        phase4_frontier_plan=plan,
+        telemetry_detail="normal",
+    )
+
+    assert telemetry["scheduler_plan_frontier_size"] == 4
+    assert telemetry["scheduler_plan_membership_hash"] == plan.selected_membership_hash
+    assert telemetry["scheduler_plan_order_hash"] == plan.selected_order_hash
+    assert telemetry["scheduler_plan_batch_count"] == 2
+    assert telemetry["scheduler_plan_boundary_reason_counts"] == plan.boundary_reason_counts
+    assert telemetry["scheduler_plan_invariants"] == plan.invariant_summary
+
+
+def test_phase4_locality_shaped_batch_end_prefers_layer_chunk_boundaries() -> None:
+    pending = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+    feat_layers = torch.zeros(6, dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+
+    end0 = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=0,
+        max_batch_size=3,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+    end1 = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=end0,
+        max_batch_size=3,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+    end2 = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=end1,
+        max_batch_size=3,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert end0 == 2
+    assert end1 == 4
+    assert end2 == 6
+
+
+def test_phase4_locality_shaped_batch_end_keeps_baseline_when_split_unavoidable() -> None:
+    pending = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    feat_layers = torch.zeros(4, dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+
+    end = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=0,
+        max_batch_size=2,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=8,
+    )
+
+    assert end == 2
+
+
+def test_phase4_locality_shaped_batch_end_avoids_tiny_split_batches() -> None:
+    pending = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    feat_layers = torch.zeros(4, dtype=torch.long)
+    feat_ids = torch.tensor([0, 2, 3, 3], dtype=torch.long)
+
+    end = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=0,
+        max_batch_size=3,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert end == 3
+
+
+def test_phase4_locality_shaped_batch_end_avoids_preserving_long_suffix_run() -> None:
+    pending = torch.tensor([0, 1, 2, 3, 4, 5, 6], dtype=torch.long)
+    feat_layers = torch.tensor([0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+    feat_ids = torch.zeros(7, dtype=torch.long)
+
+    end = _compute_phase4_locality_shaped_batch_end(
+        pending,
+        pending_offset=0,
+        max_batch_size=6,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert end == 6
+
+
+def test_phase4_locality_shaped_frontier_size_preserves_update_interval_batch_cadence() -> None:
+    pending = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+    feat_layers = torch.zeros(6, dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+
+    frontier_size = _compute_phase4_locality_shaped_frontier_size(
+        pending,
+        max_batch_size=3,
+        max_batches=2,
+        feat_layers=feat_layers,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+    )
+
+    assert frontier_size == 4
 
 
 def test_phase4_planner_batch_size_grows_and_respects_max_cap() -> None:
@@ -1318,6 +2484,90 @@ def test_phase4_normalization_stats_reports_clamped_rows() -> None:
     assert stats["clamped_row_fraction"] == pytest.approx(2 / 3)
 
 
+def test_phase4_refresh_substage_telemetry_is_compact_in_summary_mode() -> None:
+    telemetry = _build_phase4_refresh_substage_telemetry(
+        telemetry_detail="summary",
+        partial_influence_elapsed_ms=12.5,
+        rank_topk_elapsed_ms=3.25,
+        frontier_plan_elapsed_ms=1.75,
+        row_store_read_elapsed_ms=6.0,
+        influence_normalization_elapsed_ms=2.0,
+        influence_matmul_elapsed_ms=1.5,
+        chunk_request_count=7,
+        active_row_chunk_count=5,
+        row_reader_row_count=1024,
+        solver_iteration_count=3,
+    )
+
+    assert telemetry == {
+        "refresh_partial_influence_elapsed_ms": pytest.approx(12.5),
+        "refresh_rank_topk_elapsed_ms": pytest.approx(3.25),
+        "refresh_frontier_plan_elapsed_ms": pytest.approx(1.75),
+    }
+
+
+def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
+    telemetry = _build_phase4_refresh_substage_telemetry(
+        telemetry_detail="normal",
+        partial_influence_elapsed_ms=10.0,
+        rank_topk_elapsed_ms=2.0,
+        frontier_plan_elapsed_ms=1.0,
+        row_store_read_elapsed_ms=4.0,
+        influence_normalization_elapsed_ms=0.75,
+        influence_matmul_elapsed_ms=0.5,
+        chunk_request_count=9,
+        active_row_chunk_count=6,
+        row_reader_row_count=2048,
+        solver_iteration_count=4,
+        row_chunk_strategy="active_row_contiguous_chunks",
+        row_weight_nonzero_row_count=768,
+        row_weight_zero_row_count=1280,
+        row_reader_overread_zero_row_count=0,
+        active_row_range_count=6,
+    )
+
+    assert telemetry["refresh_row_store_read_elapsed_ms"] == pytest.approx(4.0)
+    assert telemetry["refresh_influence_normalization_elapsed_ms"] == pytest.approx(0.75)
+    assert telemetry["refresh_influence_matmul_elapsed_ms"] == pytest.approx(0.5)
+    assert telemetry["refresh_chunk_request_count"] == 9
+    assert telemetry["refresh_active_row_chunk_count"] == 6
+    assert telemetry["refresh_rows_touched"] == 2048
+    assert telemetry["refresh_solver_iteration_count"] == 4
+    assert telemetry["refresh_row_chunk_strategy"] == "active_row_contiguous_chunks"
+    assert telemetry["refresh_row_weight_nonzero_rows"] == 768
+    assert telemetry["refresh_row_weight_zero_rows"] == 1280
+    assert telemetry["refresh_row_reader_overread_zero_rows"] == 0
+    assert telemetry["refresh_active_row_range_count"] == 6
+
+
+def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
+    summary = _build_phase4_executor_substage_telemetry(
+        telemetry_detail="summary",
+        compute_batch_elapsed_ms=5.0,
+        cpu_staging_elapsed_ms=1.0,
+        denominator_elapsed_ms=0.5,
+        row_store_write_elapsed_ms=0.75,
+        batch_elapsed_ms=8.0,
+    )
+    normal = _build_phase4_executor_substage_telemetry(
+        telemetry_detail="normal",
+        compute_batch_elapsed_ms=5.0,
+        cpu_staging_elapsed_ms=1.0,
+        denominator_elapsed_ms=0.5,
+        row_store_write_elapsed_ms=0.75,
+        batch_elapsed_ms=8.0,
+    )
+
+    assert summary["executor_compute_batch_elapsed_ms"] == pytest.approx(5.0)
+    assert summary["executor_accounted_elapsed_ms"] == pytest.approx(7.25)
+    assert summary["executor_overhead_elapsed_ms"] == pytest.approx(0.75)
+    assert "executor_cpu_staging_elapsed_ms" not in summary
+
+    assert normal["executor_cpu_staging_elapsed_ms"] == pytest.approx(1.0)
+    assert normal["executor_denominator_elapsed_ms"] == pytest.approx(0.5)
+    assert normal["executor_row_store_write_elapsed_ms"] == pytest.approx(0.75)
+
+
 def test_record_cross_cluster_checkpoint_updates_summary_and_stream() -> None:
     summary: dict[str, object] = {"checkpoints": {}}
     stream: list[dict[str, object]] = []
@@ -1365,6 +2615,7 @@ def test_build_cross_cluster_runtime_snapshot_emits_memory_and_hashes() -> None:
     )
 
     assert "memory_snapshot" in summary_payload
+    assert "rss_current_gib" in stream_payload
     assert "rss_gib" in stream_payload
     assert "ctx_diagnostic_snapshot_hash" in stream_payload
     assert "transcoder_diagnostic_snapshot_hash" in stream_payload
@@ -1509,6 +2760,138 @@ def test_top_level_attribute_rejects_phase4_planner_flags() -> None:
         )
 
 
+def test_top_level_attribute_forwards_phase4_scheduler_args_to_nnsight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def _fake_attribute(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr("circuit_tracer.attribution.attribute_nnsight.attribute", _fake_attribute)
+
+    class _DummyModel:
+        backend = "nnsight"
+
+    result = attribute_top_level(
+        prompt="hello",
+        model=cast(object, _DummyModel()),
+        phase4_scheduler_mode="planner_v1",
+        phase4_scheduler_debug=True,
+        phase4_scheduler_telemetry_detail="debug",
+        phase4_refresh_optimization="v1",
+        phase4_row_executor="streaming_v1",
+        phase1_trace_batch_policy="cap_effective_batches",
+        phase1_trace_batch_size_max=32,
+        phase4_refresh_policy="deferred_v1",
+        phase4_refresh_interval_multiplier=2,
+        phase4_ranker="topk_v1",
+        row_store_cache_control="fadvise_dontneed_after_append_v1",
+        exact_encoder_residency="active_cpu",
+    )
+
+    assert result is sentinel
+    assert captured["phase4_scheduler_mode"] == "planner_v1"
+    assert captured["phase4_scheduler_debug"] is True
+    assert captured["phase4_scheduler_telemetry_detail"] == "debug"
+    assert captured["phase4_refresh_optimization"] == "v1"
+    assert captured["phase4_row_executor"] == "streaming_v1"
+    assert captured["phase1_trace_batch_policy"] == "cap_effective_batches"
+    assert captured["phase1_trace_batch_size_max"] == 32
+    assert captured["phase4_refresh_policy"] == "deferred_v1"
+    assert captured["phase4_refresh_interval_multiplier"] == 2
+    assert captured["phase4_ranker"] == "topk_v1"
+    assert captured["row_store_cache_control"] == "fadvise_dontneed_after_append_v1"
+    assert captured["exact_encoder_residency"] == "active_cpu"
+
+
+def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transformerlens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def _fake_attribute(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.attribute_transformerlens.attribute",
+        _fake_attribute,
+    )
+
+    class _DummyModel:
+        backend = "transformerlens"
+
+    result = attribute_top_level(
+        prompt="hello",
+        model=cast(object, _DummyModel()),
+        phase4_scheduler_mode="locality",
+        phase4_scheduler_debug=False,
+        phase4_scheduler_telemetry_detail="normal",
+        phase4_refresh_optimization="off",
+        phase4_row_executor="batched",
+        phase1_trace_batch_policy="legacy",
+        phase1_trace_batch_size_max=None,
+        phase4_refresh_policy="standard",
+        phase4_refresh_interval_multiplier=1,
+        phase4_ranker="argsort",
+        row_store_cache_control="off",
+        exact_encoder_residency="lazy",
+    )
+
+    assert result is sentinel
+    assert "phase4_scheduler_mode" not in captured
+    assert "phase4_scheduler_debug" not in captured
+    assert "phase4_scheduler_telemetry_detail" not in captured
+    assert "phase4_refresh_optimization" not in captured
+    assert "phase4_row_executor" not in captured
+    assert "phase1_trace_batch_policy" not in captured
+    assert "phase1_trace_batch_size_max" not in captured
+    assert "phase4_refresh_policy" not in captured
+    assert "phase4_refresh_interval_multiplier" not in captured
+    assert "phase4_ranker" not in captured
+    assert "row_store_cache_control" not in captured
+    assert "exact_encoder_residency" not in captured
+
+
+@pytest.mark.parametrize(
+    "scheduler_kwargs",
+    [
+        {"phase4_scheduler_mode": "planner_v1"},
+        {"phase4_scheduler_mode": "planner_v2"},
+        {"phase4_scheduler_debug": True},
+        {"phase4_scheduler_telemetry_detail": "summary"},
+        {"phase4_refresh_optimization": "v1"},
+        {"phase4_row_executor": "streaming_v1"},
+        {"phase1_trace_batch_policy": "cap_effective_batches"},
+        {"phase1_trace_batch_size_max": 8},
+        {"phase4_refresh_policy": "deferred_v1"},
+        {"phase4_refresh_interval_multiplier": 2},
+        {"phase4_ranker": "topk_v1"},
+        {"row_store_cache_control": "fadvise_dontneed_after_append_v1"},
+        {"exact_encoder_residency": "active_cpu"},
+    ],
+)
+def test_top_level_attribute_rejects_non_default_phase4_scheduler_args_on_transformerlens(
+    scheduler_kwargs: dict[str, object],
+) -> None:
+    class _DummyModel:
+        backend = "transformerlens"
+
+    with pytest.raises(
+        ValueError,
+        match=r"Phase-4 execution settings are only supported for the NNSight backend",
+    ):
+        attribute_top_level(
+            prompt="hello",
+            model=cast(object, _DummyModel()),
+            **scheduler_kwargs,
+        )
+
+
 def test_chunked_feature_replay_windows_match_full_replay() -> None:
     grads_by_output_layer = [
         torch.tensor(
@@ -1539,6 +2922,137 @@ def test_chunked_feature_replay_windows_match_full_replay() -> None:
     )
 
     assert torch.allclose(windowed_ctx._batch_buffer, expected)
+
+
+def test_chunked_attr_fallback_handles_nonmonotonic_chunk_ids_within_layer() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 0], [0, 1, 2], [0, 2, 1]]),
+        values=torch.tensor([1.0, 1.0, 1.0]),
+        size=(2, 3, 3),
+        check_invariants=True,
+    ).coalesce()
+    provider = FakeDecoderProvider(
+        {
+            0: torch.tensor(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[0.0, 1.0], [1.0, 0.0]],
+                    [[1.0, 1.0], [2.0, 0.0]],
+                ]
+            )
+        },
+        chunk_size=2,
+        enable_cache=True,
+    )
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 3, 2),
+        token_vectors=torch.zeros(3, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+    ctx._batch_buffer = torch.zeros(ctx._row_size, 1)
+
+    grads_by_output_layer = [
+        torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]]),
+        torch.tensor([[[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]]),
+    ]
+
+    expected = torch.zeros(activation_matrix._nnz(), 1)
+    positions = activation_matrix.indices()[1]
+    feature_ids = activation_matrix.indices()[2]
+    activations = activation_matrix.values()
+    decoder_block = provider.blocks[0]
+    for row_idx in range(activation_matrix._nnz()):
+        position = int(positions[row_idx].item())
+        feature_id = int(feature_ids[row_idx].item())
+        activation = activations[row_idx]
+        total = torch.zeros(1)
+        for output_layer, grads in enumerate(grads_by_output_layer):
+            decoder_vec = decoder_block[feature_id, output_layer]
+            total += torch.einsum("bd,d->b", grads[:, position], decoder_vec) * activation
+        expected[row_idx] = total
+
+    ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+
+    assert torch.allclose(ctx._batch_buffer[: activation_matrix._nnz()], expected)
+    assert provider.load_calls == [(0, 0), (0, 1)]
+
+
+def test_chunked_attr_monotonic_chunk_fast_path_matches_reference() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 0, 0], [0, 1, 2, 3], [0, 1, 2, 3]]),
+        values=torch.tensor([1.0, 1.5, 2.0, 0.5]),
+        size=(2, 4, 4),
+        check_invariants=True,
+    ).coalesce()
+    provider = FakeDecoderProvider(
+        {
+            0: torch.tensor(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[0.0, 1.0], [1.0, 0.0]],
+                    [[1.0, 1.0], [2.0, 0.0]],
+                    [[2.0, 1.0], [0.0, 2.0]],
+                ]
+            )
+        },
+        chunk_size=2,
+        enable_cache=True,
+    )
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 4, 2),
+        token_vectors=torch.zeros(4, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+    ctx._batch_buffer = torch.zeros(ctx._row_size, 1)
+
+    grads_by_output_layer = [
+        torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]),
+        torch.tensor([[[2.0, 1.0], [4.0, 3.0], [6.0, 5.0], [8.0, 7.0]]]),
+    ]
+
+    expected = torch.zeros(activation_matrix._nnz(), 1)
+    positions = activation_matrix.indices()[1]
+    feature_ids = activation_matrix.indices()[2]
+    activations = activation_matrix.values()
+    decoder_block = provider.blocks[0]
+    for row_idx in range(activation_matrix._nnz()):
+        position = int(positions[row_idx].item())
+        feature_id = int(feature_ids[row_idx].item())
+        activation = activations[row_idx]
+        total = torch.zeros(1)
+        for output_layer, grads in enumerate(grads_by_output_layer):
+            decoder_vec = decoder_block[feature_id, output_layer]
+            total += torch.einsum("bd,d->b", grads[:, position], decoder_vec) * activation
+        expected[row_idx] = total
+
+    ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+
+    assert torch.allclose(ctx._batch_buffer[: activation_matrix._nnz()], expected)
+    assert provider.load_calls == [(0, 0), (0, 1)]
 
 
 def test_decoder_cache_stays_enabled_on_churn() -> None:
