@@ -1,10 +1,43 @@
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
 
+from circuit_tracer.attribution.attribute import attribute as attribute_top_level
+from circuit_tracer.attribution.attribute_nnsight import (
+    _annotate_phase4_selection_on_feature_semantic_descriptors,
+    _build_cross_cluster_runtime_snapshot,
+    _build_matrix_abs_stats,
+    _build_feature_semantic_descriptors_payload,
+    _build_phase0_activation_matrix_from_loaded_bundle,
+    _build_phase0_donor_bundle_payload,
+    _build_phase0_replay_metadata,
+    _build_phase0_replay_validation_context,
+    _build_phase4_normalization_stats,
+    _build_phase4_deterministic_shadow_pending,
+    _build_phase4_cutoff_debug,
+    _build_phase4_probe_pending_frontier,
+    _build_phase3_seed_bundle_payload,
+    _load_phase0_donor_bundle_npz,
+    _record_cross_cluster_batch_event,
+    _record_cross_cluster_checkpoint,
+    _compute_row_abs_sums,
+    _build_vector_stats,
+    _compare_phase4_frontiers,
+    _compute_phase4_planned_feature_batch_size,
+    _reorder_pending_for_phase4_locality,
+    _resolve_internal_dtype_map,
+    _resolve_internal_precision_requested,
+    _resolve_phase0_activation_threshold_compare_mode,
+    _resolve_phase0_donor_context_policy,
+    _resolve_phase0_replay_mode,
+    _resolve_phase4_anomaly_debug_enabled,
+    _resolve_phase4_feature_batch_planner_status,
+    _hash_sparse_membership_indices,
+)
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
 )
@@ -244,6 +277,42 @@ def test_nnsight_chunked_attr_requires_sorted_source_layers() -> None:
         )
 
 
+def test_nnsight_context_replace_phase0_activation_state_refreshes_chunked_state() -> None:
+    ctx, provider = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    assert ctx.decoder_chunk_cache is not None
+
+    donor_activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 2], [1, 0], [1, 0]], dtype=torch.int64),
+        values=torch.tensor([4.0, -3.0], dtype=torch.float32),
+        size=(3, 2, 2),
+        check_invariants=True,
+    ).coalesce()
+
+    stats = ctx.replace_phase0_activation_state(donor_activation_matrix)
+
+    assert stats["old_active_feature_count"] == 3
+    assert stats["new_active_feature_count"] == 2
+    assert ctx._row_size == donor_activation_matrix._nnz() + (3 + 1) * 2
+    assert provider.clear_calls >= 1
+    assert ctx.decoder_chunk_cache is not None
+    assert torch.equal(ctx.activation_matrix.indices(), donor_activation_matrix.indices())
+    assert torch.equal(ctx.activation_matrix.values(), donor_activation_matrix.values())
+    assert ctx._chunked_layer_spans == [(0, 1), None, (1, 2)]
+    assert ctx.chunked_decoder_state is not None
+    assert torch.equal(
+        ctx.chunked_decoder_state["source_layers"],
+        donor_activation_matrix.indices()[0],
+    )
+    assert torch.equal(
+        ctx.chunked_decoder_state["positions"],
+        donor_activation_matrix.indices()[1],
+    )
+    assert torch.equal(
+        ctx.chunked_decoder_state["feature_ids"],
+        donor_activation_matrix.indices()[2],
+    )
+
+
 def test_transformerlens_chunked_attr_reuses_decoder_block_loads() -> None:
     pytest.importorskip("transformer_lens")
     from circuit_tracer.attribution.context_transformerlens import (
@@ -337,6 +406,69 @@ def test_transformerlens_chunked_attr_subchunks_large_decoder_bucket() -> None:
     )
 
     _assert_chunked_attr_subchunks_large_decoder_bucket(TransformerLensAttributionContext)
+
+
+def test_nnsight_row_subchunk_override_matches_default_replay() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 0, 0, 0, 0], [0, 1, 2, 3, 4], [0, 1, 0, 1, 0]]),
+        values=torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]),
+        size=(2, 5, 2),
+        check_invariants=True,
+    ).coalesce()
+    blocks = {
+        0: torch.tensor(
+            [
+                [[1.0, 0.0], [10.0, 1.0]],
+                [[0.0, 1.0], [1.0, 10.0]],
+            ]
+        ),
+    }
+    grads_by_output_layer = [
+        torch.tensor(
+            [
+                [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]],
+                [[2.0, 1.0], [4.0, 3.0], [6.0, 5.0], [8.0, 7.0], [10.0, 9.0]],
+            ]
+        ),
+        torch.tensor(
+            [
+                [[11.0, 12.0], [13.0, 14.0], [15.0, 16.0], [17.0, 18.0], [19.0, 20.0]],
+                [[12.0, 11.0], [14.0, 13.0], [16.0, 15.0], [18.0, 17.0], [20.0, 19.0]],
+            ]
+        ),
+    ]
+
+    def _make_ctx(*, row_subchunk_size: int | None) -> NNSightAttributionContext:
+        provider = FakeDecoderProvider(blocks=blocks, chunk_size=2, enable_cache=True)
+        ctx = NNSightAttributionContext(
+            activation_matrix=activation_matrix,
+            error_vectors=torch.zeros(2, 5, 2),
+            token_vectors=torch.zeros(5, 2),
+            decoder_vecs=torch.empty((0, 2)),
+            encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+            encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+            decoder_locations=torch.empty((2, 0), dtype=torch.long),
+            logits=torch.zeros(1),
+            decoder_provider=provider,
+            chunked_decoder_state={
+                "source_layers": activation_matrix.indices()[0],
+                "positions": activation_matrix.indices()[1],
+                "feature_ids": activation_matrix.indices()[2],
+                "activation_values": activation_matrix.values(),
+            },
+            row_subchunk_size=row_subchunk_size,
+        )
+        ctx._batch_buffer = torch.zeros(ctx._row_size, 2)
+        return ctx
+
+    baseline_ctx = _make_ctx(row_subchunk_size=None)
+    baseline_ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+
+    custom_ctx = _make_ctx(row_subchunk_size=1)
+    custom_ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
+
+    assert torch.allclose(custom_ctx._batch_buffer, baseline_ctx._batch_buffer)
+    assert custom_ctx.get_diagnostic_snapshot()["row_subchunk_size"] == 1.0
 
 
 def _create_gemmascope2_clt_files(
@@ -470,6 +602,68 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
     assert torch.equal(batch, encoder_vecs[torch.tensor([2, 0])])
 
 
+def test_exact_chunked_lazy_encoder_materialization_matches_eager_rows(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    clt = load_gemma_scope_2_clt(
+        _create_gemmascope2_clt_files(tmp_path),
+        device=torch.device("cpu"),
+        lazy_encoder=True,
+        lazy_decoder=True,
+    )
+    inputs = torch.randn(clt.n_layers, 4, clt.d_model, dtype=clt.dtype)
+
+    eager_components = clt.compute_attribution_components(
+        inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=True,
+    )
+    lazy_components = clt.compute_attribution_components(
+        inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=False,
+    )
+
+    eager_activation = cast(torch.Tensor, eager_components["activation_matrix"])
+    lazy_activation = cast(torch.Tensor, lazy_components["activation_matrix"])
+    eager_encoder_vecs = cast(torch.Tensor, eager_components["encoder_vecs"])
+    lazy_encoder_vecs = cast(torch.Tensor, lazy_components["encoder_vecs"])
+
+    assert torch.equal(lazy_activation.indices(), eager_activation.indices())
+    assert torch.allclose(lazy_activation.values(), eager_activation.values())
+    assert lazy_encoder_vecs.shape == (0, clt.d_model)
+    assert eager_activation._nnz() > 0
+
+    ctx = NNSightAttributionContext(
+        activation_matrix=lazy_activation,
+        error_vectors=torch.zeros(clt.n_layers, inputs.shape[1], clt.d_model, dtype=clt.dtype),
+        token_vectors=torch.zeros(inputs.shape[1], clt.d_model, dtype=clt.dtype),
+        decoder_vecs=cast(torch.Tensor, lazy_components["decoder_vecs"]),
+        encoder_vecs=lazy_encoder_vecs,
+        encoder_to_decoder_map=cast(torch.Tensor, lazy_components["encoder_to_decoder_map"]),
+        decoder_locations=cast(torch.Tensor, lazy_components["decoder_locations"]),
+        logits=torch.zeros(1, 1, 1, dtype=clt.dtype),
+        decoder_provider=clt,
+        chunked_decoder_state=cast(
+            dict[str, torch.Tensor], lazy_components["chunked_decoder_state"]
+        ),
+    )
+
+    nnz = eager_activation._nnz()
+    row_probe = torch.randperm(nnz)[: min(5, nnz)]
+    lazy_rows = ctx.materialize_encoder_vectors(row_probe, device=torch.device("cpu"))
+    assert torch.allclose(lazy_rows, eager_encoder_vecs[row_probe])
+
+    cap = max(1, nnz // 2)
+    selected = (
+        torch.topk(eager_activation.values().abs(), k=cap, sorted=False).indices.sort().values
+    )
+    before_cap, after_cap = ctx.apply_diagnostic_feature_cap(cap)
+    assert before_cap == nnz
+    assert after_cap == cap
+    capped_rows = ctx.materialize_encoder_vectors(torch.arange(cap), device=torch.device("cpu"))
+    assert torch.allclose(capped_rows, eager_encoder_vecs[selected])
+
+
 def test_exact_chunked_error_vector_prefetch_window_stays_bounded() -> None:
     activation_matrix = torch.sparse_coo_tensor(
         indices=torch.tensor([[0, 1, 2, 3], [0, 0, 0, 0], [0, 0, 0, 0]]),
@@ -506,6 +700,813 @@ def test_exact_chunked_error_vector_prefetch_window_stays_bounded() -> None:
         ctx.get_error_vectors_for_layer(1, device=torch.device("cpu")), error_vectors[1]
     )
     assert set(ctx._materialized_error_vector_layers) == {0, 1}
+
+
+def test_reorder_pending_for_phase4_locality_groups_layer_then_chunk_then_position() -> None:
+    pending = torch.tensor([5, 1, 4, 0, 3, 2], dtype=torch.long)
+    feat_layers = torch.tensor([1, 0, 1, 0, 1, 0], dtype=torch.long)
+    feat_positions = torch.tensor([2, 1, 0, 2, 1, 0], dtype=torch.long)
+    feat_ids = torch.tensor([9, 7, 1, 4, 6, 3], dtype=torch.long)
+
+    reordered = _reorder_pending_for_phase4_locality(
+        pending,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=4,
+    )
+
+    assert torch.equal(reordered, torch.tensor([5, 1, 3, 2, 4, 0], dtype=torch.long))
+
+
+def test_phase4_planner_batch_size_grows_and_respects_max_cap() -> None:
+    assert (
+        _compute_phase4_planned_feature_batch_size(
+            128,
+            max_feature_batch_size=256,
+            observed_reserved_bytes=8 * 1024**3,
+            total_cuda_bytes=40 * 1024**3,
+            target_reserved_fraction=0.9,
+            min_free_fraction=0.05,
+        )
+        == 256
+    )
+
+
+def test_phase4_planner_batch_size_shrinks_when_probe_is_over_budget() -> None:
+    assert (
+        _compute_phase4_planned_feature_batch_size(
+            128,
+            max_feature_batch_size=256,
+            observed_reserved_bytes=32 * 1024**3,
+            total_cuda_bytes=40 * 1024**3,
+            target_reserved_fraction=0.7,
+            min_free_fraction=0.05,
+        )
+        == 111
+    )
+
+
+def test_phase4_planner_batch_size_uses_min_free_fraction_guardrail() -> None:
+    assert (
+        _compute_phase4_planned_feature_batch_size(
+            128,
+            max_feature_batch_size=512,
+            observed_reserved_bytes=16 * 1024**3,
+            total_cuda_bytes=40 * 1024**3,
+            target_reserved_fraction=0.95,
+            min_free_fraction=0.2,
+        )
+        == 256
+    )
+
+
+def test_phase4_planner_status_skips_when_no_headroom() -> None:
+    assert _resolve_phase4_feature_batch_planner_status(
+        planner_enabled=True,
+        effective_feature_batch_size=128,
+        max_feature_batch_size=128,
+    ) == (
+        "skipped_no_headroom",
+        "feature_batch_size_max does not exceed initial feature_batch_size",
+    )
+
+
+def test_phase4_planner_status_is_pending_when_growth_is_possible() -> None:
+    assert _resolve_phase4_feature_batch_planner_status(
+        planner_enabled=True,
+        effective_feature_batch_size=128,
+        max_feature_batch_size=256,
+    ) == ("pending", None)
+
+
+def test_phase4_anomaly_debug_enabled_from_flag() -> None:
+    assert _resolve_phase4_anomaly_debug_enabled(True) is True
+
+
+def test_phase4_anomaly_debug_enabled_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PHASE4_ANOMALY_DEBUG", "1")
+    assert _resolve_phase4_anomaly_debug_enabled(False) is True
+
+
+def test_internal_precision_contract_resolves_float64_defaults() -> None:
+    precision = _resolve_internal_precision_requested("float64")
+    dtype_map = _resolve_internal_dtype_map(
+        internal_precision_requested=precision,
+        phase4_anomaly_debug_enabled=False,
+    )
+
+    assert dtype_map["internal_precision_requested"] == "float64"
+    assert dtype_map["feature_row_storage_dtype"] == "float32"
+    assert dtype_map["row_abs_sum_dtype"] == "float64"
+    assert dtype_map["influence_compute_dtype"] == "float64"
+    assert dtype_map["planner_compute_dtype"] == "float64"
+    assert dtype_map["shadow_debug_compute_dtype"] == "float64"
+
+
+def test_internal_precision_contract_resolves_float32_math() -> None:
+    precision = _resolve_internal_precision_requested("float32")
+    dtype_map = _resolve_internal_dtype_map(
+        internal_precision_requested=precision,
+        phase4_anomaly_debug_enabled=False,
+    )
+
+    assert dtype_map["internal_precision_requested"] == "float32"
+    assert dtype_map["feature_row_storage_dtype"] == "float32"
+    assert dtype_map["row_abs_sum_dtype"] == "float32"
+    assert dtype_map["influence_compute_dtype"] == "float32"
+    assert dtype_map["planner_compute_dtype"] == "float32"
+
+
+def test_build_phase4_cutoff_debug_reports_margin_and_ties() -> None:
+    scores = torch.tensor([1.0, 0.9, 0.9, 0.5], dtype=torch.float32)
+    result = _build_phase4_cutoff_debug(scores, queue_size=2)
+
+    assert result["cutoff_rank"] == 1
+    assert result["cutoff_score"] == pytest.approx(0.9)
+    assert result["next_score"] == pytest.approx(0.9)
+    assert result["cutoff_margin"] == pytest.approx(0.0)
+    assert result["exact_cutoff_count"] == 2
+    assert result["near_cutoff_count"] >= 2
+
+
+def test_build_phase3_seed_bundle_payload_canonicalizes_cpu_tensors() -> None:
+    payload = _build_phase3_seed_bundle_payload(
+        active_features=torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64),
+        activation_values=torch.tensor([0.25, -0.75], dtype=torch.float32),
+        seed_feature_influences=torch.tensor([0.4, 0.2, 0.1], dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([2, 0], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([0, 2], dtype=torch.int64),
+        queue_size=2,
+        actual_max_feature_nodes=3,
+        total_active_features=9,
+        status="captured",
+        planner_compute_dtype=torch.float64,
+        influence_compute_dtype=torch.float64,
+    )
+
+    assert payload["status"] == "captured"
+    assert payload["queue_size"] == 2
+    assert payload["actual_max_feature_nodes"] == 3
+    assert payload["total_active_features"] == 9
+    assert payload["planner_compute_dtype"] == "float64"
+    assert payload["influence_compute_dtype"] == "float64"
+    assert torch.equal(
+        payload["active_features"],
+        torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64),
+    )
+    assert torch.equal(
+        payload["activation_values"],
+        torch.tensor([0.25, -0.75], dtype=torch.float32),
+    )
+    assert torch.equal(
+        payload["seed_feature_influences"],
+        torch.tensor([0.4, 0.2, 0.1], dtype=torch.float64),
+    )
+    assert torch.equal(
+        payload["frontier_pre_locality"],
+        torch.tensor([2, 0], dtype=torch.int64),
+    )
+    assert torch.equal(
+        payload["frontier_post_locality"],
+        torch.tensor([0, 2], dtype=torch.int64),
+    )
+
+
+def test_build_phase0_donor_bundle_payload_captures_hashes_and_metadata() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[1, 0], [0, 1], [3, 2]], dtype=torch.int64),
+        values=torch.tensor([0.25, -0.5], dtype=torch.bfloat16),
+        size=(3, 2, 8),
+        check_invariants=True,
+    ).coalesce()
+
+    payload = _build_phase0_donor_bundle_payload(
+        activation_matrix=activation_matrix,
+        input_tokens=torch.tensor([11, 22, 33], dtype=torch.int64),
+        target_token_ids=torch.tensor([2, 4], dtype=torch.int64),
+        target_probabilities=torch.tensor([0.7, 0.2], dtype=torch.float32),
+        target_logits=torch.tensor([3.5, -1.0], dtype=torch.float32),
+        transcoder_diagnostic_snapshot={
+            "phase0_boundary_fingerprints": {
+                "transcoder_constant_fingerprints": {"global_hash": "clt1234"}
+            }
+        },
+        status="captured",
+    )
+
+    assert payload["schema_version"] == 1
+    assert payload["replay_kind"] == "phase0_active_features_v1"
+    assert payload["status"] == "captured"
+    assert payload["activation_values_dtype"] == "bfloat16"
+    assert payload["activation_matrix_shape"] == [3, 2, 8]
+    assert payload["active_feature_count"] == 2
+    assert payload["input_token_count"] == 3
+    assert payload["target_count"] == 2
+    assert payload["clt_constants_hash"] == "clt1234"
+    assert isinstance(payload["active_feature_membership_hash_raw_order"], str)
+    assert isinstance(payload["active_feature_membership_hash_canonical"], str)
+    assert isinstance(payload["active_feature_values_hash"], str)
+    assert isinstance(payload["input_tokens_hash"], str)
+    assert isinstance(payload["target_token_ids_hash"], str)
+    assert isinstance(payload["target_probability_hash"], str)
+    assert isinstance(payload["target_logit_hash"], str)
+
+    assert torch.equal(
+        cast(torch.Tensor, payload["active_features"]),
+        activation_matrix.indices().T.to(dtype=torch.int64),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, payload["activation_values"]),
+        activation_matrix.values().to(dtype=torch.bfloat16),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, payload["active_feature_layer_counts"]),
+        torch.tensor([1, 1, 0], dtype=torch.int64),
+    )
+
+
+def _write_phase0_donor_bundle_npz_for_test(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    include_raw_uint16: bool,
+) -> None:
+    activation_values = cast(torch.Tensor, payload["activation_values"]).detach().cpu().contiguous()
+    activation_values_dtype = str(payload.get("activation_values_dtype", "")).replace("torch.", "")
+    if not activation_values_dtype:
+        activation_values_dtype = str(activation_values.dtype).replace("torch.", "")
+
+    activation_values_np = activation_values.to(dtype=torch.float32).numpy()
+    activation_values_raw_uint16 = (
+        activation_values.view(torch.uint16).numpy()
+        if include_raw_uint16 and activation_values.dtype == torch.bfloat16
+        else np.empty((0,), dtype=np.uint16)
+    )
+
+    np.savez_compressed(
+        path,
+        active_features=cast(torch.Tensor, payload["active_features"]).detach().cpu().numpy(),
+        activation_values=activation_values_np,
+        activation_values_dtype=np.array(activation_values_dtype),
+        activation_values_raw_uint16=activation_values_raw_uint16,
+        activation_matrix_shape=np.asarray(
+            payload.get("activation_matrix_shape", []), dtype=np.int64
+        ),
+        active_feature_count=np.array(int(payload.get("active_feature_count", 0)), dtype=np.int64),
+        active_feature_membership_hash_raw_order=np.array(
+            str(payload.get("active_feature_membership_hash_raw_order", ""))
+        ),
+        active_feature_membership_hash_canonical=np.array(
+            str(payload.get("active_feature_membership_hash_canonical", ""))
+        ),
+        active_feature_values_hash=np.array(str(payload.get("active_feature_values_hash", ""))),
+        input_tokens=cast(torch.Tensor, payload["input_tokens"]).detach().cpu().numpy(),
+        input_token_count=np.array(int(payload.get("input_token_count", 0)), dtype=np.int64),
+        input_tokens_hash=np.array(str(payload.get("input_tokens_hash", ""))),
+        target_token_ids=cast(torch.Tensor, payload["target_token_ids"]).detach().cpu().numpy(),
+        target_count=np.array(int(payload.get("target_count", 0)), dtype=np.int64),
+        target_token_ids_hash=np.array(str(payload.get("target_token_ids_hash", ""))),
+        clt_constants_hash=np.array(str(payload.get("clt_constants_hash", ""))),
+        schema_version=np.array(int(payload.get("schema_version", 0)), dtype=np.int64),
+        replay_kind=np.array(str(payload.get("replay_kind", ""))),
+        status=np.array(str(payload.get("status", ""))),
+    )
+
+
+def _build_phase0_payload_fixture() -> dict[str, object]:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[1, 0], [0, 1], [3, 2]], dtype=torch.int64),
+        values=torch.tensor([0.25, -0.5], dtype=torch.bfloat16),
+        size=(3, 2, 8),
+        check_invariants=True,
+    ).coalesce()
+    return _build_phase0_donor_bundle_payload(
+        activation_matrix=activation_matrix,
+        input_tokens=torch.tensor([11, 22, 33], dtype=torch.int64),
+        target_token_ids=torch.tensor([2, 4], dtype=torch.int64),
+        target_probabilities=torch.tensor([0.7, 0.2], dtype=torch.float32),
+        target_logits=torch.tensor([3.5, -1.0], dtype=torch.float32),
+        transcoder_diagnostic_snapshot={
+            "phase0_boundary_fingerprints": {
+                "transcoder_constant_fingerprints": {"global_hash": "clt1234"}
+            }
+        },
+        status="captured",
+    )
+
+
+def test_load_phase0_donor_bundle_npz_reconstructs_bf16_from_raw_sidecar(
+    tmp_path: Path,
+) -> None:
+    payload = _build_phase0_payload_fixture()
+    bundle_path = tmp_path / "step_000_phase0_donor_bundle.npz"
+    _write_phase0_donor_bundle_npz_for_test(bundle_path, payload, include_raw_uint16=True)
+
+    loaded = _load_phase0_donor_bundle_npz(bundle_path, context_policy="strict")
+
+    assert cast(torch.Tensor, loaded["activation_values"]).dtype == torch.bfloat16
+    assert torch.equal(
+        cast(torch.Tensor, loaded["activation_values"]),
+        cast(torch.Tensor, payload["activation_values"]),
+    )
+
+    dtype_metadata = cast(dict[str, object], loaded["dtype_metadata"])
+    validation_metadata = cast(dict[str, object], loaded["validation_metadata"])
+    assert dtype_metadata["exact_bfloat16_reconstruction"] is True
+    assert dtype_metadata["dtype_roundtrip_loss"] is False
+    assert validation_metadata["validated"] is True
+    assert validation_metadata["warnings"] == []
+
+
+def test_load_phase0_donor_bundle_npz_without_raw_sidecar_tracks_roundtrip_loss(
+    tmp_path: Path,
+) -> None:
+    payload = _build_phase0_payload_fixture()
+    bundle_path = tmp_path / "step_000_phase0_donor_bundle_no_raw.npz"
+    _write_phase0_donor_bundle_npz_for_test(bundle_path, payload, include_raw_uint16=False)
+
+    loaded = _load_phase0_donor_bundle_npz(bundle_path, context_policy="strict")
+    dtype_metadata = cast(dict[str, object], loaded["dtype_metadata"])
+
+    assert cast(torch.Tensor, loaded["activation_values"]).dtype == torch.float32
+    assert dtype_metadata["exact_bfloat16_reconstruction"] is False
+    assert dtype_metadata["dtype_roundtrip_loss"] is True
+
+
+def test_load_phase0_donor_bundle_npz_strict_fails_on_context_mismatch(tmp_path: Path) -> None:
+    payload = _build_phase0_payload_fixture()
+    bundle_path = tmp_path / "step_000_phase0_donor_bundle_strict_mismatch.npz"
+    _write_phase0_donor_bundle_npz_for_test(bundle_path, payload, include_raw_uint16=True)
+
+    with pytest.raises(ValueError, match="validation_context"):
+        _load_phase0_donor_bundle_npz(
+            bundle_path,
+            context_policy="strict",
+            validation_context={
+                "input_tokens_hash": "deadbeef",
+                "target_token_ids": torch.tensor([999, 1000], dtype=torch.int64),
+                "active_feature_membership_hash_canonical": "badc0de",
+            },
+        )
+
+
+def test_load_phase0_donor_bundle_npz_warn_policy_returns_warnings(tmp_path: Path) -> None:
+    payload = _build_phase0_payload_fixture()
+    bundle_path = tmp_path / "step_000_phase0_donor_bundle_warn_mismatch.npz"
+    _write_phase0_donor_bundle_npz_for_test(bundle_path, payload, include_raw_uint16=True)
+
+    loaded = _load_phase0_donor_bundle_npz(
+        bundle_path,
+        context_policy="warn",
+        validation_context={
+            "input_tokens_hash": "deadbeef",
+            "target_token_ids_hash": "beaded",
+        },
+    )
+
+    validation_metadata = cast(dict[str, object], loaded["validation_metadata"])
+    warnings = cast(list[str], validation_metadata["warnings"])
+
+    assert len(warnings) >= 1
+    assert any("validation_context" in warning for warning in warnings)
+    assert cast(torch.Tensor, loaded["active_features"]).shape == (2, 3)
+
+
+def test_build_phase0_replay_validation_context_hashes_host_state() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 1], [1, 0], [2, 3]], dtype=torch.int64),
+        values=torch.tensor([0.5, -0.2], dtype=torch.float32),
+        size=(2, 2, 8),
+        check_invariants=True,
+    ).coalesce()
+    target_token_ids = torch.tensor([7, 8], dtype=torch.int64)
+    validation_context = _build_phase0_replay_validation_context(
+        input_tokens=torch.tensor([11, 22, 33], dtype=torch.int64),
+        target_token_ids=target_token_ids,
+        activation_matrix=activation_matrix,
+        clt_constants_hash="clt1234",
+    )
+
+    assert validation_context["clt_constants_hash"] == "clt1234"
+    assert validation_context["input_tokens_hash"]
+    assert validation_context["target_token_ids_hash"]
+    assert validation_context["active_feature_membership_hash_raw_order"]
+    assert validation_context["active_feature_membership_hash_canonical"]
+
+
+def test_build_phase0_activation_matrix_from_loaded_bundle_reconstructs_sparse_matrix() -> None:
+    loaded_bundle = {
+        "active_features": torch.tensor([[0, 1, 2], [1, 0, 3]], dtype=torch.int64),
+        "activation_values": torch.tensor([0.25, -0.75], dtype=torch.float32),
+        "activation_matrix_shape": (2, 2, 8),
+    }
+
+    activation_matrix = _build_phase0_activation_matrix_from_loaded_bundle(
+        loaded_bundle,
+        device=torch.device("cpu"),
+    )
+
+    assert activation_matrix.shape == (2, 2, 8)
+    assert activation_matrix._nnz() == 2
+    assert torch.equal(
+        activation_matrix.indices().T,
+        cast(torch.Tensor, loaded_bundle["active_features"]),
+    )
+    assert torch.equal(
+        activation_matrix.values(),
+        cast(torch.Tensor, loaded_bundle["activation_values"]),
+    )
+
+
+def test_build_phase0_replay_metadata_tracks_warnings_and_dtype_loss() -> None:
+    metadata = _build_phase0_replay_metadata(
+        mode="donor_phase0",
+        status="applied_with_warnings",
+        donor_bundle_path="/tmp/step_000_phase0_donor_bundle.npz",
+        context_policy="warn",
+        validation_warnings=["target_token_ids_hash mismatch"],
+        validation_failure_count=1,
+        dtype_metadata={"dtype_roundtrip_loss": True},
+        host_hashes={"input_tokens_hash": "abcd"},
+        donor_hashes={"computed": {"input_tokens_hash": "efgh"}},
+        host_active_feature_count=10,
+        donor_active_feature_count=9,
+    )
+
+    assert metadata["status"] == "applied_with_warnings"
+    assert metadata["mode"] == "donor_phase0"
+    assert metadata["context_policy"] == "warn"
+    assert metadata["donor_bundle_basename"] == "step_000_phase0_donor_bundle.npz"
+    assert metadata["validation_warning_count"] == 1
+    assert cast(dict[str, object], metadata["dtype_metadata"])["dtype_roundtrip_loss"] is True
+
+
+def test_phase0_replay_mode_and_context_policy_resolution() -> None:
+    assert _resolve_phase0_replay_mode("disabled") == "disabled"
+    assert _resolve_phase0_replay_mode("donor_phase0") == "donor_phase0"
+    assert _resolve_phase0_donor_context_policy("strict") == "strict"
+    assert _resolve_phase0_donor_context_policy("warn") == "warn"
+
+    with pytest.raises(ValueError, match="phase0_replay_mode"):
+        _resolve_phase0_replay_mode("legacy")
+    with pytest.raises(ValueError, match="phase0_donor_context_policy"):
+        _resolve_phase0_donor_context_policy("ignore")
+
+
+def test_build_feature_semantic_descriptors_payload_is_bounded_and_deterministic() -> None:
+    payload = _build_feature_semantic_descriptors_payload(
+        active_features=torch.tensor(
+            [[0, 0, 7], [0, 1, 3], [1, 0, 4], [1, 1, 9], [2, 0, 5]],
+            dtype=torch.int64,
+        ),
+        activation_values=torch.tensor([0.2, -0.5, 0.1, 0.9, -0.1], dtype=torch.float32),
+        seed_feature_influences=torch.tensor([0.4, 0.2, 0.7, 0.1, 0.3], dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([2, 1], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([1, 4], dtype=torch.int64),
+        total_active_features=5,
+        status="captured",
+        semantic_descriptor_top_k=3,
+        semantic_descriptor_dim=8,
+    )
+    payload_again = _build_feature_semantic_descriptors_payload(
+        active_features=torch.tensor(
+            [[0, 0, 7], [0, 1, 3], [1, 0, 4], [1, 1, 9], [2, 0, 5]],
+            dtype=torch.int64,
+        ),
+        activation_values=torch.tensor([0.2, -0.5, 0.1, 0.9, -0.1], dtype=torch.float32),
+        seed_feature_influences=torch.tensor([0.4, 0.2, 0.7, 0.1, 0.3], dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([2, 1], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([1, 4], dtype=torch.int64),
+        total_active_features=5,
+        status="captured",
+        semantic_descriptor_top_k=3,
+        semantic_descriptor_dim=8,
+    )
+
+    assert payload["status"] == "captured"
+    assert payload["descriptor_version"] == "v1"
+    assert payload["descriptor_kind"] == "fallback_identity_metadata_v1"
+    assert payload["descriptor_dim"] == 8
+    assert payload["semantic_descriptor_top_k"] == 3
+    assert payload["candidate_count"] == 3
+    assert payload["total_active_features"] == 5
+    assert cast(torch.Tensor, payload["candidate_features"]).shape == (3, 3)
+    assert cast(torch.Tensor, payload["candidate_row_indices"]).shape == (3,)
+    assert cast(torch.Tensor, payload["activation_value"]).shape == (3,)
+    assert cast(torch.Tensor, payload["seed_influence"]).shape == (3,)
+    assert cast(torch.Tensor, payload["seed_rank"]).shape == (3,)
+    assert cast(torch.Tensor, payload["is_top_seed"]).dtype == torch.bool
+    assert cast(torch.Tensor, payload["is_frontier_pre"]).dtype == torch.bool
+    assert cast(torch.Tensor, payload["is_frontier_post"]).dtype == torch.bool
+    assert cast(torch.Tensor, payload["frontier_pre_rank"]).dtype == torch.int64
+    assert cast(torch.Tensor, payload["frontier_post_rank"]).dtype == torch.int64
+    assert cast(torch.Tensor, payload["semantic_sketch"]).shape == (3, 8)
+    assert cast(torch.Tensor, payload["semantic_sketch"]).dtype == torch.float32
+
+    assert torch.equal(
+        cast(torch.Tensor, payload["candidate_row_indices"]),
+        cast(torch.Tensor, payload_again["candidate_row_indices"]),
+    )
+    assert torch.allclose(
+        cast(torch.Tensor, payload["semantic_sketch"]),
+        cast(torch.Tensor, payload_again["semantic_sketch"]),
+    )
+
+
+def test_build_feature_semantic_descriptors_payload_handles_missing_seed_scores() -> None:
+    payload = _build_feature_semantic_descriptors_payload(
+        active_features=torch.tensor([[0, 0, 1], [0, 1, 2], [1, 0, 3]], dtype=torch.int64),
+        activation_values=torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        seed_feature_influences=torch.empty(0, dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([1], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([2], dtype=torch.int64),
+        total_active_features=3,
+        status="skipped_all_features_included",
+        semantic_descriptor_top_k=4,
+        semantic_descriptor_dim=6,
+    )
+
+    assert payload["seed_influence_available"] is False
+    assert torch.equal(
+        cast(torch.Tensor, payload["seed_rank"]),
+        torch.full((2,), -1, dtype=torch.int64),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, payload["is_top_seed"]),
+        torch.zeros(2, dtype=torch.bool),
+    )
+
+
+def test_annotate_phase4_selection_on_feature_semantic_descriptors_marks_membership() -> None:
+    payload = _build_feature_semantic_descriptors_payload(
+        active_features=torch.tensor([[0, 0, 1], [0, 1, 2], [1, 0, 3]], dtype=torch.int64),
+        activation_values=torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        seed_feature_influences=torch.tensor([0.5, 0.3, 0.1], dtype=torch.float64),
+        frontier_pre_locality=torch.tensor([0, 1], dtype=torch.int64),
+        frontier_post_locality=torch.tensor([1, 2], dtype=torch.int64),
+        total_active_features=3,
+        status="captured",
+        semantic_descriptor_top_k=3,
+        semantic_descriptor_dim=4,
+    )
+
+    _annotate_phase4_selection_on_feature_semantic_descriptors(
+        payload,
+        selected_features=torch.tensor([2, 0], dtype=torch.int64),
+    )
+
+    assert payload["phase4_selection_available"] is True
+    assert torch.equal(
+        cast(torch.Tensor, payload["is_selected_phase4"]),
+        torch.tensor([True, False, True], dtype=torch.bool),
+    )
+    assert torch.equal(
+        cast(torch.Tensor, payload["phase4_selected_rank"]),
+        torch.tensor([1, -1, 0], dtype=torch.int64),
+    )
+
+
+def test_build_vector_stats_reports_effective_zero_signal() -> None:
+    stats = _build_vector_stats(torch.tensor([0.0, 0.0, 1e-13], dtype=torch.float32), epsilon=1e-12)
+
+    assert stats["count"] == 3
+    assert stats["nonzero_count"] == 1
+    assert stats["effective_nonzero_count"] == 0
+    assert stats["all_zero"] is False
+    assert stats["effectively_all_zero"] is True
+
+
+def test_build_vector_stats_reports_nonfinite_counts() -> None:
+    stats = _build_vector_stats(
+        torch.tensor([0.0, float("inf"), float("nan")], dtype=torch.float32)
+    )
+
+    assert stats["count"] == 3
+    assert stats["finite_count"] == 1
+    assert stats["posinf_count"] == 1
+    assert stats["nan_count"] == 1
+    assert stats["nonfinite_count"] == 2
+
+
+def test_compute_row_abs_sums_uses_float64_accumulation() -> None:
+    rows = torch.tensor([[1e38, 1e38, 1e38]], dtype=torch.float32)
+    result = _compute_row_abs_sums(rows)
+
+    assert result.dtype == torch.float64
+    assert torch.isfinite(result).all()
+    assert result[0].item() == pytest.approx(3e38)
+
+
+def test_build_matrix_abs_stats_reports_row_l1_nonfinite_counts() -> None:
+    stats = _build_matrix_abs_stats(
+        torch.tensor([[1.0, float("inf")], [0.0, 0.0]], dtype=torch.float32)
+    )
+
+    assert stats["nonfinite_count"] == 1
+    assert stats["row_l1_stats"]["posinf_count"] == 1
+
+
+def test_phase4_normalization_stats_reports_clamped_rows() -> None:
+    stats = _build_phase4_normalization_stats(
+        torch.tensor([0.0, 1e-9, 2.0], dtype=torch.float32),
+        clamp_epsilon=1e-8,
+    )
+
+    assert stats["clamped_row_count"] == 2
+    assert stats["clamped_row_fraction"] == pytest.approx(2 / 3)
+
+
+def test_record_cross_cluster_checkpoint_updates_summary_and_stream() -> None:
+    summary: dict[str, object] = {"checkpoints": {}}
+    stream: list[dict[str, object]] = []
+
+    _record_cross_cluster_checkpoint(
+        cross_cluster_debug_summary=summary,
+        cross_cluster_debug_checkpoints=stream,
+        checkpoint_name="phase1_target_logits",
+        phase="phase1",
+        summary_payload={"target_count": 2, "target_token_ids_hash": "abc123"},
+        stream_payload={"target_count": 2, "target_probability_abs_sum": 0.95},
+    )
+
+    checkpoints = summary.get("checkpoints")
+    assert isinstance(checkpoints, dict)
+    assert checkpoints["phase1_target_logits"]["target_count"] == 2
+    assert len(stream) == 1
+    assert stream[0]["checkpoint_name"] == "phase1_target_logits"
+    assert stream[0]["phase"] == "phase1"
+    assert stream[0]["target_probability_abs_sum"] == pytest.approx(0.95)
+
+
+def test_record_cross_cluster_batch_event_emits_scalar_event_record() -> None:
+    events: list[dict[str, object]] = []
+
+    _record_cross_cluster_batch_event(
+        cross_cluster_debug_batches=events,
+        event_name="phase4.refresh",
+        phase="phase4",
+        event_index=3,
+        payload={"queue_size": 64, "rank_abs_sum": 12.5, "rank_effectively_all_zero": False},
+    )
+
+    assert len(events) == 1
+    assert events[0]["event_name"] == "phase4.refresh"
+    assert events[0]["phase"] == "phase4"
+    assert events[0]["event_index"] == 3
+    assert events[0]["queue_size"] == 64
+    assert events[0]["rank_abs_sum"] == pytest.approx(12.5)
+
+
+def test_build_cross_cluster_runtime_snapshot_emits_memory_and_hashes() -> None:
+    summary_payload, stream_payload = _build_cross_cluster_runtime_snapshot(
+        device=torch.device("cpu")
+    )
+
+    assert "memory_snapshot" in summary_payload
+    assert "rss_gib" in stream_payload
+    assert "ctx_diagnostic_snapshot_hash" in stream_payload
+    assert "transcoder_diagnostic_snapshot_hash" in stream_payload
+
+
+def test_compare_phase4_frontiers_reports_overlap_and_first_difference() -> None:
+    result = _compare_phase4_frontiers(
+        torch.tensor([1, 3, 5], dtype=torch.long),
+        torch.tensor([1, 4, 5], dtype=torch.long),
+    )
+
+    assert result["overlap_count"] == 2
+    assert result["changed_selected_nodes"] == 2
+    assert result["first_differing_rank"] == 1
+    assert result["prefix_match_count"] == 1
+    assert result["jaccard_similarity"] == pytest.approx(0.5)
+
+
+def test_build_phase4_deterministic_shadow_pending_breaks_ties_stably() -> None:
+    candidate_indices = torch.tensor([4, 2, 1, 3], dtype=torch.long)
+    feature_influences = torch.tensor([0.0, 0.7, 0.7, 0.6, 0.7], dtype=torch.float32)
+    feat_layers = torch.tensor([0, 0, 0, 0, 0], dtype=torch.long)
+    feat_positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
+    feat_ids = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
+
+    pending = _build_phase4_deterministic_shadow_pending(
+        candidate_indices,
+        feature_influences,
+        queue_size=3,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=False,
+        decoder_chunk_size=None,
+    )
+
+    assert torch.equal(pending, torch.tensor([1, 2, 4], dtype=torch.long))
+
+
+def test_phase0_activation_threshold_compare_mode_resolution() -> None:
+    assert _resolve_phase0_activation_threshold_compare_mode("DEFAULT") == "baseline"
+    assert _resolve_phase0_activation_threshold_compare_mode("bfloat16") == "bf16"
+    assert _resolve_phase0_activation_threshold_compare_mode("fp64") == "fp64"
+
+    with pytest.raises(ValueError, match="phase0_activation_threshold_compare_mode"):
+        _resolve_phase0_activation_threshold_compare_mode("float16")
+
+
+def test_hash_sparse_membership_indices_canonicalizes_ordering() -> None:
+    indices_a = torch.tensor(
+        [
+            [0, 1, 0],
+            [1, 0, 2],
+            [3, 4, 1],
+        ],
+        dtype=torch.long,
+    )
+    indices_b = torch.tensor(
+        [
+            [0, 0, 1],
+            [2, 1, 0],
+            [1, 3, 4],
+        ],
+        dtype=torch.long,
+    )
+    shape = (2, 3, 8)
+
+    raw_hash_a = _hash_sparse_membership_indices(indices_a, shape=shape, canonicalize=False)
+    raw_hash_b = _hash_sparse_membership_indices(indices_b, shape=shape, canonicalize=False)
+    canonical_hash_a = _hash_sparse_membership_indices(
+        indices_a,
+        shape=shape,
+        canonicalize=True,
+    )
+    canonical_hash_b = _hash_sparse_membership_indices(
+        indices_b,
+        shape=shape,
+        canonicalize=True,
+    )
+
+    assert raw_hash_a != raw_hash_b
+    assert canonical_hash_a == canonical_hash_b
+
+
+def test_phase4_probe_frontier_uses_ranked_first_frontier_then_locality() -> None:
+    feature_influences = torch.tensor([0.1, 0.7, 0.2, 0.9, 0.3, 0.8], dtype=torch.float32)
+    feat_layers = torch.tensor([1, 0, 1, 0, 1, 0], dtype=torch.long)
+    feat_positions = torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.long)
+    feat_ids = torch.tensor([5, 8, 2, 1, 6, 4], dtype=torch.long)
+
+    pending = _build_phase4_probe_pending_frontier(
+        feature_influences=feature_influences,
+        total_active_feats=6,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=4,
+        initial_feature_batch_size=2,
+        feature_batch_probe_batches=1,
+        update_interval=2,
+        max_feature_nodes=3,
+    )
+
+    assert torch.equal(pending, torch.tensor([3, 5], dtype=torch.long))
+
+
+def test_phase4_probe_frontier_preserves_full_frontier_order_when_all_features_included() -> None:
+    feat_layers = torch.tensor([1, 0, 1, 0], dtype=torch.long)
+    feat_positions = torch.tensor([2, 0, 1, 3], dtype=torch.long)
+    feat_ids = torch.tensor([8, 1, 6, 3], dtype=torch.long)
+
+    pending = _build_phase4_probe_pending_frontier(
+        feature_influences=torch.tensor([0.4, 0.9, 0.2, 0.7], dtype=torch.float32),
+        total_active_feats=4,
+        feat_layers=feat_layers,
+        feat_positions=feat_positions,
+        feat_ids=feat_ids,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=4,
+        initial_feature_batch_size=2,
+        feature_batch_probe_batches=2,
+        update_interval=4,
+        max_feature_nodes=4,
+    )
+
+    assert torch.equal(pending, torch.tensor([0, 1, 2, 3], dtype=torch.long))
+
+
+def test_top_level_attribute_rejects_phase4_planner_flags() -> None:
+    class _DummyModel:
+        backend = "nnsight"
+
+    with pytest.raises(
+        ValueError,
+        match=r"unsupported via circuit_tracer\.attribution\.attribute",
+    ):
+        attribute_top_level(
+            prompt="hello",
+            model=cast(object, _DummyModel()),
+            plan_feature_batch_size=True,
+        )
 
 
 def test_chunked_feature_replay_windows_match_full_replay() -> None:

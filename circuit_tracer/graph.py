@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Callable
 from typing import NamedTuple
 import warnings
 
@@ -415,5 +417,312 @@ def compute_partial_influences(
         influences += prod
     else:
         raise RuntimeError("Failed to converge")
+
+    return influences
+
+
+def compute_partial_feature_influences(
+    feature_edge_matrix: torch.Tensor,
+    row_abs_sums: torch.Tensor,
+    logit_p: torch.Tensor,
+    row_to_node_index: torch.Tensor,
+    *,
+    n_feature_nodes: int,
+    n_logits: int,
+    max_iter: int = 128,
+    device=None,
+    row_chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Compute feature-only partial influences from compact row storage.
+
+    This is mathematically equivalent to ``compute_partial_influences(...)[ :n_feature_nodes ]``
+    when:
+      - rows correspond to logit + feature source nodes,
+      - only feature-column edges are materialized, and
+      - ``row_abs_sums`` stores exact L1 row sums over *all* original columns.
+
+    Args:
+        feature_edge_matrix: Dense matrix of shape ``(n_rows, n_feature_nodes)`` containing
+            feature-column edge values for each stored row.
+        row_abs_sums: Exact absolute row sums over the original full edge rows
+            (shape ``(n_rows,)``). These preserve normalization semantics even when
+            non-feature columns are not materialized.
+        logit_p: Logit probabilities / weights for the first ``n_logits`` rows.
+        row_to_node_index: Mapping from row index to original node index.
+        n_feature_nodes: Number of active feature columns in the original graph.
+        n_logits: Number of logit rows at the start of the stored rows.
+        max_iter: Maximum number of power-iteration steps.
+        device: Device to run computation on.
+        row_chunk_size: Row chunk size for batched matrix-vector products.
+
+    Returns:
+        Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
+
+    Raises:
+        ValueError: If inputs are inconsistent.
+        RuntimeError: If computation fails to converge within ``max_iter``.
+    """
+
+    if n_feature_nodes < 0:
+        raise ValueError("n_feature_nodes must be >= 0")
+    if n_logits < 0:
+        raise ValueError("n_logits must be >= 0")
+    if feature_edge_matrix.ndim != 2:
+        raise ValueError("feature_edge_matrix must be rank-2")
+
+    n_rows, feature_cols = feature_edge_matrix.shape
+    if feature_cols != n_feature_nodes:
+        raise ValueError(
+            "feature_edge_matrix second dimension must equal n_feature_nodes "
+            f"({feature_cols} != {n_feature_nodes})"
+        )
+    if row_abs_sums.numel() != n_rows:
+        raise ValueError("row_abs_sums length must equal number of rows")
+    if row_to_node_index.numel() != n_rows:
+        raise ValueError("row_to_node_index length must equal number of rows")
+    if n_logits > n_rows:
+        raise ValueError("n_logits must be <= number of rows")
+    if logit_p.numel() != n_logits:
+        raise ValueError("logit_p length must equal n_logits")
+
+    device = device or feature_edge_matrix.device
+    working_feature_matrix = (
+        feature_edge_matrix
+        if feature_edge_matrix.device == device
+        else feature_edge_matrix.to(device)
+    )
+    working_row_abs_sums = (
+        row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
+    ).to(dtype=working_feature_matrix.dtype)
+    working_row_index = (
+        row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
+    ).long()
+    working_logit_p = logit_p if logit_p.device == device else logit_p.to(device)
+
+    feature_row_node_index = working_row_index[n_logits:]
+    if feature_row_node_index.numel():
+        if feature_row_node_index.min() < 0 or feature_row_node_index.max() >= n_feature_nodes:
+            raise ValueError(
+                "feature row node indices must be in [0, n_feature_nodes) for compact influences"
+            )
+
+    influences = torch.zeros(n_feature_nodes, device=device, dtype=working_feature_matrix.dtype)
+    row_weights = torch.zeros(n_rows, device=device, dtype=working_feature_matrix.dtype)
+    row_weights[:n_logits] = working_logit_p.to(dtype=working_feature_matrix.dtype)
+
+    for _ in range(max_iter):
+        next_feature_prod = torch.zeros_like(influences)
+        for start in range(0, n_rows, row_chunk_size):
+            end = min(start + row_chunk_size, n_rows)
+            chunk = working_feature_matrix[start:end].abs()
+            if not chunk.numel():
+                continue
+
+            chunk_row_weights = row_weights[start:end]
+            if not chunk_row_weights.any():
+                continue
+
+            denom = working_row_abs_sums[start:end].clamp(min=1e-8)
+            next_feature_prod += (chunk_row_weights / denom) @ chunk
+
+        if not next_feature_prod.any():
+            break
+
+        influences += next_feature_prod
+        row_weights.zero_()
+        if feature_row_node_index.numel():
+            row_weights[n_logits:] = next_feature_prod[feature_row_node_index]
+    else:
+        raise RuntimeError("Failed to converge")
+
+    return influences
+
+
+def compute_partial_feature_influences_streaming(
+    row_reader: Callable[[int, int], torch.Tensor],
+    row_abs_sums: torch.Tensor,
+    logit_p: torch.Tensor,
+    row_to_node_index: torch.Tensor,
+    *,
+    n_feature_nodes: int,
+    n_logits: int,
+    max_iter: int = 128,
+    device=None,
+    row_chunk_size: int = 4096,
+    chunk_cache_max_bytes: int = 0,
+    chunk_reuse_stats: dict[str, int] | None = None,
+    compute_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Compute feature-only partial influences from streamed dense row chunks.
+
+    This computes the same quantity as ``compute_partial_feature_influences`` while
+    reading feature rows incrementally via ``row_reader``. It is intended for
+    file-backed row stores where materializing the full dense feature matrix in RAM
+    is undesirable.
+
+    Args:
+        row_reader: Callable receiving ``(row_start, row_end)`` and returning a dense
+            tensor of shape ``(row_end - row_start, n_feature_nodes)`` for that row range.
+        row_abs_sums: Exact absolute row sums over the original full rows.
+        logit_p: Logit probabilities / weights for the first ``n_logits`` rows.
+        row_to_node_index: Mapping from row index to original node index.
+        n_feature_nodes: Number of active feature columns in the original graph.
+        n_logits: Number of logit rows at the start of the stored rows.
+        max_iter: Maximum number of power-iteration steps.
+        device: Device to run computation on.
+        row_chunk_size: Row chunk size used for streamed reads.
+        chunk_cache_max_bytes: Strict byte budget for optional solver-local
+            row-chunk reuse cache. ``0`` disables solver-local caching.
+        chunk_reuse_stats: Optional output dictionary populated with lightweight
+            chunk reuse counters for diagnostics.
+        compute_dtype: Optional explicit compute dtype for influence math. When
+            omitted, defaults to ``row_abs_sums.dtype`` for backward compatibility.
+
+    Returns:
+        Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
+
+    Raises:
+        ValueError: If inputs are inconsistent.
+        RuntimeError: If computation fails to converge within ``max_iter``.
+    """
+
+    if n_feature_nodes < 0:
+        raise ValueError("n_feature_nodes must be >= 0")
+    if n_logits < 0:
+        raise ValueError("n_logits must be >= 0")
+    if row_chunk_size <= 0:
+        raise ValueError("row_chunk_size must be > 0")
+    if chunk_cache_max_bytes < 0:
+        raise ValueError("chunk_cache_max_bytes must be >= 0")
+
+    n_rows = row_abs_sums.numel()
+    if row_to_node_index.numel() != n_rows:
+        raise ValueError("row_to_node_index length must equal row_abs_sums length")
+    if n_logits > n_rows:
+        raise ValueError("n_logits must be <= number of rows")
+    if logit_p.numel() != n_logits:
+        raise ValueError("logit_p length must equal n_logits")
+
+    if compute_dtype is not None and compute_dtype not in (torch.float32, torch.float64):
+        raise ValueError("compute_dtype must be float32 or float64 when provided")
+
+    device = device or row_abs_sums.device
+    dtype = row_abs_sums.dtype if compute_dtype is None else compute_dtype
+    working_row_abs_sums = (
+        row_abs_sums if row_abs_sums.device == device else row_abs_sums.to(device)
+    )
+    working_row_abs_sums = working_row_abs_sums.to(dtype=dtype)
+    working_row_index = (
+        row_to_node_index if row_to_node_index.device == device else row_to_node_index.to(device)
+    ).long()
+    working_logit_p = logit_p if logit_p.device == device else logit_p.to(device)
+
+    feature_row_node_index = working_row_index[n_logits:]
+    if feature_row_node_index.numel():
+        if feature_row_node_index.min() < 0 or feature_row_node_index.max() >= n_feature_nodes:
+            raise ValueError(
+                "feature row node indices must be in [0, n_feature_nodes) for compact influences"
+            )
+
+    influences = torch.zeros(n_feature_nodes, device=device, dtype=dtype)
+    row_weights = torch.zeros(n_rows, device=device, dtype=dtype)
+    row_weights[:n_logits] = working_logit_p.to(dtype=dtype)
+    denom = working_row_abs_sums.clamp(min=1e-8)
+    chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+    cache_enabled = bool(chunk_cache_max_bytes > 0)
+    chunk_cache_nbytes = 0
+    chunk_request_count = 0
+    chunk_cache_hit_count = 0
+    chunk_cache_miss_count = 0
+    chunk_cache_eviction_count = 0
+    chunk_cache_store_success_count = 0
+    chunk_cache_store_skip_disabled_count = 0
+    chunk_cache_store_skip_too_large_count = 0
+
+    def _tensor_nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel() * tensor.element_size())
+
+    def _drop_oldest_chunk() -> None:
+        nonlocal chunk_cache_nbytes, chunk_cache_eviction_count
+        oldest_key = next(iter(chunk_cache))
+        dropped = chunk_cache.pop(oldest_key)
+        chunk_cache_nbytes = max(0, chunk_cache_nbytes - _tensor_nbytes(dropped))
+        chunk_cache_eviction_count += 1
+
+    for _ in range(max_iter):
+        next_feature_prod = torch.zeros_like(influences)
+        for start in range(0, n_rows, row_chunk_size):
+            end = min(start + row_chunk_size, n_rows)
+            chunk_row_weights = row_weights[start:end]
+            if not bool(chunk_row_weights.any()):
+                continue
+
+            chunk_request_count += 1
+            cache_key = (start, end)
+            cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
+            if cached_chunk is None:
+                chunk = row_reader(start, end)
+                if chunk.ndim != 2 or chunk.shape != (end - start, n_feature_nodes):
+                    raise ValueError(
+                        "row_reader must return shape "
+                        f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
+                    )
+                if chunk.device != device:
+                    chunk = chunk.to(device)
+                chunk = chunk.to(dtype=dtype).abs()
+                if not cache_enabled:
+                    chunk_cache_store_skip_disabled_count += 1
+                else:
+                    chunk_nbytes = _tensor_nbytes(chunk)
+                    if chunk_nbytes > chunk_cache_max_bytes:
+                        chunk_cache_store_skip_too_large_count += 1
+                    else:
+                        while (
+                            chunk_cache
+                            and chunk_cache_nbytes + chunk_nbytes > chunk_cache_max_bytes
+                        ):
+                            _drop_oldest_chunk()
+                        chunk_cache[cache_key] = chunk
+                        chunk_cache.move_to_end(cache_key)
+                        chunk_cache_nbytes += chunk_nbytes
+                        chunk_cache_store_success_count += 1
+                chunk_cache_miss_count += 1
+            else:
+                chunk = cached_chunk
+                chunk_cache.move_to_end(cache_key)
+                chunk_cache_hit_count += 1
+
+            next_feature_prod += (chunk_row_weights / denom[start:end]) @ chunk
+
+        if not bool(next_feature_prod.any()):
+            break
+
+        influences += next_feature_prod
+        row_weights.zero_()
+        if feature_row_node_index.numel():
+            row_weights[n_logits:] = next_feature_prod[feature_row_node_index]
+    else:
+        raise RuntimeError("Failed to converge")
+
+    if chunk_reuse_stats is not None:
+        chunk_reuse_stats.clear()
+        chunk_reuse_stats.update(
+            {
+                "chunk_request_count": int(chunk_request_count),
+                "chunk_cache_enabled": int(cache_enabled),
+                "chunk_cache_max_bytes": int(chunk_cache_max_bytes),
+                "chunk_cache_hit_count": int(chunk_cache_hit_count),
+                "chunk_cache_miss_count": int(chunk_cache_miss_count),
+                "row_reader_call_count": int(chunk_cache_miss_count),
+                "chunk_cache_eviction_count": int(chunk_cache_eviction_count),
+                "chunk_cache_store_success_count": int(chunk_cache_store_success_count),
+                "chunk_cache_store_skip_disabled_count": int(chunk_cache_store_skip_disabled_count),
+                "chunk_cache_store_skip_too_large_count": int(
+                    chunk_cache_store_skip_too_large_count
+                ),
+                "chunk_cache_unique_entries": int(len(chunk_cache)),
+                "chunk_cache_nbytes": int(chunk_cache_nbytes),
+            }
+        )
 
     return influences

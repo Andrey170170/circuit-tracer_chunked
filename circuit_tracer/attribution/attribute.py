@@ -135,6 +135,18 @@ def attribute(
     profile_log_interval: int = 1,
     diagnostic_feature_cap: int | None = None,
     sparsification: SparsificationConfig | None = None,
+    chunked_feature_replay_window: int = 4,
+    error_vector_prefetch_lookahead: int = 2,
+    stage_encoder_vecs_on_cpu: bool | None = None,
+    stage_error_vectors_on_cpu: bool | None = None,
+    row_subchunk_size: int | None = None,
+    plan_feature_batch_size: bool = False,
+    auto_scale_feature_batch_size: bool = False,
+    feature_batch_size_max: int | None = None,
+    feature_batch_target_reserved_fraction: float = 0.9,
+    feature_batch_min_free_fraction: float = 0.05,
+    feature_batch_probe_batches: int = 1,
+    exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp64",
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -171,10 +183,19 @@ def attribute(
         sparsification: Optional candidate-screening config. When provided, phase 0
             keeps only retained feature candidates before reconstruction, and later
             attribution phases reuse the same candidate set.
+        exact_trace_internal_dtype: Internal dtype used by compact exact-trace
+            normalization/ranking internals ("fp32" or "fp64").
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
     """
+
+    planner_enabled = bool(plan_feature_batch_size or auto_scale_feature_batch_size)
+    if planner_enabled:
+        raise ValueError(
+            "Phase-4 feature batch planner is unsupported via circuit_tracer.attribution.attribute(). "
+            "Use the NNSight entrypoint with compact_output=True on exact_chunked_decoder paths."
+        )
 
     if model.backend == "nnsight":
         from .attribute_nnsight import attribute as attribute_nnsight
@@ -196,6 +217,18 @@ def attribute(
             profile_log_interval=profile_log_interval,
             diagnostic_feature_cap=diagnostic_feature_cap,
             sparsification=sparsification,
+            chunked_feature_replay_window=chunked_feature_replay_window,
+            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            row_subchunk_size=row_subchunk_size,
+            plan_feature_batch_size=plan_feature_batch_size,
+            auto_scale_feature_batch_size=auto_scale_feature_batch_size,
+            feature_batch_size_max=feature_batch_size_max,
+            feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
+            feature_batch_min_free_fraction=feature_batch_min_free_fraction,
+            feature_batch_probe_batches=feature_batch_probe_batches,
+            exact_trace_internal_dtype=exact_trace_internal_dtype,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens

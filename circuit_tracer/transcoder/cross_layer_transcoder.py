@@ -1,4 +1,6 @@
 import glob
+import hashlib
+import json
 import os
 import time
 from collections import OrderedDict
@@ -17,6 +19,7 @@ from circuit_tracer.attribution.sparsification import (
 )
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.utils import get_default_device
+from circuit_tracer.utils.telemetry import TelemetryRecorder
 
 
 DEFAULT_EXACT_DECODER_CHUNK_SIZE = 1024
@@ -140,8 +143,13 @@ class CrossLayerTranscoder(torch.nn.Module):
         self.cross_batch_decoder_cache_bytes = max(0, int(cross_batch_decoder_cache_bytes))
         self._diagnostic_stats = self._make_empty_diagnostic_stats()
         self._trace_logger = None
+        self._telemetry_recorder: TelemetryRecorder | None = None
         self._trace_chunk_interval = 16
         self._trace_decoder_load_interval = 32
+        self._phase0_activation_threshold_compare_mode = "baseline"
+        self._phase0_threshold_membership_debug_enabled = False
+        self._phase0_threshold_membership_sample_limit_per_layer = 3
+        self._phase0_threshold_near_epsilons = (1e-7, 1e-6, 1e-5, 1e-4, 1e-3)
 
         self.feature_input_hook = feature_input_hook
         self.feature_output_hook = feature_output_hook
@@ -225,6 +233,363 @@ class CrossLayerTranscoder(torch.nn.Module):
             "reconstruction_seconds": 0.0,
             "reconstruction_by_layer": {},
             "reconstruction_chunks_by_layer": {},
+            "phase0_activation_threshold_compare_mode": "baseline",
+            "phase0_activation_threshold_compare_dtype": None,
+            "phase0_threshold_membership_debug_enabled": False,
+            "phase0_threshold_membership_sample_limit_per_layer": 0,
+            "phase0_threshold_membership": None,
+            "phase0_boundary_fingerprints": None,
+        }
+
+    @staticmethod
+    def _resolve_phase0_activation_threshold_compare_mode(mode: str) -> str:
+        aliases = {
+            "baseline": "baseline",
+            "default": "baseline",
+            "bf16": "bf16",
+            "bfloat16": "bf16",
+            "fp32": "fp32",
+            "float32": "fp32",
+            "torch.float32": "fp32",
+            "fp64": "fp64",
+            "float64": "fp64",
+            "torch.float64": "fp64",
+        }
+        normalized = str(mode).strip().lower()
+        resolved = aliases.get(normalized)
+        if resolved is None:
+            allowed = "baseline, bf16, fp32, fp64"
+            raise ValueError(
+                "phase0_activation_threshold_compare_mode must be one of "
+                f"{{{allowed}}} (got {mode!r})"
+            )
+        return resolved
+
+    @staticmethod
+    def _dtype_name(dtype: torch.dtype) -> str:
+        if dtype == torch.bfloat16:
+            return "bfloat16"
+        if dtype == torch.float32:
+            return "float32"
+        if dtype == torch.float64:
+            return "float64"
+        return str(dtype)
+
+    @staticmethod
+    def _hash_json_payload(payload: object) -> str:
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha1(encoded).hexdigest()[:16]
+
+    @staticmethod
+    def _hash_tensor_payload(
+        values: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> str:
+        resolved = values.detach()
+        if dtype is not None:
+            resolved = resolved.to(dtype=dtype)
+        resolved_cpu = resolved.to(device="cpu").contiguous()
+        hasher = hashlib.blake2s(digest_size=8)
+        hasher.update(np.asarray(list(resolved_cpu.shape), dtype=np.int64).tobytes())
+        hasher.update(resolved_cpu.numpy().tobytes())
+        return hasher.hexdigest()
+
+    @staticmethod
+    def _build_compact_tensor_stats(
+        values: torch.Tensor,
+        *,
+        epsilon: float = 1e-12,
+    ) -> dict[str, object]:
+        flat = values.detach().to(device="cpu", dtype=torch.float64).flatten()
+        count = int(flat.numel())
+        if count == 0:
+            return {
+                "count": 0,
+                "finite_count": 0,
+                "nonfinite_count": 0,
+                "nan_count": 0,
+                "posinf_count": 0,
+                "neginf_count": 0,
+                "min": None,
+                "max": None,
+                "mean": None,
+                "abs_sum": 0.0,
+                "abs_max": None,
+                "effective_nonzero_count": 0,
+                "effective_zero_count": 0,
+                "epsilon": float(epsilon),
+            }
+
+        finite_mask = torch.isfinite(flat)
+        finite_values = flat[finite_mask]
+        abs_flat = flat.abs()
+        effective_nonzero_count = int((abs_flat > epsilon).sum().item())
+        return {
+            "count": count,
+            "finite_count": int(finite_mask.sum().item()),
+            "nonfinite_count": int(count - int(finite_mask.sum().item())),
+            "nan_count": int(torch.isnan(flat).sum().item()),
+            "posinf_count": int(torch.isposinf(flat).sum().item()),
+            "neginf_count": int(torch.isneginf(flat).sum().item()),
+            "min": float(finite_values.min().item()) if finite_values.numel() > 0 else None,
+            "max": float(finite_values.max().item()) if finite_values.numel() > 0 else None,
+            "mean": float(finite_values.mean().item()) if finite_values.numel() > 0 else None,
+            "abs_sum": float(abs_flat.sum().item()),
+            "abs_max": float(abs_flat.max().item()) if abs_flat.numel() > 0 else None,
+            "effective_nonzero_count": effective_nonzero_count,
+            "effective_zero_count": int(count - effective_nonzero_count),
+            "epsilon": float(epsilon),
+        }
+
+    @staticmethod
+    def _hash_sparse_membership_indices_2d(
+        indices: torch.Tensor,
+        *,
+        shape: tuple[int, int],
+        canonicalize: bool,
+    ) -> str:
+        indices_cpu = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
+        hasher = hashlib.blake2s(digest_size=8)
+        hasher.update(np.asarray(list(shape), dtype=np.int64).tobytes())
+        if indices_cpu.numel() == 0:
+            hasher.update(b"empty")
+            return hasher.hexdigest()
+
+        if not canonicalize:
+            hasher.update(indices_cpu.numpy().tobytes())
+            return hasher.hexdigest()
+
+        flat = indices_cpu[:, 0] * int(shape[1]) + indices_cpu[:, 1]
+        hasher.update(torch.sort(flat).values.contiguous().numpy().tobytes())
+        return hasher.hexdigest()
+
+    def _build_sampled_tensor_fingerprint(
+        self,
+        values: torch.Tensor,
+        *,
+        sample_limit: int = 4096,
+        hash_dtype: torch.dtype = torch.float32,
+    ) -> dict[str, object]:
+        flat = values.detach().flatten()
+        total_count = int(flat.numel())
+        sample_limit = max(1, int(sample_limit))
+        if total_count == 0:
+            sample = flat
+            sample_stride = 1
+        elif total_count <= sample_limit:
+            sample = flat
+            sample_stride = 1
+        else:
+            sample_count = min(total_count, sample_limit)
+            sample_indices = (
+                torch.linspace(
+                    0,
+                    total_count - 1,
+                    steps=sample_count,
+                    device=flat.device,
+                )
+                .round()
+                .to(dtype=torch.int64)
+            )
+            sample = flat.index_select(0, sample_indices)
+            sample_stride = max(1, total_count // sample_count)
+
+        return {
+            "shape": list(values.shape),
+            "dtype": self._dtype_name(values.dtype),
+            "element_count": total_count,
+            "sample_count": int(sample.numel()),
+            "sample_stride": int(sample_stride),
+            "sample_hash": self._hash_tensor_payload(sample, dtype=hash_dtype),
+            "sample_hash_dtype": self._dtype_name(hash_dtype),
+            "sample_stats": self._build_compact_tensor_stats(sample, epsilon=1e-12),
+        }
+
+    def _build_layer_constant_fingerprint(
+        self,
+        *,
+        layer_id: int,
+        encoder_weights: torch.Tensor,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "layer": int(layer_id),
+            "encoder_weight": self._build_sampled_tensor_fingerprint(
+                encoder_weights,
+                sample_limit=4096,
+            ),
+            "encoder_bias_hash_fp32": self._hash_tensor_payload(
+                self.b_enc[layer_id],
+                dtype=torch.float32,
+            ),
+            "encoder_bias_stats": self._build_compact_tensor_stats(
+                self.b_enc[layer_id],
+                epsilon=1e-12,
+            ),
+        }
+        if isinstance(self.activation_function, JumpReLU):
+            threshold = cast(JumpReLU, self.activation_function).threshold[layer_id]
+            payload["threshold_hash_fp32"] = self._hash_tensor_payload(
+                threshold,
+                dtype=torch.float32,
+            )
+            payload["threshold_stats"] = self._build_compact_tensor_stats(
+                threshold,
+                epsilon=1e-12,
+            )
+        payload["layer_constant_hash"] = self._hash_json_payload(payload)
+        return payload
+
+    def configure_phase0_activation_threshold_compare(
+        self,
+        *,
+        mode: str = "baseline",
+        collect_diagnostics: bool = False,
+        sample_limit_per_layer: int = 3,
+    ) -> None:
+        resolved_mode = self._resolve_phase0_activation_threshold_compare_mode(mode)
+        self._phase0_activation_threshold_compare_mode = resolved_mode
+        self._phase0_threshold_membership_debug_enabled = bool(collect_diagnostics)
+        self._phase0_threshold_membership_sample_limit_per_layer = max(
+            0,
+            int(sample_limit_per_layer),
+        )
+
+    def _resolve_phase0_compare_dtype(self) -> torch.dtype | None:
+        mode = self._phase0_activation_threshold_compare_mode
+        if mode == "bf16":
+            return torch.bfloat16
+        if mode == "fp32":
+            return torch.float32
+        if mode == "fp64":
+            return torch.float64
+        return None
+
+    def _compute_jump_relu_mask(
+        self,
+        *,
+        layer_id: int,
+        features: torch.Tensor,
+        collect_diagnostics: bool,
+    ) -> tuple[torch.Tensor, dict[str, object] | None]:
+        thresholds = cast(JumpReLU, self.activation_function).threshold[layer_id]
+        compare_dtype = self._resolve_phase0_compare_dtype()
+        if compare_dtype is None:
+            compare_features = features
+            compare_thresholds = thresholds
+            compare_dtype_name = self._dtype_name(features.dtype)
+        else:
+            compare_features = features.to(dtype=compare_dtype)
+            compare_thresholds = thresholds.to(device=features.device, dtype=compare_dtype)
+            compare_dtype_name = self._dtype_name(compare_dtype)
+
+        mask = compare_features > compare_thresholds
+        self._diagnostic_stats["phase0_activation_threshold_compare_dtype"] = compare_dtype_name
+
+        if not collect_diagnostics:
+            return mask, None
+
+        pre_activation_fingerprint = self._build_sampled_tensor_fingerprint(
+            features,
+            sample_limit=4096,
+            hash_dtype=torch.float32,
+        )
+
+        margin_cpu = (
+            (compare_features - compare_thresholds)
+            .detach()
+            .to(
+                device="cpu",
+                dtype=torch.float64,
+            )
+        )
+        abs_margin_flat = margin_cpu.abs().flatten()
+        mask_flat_cpu = mask.detach().to(device="cpu").flatten()
+        mask_2d_cpu = mask.detach().to(device="cpu")
+        mask_u8 = mask_2d_cpu.to(dtype=torch.uint8)
+        compare_margin_fingerprint = self._build_sampled_tensor_fingerprint(
+            margin_cpu,
+            sample_limit=4096,
+            hash_dtype=torch.float64,
+        )
+        total_entries = int(mask_flat_cpu.numel())
+        active_entries = int(mask_flat_cpu.sum().item())
+
+        active_indices = torch.nonzero(mask_2d_cpu, as_tuple=False)
+        mask_membership_hash_raw = self._hash_sparse_membership_indices_2d(
+            active_indices,
+            shape=(int(mask.shape[0]), int(mask.shape[1])),
+            canonicalize=False,
+        )
+        mask_membership_hash_canonical = self._hash_sparse_membership_indices_2d(
+            active_indices,
+            shape=(int(mask.shape[0]), int(mask.shape[1])),
+            canonicalize=True,
+        )
+
+        near_counts_by_epsilon: dict[str, int] = {}
+        near_active_counts_by_epsilon: dict[str, int] = {}
+        near_inactive_counts_by_epsilon: dict[str, int] = {}
+        for epsilon in self._phase0_threshold_near_epsilons:
+            epsilon_key = f"abs_lte_{epsilon:.0e}"
+            near_mask = abs_margin_flat <= float(epsilon)
+            near_count = int(near_mask.sum().item())
+            near_active_count = int((near_mask & mask_flat_cpu).sum().item())
+            near_counts_by_epsilon[epsilon_key] = near_count
+            near_active_counts_by_epsilon[epsilon_key] = near_active_count
+            near_inactive_counts_by_epsilon[epsilon_key] = near_count - near_active_count
+
+        sample_limit = min(
+            self._phase0_threshold_membership_sample_limit_per_layer,
+            total_entries,
+        )
+        borderline_samples: list[dict[str, object]] = []
+        if sample_limit > 0 and total_entries > 0:
+            _, sample_indices = torch.topk(
+                abs_margin_flat,
+                k=sample_limit,
+                largest=False,
+            )
+            margin_flat = margin_cpu.flatten()
+            raw_features_flat = features.detach().to(device="cpu", dtype=torch.float64).flatten()
+            thresholds_flat = thresholds.detach().to(device="cpu", dtype=torch.float64).flatten()
+            for rank, flat_idx in enumerate(sample_indices.tolist(), start=1):
+                flat_idx_int = int(flat_idx)
+                pos_idx = flat_idx_int // self.d_transcoder
+                feat_idx = flat_idx_int % self.d_transcoder
+                borderline_samples.append(
+                    {
+                        "rank": rank,
+                        "position": int(pos_idx),
+                        "feature_id": int(feat_idx),
+                        "active": bool(mask_flat_cpu[flat_idx_int].item()),
+                        "pre_activation": float(raw_features_flat[flat_idx_int].item()),
+                        "threshold": float(thresholds_flat[feat_idx].item()),
+                        "compare_margin": float(margin_flat[flat_idx_int].item()),
+                        "abs_compare_margin": float(abs_margin_flat[flat_idx_int].item()),
+                    }
+                )
+
+        return mask, {
+            "layer": int(layer_id),
+            "compare_mode": self._phase0_activation_threshold_compare_mode,
+            "compare_dtype": compare_dtype_name,
+            "pre_activation_hash_fp32": pre_activation_fingerprint["sample_hash"],
+            "pre_activation_stats": pre_activation_fingerprint["sample_stats"],
+            "pre_activation_fingerprint": pre_activation_fingerprint,
+            "compare_margin_hash_fp64": compare_margin_fingerprint["sample_hash"],
+            "compare_margin_stats": compare_margin_fingerprint["sample_stats"],
+            "compare_margin_fingerprint": compare_margin_fingerprint,
+            "mask_value_hash_u8": self._hash_tensor_payload(mask_u8, dtype=torch.uint8),
+            "mask_membership_hash_raw_order": mask_membership_hash_raw,
+            "mask_membership_hash_canonical": mask_membership_hash_canonical,
+            "total_entries": total_entries,
+            "active_entries": active_entries,
+            "inactive_entries": int(total_entries - active_entries),
+            "near_counts_by_epsilon": near_counts_by_epsilon,
+            "near_active_counts_by_epsilon": near_active_counts_by_epsilon,
+            "near_inactive_counts_by_epsilon": near_inactive_counts_by_epsilon,
+            "borderline_samples": borderline_samples,
         }
 
     def reset_diagnostic_stats(self) -> None:
@@ -236,19 +601,44 @@ class CrossLayerTranscoder(torch.nn.Module):
         *,
         chunk_interval: int = 16,
         decoder_load_interval: int = 32,
+        telemetry_recorder: TelemetryRecorder | None = None,
     ) -> None:
         self._trace_logger = logger
+        self._telemetry_recorder = telemetry_recorder
         self._trace_chunk_interval = max(1, chunk_interval)
         self._trace_decoder_load_interval = max(1, decoder_load_interval)
 
+    @staticmethod
+    def _infer_phase_from_trace_event(event: str) -> str | None:
+        phase_name = event.split(".", 1)[0]
+        if phase_name.startswith("phase") and len(phase_name) > len("phase"):
+            suffix = phase_name[len("phase") :]
+            if suffix.isdigit():
+                return phase_name
+        return None
+
     def emit_trace_event(self, event: str, **fields: object) -> None:
-        if self._trace_logger is None:
-            return
-        payload = ", ".join(f"{key}={value}" for key, value in fields.items())
-        message = f"TRACE {event}"
-        if payload:
-            message = f"{message} | {payload}"
-        self._trace_logger(message)
+        if self._trace_logger is not None:
+            payload = ", ".join(f"{key}={value}" for key, value in fields.items())
+            message = f"TRACE {event}"
+            if payload:
+                message = f"{message} | {payload}"
+            self._trace_logger(message)
+
+        if self._telemetry_recorder is not None:
+            elapsed_ms = fields.get("elapsed_ms")
+            elapsed_ms_value: float | None
+            if isinstance(elapsed_ms, (int, float)):
+                elapsed_ms_value = float(elapsed_ms)
+            else:
+                elapsed_ms_value = None
+            self._telemetry_recorder.record_event(
+                scope="op",
+                name=f"transcoder.{event}",
+                phase=self._infer_phase_from_trace_event(event),
+                elapsed_ms=elapsed_ms_value,
+                attrs=fields,
+            )
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:
         snapshot: dict[str, object] = {}
@@ -402,9 +792,14 @@ class CrossLayerTranscoder(torch.nn.Module):
                         f.get_tensor("w_enc").transpose(-1, -2).to(dtype=self.dtype).contiguous()
                     )
                 self._add_diagnostic_value("encoder_load_count", 1)
-                self._add_diagnostic_value("encoder_load_seconds", time.perf_counter() - start)
-                self._add_diagnostic_layer_value(
-                    "encoder_load_by_layer", layer_id, time.perf_counter() - start
+                elapsed = time.perf_counter() - start
+                self._add_diagnostic_value("encoder_load_seconds", elapsed)
+                self._add_diagnostic_layer_value("encoder_load_by_layer", layer_id, elapsed)
+                self.emit_trace_event(
+                    "encoder.load",
+                    source_layer=layer_id,
+                    elapsed_ms=elapsed * 1000.0,
+                    lazy_encoder=self.lazy_encoder,
                 )
                 return result
 
@@ -419,7 +814,15 @@ class CrossLayerTranscoder(torch.nn.Module):
                 with safe_open(self.layer_paths[i], framework="pt", device=str(self.device)) as f:
                     W_enc[i] = f.get_tensor("w_enc").transpose(-1, -2).to(dtype=self.dtype)
             self._add_diagnostic_value("encoder_load_count", self.n_layers)
-            self._add_diagnostic_value("encoder_load_seconds", time.perf_counter() - start)
+            elapsed = time.perf_counter() - start
+            self._add_diagnostic_value("encoder_load_seconds", elapsed)
+            self.emit_trace_event(
+                "encoder.load",
+                source_layer="all",
+                elapsed_ms=elapsed * 1000.0,
+                layers=self.n_layers,
+                lazy_encoder=self.lazy_encoder,
+            )
             return W_enc
 
         assert self.clt_path is not None, "CLT path is not set"
@@ -429,9 +832,14 @@ class CrossLayerTranscoder(torch.nn.Module):
             with safe_open(enc_file, framework="pt", device=str(self.device)) as f:
                 result = f.get_tensor(f"W_enc_{layer_id}").to(dtype=self.dtype)
             self._add_diagnostic_value("encoder_load_count", 1)
-            self._add_diagnostic_value("encoder_load_seconds", time.perf_counter() - start)
-            self._add_diagnostic_layer_value(
-                "encoder_load_by_layer", layer_id, time.perf_counter() - start
+            elapsed = time.perf_counter() - start
+            self._add_diagnostic_value("encoder_load_seconds", elapsed)
+            self._add_diagnostic_layer_value("encoder_load_by_layer", layer_id, elapsed)
+            self.emit_trace_event(
+                "encoder.load",
+                source_layer=layer_id,
+                elapsed_ms=elapsed * 1000.0,
+                lazy_encoder=self.lazy_encoder,
             )
             return result
 
@@ -448,7 +856,15 @@ class CrossLayerTranscoder(torch.nn.Module):
             with safe_open(enc_file, framework="pt", device=str(self.device)) as f:
                 W_enc[i] = f.get_tensor(f"W_enc_{i}").to(dtype=self.dtype)
         self._add_diagnostic_value("encoder_load_count", self.n_layers)
-        self._add_diagnostic_value("encoder_load_seconds", time.perf_counter() - start)
+        elapsed = time.perf_counter() - start
+        self._add_diagnostic_value("encoder_load_seconds", elapsed)
+        self.emit_trace_event(
+            "encoder.load",
+            source_layer="all",
+            elapsed_ms=elapsed * 1000.0,
+            layers=self.n_layers,
+            lazy_encoder=self.lazy_encoder,
+        )
         return W_enc
 
     def encode(self, x):
@@ -495,6 +911,68 @@ class CrossLayerTranscoder(torch.nn.Module):
         """
         sparse_layers = []
         feature_ids_by_layer = [] if return_encoder_vectors else None
+        collect_threshold_membership = bool(
+            self._phase0_threshold_membership_debug_enabled
+            and isinstance(self.activation_function, JumpReLU)
+        )
+        self._diagnostic_stats["phase0_activation_threshold_compare_mode"] = (
+            self._phase0_activation_threshold_compare_mode
+        )
+        self._diagnostic_stats["phase0_threshold_membership_debug_enabled"] = (
+            collect_threshold_membership
+        )
+        self._diagnostic_stats["phase0_threshold_membership_sample_limit_per_layer"] = (
+            int(self._phase0_threshold_membership_sample_limit_per_layer)
+            if collect_threshold_membership
+            else 0
+        )
+        self._diagnostic_stats["phase0_activation_threshold_compare_dtype"] = None
+        phase0_threshold_membership_summary: dict[str, object] | None = None
+        self._diagnostic_stats["phase0_boundary_fingerprints"] = None
+        phase0_boundary_fingerprints: dict[str, object] | None = None
+        constant_layer_hashes: list[str] = []
+        pre_activation_layer_hashes: list[str] = []
+        compare_margin_layer_hashes: list[str] = []
+        mask_membership_layer_hashes: list[str] = []
+        post_activation_layer_hashes: list[str] = []
+        if collect_threshold_membership:
+            phase0_threshold_membership_summary = {
+                "boundary_fingerprint_schema_version": 1,
+                "compare_mode": self._phase0_activation_threshold_compare_mode,
+                "sample_limit_per_layer": int(
+                    self._phase0_threshold_membership_sample_limit_per_layer
+                ),
+                "near_epsilons": [
+                    f"abs_lte_{epsilon:.0e}" for epsilon in self._phase0_threshold_near_epsilons
+                ],
+                "transcoder_constant_fingerprints": {
+                    "per_layer": {},
+                    "global_hash": None,
+                },
+                "per_layer": {},
+                "total_entries": 0,
+                "total_active_entries": 0,
+                "near_counts_by_epsilon": {
+                    f"abs_lte_{epsilon:.0e}": 0 for epsilon in self._phase0_threshold_near_epsilons
+                },
+                "near_active_counts_by_epsilon": {
+                    f"abs_lte_{epsilon:.0e}": 0 for epsilon in self._phase0_threshold_near_epsilons
+                },
+                "near_inactive_counts_by_epsilon": {
+                    f"abs_lte_{epsilon:.0e}": 0 for epsilon in self._phase0_threshold_near_epsilons
+                },
+                "borderline_sample_count": 0,
+            }
+            phase0_boundary_fingerprints = {
+                "schema_version": 1,
+                "transcoder_constant_fingerprints": {
+                    "per_layer": {},
+                    "global_hash": None,
+                },
+                "per_layer": {},
+                "global_hashes": {},
+            }
+        self._diagnostic_stats["phase0_threshold_membership"] = None
         encode_start = time.perf_counter()
         self.emit_trace_event(
             "phase0.encode_sparse.start",
@@ -507,13 +985,55 @@ class CrossLayerTranscoder(torch.nn.Module):
         for layer_id in range(self.n_layers):
             layer_start = time.perf_counter()
             W_enc_layer = self._get_encoder_weights(layer_id)
+            if phase0_threshold_membership_summary is not None:
+                constants = phase0_threshold_membership_summary["transcoder_constant_fingerprints"]
+                assert isinstance(constants, dict)
+                per_layer_constants = constants.setdefault("per_layer", {})
+                assert isinstance(per_layer_constants, dict)
+                layer_constants = self._build_layer_constant_fingerprint(
+                    layer_id=layer_id,
+                    encoder_weights=W_enc_layer,
+                )
+                per_layer_constants[str(layer_id)] = layer_constants
+                constant_layer_hashes.append(str(layer_constants.get("layer_constant_hash")))
+                if phase0_boundary_fingerprints is not None:
+                    boundary_constants = phase0_boundary_fingerprints[
+                        "transcoder_constant_fingerprints"
+                    ]
+                    assert isinstance(boundary_constants, dict)
+                    boundary_per_layer = boundary_constants.setdefault("per_layer", {})
+                    assert isinstance(boundary_per_layer, dict)
+                    boundary_per_layer[str(layer_id)] = layer_constants
             layer_features = (
                 torch.einsum("bd,fd->bf", x[layer_id], W_enc_layer) + self.b_enc[layer_id]
             )
 
-            layer_features = self.apply_activation_function(layer_id, layer_features)
+            layer_threshold_diag: dict[str, object] | None = None
+            if isinstance(self.activation_function, JumpReLU):
+                mask, layer_threshold_diag = self._compute_jump_relu_mask(
+                    layer_id=layer_id,
+                    features=layer_features,
+                    collect_diagnostics=collect_threshold_membership,
+                )
+                layer_features = layer_features * mask
+            else:
+                layer_features = self.activation_function(layer_features)
 
             layer_features[zero_positions] = 0
+            if layer_threshold_diag is not None:
+                post_activation_fingerprint = self._build_sampled_tensor_fingerprint(
+                    layer_features,
+                    sample_limit=4096,
+                    hash_dtype=torch.float32,
+                )
+                layer_threshold_diag["post_activation_hash_fp32"] = post_activation_fingerprint[
+                    "sample_hash"
+                ]
+                layer_threshold_diag["post_activation_stats"] = post_activation_fingerprint[
+                    "sample_stats"
+                ]
+                layer_threshold_diag["post_activation_fingerprint"] = post_activation_fingerprint
+                layer_threshold_diag["post_activation_zero_positions_applied"] = True
 
             sparse_layer = layer_features.to_sparse().coalesce()
             sparse_layers.append(sparse_layer)
@@ -521,9 +1041,93 @@ class CrossLayerTranscoder(torch.nn.Module):
             _, feat_idx = sparse_layer.indices()
             if feature_ids_by_layer is not None:
                 feature_ids_by_layer.append(feat_idx)
-            self._add_diagnostic_layer_value(
-                "encode_sparse_by_layer", layer_id, time.perf_counter() - layer_start
-            )
+            if phase0_threshold_membership_summary is not None and layer_threshold_diag is not None:
+                per_layer = phase0_threshold_membership_summary["per_layer"]
+                assert isinstance(per_layer, dict)
+                per_layer[str(layer_id)] = layer_threshold_diag
+                if phase0_boundary_fingerprints is not None:
+                    boundary_per_layer = phase0_boundary_fingerprints.setdefault("per_layer", {})
+                    assert isinstance(boundary_per_layer, dict)
+                    boundary_per_layer[str(layer_id)] = {
+                        "layer": int(layer_id),
+                        "pre_activation_hash_fp32": layer_threshold_diag.get(
+                            "pre_activation_hash_fp32"
+                        ),
+                        "compare_margin_hash_fp64": layer_threshold_diag.get(
+                            "compare_margin_hash_fp64"
+                        ),
+                        "mask_membership_hash_canonical": layer_threshold_diag.get(
+                            "mask_membership_hash_canonical"
+                        ),
+                        "post_activation_hash_fp32": layer_threshold_diag.get(
+                            "post_activation_hash_fp32"
+                        ),
+                        "post_activation_zero_positions_applied": bool(
+                            layer_threshold_diag.get(
+                                "post_activation_zero_positions_applied",
+                                False,
+                            )
+                        ),
+                    }
+                pre_activation_layer_hashes.append(
+                    str(layer_threshold_diag.get("pre_activation_hash_fp32"))
+                )
+                compare_margin_layer_hashes.append(
+                    str(layer_threshold_diag.get("compare_margin_hash_fp64"))
+                )
+                mask_membership_layer_hashes.append(
+                    str(layer_threshold_diag.get("mask_membership_hash_canonical"))
+                )
+                post_activation_layer_hashes.append(
+                    str(layer_threshold_diag.get("post_activation_hash_fp32"))
+                )
+
+                phase0_threshold_membership_summary["total_entries"] = int(
+                    phase0_threshold_membership_summary["total_entries"]
+                    + int(layer_threshold_diag["total_entries"])
+                )
+                phase0_threshold_membership_summary["total_active_entries"] = int(
+                    phase0_threshold_membership_summary["total_active_entries"]
+                    + int(layer_threshold_diag["active_entries"])
+                )
+
+                near_counts = phase0_threshold_membership_summary["near_counts_by_epsilon"]
+                near_active_counts = phase0_threshold_membership_summary[
+                    "near_active_counts_by_epsilon"
+                ]
+                near_inactive_counts = phase0_threshold_membership_summary[
+                    "near_inactive_counts_by_epsilon"
+                ]
+                assert isinstance(near_counts, dict)
+                assert isinstance(near_active_counts, dict)
+                assert isinstance(near_inactive_counts, dict)
+
+                layer_near_counts = layer_threshold_diag["near_counts_by_epsilon"]
+                layer_near_active_counts = layer_threshold_diag["near_active_counts_by_epsilon"]
+                layer_near_inactive_counts = layer_threshold_diag["near_inactive_counts_by_epsilon"]
+                assert isinstance(layer_near_counts, dict)
+                assert isinstance(layer_near_active_counts, dict)
+                assert isinstance(layer_near_inactive_counts, dict)
+
+                for epsilon_key, value in layer_near_counts.items():
+                    near_counts[epsilon_key] = int(near_counts.get(epsilon_key, 0)) + int(value)
+                for epsilon_key, value in layer_near_active_counts.items():
+                    near_active_counts[epsilon_key] = int(
+                        near_active_counts.get(epsilon_key, 0)
+                    ) + int(value)
+                for epsilon_key, value in layer_near_inactive_counts.items():
+                    near_inactive_counts[epsilon_key] = int(
+                        near_inactive_counts.get(epsilon_key, 0)
+                    ) + int(value)
+
+                borderline_samples = layer_threshold_diag.get("borderline_samples")
+                if isinstance(borderline_samples, list):
+                    phase0_threshold_membership_summary["borderline_sample_count"] = int(
+                        phase0_threshold_membership_summary["borderline_sample_count"]
+                        + len(borderline_samples)
+                    )
+            layer_elapsed = time.perf_counter() - layer_start
+            self._add_diagnostic_layer_value("encode_sparse_by_layer", layer_id, layer_elapsed)
             self._add_diagnostic_layer_value(
                 "encode_sparse_active_features_by_layer", layer_id, float(len(feat_idx))
             )
@@ -531,7 +1135,8 @@ class CrossLayerTranscoder(torch.nn.Module):
                 "phase0.encode_sparse.layer_done",
                 layer=layer_id,
                 active_features=len(feat_idx),
-                elapsed_s=f"{time.perf_counter() - layer_start:.2f}",
+                elapsed_s=f"{layer_elapsed:.2f}",
+                elapsed_ms=layer_elapsed * 1000.0,
             )
 
         sparse_features = torch.stack(sparse_layers).coalesce()
@@ -542,10 +1147,46 @@ class CrossLayerTranscoder(torch.nn.Module):
         )
         encode_elapsed = time.perf_counter() - encode_start
         self._add_diagnostic_value("encode_sparse_seconds", encode_elapsed)
+        if phase0_threshold_membership_summary is not None:
+            constants = phase0_threshold_membership_summary.get("transcoder_constant_fingerprints")
+            if isinstance(constants, dict):
+                constants["global_hash"] = self._hash_json_payload(constant_layer_hashes)
+            phase0_threshold_membership_summary["global_hashes"] = {
+                "transcoder_constants_global_hash": (
+                    constants.get("global_hash") if isinstance(constants, dict) else None
+                ),
+                "pre_activation_hash_global": self._hash_json_payload(pre_activation_layer_hashes),
+                "compare_margin_hash_global": self._hash_json_payload(compare_margin_layer_hashes),
+                "mask_membership_hash_global": self._hash_json_payload(
+                    mask_membership_layer_hashes
+                ),
+                "post_activation_hash_global": self._hash_json_payload(
+                    post_activation_layer_hashes
+                ),
+            }
+            if phase0_boundary_fingerprints is not None:
+                boundary_constants = phase0_boundary_fingerprints.get(
+                    "transcoder_constant_fingerprints"
+                )
+                if isinstance(boundary_constants, dict):
+                    boundary_constants["global_hash"] = (
+                        constants.get("global_hash") if isinstance(constants, dict) else None
+                    )
+                boundary_global_hashes = phase0_boundary_fingerprints.setdefault(
+                    "global_hashes",
+                    {},
+                )
+                assert isinstance(boundary_global_hashes, dict)
+                boundary_global_hashes.update(phase0_threshold_membership_summary["global_hashes"])
+            self._diagnostic_stats["phase0_threshold_membership"] = (
+                phase0_threshold_membership_summary
+            )
+            self._diagnostic_stats["phase0_boundary_fingerprints"] = phase0_boundary_fingerprints
         self.emit_trace_event(
             "phase0.encode_sparse.done",
             total_active_features=sparse_features._nnz(),
             elapsed_s=f"{encode_elapsed:.2f}",
+            elapsed_ms=encode_elapsed * 1000.0,
         )
         return sparse_features, active_encoders
 
@@ -588,6 +1229,86 @@ class CrossLayerTranscoder(torch.nn.Module):
 
         return self._gather_encoder_vectors_by_layer(feature_ids_by_layer, device=features.device)
 
+    def _get_encoder_rows_for_layer(
+        self,
+        layer_id: int,
+        feat_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        feat_ids = feat_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+        if feat_ids.numel() == 0:
+            return torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+
+        if not self.lazy_encoder:
+            assert self.W_enc is not None, "Encoder weights are not set"
+            return self.W_enc[layer_id][feat_ids.to(device=self.W_enc.device)].to(dtype=self.dtype)
+
+        start = time.perf_counter()
+        if self.layer_paths is not None:
+            path = self.layer_paths[layer_id]
+            with safe_open(path, framework="pt", device="cpu") as f:
+                encoder_rows = f.get_slice("w_enc")[:, feat_ids].transpose(0, 1).contiguous()
+                result = self._move_lazy_slice_to_device(encoder_rows)
+        else:
+            assert self.clt_path is not None, "CLT path is not set"
+            path = os.path.join(self.clt_path, f"W_enc_{layer_id}.safetensors")
+            with safe_open(path, framework="pt", device="cpu") as f:
+                result = self._move_lazy_slice_to_device(f.get_slice(f"W_enc_{layer_id}")[feat_ids])
+
+        elapsed = time.perf_counter() - start
+        self._add_diagnostic_value("encoder_load_count", 1)
+        self._add_diagnostic_value("encoder_load_seconds", elapsed)
+        self._add_diagnostic_layer_value("encoder_load_by_layer", layer_id, elapsed)
+        self.emit_trace_event(
+            "encoder.row_load",
+            source_layer=layer_id,
+            row_count=int(feat_ids.numel()),
+            elapsed_ms=elapsed * 1000.0,
+        )
+        return result
+
+    def materialize_encoder_rows(
+        self,
+        source_layers: torch.Tensor,
+        feature_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Materialize encoder rows for specific (layer, feature) pairs.
+
+        Args:
+            source_layers: 1-D tensor of source layer indices in requested row order.
+            feature_ids: 1-D tensor of feature indices aligned with ``source_layers``.
+
+        Returns:
+            Tensor of shape ``(len(source_layers), d_model)`` with rows in exactly
+            the input order.
+        """
+
+        source_layers = source_layers.reshape(-1).to(device="cpu", dtype=torch.long)
+        feature_ids = feature_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+        if source_layers.numel() != feature_ids.numel():
+            raise ValueError("source_layers and feature_ids must have matching lengths")
+
+        if source_layers.numel() == 0:
+            return torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+
+        active_encoders = torch.empty(
+            (source_layers.numel(), self.d_model),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        for layer_id in torch.unique(source_layers, sorted=True).tolist():
+            layer_mask = source_layers == layer_id
+            layer_rows = torch.nonzero(layer_mask, as_tuple=False).squeeze(-1)
+            if layer_rows.numel() == 0:
+                continue
+
+            layer_feat_ids = feature_ids[layer_rows]
+            active_encoders[layer_rows.to(device=self.device)] = self._get_encoder_rows_for_layer(
+                layer_id,
+                layer_feat_ids,
+            )
+
+        return active_encoders
+
     def _get_decoder_vectors(self, layer_id, feat_ids=None):
         to_read = feat_ids if feat_ids is not None else np.s_[:]
 
@@ -615,6 +1336,7 @@ class CrossLayerTranscoder(torch.nn.Module):
                     source_layer=layer_id,
                     load_count=load_count,
                     elapsed_s=f"{elapsed:.2f}",
+                    elapsed_ms=elapsed * 1000.0,
                     lazy_decoder=self.lazy_decoder,
                 )
             return result
@@ -636,6 +1358,7 @@ class CrossLayerTranscoder(torch.nn.Module):
                 source_layer=layer_id,
                 load_count=load_count,
                 elapsed_s=f"{elapsed:.2f}",
+                elapsed_ms=elapsed * 1000.0,
                 lazy_decoder=self.lazy_decoder,
             )
         return result
@@ -676,6 +1399,7 @@ class CrossLayerTranscoder(torch.nn.Module):
                 chunk_id=chunk_id,
                 load_count=load_count,
                 elapsed_s=f"{elapsed:.2f}",
+                elapsed_ms=elapsed * 1000.0,
                 lazy_decoder=self.lazy_decoder,
             )
         return result
@@ -891,6 +1615,7 @@ class CrossLayerTranscoder(torch.nn.Module):
                 layer=layer_id,
                 chunks=layer_chunk_count,
                 elapsed_s=f"{layer_elapsed:.2f}",
+                elapsed_ms=layer_elapsed * 1000.0,
             )
 
         recon = recon.reshape(self.n_layers, n_pos, self.d_model) + self.b_dec[:, None].to(
@@ -907,6 +1632,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             "phase0.reconstruction.done",
             total_chunks=int(cast(float, self._diagnostic_stats["reconstruction_chunk_count"])),
             elapsed_s=f"{reconstruction_elapsed:.2f}",
+            elapsed_ms=reconstruction_elapsed * 1000.0,
         )
         return recon.to(dtype=self.dtype)
 
@@ -938,6 +1664,8 @@ class CrossLayerTranscoder(torch.nn.Module):
         inputs,
         zero_positions: slice = slice(0, 1),
         sparsification: SparsificationConfig | None = None,
+        *,
+        materialize_encoder_vecs: bool = True,
     ):
         """Extract active features and their encoder/decoder vectors for attribution.
 
@@ -956,12 +1684,19 @@ class CrossLayerTranscoder(torch.nn.Module):
             "phase0.components.start",
             input_shape=tuple(inputs.shape),
             exact_chunked_decoder=self.exact_chunked_decoder,
+            materialize_encoder_vecs=materialize_encoder_vecs,
         )
         component_start = time.perf_counter()
+
+        if not materialize_encoder_vecs and not self.exact_chunked_decoder:
+            raise ValueError(
+                "materialize_encoder_vecs=False is only supported with exact_chunked_decoder"
+            )
+
         features, encoder_vectors = self.encode_sparse(
             inputs,
             zero_positions=zero_positions,
-            return_encoder_vectors=sparsification is None,
+            return_encoder_vectors=materialize_encoder_vecs and sparsification is None,
         )
         sparsification_stats = None
 
@@ -970,9 +1705,13 @@ class CrossLayerTranscoder(torch.nn.Module):
                 features, sparsification
             )
             features = filter_sparse_activations(features, selected_indices)
+            if materialize_encoder_vecs:
+                encoder_vectors = self.gather_encoder_vectors(features)
+        elif encoder_vectors is None and materialize_encoder_vecs:
             encoder_vectors = self.gather_encoder_vectors(features)
-        elif encoder_vectors is None:
-            encoder_vectors = self.gather_encoder_vectors(features)
+
+        if not materialize_encoder_vecs:
+            encoder_vectors = torch.empty((0, self.d_model), dtype=self.dtype, device=inputs.device)
 
         if self.exact_chunked_decoder:
             reconstruction = self.compute_reconstruction_chunked(features, inputs)
@@ -1010,10 +1749,12 @@ class CrossLayerTranscoder(torch.nn.Module):
         if sparsification_stats is not None:
             attribution_data["sparsification_stats"] = sparsification_stats
 
+        component_elapsed = time.perf_counter() - component_start
         self.emit_trace_event(
             "phase0.components.done",
             active_features=features._nnz(),
-            elapsed_s=f"{time.perf_counter() - component_start:.2f}",
+            elapsed_s=f"{component_elapsed:.2f}",
+            elapsed_ms=component_elapsed * 1000.0,
         )
 
         return attribution_data
