@@ -773,11 +773,9 @@ class _FileBackedFeatureRowStore:
         elif full_row_abs_sums is not None:
             if full_row_abs_sums.numel() != row_count:
                 raise ValueError("full_row_abs_sums length must equal number of feature_rows")
-            row_abs_max = full_row_abs_sums
-            row_l1_scaled = torch.where(
-                full_row_abs_sums > 0,
-                torch.ones_like(full_row_abs_sums),
-                torch.zeros_like(full_row_abs_sums),
+            row_abs_max, row_l1_scaled = _row_abs_sums_to_scaled_l1(
+                full_row_abs_sums,
+                dtype=self.row_abs_max.dtype,
             )
         else:
             raise ValueError("row denominator data must be provided")
@@ -3465,6 +3463,117 @@ def _compute_row_abs_sums(
 
     row_abs_max, row_l1_scaled = _compute_row_denominator_scaled_l1(row_values, dtype=dtype)
     return row_abs_max * row_l1_scaled
+
+
+def _row_abs_sums_to_scaled_l1(
+    row_abs_sums: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.float64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert materialized row-L1 sums to the scaled denominator representation."""
+
+    resolved_dtype = _resolve_exact_trace_internal_dtype(dtype)
+    row_abs_sums_cpu = row_abs_sums.detach()
+    if row_abs_sums_cpu.ndim != 1:
+        raise ValueError("row_abs_sums must be rank-1")
+    if row_abs_sums_cpu.device.type != "cpu" or row_abs_sums_cpu.dtype != torch.float64:
+        row_abs_sums_cpu = row_abs_sums_cpu.to(device="cpu", dtype=torch.float64)
+    if not torch.isfinite(row_abs_sums_cpu).all().item():
+        raise ValueError("row_abs_sums must be finite")
+    if bool((row_abs_sums_cpu < 0).any().item()):
+        raise ValueError("row_abs_sums must be non-negative")
+
+    max_for_dtype = torch.full_like(row_abs_sums_cpu, torch.finfo(resolved_dtype).max)
+    row_abs_max_f64 = torch.minimum(row_abs_sums_cpu, max_for_dtype)
+    row_l1_scaled_f64 = torch.zeros_like(row_abs_sums_cpu)
+    positive_rows = row_abs_sums_cpu > 0
+    if bool(positive_rows.any().item()):
+        row_l1_scaled_f64[positive_rows] = (
+            row_abs_sums_cpu[positive_rows] / row_abs_max_f64[positive_rows]
+        )
+    row_abs_max = row_abs_max_f64.to(dtype=resolved_dtype).contiguous()
+    row_l1_scaled = row_l1_scaled_f64.to(dtype=resolved_dtype).contiguous()
+    return row_abs_max, row_l1_scaled
+
+
+def _resolve_phase3_effective_row_state(
+    *,
+    rows_cpu: torch.Tensor,
+    row_input_column_count: int,
+    total_active_features: int,
+    dtype: torch.dtype,
+    donor_feature_rows: torch.Tensor | None = None,
+    donor_row_abs_sums: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor],
+    torch.Tensor,
+]:
+    """Resolve Phase-3 rows used by capture and compact row storage.
+
+    The returned rows, feature slice, denominator, and materialized row sums all
+    describe the same effective state. In donor row replay, feature columns and row
+    normalizers are donor-effective while dense token/error columns remain host
+    computed.
+    """
+
+    if rows_cpu.ndim != 2:
+        raise ValueError("rows_cpu must be rank-2")
+    row_input_column_count = int(row_input_column_count)
+    total_active_features = int(total_active_features)
+    if row_input_column_count < 0 or row_input_column_count > int(rows_cpu.shape[1]):
+        raise ValueError("row_input_column_count is out of bounds")
+    if total_active_features < 0 or total_active_features > row_input_column_count:
+        raise ValueError("total_active_features is out of bounds")
+    if (donor_feature_rows is None) != (donor_row_abs_sums is None):
+        raise ValueError("donor_feature_rows and donor_row_abs_sums must be provided together")
+
+    effective_rows_cpu = rows_cpu
+    if donor_feature_rows is not None and donor_row_abs_sums is not None:
+        if donor_feature_rows.ndim != 2:
+            raise ValueError("donor_feature_rows must be rank-2")
+        if tuple(donor_feature_rows.shape) != (int(rows_cpu.shape[0]), total_active_features):
+            raise ValueError(
+                "donor_feature_rows shape must match current row batch and active feature count"
+            )
+        if donor_row_abs_sums.ndim != 1 or int(donor_row_abs_sums.numel()) != int(
+            rows_cpu.shape[0]
+        ):
+            raise ValueError("donor_row_abs_sums length must match current row batch")
+        effective_rows_cpu = rows_cpu.clone()
+        effective_rows_cpu[:, :total_active_features] = donor_feature_rows.to(
+            device=effective_rows_cpu.device,
+            dtype=effective_rows_cpu.dtype,
+        )
+        row_denominator_scaled_l1 = _row_abs_sums_to_scaled_l1(
+            donor_row_abs_sums,
+            dtype=dtype,
+        )
+        row_abs_sums_cpu = donor_row_abs_sums.detach()
+        if row_abs_sums_cpu.device.type != "cpu" or row_abs_sums_cpu.dtype != torch.float64:
+            row_abs_sums_cpu = row_abs_sums_cpu.to(device="cpu", dtype=torch.float64)
+        row_abs_sums_cpu = row_abs_sums_cpu.contiguous()
+    else:
+        row_denominator_scaled_l1 = _compute_row_denominator_scaled_l1(
+            effective_rows_cpu[:, :row_input_column_count],
+            dtype=dtype,
+        )
+        row_abs_sums_cpu = (
+            row_denominator_scaled_l1[0].to(dtype=torch.float64)
+            * row_denominator_scaled_l1[1].to(dtype=torch.float64)
+        ).contiguous()
+
+    row_input_slice = effective_rows_cpu[:, :row_input_column_count]
+    feature_row_slice = effective_rows_cpu[:, :total_active_features]
+    return (
+        effective_rows_cpu,
+        row_input_slice,
+        feature_row_slice,
+        row_denominator_scaled_l1,
+        row_abs_sums_cpu,
+    )
 
 
 def _copy_rows_to_cpu_staging(
@@ -7712,12 +7821,8 @@ def _run_attribution(
                 rows,
                 staging_buffer=rows_cpu_staging,
             )
-            row_input_slice = rows_cpu[:, :logit_offset]
-            feature_row_slice = rows_cpu[:, :total_active_feats]
-            row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
-                row_input_slice,
-                dtype=exact_trace_internal_dtype_resolved,
-            )
+            donor_feature_rows: torch.Tensor | None = None
+            donor_row_abs_sums: torch.Tensor | None = None
             donor_feature_abs_sums: torch.Tensor | None = None
             donor_error_abs_sums: torch.Tensor | None = None
             donor_token_abs_sums: torch.Tensor | None = None
@@ -7726,29 +7831,39 @@ def _run_attribution(
                 donor_feature_rows = cast(
                     torch.Tensor,
                     loaded_phase3_row_donor_bundle["phase3_feature_rows"],
-                )[i:end].to(dtype=rows_cpu.dtype)
+                )[i:end]
                 donor_row_abs_sums = cast(
                     torch.Tensor,
                     loaded_phase3_row_donor_bundle["row_abs_sums"],
-                )[i:end].to(dtype=exact_trace_internal_dtype_resolved)
+                )[i:end]
                 donor_feature_abs_sums = cast(
                     torch.Tensor,
                     loaded_phase3_row_donor_bundle["feature_abs_sums"],
-                )[i:end].to(dtype=exact_trace_internal_dtype_resolved)
+                )[i:end]
                 donor_error_abs_sums = cast(
                     torch.Tensor,
                     loaded_phase3_row_donor_bundle["error_abs_sums"],
-                )[i:end].to(dtype=exact_trace_internal_dtype_resolved)
+                )[i:end]
                 donor_token_abs_sums = cast(
                     torch.Tensor,
                     loaded_phase3_row_donor_bundle["token_abs_sums"],
-                )[i:end].to(dtype=exact_trace_internal_dtype_resolved)
-                rows_cpu = rows_cpu.clone()
-                rows_cpu[:, :total_active_feats] = donor_feature_rows
-                row_input_slice = rows_cpu[:, :logit_offset]
-                row_abs_sums_cpu = donor_row_abs_sums.contiguous()
+                )[i:end]
+            (
+                rows_cpu,
+                row_input_slice,
+                feature_row_slice,
+                (row_abs_max_cpu, row_l1_scaled_cpu),
+                row_abs_sums_cpu,
+            ) = _resolve_phase3_effective_row_state(
+                rows_cpu=rows_cpu,
+                row_input_column_count=int(logit_offset),
+                total_active_features=int(total_active_feats),
+                dtype=exact_trace_internal_dtype_resolved,
+                donor_feature_rows=donor_feature_rows,
+                donor_row_abs_sums=donor_row_abs_sums,
+            )
             if capture_phase3_row_bundle_enabled:
-                feature_rows_cpu = rows_cpu[:, :total_active_feats].contiguous()
+                feature_rows_cpu = feature_row_slice.contiguous()
                 error_start = int(total_active_feats)
                 error_end = int(total_active_feats + n_layers * n_pos)
                 token_end = int(logit_offset)
@@ -7766,19 +7881,19 @@ def _run_attribution(
                     phase3_feature_abs_sum_batches.append(
                         _compute_row_abs_sums(
                             feature_rows_cpu,
-                            dtype=exact_trace_internal_dtype_resolved,
+                            dtype=torch.float64,
                         ).contiguous()
                     )
                     phase3_error_abs_sum_batches.append(
                         _compute_row_abs_sums(
                             rows_cpu[:, error_start:error_end],
-                            dtype=exact_trace_internal_dtype_resolved,
+                            dtype=torch.float64,
                         ).contiguous()
                     )
                     phase3_token_abs_sum_batches.append(
                         _compute_row_abs_sums(
                             rows_cpu[:, error_end:token_end],
-                            dtype=exact_trace_internal_dtype_resolved,
+                            dtype=torch.float64,
                         ).contiguous()
                     )
             if anomaly_debug_result is not None:

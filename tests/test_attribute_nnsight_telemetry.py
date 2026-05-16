@@ -11,6 +11,8 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _compute_row_abs_sums,
     _compute_row_denominator_scaled_l1,
     _FileBackedFeatureRowStore,
+    _resolve_phase3_effective_row_state,
+    _row_abs_sums_to_scaled_l1,
     _resolve_exact_trace_internal_dtype,
     attribute as nnsight_attribute,
 )
@@ -100,6 +102,29 @@ def test_file_backed_feature_row_store_read_cache_invalidates_on_overlap_append(
     stats = store.get_diagnostic_snapshot()
     assert stats["read_cache_hit_count"] == 1
     assert stats["read_cache_miss_count"] == 2
+
+
+def test_file_backed_feature_row_store_full_row_abs_sums_uses_scaled_representation() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=1,
+        n_feature_columns=2,
+        dtype=torch.float32,
+        row_abs_sum_dtype=torch.float32,
+    )
+
+    try:
+        store.append_rows(
+            row_start=0,
+            feature_rows=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+            full_row_abs_sums=torch.tensor([4e38], dtype=torch.float64),
+        )
+    finally:
+        store.cleanup()
+
+    assert torch.isfinite(store.row_abs_max).all()
+    assert torch.isfinite(store.row_l1_scaled).all()
+    assert store.row_abs_max[0].item() == pytest.approx(torch.finfo(torch.float32).max)
+    assert store.row_l1_scaled[0].item() == pytest.approx(4e38 / torch.finfo(torch.float32).max)
 
 
 def test_file_backed_feature_row_store_read_cache_too_large_is_reported() -> None:
@@ -486,6 +511,154 @@ def test_compute_row_denominator_scaled_l1_chunked_matches_reference_on_strided_
     assert torch.allclose(row_l1_scaled, reference_row_l1_scaled)
     assert row_l1_scaled[1].item() == pytest.approx(0.0)
     assert row_l1_scaled[2].item() == pytest.approx(1.0)
+
+
+def test_row_abs_sums_to_scaled_l1_handles_zero_and_finite_rows() -> None:
+    row_abs_max, row_l1_scaled = _row_abs_sums_to_scaled_l1(
+        torch.tensor([0.0, 7.5], dtype=torch.float64),
+        dtype=torch.float32,
+    )
+
+    assert row_abs_max.dtype == torch.float32
+    assert row_l1_scaled.dtype == torch.float32
+    assert torch.allclose(row_abs_max, torch.tensor([0.0, 7.5], dtype=torch.float32))
+    assert torch.equal(row_l1_scaled, torch.tensor([0.0, 1.0], dtype=torch.float32))
+
+
+def test_row_abs_sums_to_scaled_l1_avoids_fp32_overflow_for_large_raw_sums() -> None:
+    row_abs_max, row_l1_scaled = _row_abs_sums_to_scaled_l1(
+        torch.tensor([4e38], dtype=torch.float64),
+        dtype=torch.float32,
+    )
+
+    assert row_abs_max.dtype == torch.float32
+    assert row_l1_scaled.dtype == torch.float32
+    assert torch.isfinite(row_abs_max).all()
+    assert torch.isfinite(row_l1_scaled).all()
+    assert row_abs_max.item() == pytest.approx(torch.finfo(torch.float32).max)
+    assert row_l1_scaled.item() == pytest.approx(4e38 / torch.finfo(torch.float32).max)
+
+
+def test_resolve_phase3_effective_row_state_without_donor_provides_capture_row_sums() -> None:
+    rows = torch.tensor(
+        [
+            [1.0, -2.0, 3.0, 99.0],
+            [0.0, 0.0, 0.0, 88.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    (
+        effective_rows,
+        row_input_slice,
+        feature_row_slice,
+        row_denominator_scaled_l1,
+        row_abs_sums_cpu,
+    ) = _resolve_phase3_effective_row_state(
+        rows_cpu=rows,
+        row_input_column_count=3,
+        total_active_features=2,
+        dtype=torch.float32,
+    )
+
+    assert effective_rows is rows
+    assert torch.allclose(row_input_slice, rows[:, :3])
+    assert torch.allclose(feature_row_slice, rows[:, :2])
+    assert row_abs_sums_cpu.dtype == torch.float64
+    assert torch.allclose(row_abs_sums_cpu, torch.tensor([6.0, 0.0], dtype=torch.float64))
+    assert torch.allclose(row_denominator_scaled_l1[0], torch.tensor([3.0, 0.0]))
+    assert torch.allclose(row_denominator_scaled_l1[1], torch.tensor([2.0, 0.0]))
+
+
+def test_resolve_phase3_effective_row_state_no_donor_capture_sums_do_not_overflow_fp32() -> None:
+    rows = torch.tensor([[1e38, -1e38, 1e38, -1e38]], dtype=torch.float32)
+
+    _, _, _, row_denominator_scaled_l1, row_abs_sums_cpu = _resolve_phase3_effective_row_state(
+        rows_cpu=rows,
+        row_input_column_count=4,
+        total_active_features=2,
+        dtype=torch.float32,
+    )
+
+    assert torch.isfinite(row_denominator_scaled_l1[0]).all()
+    assert torch.isfinite(row_denominator_scaled_l1[1]).all()
+    assert row_denominator_scaled_l1[0].item() == pytest.approx(1e38)
+    assert row_denominator_scaled_l1[1].item() == pytest.approx(4.0)
+    assert row_abs_sums_cpu.dtype == torch.float64
+    assert torch.isfinite(row_abs_sums_cpu).all()
+    assert row_abs_sums_cpu.item() == pytest.approx(4e38)
+
+
+def test_resolve_phase3_effective_row_state_uses_donor_rows_and_denominators() -> None:
+    rows = torch.tensor(
+        [
+            [1.0, 2.0, 10.0, 20.0],
+            [3.0, 4.0, 30.0, 40.0],
+        ],
+        dtype=torch.float32,
+    )
+    donor_feature_rows = torch.tensor(
+        [[9.0, 8.0], [7.0, 6.0]],
+        dtype=torch.float64,
+    )
+    donor_row_abs_sums = torch.tensor([100.0, 0.0], dtype=torch.float64)
+
+    (
+        effective_rows,
+        row_input_slice,
+        feature_row_slice,
+        row_denominator_scaled_l1,
+        row_abs_sums_cpu,
+    ) = _resolve_phase3_effective_row_state(
+        rows_cpu=rows,
+        row_input_column_count=4,
+        total_active_features=2,
+        dtype=torch.float32,
+        donor_feature_rows=donor_feature_rows,
+        donor_row_abs_sums=donor_row_abs_sums,
+    )
+
+    assert effective_rows is not rows
+    assert torch.allclose(rows[:, :2], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    assert torch.allclose(feature_row_slice, donor_feature_rows.to(dtype=torch.float32))
+    assert torch.allclose(row_input_slice[:, :2], donor_feature_rows.to(dtype=torch.float32))
+    assert torch.allclose(row_input_slice[:, 2:], rows[:, 2:])
+    assert row_abs_sums_cpu.dtype == torch.float64
+    assert torch.allclose(row_abs_sums_cpu, donor_row_abs_sums)
+    assert torch.allclose(row_denominator_scaled_l1[0], torch.tensor([100.0, 0.0]))
+    assert torch.equal(row_denominator_scaled_l1[1], torch.tensor([1.0, 0.0]))
+
+
+def test_resolve_phase3_effective_row_state_donor_denominator_avoids_fp32_overflow() -> None:
+    rows = torch.tensor([[1.0, 2.0, 10.0, 20.0]], dtype=torch.float32)
+    donor_feature_rows = torch.tensor([[9.0, 8.0]], dtype=torch.float64)
+    donor_row_abs_sums = torch.tensor([4e38], dtype=torch.float64)
+
+    (
+        _,
+        row_input_slice,
+        feature_row_slice,
+        row_denominator_scaled_l1,
+        row_abs_sums_cpu,
+    ) = _resolve_phase3_effective_row_state(
+        rows_cpu=rows,
+        row_input_column_count=4,
+        total_active_features=2,
+        dtype=torch.float32,
+        donor_feature_rows=donor_feature_rows,
+        donor_row_abs_sums=donor_row_abs_sums,
+    )
+
+    assert torch.allclose(feature_row_slice, donor_feature_rows.to(dtype=torch.float32))
+    assert torch.allclose(row_input_slice[:, :2], donor_feature_rows.to(dtype=torch.float32))
+    assert torch.isfinite(row_denominator_scaled_l1[0]).all()
+    assert torch.isfinite(row_denominator_scaled_l1[1]).all()
+    assert row_denominator_scaled_l1[0].item() == pytest.approx(torch.finfo(torch.float32).max)
+    assert row_denominator_scaled_l1[1].item() == pytest.approx(
+        4e38 / torch.finfo(torch.float32).max
+    )
+    assert row_abs_sums_cpu.dtype == torch.float64
+    assert row_abs_sums_cpu.item() == pytest.approx(4e38)
 
 
 def test_file_backed_feature_row_store_append_rows_supports_strided_cpu_slices() -> None:
