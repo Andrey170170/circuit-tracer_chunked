@@ -44,6 +44,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _reorder_pending_for_phase4_locality,
     _resolve_internal_dtype_map,
     _resolve_internal_precision_requested,
+    _resolve_telemetry_max_events,
     _resolve_phase0_activation_threshold_compare_mode,
     _resolve_phase0_donor_context_policy,
     _resolve_phase0_replay_mode,
@@ -1951,9 +1952,27 @@ def test_phase4_anomaly_debug_enabled_from_flag() -> None:
     assert _resolve_phase4_anomaly_debug_enabled(True) is True
 
 
-def test_phase4_anomaly_debug_enabled_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_phase4_anomaly_debug_ignores_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("PHASE4_ANOMALY_DEBUG", "1")
-    assert _resolve_phase4_anomaly_debug_enabled(False) is True
+    assert _resolve_phase4_anomaly_debug_enabled(False) is False
+
+
+def test_telemetry_max_events_ignores_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CIRCUIT_TRACER_TELEMETRY_MAX_EVENTS", "17")
+    assert (
+        _resolve_telemetry_max_events(
+            telemetry_max_events=None,
+            compact_output=False,
+            exact_chunked_decoder=False,
+            profile=False,
+            phase4_anomaly_debug_enabled=False,
+        )
+        == 20_000
+    )
 
 
 def test_internal_precision_contract_resolves_float64_defaults() -> None:
@@ -1969,6 +1988,23 @@ def test_internal_precision_contract_resolves_float64_defaults() -> None:
     assert dtype_map["influence_compute_dtype"] == "float64"
     assert dtype_map["planner_compute_dtype"] == "float64"
     assert dtype_map["shadow_debug_compute_dtype"] == "float64"
+
+
+def test_internal_precision_defaults_to_exact_trace_internal_dtype() -> None:
+    assert (
+        _resolve_internal_precision_requested(
+            None,
+            exact_trace_internal_dtype=torch.float32,
+        )
+        == "float32"
+    )
+    assert (
+        _resolve_internal_precision_requested(
+            None,
+            exact_trace_internal_dtype=torch.float64,
+        )
+        == "float64"
+    )
 
 
 def test_internal_precision_contract_resolves_float32_math() -> None:

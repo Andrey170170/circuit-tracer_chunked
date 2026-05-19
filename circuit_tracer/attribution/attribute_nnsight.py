@@ -28,6 +28,7 @@ import os
 import sys
 import tempfile
 import time
+import warnings
 from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -3156,24 +3157,6 @@ def _resolve_phase4_feature_batch_planner_enabled(
     return bool(plan_feature_batch_size or auto_scale_feature_batch_size)
 
 
-def _parse_env_bool(name: str) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return False
-    return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-
-
-def _parse_env_int(name: str) -> int | None:
-    value = os.getenv(name)
-    if value is None:
-        return None
-    try:
-        parsed = int(value.strip())
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
 def _resolve_telemetry_max_events(
     *,
     telemetry_max_events: int | None,
@@ -3185,10 +3168,6 @@ def _resolve_telemetry_max_events(
     if telemetry_max_events is not None and telemetry_max_events > 0:
         return int(telemetry_max_events)
 
-    env_override = _parse_env_int("CIRCUIT_TRACER_TELEMETRY_MAX_EVENTS")
-    if env_override is not None:
-        return env_override
-
     if compact_output and exact_chunked_decoder:
         return 120_000
     if profile or phase4_anomaly_debug_enabled:
@@ -3197,14 +3176,30 @@ def _resolve_telemetry_max_events(
 
 
 def _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug: bool) -> bool:
-    return bool(phase4_anomaly_debug or _parse_env_bool("PHASE4_ANOMALY_DEBUG"))
+    return bool(phase4_anomaly_debug)
 
 
-def _resolve_internal_precision_requested(internal_precision: str) -> str:
+def _resolve_internal_precision_requested(
+    internal_precision: str | None,
+    *,
+    exact_trace_internal_dtype: torch.dtype = torch.float32,
+) -> str:
+    if internal_precision is None:
+        return _dtype_to_name(exact_trace_internal_dtype)
+
     normalized = str(internal_precision).strip().lower()
     if normalized not in {"float32", "float64"}:
         raise ValueError("internal_precision must be one of {'float32', 'float64'}")
     return normalized
+
+
+def _warn_internal_precision_deprecated() -> None:
+    warnings.warn(
+        "internal_precision is deprecated; use exact_trace_internal_dtype instead. "
+        "When internal_precision is omitted, it is derived from exact_trace_internal_dtype.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 def _dtype_to_name(dtype: torch.dtype) -> str:
@@ -6075,7 +6070,7 @@ def attribute(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
-    internal_precision: Literal["float32", "float64"] = "float64",
+    internal_precision: Literal["float32", "float64"] | None = None,
     phase4_anomaly_debug: bool = False,
     cross_cluster_debug: bool = False,
     capture_phase0_donor_bundle: bool = False,
@@ -6167,10 +6162,12 @@ def attribute(
             unused (0-1), applied as a stricter cap than target utilization.
         feature_batch_probe_batches: Number of preflight Phase-4 probe batches
             to run before the real attribution pass.
-        internal_precision: Public precision contract for exact chunked internals.
-            ``float64`` preserves prior default behavior as closely as practical.
+        internal_precision: Deprecated compatibility override for exact chunked
+            internals. Prefer ``exact_trace_internal_dtype``; when omitted,
+            internal precision is derived from that canonical contract.
         phase4_anomaly_debug: Enable opt-in Phase-4 anomaly debug scaffolding.
-            Can also be activated via ``PHASE4_ANOMALY_DEBUG=1``.
+            Environment-variable activation is intentionally unsupported so run
+            provenance stays explicit in scenario/config inputs.
         cross_cluster_debug: Enable broad scalar-only cross-cluster debug summary
             scaffolding (Phase 0 through pre-Phase-4 checkpoints).
         capture_phase0_donor_bundle: Enable opt-in Phase-0 donor bundle payload
@@ -6188,7 +6185,7 @@ def attribute(
         semantic_descriptor_dim: Descriptor width (number of float values)
             for each candidate feature sketch.
         telemetry_max_events: Optional cap for in-memory telemetry event storage.
-            If omitted, an environment/default policy is used.
+            If omitted, a deterministic in-code default policy is used.
         phase0_donor_bundle: Optional path to a saved Phase-0 donor bundle
             (``*.npz``) used for replay in compact exact-chunked runs.
         phase0_replay_mode: Phase-0 donor replay mode. ``"disabled"`` keeps
@@ -6378,7 +6375,7 @@ def _run_attribution(
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,
     feature_batch_probe_batches: int = 1,
-    internal_precision: Literal["float32", "float64"] = "float64",
+    internal_precision: Literal["float32", "float64"] | None = None,
     phase4_anomaly_debug: bool = False,
     cross_cluster_debug: bool = False,
     capture_phase0_donor_bundle: bool = False,
@@ -6487,7 +6484,12 @@ def _run_attribution(
         raise ValueError("phase3_row_replay_mode requires a phase3_row_donor_bundle path")
 
     phase4_anomaly_debug_enabled = _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug)
-    internal_precision_requested = _resolve_internal_precision_requested(internal_precision)
+    if internal_precision is not None:
+        _warn_internal_precision_deprecated()
+    internal_precision_requested = _resolve_internal_precision_requested(
+        internal_precision,
+        exact_trace_internal_dtype=exact_trace_internal_dtype_resolved,
+    )
     resolved_dtype_map = _resolve_internal_dtype_map(
         internal_precision_requested=internal_precision_requested,
         phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,

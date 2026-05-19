@@ -240,6 +240,7 @@ def test_exact_trace_internal_dtype_default_is_fp32_on_public_entrypoints() -> N
         inspect.signature(nnsight_attribute).parameters["exact_trace_internal_dtype"].default
         == "fp32"
     )
+    assert inspect.signature(nnsight_attribute).parameters["internal_precision"].default is None
 
 
 def test_phase4_scheduler_defaults_match_between_public_entrypoints() -> None:
