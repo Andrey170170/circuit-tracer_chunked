@@ -11,6 +11,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _compute_row_abs_sums,
     _compute_row_denominator_scaled_l1,
     _FileBackedFeatureRowStore,
+    _build_row_transfer_telemetry,
     _resolve_phase3_effective_row_state,
     _row_abs_sums_to_scaled_l1,
     _resolve_exact_trace_internal_dtype,
@@ -102,6 +103,41 @@ def test_file_backed_feature_row_store_read_cache_invalidates_on_overlap_append(
     stats = store.get_diagnostic_snapshot()
     assert stats["read_cache_hit_count"] == 1
     assert stats["read_cache_miss_count"] == 2
+
+
+def test_row_transfer_telemetry_reports_shapes_without_cpu_copy_transfer() -> None:
+    rows = torch.ones((2, 4), dtype=torch.float32)
+    telemetry = _build_row_transfer_telemetry(
+        rows=rows,
+        rows_cpu=rows,
+        row_input_slice=rows[:, :3],
+        feature_row_slice=rows[:, :2],
+    )
+
+    assert telemetry["row_transfer_source"] == "cpu"
+    assert telemetry["row_transfer_destination"] == "cpu"
+    assert telemetry["row_transfer_count"] == 2
+    assert telemetry["row_transfer_bytes"] == 0
+    assert telemetry["row_input_bytes"] == 2 * 3 * rows.element_size()
+    assert telemetry["feature_row_bytes"] == 2 * 2 * rows.element_size()
+
+
+def test_row_transfer_telemetry_counts_dtype_materialization_bytes() -> None:
+    rows = torch.ones((2, 4), dtype=torch.float32)
+    rows_cpu = rows.to(dtype=torch.float64)
+    telemetry = _build_row_transfer_telemetry(
+        rows=rows,
+        rows_cpu=rows_cpu,
+        row_input_slice=rows_cpu[:, :3],
+        feature_row_slice=rows_cpu[:, :2],
+    )
+
+    assert telemetry["row_transfer_source"] == "cpu"
+    assert telemetry["row_transfer_destination"] == "cpu"
+    assert telemetry["row_transfer_count"] == 2
+    assert telemetry["row_transfer_bytes"] == rows_cpu.numel() * rows_cpu.element_size()
+    assert telemetry["row_input_bytes"] == 2 * 3 * rows_cpu.element_size()
+    assert telemetry["feature_row_bytes"] == 2 * 2 * rows_cpu.element_size()
 
 
 def test_file_backed_feature_row_store_full_row_abs_sums_uses_scaled_representation() -> None:

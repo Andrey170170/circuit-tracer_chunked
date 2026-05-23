@@ -33,7 +33,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, TypedDict, cast
 
 import numpy as np
 import torch
@@ -3762,6 +3762,70 @@ def _safe_int(value: object) -> int | None:
     return None
 
 
+def _tensor_nbytes_estimate(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    return int(torch.empty((), dtype=dtype).element_size())
+
+
+def _build_tensor_transfer_estimate(
+    *,
+    prefix: str,
+    source: torch.Tensor,
+    destination_device: torch.device | str,
+    destination_dtype: torch.dtype | None = None,
+) -> dict[str, object]:
+    dest_device = torch.device(destination_device)
+    dest_dtype = source.dtype if destination_dtype is None else destination_dtype
+    estimated_bytes = int(source.numel() * _dtype_element_size(dest_dtype))
+    transfer_bytes = (
+        estimated_bytes
+        if source.device.type != dest_device.type or source.dtype != dest_dtype
+        else 0
+    )
+    return {
+        f"{prefix}_source": str(source.device.type),
+        f"{prefix}_destination": str(dest_device.type),
+        f"{prefix}_dtype_source": str(source.dtype),
+        f"{prefix}_dtype_destination": str(dest_dtype),
+        f"{prefix}_bytes": int(estimated_bytes),
+        f"{prefix}_transfer_bytes": int(transfer_bytes),
+    }
+
+
+class _RowTransferTelemetry(TypedDict):
+    row_transfer_source: str
+    row_transfer_destination: str
+    row_transfer_count: int
+    row_transfer_bytes: int
+    row_input_bytes: int
+    feature_row_bytes: int
+
+
+def _build_row_transfer_telemetry(
+    *,
+    rows: torch.Tensor,
+    rows_cpu: torch.Tensor,
+    row_input_slice: torch.Tensor,
+    feature_row_slice: torch.Tensor,
+) -> _RowTransferTelemetry:
+    source = str(rows.device.type)
+    destination = str(rows_cpu.device.type)
+    transferred = source != destination or rows.dtype != rows_cpu.dtype
+    return {
+        "row_transfer_source": source,
+        "row_transfer_destination": destination,
+        "row_transfer_count": int(rows.shape[0]),
+        "row_transfer_bytes": int(_tensor_nbytes_estimate(rows_cpu) if transferred else 0),
+        "row_input_bytes": int(_tensor_nbytes_estimate(row_input_slice)),
+        "feature_row_bytes": int(_tensor_nbytes_estimate(feature_row_slice)),
+    }
+
+
 def _build_phase4_refresh_substage_telemetry(
     *,
     telemetry_detail: Literal["summary", "normal", "debug"],
@@ -3813,6 +3877,7 @@ def _build_phase4_refresh_substage_telemetry(
 def _build_phase4_executor_substage_telemetry(
     *,
     telemetry_detail: Literal["summary", "normal", "debug"],
+    encoder_materialize_elapsed_ms: float,
     compute_batch_elapsed_ms: float,
     cpu_staging_elapsed_ms: float,
     denominator_elapsed_ms: float,
@@ -3820,12 +3885,14 @@ def _build_phase4_executor_substage_telemetry(
     batch_elapsed_ms: float,
 ) -> dict[str, object]:
     accounted_elapsed_ms = (
-        compute_batch_elapsed_ms
+        encoder_materialize_elapsed_ms
+        + compute_batch_elapsed_ms
         + cpu_staging_elapsed_ms
         + denominator_elapsed_ms
         + row_store_write_elapsed_ms
     )
     payload: dict[str, object] = {
+        "executor_encoder_materialize_elapsed_ms": float(encoder_materialize_elapsed_ms),
         "executor_compute_batch_elapsed_ms": float(compute_batch_elapsed_ms),
         "executor_accounted_elapsed_ms": float(accounted_elapsed_ms),
         "executor_overhead_elapsed_ms": float(max(0.0, batch_elapsed_ms - accounted_elapsed_ms)),
@@ -7806,23 +7873,49 @@ def _run_attribution(
         phase3_error_abs_sum_batches: list[torch.Tensor] = []
         phase3_token_abs_sum_batches: list[torch.Tensor] = []
         rows_cpu_staging: torch.Tensor | None = None
+        phase3_compute_batch_elapsed_ms_total = 0.0
+        phase3_cpu_staging_elapsed_ms_total = 0.0
+        phase3_denominator_elapsed_ms_total = 0.0
+        phase3_row_store_write_elapsed_ms_total = 0.0
+        phase3_gpu_to_cpu_bytes_total = 0
+        phase3_cpu_to_gpu_bytes_total = 0
+        phase3_copy_count = 0
         for i in range(0, len(targets), effective_logit_batch_size):
             batch = targets.logit_vectors[i : i + effective_logit_batch_size]
             ctx_before = _snapshot_diagnostics(ctx) if profile else None
             transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
             batch_start = time.perf_counter()
+            batch_memory_before = get_memory_snapshot(model.device)
             if phase3_gradient_replay_mode_resolved == "donor":
                 setattr(ctx, "phase3_gradient_replay_column_offset", int(i))
+            phase3_inject_transfer_telemetry = _build_tensor_transfer_estimate(
+                prefix="inject_values",
+                source=batch,
+                destination_device=model.device,
+            )
+            if (
+                phase3_inject_transfer_telemetry["inject_values_source"] == "cpu"
+                and phase3_inject_transfer_telemetry["inject_values_destination"] == "cuda"
+            ):
+                phase3_cpu_to_gpu_bytes_total += int(
+                    phase3_inject_transfer_telemetry["inject_values_transfer_bytes"]
+                )
+            compute_batch_start = time.perf_counter()
             rows = ctx.compute_batch(
                 layers=torch.full((batch.shape[0],), n_layers),
                 positions=torch.full((batch.shape[0],), n_pos - 1),
                 inject_values=batch,
                 phase_label="phase3_logits",
             )
+            phase3_compute_batch_elapsed_ms = (time.perf_counter() - compute_batch_start) * 1000.0
+            phase3_compute_batch_elapsed_ms_total += phase3_compute_batch_elapsed_ms
+            cpu_staging_start = time.perf_counter()
             rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
                 rows,
                 staging_buffer=rows_cpu_staging,
             )
+            phase3_cpu_staging_elapsed_ms = (time.perf_counter() - cpu_staging_start) * 1000.0
+            phase3_cpu_staging_elapsed_ms_total += phase3_cpu_staging_elapsed_ms
             donor_feature_rows: torch.Tensor | None = None
             donor_row_abs_sums: torch.Tensor | None = None
             donor_feature_abs_sums: torch.Tensor | None = None
@@ -7850,6 +7943,7 @@ def _run_attribution(
                     torch.Tensor,
                     loaded_phase3_row_donor_bundle["token_abs_sums"],
                 )[i:end]
+            denominator_start = time.perf_counter()
             (
                 rows_cpu,
                 row_input_slice,
@@ -7864,6 +7958,24 @@ def _run_attribution(
                 donor_feature_rows=donor_feature_rows,
                 donor_row_abs_sums=donor_row_abs_sums,
             )
+            phase3_denominator_elapsed_ms = (time.perf_counter() - denominator_start) * 1000.0
+            phase3_denominator_elapsed_ms_total += phase3_denominator_elapsed_ms
+            phase3_row_transfer_telemetry = _build_row_transfer_telemetry(
+                rows=rows,
+                rows_cpu=rows_cpu,
+                row_input_slice=row_input_slice,
+                feature_row_slice=feature_row_slice,
+            )
+            if phase3_row_transfer_telemetry["row_transfer_source"] == "cuda":
+                phase3_gpu_to_cpu_bytes_total += int(
+                    phase3_row_transfer_telemetry["row_transfer_bytes"]
+                )
+            if phase3_row_transfer_telemetry["row_transfer_destination"] == "cuda":
+                phase3_cpu_to_gpu_bytes_total += int(
+                    phase3_row_transfer_telemetry["row_transfer_bytes"]
+                )
+            if int(phase3_row_transfer_telemetry["row_transfer_bytes"]) > 0:
+                phase3_copy_count += 1
             if capture_phase3_row_bundle_enabled:
                 feature_rows_cpu = feature_row_slice.contiguous()
                 error_start = int(total_active_feats)
@@ -7922,18 +8034,28 @@ def _run_attribution(
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
                 end = i + batch.shape[0]
+                row_store_write_start = time.perf_counter()
                 feature_row_store.append_rows(
                     row_start=i,
                     feature_rows=feature_row_slice,
                     row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                     phase="phase3",
                 )
+                phase3_row_store_write_elapsed_ms = (
+                    time.perf_counter() - row_store_write_start
+                ) * 1000.0
             else:
+                row_store_write_start = time.perf_counter()
                 edge_matrix[i : i + batch.shape[0], :logit_offset] = rows_cpu
+                phase3_row_store_write_elapsed_ms = (
+                    time.perf_counter() - row_store_write_start
+                ) * 1000.0
+            phase3_row_store_write_elapsed_ms_total += phase3_row_store_write_elapsed_ms
             row_to_node_index[i : i + batch.shape[0]] = (
                 torch.arange(i, i + batch.shape[0]) + logit_offset
             )
             batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+            batch_memory_after = get_memory_snapshot(model.device)
             telemetry_recorder.record_event(
                 scope="batch",
                 name="phase3.logit_batch",
@@ -7944,6 +8066,17 @@ def _run_attribution(
                     "batch_rows": int(batch.shape[0]),
                     "batch_start_index": int(i),
                     "total_logit_batches": int(total_logit_batches),
+                    "compute_batch_elapsed_ms": float(phase3_compute_batch_elapsed_ms),
+                    "cpu_staging_elapsed_ms": float(phase3_cpu_staging_elapsed_ms),
+                    "denominator_elapsed_ms": float(phase3_denominator_elapsed_ms),
+                    "row_store_write_elapsed_ms": float(phase3_row_store_write_elapsed_ms),
+                    **phase3_inject_transfer_telemetry,
+                    **phase3_row_transfer_telemetry,
+                    **build_memory_before_after_attrs(
+                        before=batch_memory_before,
+                        after=batch_memory_after,
+                        keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
+                    ),
                 },
             )
             telemetry_recorder.record_wall_clock_duration(
@@ -8008,7 +8141,21 @@ def _run_attribution(
             name="phase3.logit_attribution",
             phase="phase3",
             elapsed_ms=phase3_elapsed_ms,
-            attrs={"logit_count": int(len(targets)), "batches": int(total_logit_batches)},
+            attrs={
+                "logit_count": int(len(targets)),
+                "batches": int(total_logit_batches),
+                "phase3_compute_batch_elapsed_ms_total": float(
+                    phase3_compute_batch_elapsed_ms_total
+                ),
+                "phase3_cpu_staging_elapsed_ms_total": float(phase3_cpu_staging_elapsed_ms_total),
+                "phase3_denominator_elapsed_ms_total": float(phase3_denominator_elapsed_ms_total),
+                "phase3_row_store_write_elapsed_ms_total": float(
+                    phase3_row_store_write_elapsed_ms_total
+                ),
+                "phase3_gpu_to_cpu_bytes_total": int(phase3_gpu_to_cpu_bytes_total),
+                "phase3_cpu_to_gpu_bytes_total": int(phase3_cpu_to_gpu_bytes_total),
+                "phase3_copy_count": int(phase3_copy_count),
+            },
         )
         telemetry_recorder.record_wall_clock_duration(
             scope="phase",
@@ -8564,6 +8711,14 @@ def _run_attribution(
         phase4_refresh_frontier_plan_elapsed_ms_total = 0.0
         phase4_refresh_influence_normalization_elapsed_ms_total = 0.0
         phase4_refresh_influence_matmul_elapsed_ms_total = 0.0
+        phase4_executor_encoder_materialize_elapsed_ms_total = 0.0
+        phase4_executor_compute_batch_elapsed_ms_total = 0.0
+        phase4_executor_cpu_staging_elapsed_ms_total = 0.0
+        phase4_executor_denominator_elapsed_ms_total = 0.0
+        phase4_executor_row_store_write_elapsed_ms_total = 0.0
+        phase4_gpu_to_cpu_bytes_total = 0
+        phase4_cpu_to_gpu_bytes_total = 0
+        phase4_copy_count = 0
         phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
         previous_phase4_pending: torch.Tensor | None = None
         first_phase4_pending: torch.Tensor | None = None
@@ -8986,6 +9141,19 @@ def _run_attribution(
                         "feature_row_store_read_rows": _safe_float(
                             (feature_row_store_read_stats or {}).get("read_row_count")
                         ),
+                        "feature_row_store_read_bytes": (
+                            int(
+                                float(
+                                    (feature_row_store_read_stats or {}).get("read_row_count") or 0
+                                )
+                                * int(total_active_feats)
+                                * torch.empty(
+                                    (), dtype=exact_trace_internal_dtype_resolved
+                                ).element_size()
+                            )
+                            if use_compact_feature_row_store
+                            else None
+                        ),
                         "feature_row_store_read_cache_hits": _safe_float(
                             (feature_row_store_read_stats or {}).get("read_cache_hit_count")
                         ),
@@ -9021,6 +9189,26 @@ def _run_attribution(
                         ),
                         "streaming_chunk_cache_misses": _safe_float(
                             (streaming_chunk_reuse_stats or {}).get("chunk_cache_miss_count")
+                        ),
+                        "streaming_row_reader_calls": _safe_int(
+                            (streaming_chunk_reuse_stats or {}).get("row_reader_call_count")
+                        ),
+                        "streaming_row_reader_rows": _safe_int(
+                            (streaming_chunk_reuse_stats or {}).get("row_reader_row_count")
+                        ),
+                        "streaming_row_reader_estimated_bytes": (
+                            int(
+                                float(
+                                    (streaming_chunk_reuse_stats or {}).get("row_reader_row_count")
+                                    or 0
+                                )
+                                * int(total_active_feats)
+                                * torch.empty(
+                                    (), dtype=exact_trace_internal_dtype_resolved
+                                ).element_size()
+                            )
+                            if streaming_chunk_reuse_stats is not None
+                            else None
                         ),
                         "streaming_chunk_cache_store_success": _safe_float(
                             (streaming_chunk_reuse_stats or {}).get(
@@ -9336,11 +9524,52 @@ def _run_attribution(
                         _snapshot_diagnostics(model.transcoders) if profile else None
                     )
                     batch_start = time.perf_counter()
+                    batch_memory_before = get_memory_snapshot(model.device)
+                    encoder_vectors_source_device = None
+                    encoder_vectors_source_dtype = None
+                    if (
+                        getattr(ctx, "encoder_vecs", None) is not None
+                        and ctx.encoder_vecs.numel() > 0
+                    ):
+                        encoder_vectors_source_device = str(ctx.encoder_vecs.device.type)
+                        encoder_vectors_source_dtype = ctx.encoder_vecs.dtype
+                    encoder_materialize_start = time.perf_counter()
+                    encoder_vectors = ctx.materialize_encoder_vectors(idx_batch)
+                    executor_encoder_materialize_elapsed_ms = (
+                        time.perf_counter() - encoder_materialize_start
+                    ) * 1000.0
+                    encoder_vectors_transfer_bytes = (
+                        _tensor_nbytes_estimate(encoder_vectors)
+                        if encoder_vectors_source_device is not None
+                        and (
+                            encoder_vectors_source_device != encoder_vectors.device.type
+                            or encoder_vectors_source_dtype != encoder_vectors.dtype
+                        )
+                        else 0
+                    )
+                    encoder_vectors_transfer_telemetry = {
+                        "encoder_vectors_source": encoder_vectors_source_device,
+                        "encoder_vectors_destination": str(encoder_vectors.device.type),
+                        "encoder_vectors_dtype_source": str(encoder_vectors_source_dtype)
+                        if encoder_vectors_source_dtype is not None
+                        else None,
+                        "encoder_vectors_dtype_destination": str(encoder_vectors.dtype),
+                        "encoder_vectors_bytes": int(_tensor_nbytes_estimate(encoder_vectors)),
+                        "encoder_vectors_transfer_bytes": int(encoder_vectors_transfer_bytes),
+                        "encoder_vectors_materialize_elapsed_ms": float(
+                            executor_encoder_materialize_elapsed_ms
+                        ),
+                    }
+                    if (
+                        encoder_vectors_source_device == "cpu"
+                        and encoder_vectors.device.type == "cuda"
+                    ):
+                        phase4_cpu_to_gpu_bytes_total += int(encoder_vectors_transfer_bytes)
                     compute_batch_start = time.perf_counter()
                     rows = ctx.compute_batch(
                         layers=feat_layers[idx_batch],
                         positions=feat_pos[idx_batch],
-                        inject_values=ctx.materialize_encoder_vectors(idx_batch),
+                        inject_values=encoder_vectors,
                         retain_graph=n_visited < actual_max_feature_nodes,
                         phase_label="phase4_features",
                     )
@@ -9360,6 +9589,22 @@ def _run_attribution(
                     ) * 1000.0
                     row_input_slice = rows_cpu[:, :logit_offset]
                     feature_row_slice = rows_cpu[:, :total_active_feats]
+                    executor_row_transfer_telemetry = _build_row_transfer_telemetry(
+                        rows=rows,
+                        rows_cpu=rows_cpu,
+                        row_input_slice=row_input_slice,
+                        feature_row_slice=feature_row_slice,
+                    )
+                    if executor_row_transfer_telemetry["row_transfer_source"] == "cuda":
+                        phase4_gpu_to_cpu_bytes_total += int(
+                            executor_row_transfer_telemetry["row_transfer_bytes"]
+                        )
+                    if executor_row_transfer_telemetry["row_transfer_destination"] == "cuda":
+                        phase4_cpu_to_gpu_bytes_total += int(
+                            executor_row_transfer_telemetry["row_transfer_bytes"]
+                        )
+                    if int(executor_row_transfer_telemetry["row_transfer_bytes"]) > 0:
+                        phase4_copy_count += 1
                     denominator_start = time.perf_counter()
                     row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
                         row_input_slice,
@@ -9429,7 +9674,19 @@ def _run_attribution(
                             )
                     batch_number = executor_microbatch_index
                     batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                    batch_memory_after = get_memory_snapshot(model.device)
                     phase4_feature_batch_elapsed_ms_total += batch_elapsed_ms
+                    phase4_executor_encoder_materialize_elapsed_ms_total += (
+                        executor_encoder_materialize_elapsed_ms
+                    )
+                    phase4_executor_compute_batch_elapsed_ms_total += (
+                        executor_compute_batch_elapsed_ms
+                    )
+                    phase4_executor_cpu_staging_elapsed_ms_total += executor_cpu_staging_elapsed_ms
+                    phase4_executor_denominator_elapsed_ms_total += executor_denominator_elapsed_ms
+                    phase4_executor_row_store_write_elapsed_ms_total += (
+                        executor_row_store_write_elapsed_ms
+                    )
                     executor_batch_telemetry = _build_phase4_executor_batch_telemetry(
                         scheduler_reference_batch_index=scheduler_reference_batch_index,
                         scheduler_reference_batch_count=phase4_scheduler_reference_batch_count,
@@ -9442,6 +9699,7 @@ def _run_attribution(
                     )
                     executor_substage_telemetry = _build_phase4_executor_substage_telemetry(
                         telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                        encoder_materialize_elapsed_ms=executor_encoder_materialize_elapsed_ms,
                         compute_batch_elapsed_ms=executor_compute_batch_elapsed_ms,
                         cpu_staging_elapsed_ms=executor_cpu_staging_elapsed_ms,
                         denominator_elapsed_ms=executor_denominator_elapsed_ms,
@@ -9489,6 +9747,13 @@ def _run_attribution(
                             **executor_streaming_telemetry,
                             **batch_locality_summary,
                             **executor_substage_telemetry,
+                            **encoder_vectors_transfer_telemetry,
+                            **executor_row_transfer_telemetry,
+                            **build_memory_before_after_attrs(
+                                before=batch_memory_before,
+                                after=batch_memory_after,
+                                keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
+                            ),
                         },
                     )
                     telemetry_recorder.record_wall_clock_duration(
@@ -9594,6 +9859,24 @@ def _run_attribution(
                 "phase4_refresh_influence_matmul_elapsed_ms_total": float(
                     phase4_refresh_influence_matmul_elapsed_ms_total
                 ),
+                "phase4_executor_encoder_materialize_elapsed_ms_total": float(
+                    phase4_executor_encoder_materialize_elapsed_ms_total
+                ),
+                "phase4_executor_compute_batch_elapsed_ms_total": float(
+                    phase4_executor_compute_batch_elapsed_ms_total
+                ),
+                "phase4_executor_cpu_staging_elapsed_ms_total": float(
+                    phase4_executor_cpu_staging_elapsed_ms_total
+                ),
+                "phase4_executor_denominator_elapsed_ms_total": float(
+                    phase4_executor_denominator_elapsed_ms_total
+                ),
+                "phase4_executor_row_store_write_elapsed_ms_total": float(
+                    phase4_executor_row_store_write_elapsed_ms_total
+                ),
+                "phase4_gpu_to_cpu_bytes_total": int(phase4_gpu_to_cpu_bytes_total),
+                "phase4_cpu_to_gpu_bytes_total": int(phase4_cpu_to_gpu_bytes_total),
+                "phase4_copy_count": int(phase4_copy_count),
                 **phase4_execution_metadata,
                 **(phase4_no_refresh_plan_telemetry or {}),
             },
