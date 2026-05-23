@@ -220,6 +220,11 @@ _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "streaming_v1": "streaming_v1",
 }
 
+_PHASE4_ROW_REDUCTION_VERSION_BY_MODE: dict[str, str] = {
+    "off": "off_v1",
+    "gpu_v1": "gpu_v1",
+}
+
 _PHASE1_TRACE_BATCH_POLICY_DEFAULT: Literal["legacy"] = "legacy"
 _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT: int | None = None
 _PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
@@ -306,6 +311,15 @@ class _Phase4RowExecutorConfig:
     version: str
     effective_version: str
     effective_behavior: Literal["requested", "batched_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _Phase4RowReductionConfig:
+    requested_mode: Literal["off", "gpu_v1"]
+    effective_mode: Literal["off", "gpu_v1"]
+    version: str
+    effective_version: str
+    effective_behavior: Literal["requested", "off_reference_execution"]
 
 
 @dataclass(frozen=True)
@@ -1444,6 +1458,63 @@ def _build_phase4_row_executor_metadata(
         "row_executor_effective_behavior": phase4_row_executor_config.effective_behavior,
         "row_executor_reference_execution": bool(
             phase4_row_executor_config.requested_mode != phase4_row_executor_config.effective_mode
+        ),
+    }
+
+
+def _resolve_phase4_row_reduction_mode(
+    phase4_row_reduction: str,
+) -> Literal["off", "gpu_v1"]:
+    normalized = str(phase4_row_reduction).strip().lower()
+    allowed_values = {"off", "gpu_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"phase4_row_reduction must be one of: {allowed} (got {phase4_row_reduction!r})"
+        )
+    return cast(Literal["off", "gpu_v1"], normalized)
+
+
+def _resolve_phase4_row_reduction_config(
+    phase4_row_reduction: str,
+    *,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
+) -> _Phase4RowReductionConfig:
+    requested_mode = _resolve_phase4_row_reduction_mode(phase4_row_reduction)
+    gpu_v1_applicable = bool(compact_output and exact_chunked_decoder)
+    effective_mode = cast(
+        Literal["off", "gpu_v1"],
+        requested_mode if requested_mode == "off" or gpu_v1_applicable else "off",
+    )
+    effective_behavior: Literal["requested", "off_reference_execution"] = (
+        "off_reference_execution" if requested_mode != effective_mode else "requested"
+    )
+    return _Phase4RowReductionConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        version=_PHASE4_ROW_REDUCTION_VERSION_BY_MODE[requested_mode],
+        effective_version=_PHASE4_ROW_REDUCTION_VERSION_BY_MODE[effective_mode],
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase4_row_reduction_metadata(
+    phase4_row_reduction_config: _Phase4RowReductionConfig,
+) -> dict[str, object]:
+    return {
+        "row_reduction_requested": phase4_row_reduction_config.requested_mode,
+        "row_reduction_mode_requested": phase4_row_reduction_config.requested_mode,
+        "row_reduction": phase4_row_reduction_config.requested_mode,
+        "row_reduction_version": phase4_row_reduction_config.version,
+        "row_reduction_version_requested": phase4_row_reduction_config.version,
+        "row_reduction_effective": phase4_row_reduction_config.effective_mode,
+        "row_reduction_mode_effective": phase4_row_reduction_config.effective_mode,
+        "row_reduction_effective_version": phase4_row_reduction_config.effective_version,
+        "row_reduction_version_effective": phase4_row_reduction_config.effective_version,
+        "row_reduction_effective_behavior": phase4_row_reduction_config.effective_behavior,
+        "row_reduction_reference_execution": bool(
+            phase4_row_reduction_config.requested_mode != phase4_row_reduction_config.effective_mode
         ),
     }
 
@@ -3403,6 +3474,7 @@ def _compute_row_denominator_scaled_l1(
     row_values: torch.Tensor,
     *,
     dtype: torch.dtype = torch.float64,
+    preserve_device: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build stable row-L1 denominator representation.
 
@@ -3414,19 +3486,20 @@ def _compute_row_denominator_scaled_l1(
     row_values_cpu = row_values.detach()
     if row_values_cpu.ndim != 2:
         raise ValueError("row_values must be rank-2")
-    if row_values_cpu.device.type != "cpu" or row_values_cpu.dtype != resolved_dtype:
-        row_values_cpu = row_values_cpu.to(device="cpu", dtype=resolved_dtype)
+    target_device = row_values_cpu.device if preserve_device else torch.device("cpu")
+    if row_values_cpu.device != target_device or row_values_cpu.dtype != resolved_dtype:
+        row_values_cpu = row_values_cpu.to(device=target_device, dtype=resolved_dtype)
 
     n_rows = int(row_values_cpu.shape[0])
     n_cols = int(row_values_cpu.shape[1])
     if n_cols == 0:
-        row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
-        row_l1_scaled = torch.zeros(n_rows, dtype=resolved_dtype)
+        row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype, device=target_device)
+        row_l1_scaled = torch.zeros(n_rows, dtype=resolved_dtype, device=target_device)
         return row_abs_max, row_l1_scaled
 
     # Two-pass chunked reduction to avoid materializing a full abs() matrix copy.
     col_chunk_size = min(max(n_cols, 1), 4096)
-    row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
+    row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype, device=target_device)
     for col_start in range(0, n_cols, col_chunk_size):
         col_end = min(col_start + col_chunk_size, n_cols)
         chunk_abs_max = row_values_cpu[:, col_start:col_end].abs().amax(dim=1)
@@ -3436,7 +3509,9 @@ def _compute_row_denominator_scaled_l1(
     nonzero_rows = (row_abs_max > 0) & torch.isfinite(row_abs_max)
     if bool(nonzero_rows.any()):
         nonzero_denom = row_abs_max[nonzero_rows].unsqueeze(1)
-        nonzero_scaled_sum = torch.zeros(nonzero_denom.shape[0], dtype=resolved_dtype)
+        nonzero_scaled_sum = torch.zeros(
+            nonzero_denom.shape[0], dtype=resolved_dtype, device=target_device
+        )
         for col_start in range(0, n_cols, col_chunk_size):
             col_end = min(col_start + col_chunk_size, n_cols)
             chunk = row_values_cpu[nonzero_rows, col_start:col_end].abs()
@@ -3826,6 +3901,37 @@ def _build_row_transfer_telemetry(
     }
 
 
+def _build_phase4_gpu_row_reduction_transfer_telemetry(
+    *,
+    rows: torch.Tensor,
+    feature_row_slice: torch.Tensor,
+    row_abs_max: torch.Tensor,
+    row_l1_scaled: torch.Tensor,
+) -> dict[str, object]:
+    compact_transfer_bytes = (
+        _tensor_nbytes_estimate(feature_row_slice)
+        + _tensor_nbytes_estimate(row_abs_max)
+        + _tensor_nbytes_estimate(row_l1_scaled)
+    )
+    baseline_full_row_transfer_bytes = _tensor_nbytes_estimate(rows)
+    return {
+        "row_transfer_source": str(rows.device.type),
+        "row_transfer_destination": "cpu",
+        "row_transfer_count": int(rows.shape[0]),
+        "row_transfer_bytes": int(compact_transfer_bytes),
+        "row_input_bytes": int(
+            _tensor_nbytes_estimate(row_abs_max) + _tensor_nbytes_estimate(row_l1_scaled)
+        ),
+        "feature_row_bytes": int(_tensor_nbytes_estimate(feature_row_slice)),
+        "row_reduction_backend": "gpu_v1",
+        "row_reduction_baseline_full_row_transfer_bytes": int(baseline_full_row_transfer_bytes),
+        "row_reduction_compact_transfer_bytes": int(compact_transfer_bytes),
+        "row_reduction_gpu_to_cpu_bytes_saved": int(
+            max(0, baseline_full_row_transfer_bytes - compact_transfer_bytes)
+        ),
+    }
+
+
 def _build_phase4_refresh_substage_telemetry(
     *,
     telemetry_detail: Literal["summary", "normal", "debug"],
@@ -3844,6 +3950,7 @@ def _build_phase4_refresh_substage_telemetry(
     row_weight_zero_row_count: int | None = None,
     row_reader_overread_zero_row_count: int | None = None,
     active_row_range_count: int | None = None,
+    streaming_chunk_reuse_stats: dict[str, object] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "refresh_partial_influence_elapsed_ms": float(partial_influence_elapsed_ms),
@@ -3871,6 +3978,19 @@ def _build_phase4_refresh_substage_telemetry(
                 "refresh_active_row_range_count": _safe_int(active_row_range_count),
             }
         )
+        if streaming_chunk_reuse_stats is not None:
+            for source_key, telemetry_key in {
+                "active_row_scan_elapsed_ms_total": "refresh_active_row_scan_elapsed_ms",
+                "chunk_allocation_zero_fill_elapsed_ms_total": "refresh_chunk_allocation_zero_fill_elapsed_ms",
+                "transfer_cast_abs_elapsed_ms_total": "refresh_transfer_cast_abs_elapsed_ms",
+                "cache_lookup_elapsed_ms_total": "refresh_cache_lookup_elapsed_ms",
+                "cache_store_elapsed_ms_total": "refresh_cache_store_elapsed_ms",
+                "cache_eviction_elapsed_ms_total": "refresh_cache_eviction_elapsed_ms",
+                "row_weight_update_elapsed_ms_total": "refresh_row_weight_update_elapsed_ms",
+                "accounted_elapsed_ms_total": "refresh_accounted_elapsed_ms",
+                "unaccounted_elapsed_ms_total": "refresh_unaccounted_elapsed_ms",
+            }.items():
+                payload[telemetry_key] = _safe_float(streaming_chunk_reuse_stats.get(source_key))
     return payload
 
 
@@ -6162,6 +6282,7 @@ def attribute(
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase4_row_reduction: Literal["off", "gpu_v1"] = "off",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
     phase1_trace_batch_size_max: int | None = None,
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
@@ -6282,6 +6403,8 @@ def attribute(
             ``"off"`` keeps current behavior. ``"v1"`` enables the compact
             refresh row-range reader optimization while preserving exact math.
         phase4_row_executor: Requested Phase-4 row execution mode.
+        phase4_row_reduction: Requested Phase-4 row-reduction backend.
+            ``"gpu_v1"`` enables the compact exact Phase-4 prototype.
             ``"batched"`` keeps current behavior. ``"streaming_v1"`` executes
             compact exact-trace Phase-4 feature rows in smaller compute micro-batches
             while preserving scheduler frontier membership/order semantics.
@@ -6393,6 +6516,7 @@ def attribute(
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             phase4_refresh_optimization=phase4_refresh_optimization,
             phase4_row_executor=phase4_row_executor,
+            phase4_row_reduction=phase4_row_reduction,
             phase1_trace_batch_policy=phase1_trace_batch_policy,
             phase1_trace_batch_size_max=phase1_trace_batch_size_max,
             phase4_refresh_policy=phase4_refresh_policy,
@@ -6467,6 +6591,7 @@ def _run_attribution(
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase4_row_reduction: Literal["off", "gpu_v1"] = "off",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
     phase1_trace_batch_size_max: int | None = None,
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
@@ -6600,6 +6725,14 @@ def _run_attribution(
         exact_chunked_decoder=exact_chunked_decoder,
     )
     phase4_row_executor_metadata = _build_phase4_row_executor_metadata(phase4_row_executor_config)
+    phase4_row_reduction_config = _resolve_phase4_row_reduction_config(
+        phase4_row_reduction,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
+    )
+    phase4_row_reduction_metadata = _build_phase4_row_reduction_metadata(
+        phase4_row_reduction_config
+    )
     phase1_trace_batch_config = _resolve_phase1_trace_batch_config(
         phase1_trace_batch_policy=phase1_trace_batch_policy,
         phase1_trace_batch_size_max=phase1_trace_batch_size_max,
@@ -6651,6 +6784,7 @@ def _run_attribution(
         **phase4_scheduler_metadata,
         **phase4_refresh_optimization_metadata,
         **phase4_row_executor_metadata,
+        **phase4_row_reduction_metadata,
         **phase4_refresh_policy_metadata,
         **phase4_ranker_metadata,
         **row_store_cache_control_metadata,
@@ -8717,6 +8851,7 @@ def _run_attribution(
         phase4_executor_denominator_elapsed_ms_total = 0.0
         phase4_executor_row_store_write_elapsed_ms_total = 0.0
         phase4_gpu_to_cpu_bytes_total = 0
+        phase4_row_reduction_gpu_to_cpu_bytes_saved_total = 0
         phase4_cpu_to_gpu_bytes_total = 0
         phase4_copy_count = 0
         phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
@@ -9070,6 +9205,7 @@ def _run_attribution(
                     row_weight_zero_row_count=refresh_row_weight_zero_rows,
                     row_reader_overread_zero_row_count=refresh_row_reader_overread_zero_rows,
                     active_row_range_count=refresh_active_row_range_count,
+                    streaming_chunk_reuse_stats=streaming_chunk_reuse_stats,
                 )
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
@@ -9579,40 +9715,80 @@ def _run_attribution(
 
                     row_count = rows.shape[0]
                     end = st + row_count
-                    cpu_staging_start = time.perf_counter()
-                    rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
-                        rows,
-                        staging_buffer=rows_cpu_staging,
-                    )
-                    executor_cpu_staging_elapsed_ms = (
-                        time.perf_counter() - cpu_staging_start
-                    ) * 1000.0
-                    row_input_slice = rows_cpu[:, :logit_offset]
-                    feature_row_slice = rows_cpu[:, :total_active_feats]
-                    executor_row_transfer_telemetry = _build_row_transfer_telemetry(
-                        rows=rows,
-                        rows_cpu=rows_cpu,
-                        row_input_slice=row_input_slice,
-                        feature_row_slice=feature_row_slice,
-                    )
+                    if phase4_row_reduction_config.effective_mode == "gpu_v1":
+                        if not use_compact_feature_row_store:
+                            raise RuntimeError(
+                                "phase4_row_reduction='gpu_v1' requires compact Phase-4 row store"
+                            )
+                        cpu_staging_start = time.perf_counter()
+                        feature_row_slice = rows[:, :total_active_feats].to(
+                            device="cpu",
+                            dtype=rows.dtype,
+                        )
+                        executor_cpu_staging_elapsed_ms = (
+                            time.perf_counter() - cpu_staging_start
+                        ) * 1000.0
+                        row_input_slice = rows[:, :logit_offset]
+                        denominator_start = time.perf_counter()
+                        row_abs_max_gpu, row_l1_scaled_gpu = _compute_row_denominator_scaled_l1(
+                            row_input_slice,
+                            dtype=exact_trace_internal_dtype_resolved,
+                            preserve_device=True,
+                        )
+                        row_abs_max_cpu = row_abs_max_gpu.to(device="cpu")
+                        row_l1_scaled_cpu = row_l1_scaled_gpu.to(device="cpu")
+                        executor_denominator_elapsed_ms = (
+                            time.perf_counter() - denominator_start
+                        ) * 1000.0
+                        executor_row_transfer_telemetry = (
+                            _build_phase4_gpu_row_reduction_transfer_telemetry(
+                                rows=rows,
+                                feature_row_slice=feature_row_slice,
+                                row_abs_max=row_abs_max_cpu,
+                                row_l1_scaled=row_l1_scaled_cpu,
+                            )
+                        )
+                    else:
+                        cpu_staging_start = time.perf_counter()
+                        rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                            rows,
+                            staging_buffer=rows_cpu_staging,
+                        )
+                        executor_cpu_staging_elapsed_ms = (
+                            time.perf_counter() - cpu_staging_start
+                        ) * 1000.0
+                        row_input_slice = rows_cpu[:, :logit_offset]
+                        feature_row_slice = rows_cpu[:, :total_active_feats]
+                        executor_row_transfer_telemetry = _build_row_transfer_telemetry(
+                            rows=rows,
+                            rows_cpu=rows_cpu,
+                            row_input_slice=row_input_slice,
+                            feature_row_slice=feature_row_slice,
+                        )
+                        denominator_start = time.perf_counter()
+                        row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
+                            row_input_slice,
+                            dtype=exact_trace_internal_dtype_resolved,
+                        )
+                        executor_denominator_elapsed_ms = (
+                            time.perf_counter() - denominator_start
+                        ) * 1000.0
                     if executor_row_transfer_telemetry["row_transfer_source"] == "cuda":
                         phase4_gpu_to_cpu_bytes_total += int(
                             executor_row_transfer_telemetry["row_transfer_bytes"]
                         )
+                    phase4_row_reduction_gpu_to_cpu_bytes_saved_total += int(
+                        executor_row_transfer_telemetry.get(
+                            "row_reduction_gpu_to_cpu_bytes_saved",
+                            0,
+                        )
+                    )
                     if executor_row_transfer_telemetry["row_transfer_destination"] == "cuda":
                         phase4_cpu_to_gpu_bytes_total += int(
                             executor_row_transfer_telemetry["row_transfer_bytes"]
                         )
                     if int(executor_row_transfer_telemetry["row_transfer_bytes"]) > 0:
                         phase4_copy_count += 1
-                    denominator_start = time.perf_counter()
-                    row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
-                        row_input_slice,
-                        dtype=exact_trace_internal_dtype_resolved,
-                    )
-                    executor_denominator_elapsed_ms = (
-                        time.perf_counter() - denominator_start
-                    ) * 1000.0
                     if anomaly_debug_result is not None and phase4_executor_microbatch_count <= 2:
                         feature_row_batches = anomaly_debug_result.setdefault(
                             "phase4_feature_row_batches",
@@ -9647,6 +9823,7 @@ def _run_attribution(
                             time.perf_counter() - row_store_write_start
                         ) * 1000.0
                     else:
+                        assert phase4_row_reduction_config.effective_mode == "off"
                         row_store_write_start = time.perf_counter()
                         edge_matrix[st:end, :logit_offset] = rows_cpu
                         executor_row_store_write_elapsed_ms = (
@@ -9875,6 +10052,9 @@ def _run_attribution(
                     phase4_executor_row_store_write_elapsed_ms_total
                 ),
                 "phase4_gpu_to_cpu_bytes_total": int(phase4_gpu_to_cpu_bytes_total),
+                "phase4_row_reduction_gpu_to_cpu_bytes_saved_total": int(
+                    phase4_row_reduction_gpu_to_cpu_bytes_saved_total
+                ),
                 "phase4_cpu_to_gpu_bytes_total": int(phase4_cpu_to_gpu_bytes_total),
                 "phase4_copy_count": int(phase4_copy_count),
                 **phase4_execution_metadata,
@@ -10373,6 +10553,20 @@ def _run_attribution(
                 "phase4_row_executor_reference_execution": bool(
                     phase4_row_executor_config.requested_mode
                     != phase4_row_executor_config.effective_mode
+                ),
+                "phase4_row_reduction_requested": phase4_row_reduction_config.requested_mode,
+                "phase4_row_reduction": phase4_row_reduction_config.requested_mode,
+                "phase4_row_reduction_mode_requested": phase4_row_reduction_config.requested_mode,
+                "phase4_row_reduction_effective": phase4_row_reduction_config.effective_mode,
+                "phase4_row_reduction_mode_effective": phase4_row_reduction_config.effective_mode,
+                "phase4_row_reduction_version": phase4_row_reduction_config.version,
+                "phase4_row_reduction_version_requested": phase4_row_reduction_config.version,
+                "phase4_row_reduction_effective_version": phase4_row_reduction_config.effective_version,
+                "phase4_row_reduction_version_effective": phase4_row_reduction_config.effective_version,
+                "phase4_row_reduction_effective_behavior": phase4_row_reduction_config.effective_behavior,
+                "phase4_row_reduction_reference_execution": bool(
+                    phase4_row_reduction_config.requested_mode
+                    != phase4_row_reduction_config.effective_mode
                 ),
                 **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
                 "phase4_executor_configured_reference_batch_size": int(

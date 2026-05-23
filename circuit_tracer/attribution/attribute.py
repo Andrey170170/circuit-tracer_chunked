@@ -151,6 +151,7 @@ def attribute(
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase4_row_reduction: Literal["off", "gpu_v1"] = "off",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
     phase1_trace_batch_size_max: int | None = None,
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
@@ -209,6 +210,8 @@ def attribute(
             (``"off"`` or ``"v1"``).
         phase4_row_executor: Requested Phase-4 row execution mode
             (``"batched"`` or ``"streaming_v1"``).
+        phase4_row_reduction: Requested Phase-4 row-reduction backend
+            (``"off"`` or reserved ``"gpu_v1"``).
         phase1_trace_batch_policy: Requested Phase-1 trace-batch sizing policy.
         phase1_trace_batch_size_max: Optional Phase-1 trace-batch cap.
             Used by ``"cap_effective_batches"``; ignored by legacy execution.
@@ -239,6 +242,7 @@ def attribute(
         or phase4_scheduler_telemetry_detail != "normal"
         or phase4_refresh_optimization != "off"
         or phase4_row_executor != "batched"
+        or phase4_row_reduction != "off"
         or phase1_trace_batch_policy != "legacy"
         or phase1_trace_batch_size_max is not None
         or phase4_refresh_policy != "standard"
@@ -284,6 +288,7 @@ def attribute(
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             phase4_refresh_optimization=phase4_refresh_optimization,
             phase4_row_executor=phase4_row_executor,
+            phase4_row_reduction=phase4_row_reduction,
             phase1_trace_batch_policy=phase1_trace_batch_policy,
             phase1_trace_batch_size_max=phase1_trace_batch_size_max,
             phase4_refresh_policy=phase4_refresh_policy,

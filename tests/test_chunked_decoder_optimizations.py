@@ -20,6 +20,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_executor_batch_telemetry,
     _build_phase4_executor_substage_telemetry,
     _build_phase4_normalization_stats,
+    _compute_row_denominator_scaled_l1,
     _build_phase4_planner_v2_candidate_window,
     _build_phase4_refresh_substage_telemetry,
     _select_phase4_planner_v2_membership,
@@ -78,6 +79,10 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_phase4_row_executor_config,
     _resolve_phase4_streaming_v1_microbatch_size,
     _build_phase4_row_executor_metadata,
+    _resolve_phase4_row_reduction_config,
+    _resolve_phase4_row_reduction_mode,
+    _build_phase4_row_reduction_metadata,
+    _build_phase4_gpu_row_reduction_transfer_telemetry,
     _resolve_phase4_scheduler_mode,
     _resolve_phase4_scheduler_config,
     _resolve_phase4_scheduler_telemetry_detail,
@@ -1363,6 +1368,82 @@ def test_phase4_row_executor_falls_back_to_batched_when_streaming_path_unavailab
     assert metadata["row_executor_effective_behavior"] == "batched_reference_execution"
 
 
+def test_phase4_row_reduction_off_metadata_and_gpu_v1_rejection() -> None:
+    assert _resolve_phase4_row_reduction_mode("off") == "off"
+    assert _resolve_phase4_row_reduction_mode("gpu_v1") == "gpu_v1"
+    with pytest.raises(ValueError, match="phase4_row_reduction must be one of"):
+        _resolve_phase4_row_reduction_mode("gpu_v2")
+
+    metadata = _build_phase4_row_reduction_metadata(
+        _resolve_phase4_row_reduction_config(
+            "off",
+            compact_output=True,
+            exact_chunked_decoder=True,
+        )
+    )
+    assert metadata["row_reduction_requested"] == "off"
+    assert metadata["row_reduction_effective"] == "off"
+    assert metadata["row_reduction_mode_effective"] == "off"
+    assert metadata["row_reduction_reference_execution"] is False
+
+    gpu_metadata = _build_phase4_row_reduction_metadata(
+        _resolve_phase4_row_reduction_config(
+            "gpu_v1",
+            compact_output=True,
+            exact_chunked_decoder=True,
+        )
+    )
+    assert gpu_metadata["row_reduction_requested"] == "gpu_v1"
+    assert gpu_metadata["row_reduction_effective"] == "gpu_v1"
+    assert gpu_metadata["row_reduction_reference_execution"] is False
+
+    fallback_metadata = _build_phase4_row_reduction_metadata(
+        _resolve_phase4_row_reduction_config(
+            "gpu_v1",
+            compact_output=False,
+            exact_chunked_decoder=True,
+        )
+    )
+    assert fallback_metadata["row_reduction_requested"] == "gpu_v1"
+    assert fallback_metadata["row_reduction_effective"] == "off"
+    assert fallback_metadata["row_reduction_reference_execution"] is True
+
+
+def test_phase4_gpu_row_reduction_transfer_telemetry_counts_compact_bytes() -> None:
+    rows = torch.zeros((2, 10), dtype=torch.float32)
+    feature_rows = rows[:, :3].contiguous()
+    row_abs_max = torch.zeros(2, dtype=torch.float64)
+    row_l1_scaled = torch.zeros(2, dtype=torch.float64)
+
+    telemetry = _build_phase4_gpu_row_reduction_transfer_telemetry(
+        rows=rows,
+        feature_row_slice=feature_rows,
+        row_abs_max=row_abs_max,
+        row_l1_scaled=row_l1_scaled,
+    )
+
+    assert telemetry["row_reduction_backend"] == "gpu_v1"
+    assert telemetry["row_reduction_baseline_full_row_transfer_bytes"] == 80
+    assert telemetry["row_reduction_compact_transfer_bytes"] == 56
+    assert telemetry["row_reduction_gpu_to_cpu_bytes_saved"] == 24
+    assert telemetry["row_transfer_bytes"] == 56
+
+
+def test_row_denominator_scaled_l1_preserve_device_matches_cpu_path() -> None:
+    rows = torch.tensor([[1.0, -3.0, 2.0], [0.0, 0.0, 0.0]], dtype=torch.float32)
+    cpu_max, cpu_scaled = _compute_row_denominator_scaled_l1(rows, dtype=torch.float64)
+    same_device_max, same_device_scaled = _compute_row_denominator_scaled_l1(
+        rows,
+        dtype=torch.float64,
+        preserve_device=True,
+    )
+
+    assert same_device_max.device == rows.device
+    assert same_device_scaled.device == rows.device
+    assert torch.equal(cpu_max, same_device_max)
+    assert torch.equal(cpu_scaled, same_device_scaled)
+
+
 def test_phase4_streaming_v1_microbatch_size_is_capped() -> None:
     assert _resolve_phase4_streaming_v1_microbatch_size(1) == 1
     assert _resolve_phase4_streaming_v1_microbatch_size(64) == 64
@@ -2560,6 +2641,17 @@ def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
         row_weight_zero_row_count=1280,
         row_reader_overread_zero_row_count=0,
         active_row_range_count=6,
+        streaming_chunk_reuse_stats={
+            "active_row_scan_elapsed_ms_total": 0.1,
+            "chunk_allocation_zero_fill_elapsed_ms_total": 0.2,
+            "transfer_cast_abs_elapsed_ms_total": 0.3,
+            "cache_lookup_elapsed_ms_total": 0.4,
+            "cache_store_elapsed_ms_total": 0.5,
+            "cache_eviction_elapsed_ms_total": 0.6,
+            "row_weight_update_elapsed_ms_total": 0.7,
+            "accounted_elapsed_ms_total": 8.8,
+            "unaccounted_elapsed_ms_total": 1.2,
+        },
     )
 
     assert telemetry["refresh_row_store_read_elapsed_ms"] == pytest.approx(4.0)
@@ -2574,11 +2666,21 @@ def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
     assert telemetry["refresh_row_weight_zero_rows"] == 1280
     assert telemetry["refresh_row_reader_overread_zero_rows"] == 0
     assert telemetry["refresh_active_row_range_count"] == 6
+    assert telemetry["refresh_active_row_scan_elapsed_ms"] == pytest.approx(0.1)
+    assert telemetry["refresh_chunk_allocation_zero_fill_elapsed_ms"] == pytest.approx(0.2)
+    assert telemetry["refresh_transfer_cast_abs_elapsed_ms"] == pytest.approx(0.3)
+    assert telemetry["refresh_cache_lookup_elapsed_ms"] == pytest.approx(0.4)
+    assert telemetry["refresh_cache_store_elapsed_ms"] == pytest.approx(0.5)
+    assert telemetry["refresh_cache_eviction_elapsed_ms"] == pytest.approx(0.6)
+    assert telemetry["refresh_row_weight_update_elapsed_ms"] == pytest.approx(0.7)
+    assert telemetry["refresh_accounted_elapsed_ms"] == pytest.approx(8.8)
+    assert telemetry["refresh_unaccounted_elapsed_ms"] == pytest.approx(1.2)
 
 
 def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
     summary = _build_phase4_executor_substage_telemetry(
         telemetry_detail="summary",
+        encoder_materialize_elapsed_ms=0.25,
         compute_batch_elapsed_ms=5.0,
         cpu_staging_elapsed_ms=1.0,
         denominator_elapsed_ms=0.5,
@@ -2587,6 +2689,7 @@ def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
     )
     normal = _build_phase4_executor_substage_telemetry(
         telemetry_detail="normal",
+        encoder_materialize_elapsed_ms=0.25,
         compute_batch_elapsed_ms=5.0,
         cpu_staging_elapsed_ms=1.0,
         denominator_elapsed_ms=0.5,
@@ -2594,9 +2697,10 @@ def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
         batch_elapsed_ms=8.0,
     )
 
+    assert summary["executor_encoder_materialize_elapsed_ms"] == pytest.approx(0.25)
     assert summary["executor_compute_batch_elapsed_ms"] == pytest.approx(5.0)
-    assert summary["executor_accounted_elapsed_ms"] == pytest.approx(7.25)
-    assert summary["executor_overhead_elapsed_ms"] == pytest.approx(0.75)
+    assert summary["executor_accounted_elapsed_ms"] == pytest.approx(7.5)
+    assert summary["executor_overhead_elapsed_ms"] == pytest.approx(0.5)
     assert "executor_cpu_staging_elapsed_ms" not in summary
 
     assert normal["executor_cpu_staging_elapsed_ms"] == pytest.approx(1.0)

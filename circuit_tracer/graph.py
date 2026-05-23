@@ -823,6 +823,13 @@ def compute_partial_feature_influences_streaming(
     row_reader_elapsed_ms_total = 0.0
     normalization_elapsed_ms_total = 0.0
     matmul_elapsed_ms_total = 0.0
+    active_row_scan_elapsed_ms_total = 0.0
+    chunk_allocation_zero_fill_elapsed_ms_total = 0.0
+    transfer_cast_abs_elapsed_ms_total = 0.0
+    cache_lookup_elapsed_ms_total = 0.0
+    cache_store_elapsed_ms_total = 0.0
+    cache_eviction_elapsed_ms_total = 0.0
+    row_weight_update_elapsed_ms_total = 0.0
     iteration_count = 0
     solver_start = time.perf_counter()
     row_chunk_strategy = (
@@ -862,11 +869,13 @@ def compute_partial_feature_influences_streaming(
         return int(tensor.numel() * tensor.element_size())
 
     def _drop_oldest_chunk() -> None:
-        nonlocal chunk_cache_nbytes, chunk_cache_eviction_count
+        nonlocal chunk_cache_nbytes, chunk_cache_eviction_count, cache_eviction_elapsed_ms_total
+        eviction_start = time.perf_counter()
         oldest_key = next(iter(chunk_cache))
         dropped = chunk_cache.pop(oldest_key)
         chunk_cache_nbytes = max(0, chunk_cache_nbytes - _tensor_nbytes(dropped))
         chunk_cache_eviction_count += 1
+        cache_eviction_elapsed_ms_total += (time.perf_counter() - eviction_start) * 1000.0
 
     for _ in range(max_iter):
         iteration_count += 1
@@ -885,7 +894,9 @@ def compute_partial_feature_influences_streaming(
                 active_row_chunk_count += 1
                 chunk_request_count += 1
                 cache_key = (start, end)
+                cache_lookup_start = time.perf_counter()
                 cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
+                cache_lookup_elapsed_ms_total += (time.perf_counter() - cache_lookup_start) * 1000.0
                 if cached_chunk is None:
                     row_reader_start = time.perf_counter()
                     chunk = row_reader(start, end)
@@ -898,8 +909,17 @@ def compute_partial_feature_influences_streaming(
                             f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
                         )
                     if chunk.device != device:
+                        transfer_cast_abs_start = time.perf_counter()
                         chunk = chunk.to(device)
+                        transfer_cast_abs_elapsed_ms_total += (
+                            time.perf_counter() - transfer_cast_abs_start
+                        ) * 1000.0
+                    transfer_cast_abs_start = time.perf_counter()
                     chunk = chunk.to(dtype=dtype).abs()
+                    transfer_cast_abs_elapsed_ms_total += (
+                        time.perf_counter() - transfer_cast_abs_start
+                    ) * 1000.0
+                    cache_store_start = time.perf_counter()
                     if not cache_enabled:
                         chunk_cache_store_skip_disabled_count += 1
                     else:
@@ -916,6 +936,9 @@ def compute_partial_feature_influences_streaming(
                             chunk_cache.move_to_end(cache_key)
                             chunk_cache_nbytes += chunk_nbytes
                             chunk_cache_store_success_count += 1
+                    cache_store_elapsed_ms_total += (
+                        time.perf_counter() - cache_store_start
+                    ) * 1000.0
                     chunk_cache_miss_count += 1
                 else:
                     chunk = cached_chunk
@@ -942,7 +965,11 @@ def compute_partial_feature_influences_streaming(
             for start in range(0, n_rows, row_chunk_size):
                 end = min(start + row_chunk_size, n_rows)
                 chunk_row_weights = row_weights[start:end]
+                active_row_scan_start = time.perf_counter()
                 active_row_subranges = list(_iter_active_row_subranges(start, end, row_weights))
+                active_row_scan_elapsed_ms_total += (
+                    time.perf_counter() - active_row_scan_start
+                ) * 1000.0
                 if not active_row_subranges:
                     continue
 
@@ -950,9 +977,15 @@ def compute_partial_feature_influences_streaming(
                 active_row_range_count += len(active_row_subranges)
                 chunk_request_count += 1
                 cache_key = (start, end)
+                cache_lookup_start = time.perf_counter()
                 cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
+                cache_lookup_elapsed_ms_total += (time.perf_counter() - cache_lookup_start) * 1000.0
                 if cached_chunk is None:
+                    allocation_start = time.perf_counter()
                     chunk = torch.zeros((end - start, n_feature_nodes), device=device, dtype=dtype)
+                    chunk_allocation_zero_fill_elapsed_ms_total += (
+                        time.perf_counter() - allocation_start
+                    ) * 1000.0
                     for sub_start, sub_end in active_row_subranges:
                         row_reader_start = time.perf_counter()
                         subchunk = row_reader(sub_start, sub_end)
@@ -971,9 +1004,18 @@ def compute_partial_feature_influences_streaming(
                                 f"[{sub_start}, {sub_end})"
                             )
                         if subchunk.device != device:
+                            transfer_cast_abs_start = time.perf_counter()
                             subchunk = subchunk.to(device)
+                            transfer_cast_abs_elapsed_ms_total += (
+                                time.perf_counter() - transfer_cast_abs_start
+                            ) * 1000.0
+                        transfer_cast_abs_start = time.perf_counter()
                         subchunk = subchunk.to(dtype=dtype).abs()
+                        transfer_cast_abs_elapsed_ms_total += (
+                            time.perf_counter() - transfer_cast_abs_start
+                        ) * 1000.0
                         chunk[sub_start - start : sub_end - start] = subchunk
+                    cache_store_start = time.perf_counter()
                     if not cache_enabled:
                         chunk_cache_store_skip_disabled_count += 1
                     else:
@@ -990,6 +1032,9 @@ def compute_partial_feature_influences_streaming(
                             chunk_cache.move_to_end(cache_key)
                             chunk_cache_nbytes += chunk_nbytes
                             chunk_cache_store_success_count += 1
+                    cache_store_elapsed_ms_total += (
+                        time.perf_counter() - cache_store_start
+                    ) * 1000.0
                     chunk_cache_miss_count += 1
                 else:
                     chunk = cached_chunk
@@ -1017,15 +1062,30 @@ def compute_partial_feature_influences_streaming(
             break
 
         influences += next_feature_prod
+        row_weight_update_start = time.perf_counter()
         row_weights.zero_()
         if feature_row_node_index.numel():
             row_weights[n_logits:] = next_feature_prod[feature_row_node_index]
+        row_weight_update_elapsed_ms_total += (
+            time.perf_counter() - row_weight_update_start
+        ) * 1000.0
     else:
         raise RuntimeError("Failed to converge")
 
     if chunk_reuse_stats is not None:
         chunk_reuse_stats.clear()
         solver_elapsed_ms_total = (time.perf_counter() - solver_start) * 1000.0
+        accounted_elapsed_ms_total = float(
+            row_reader_elapsed_ms_total
+            + normalization_elapsed_ms_total
+            + matmul_elapsed_ms_total
+            + active_row_scan_elapsed_ms_total
+            + chunk_allocation_zero_fill_elapsed_ms_total
+            + transfer_cast_abs_elapsed_ms_total
+            + cache_lookup_elapsed_ms_total
+            + cache_store_elapsed_ms_total
+            + row_weight_update_elapsed_ms_total
+        )
         chunk_reuse_stats.update(
             {
                 "chunk_request_count": int(chunk_request_count),
@@ -1057,6 +1117,22 @@ def compute_partial_feature_influences_streaming(
                 "row_reader_elapsed_ms_total": float(row_reader_elapsed_ms_total),
                 "normalization_elapsed_ms_total": float(normalization_elapsed_ms_total),
                 "matmul_elapsed_ms_total": float(matmul_elapsed_ms_total),
+                "active_row_scan_elapsed_ms_total": float(active_row_scan_elapsed_ms_total),
+                "chunk_allocation_zero_fill_elapsed_ms_total": float(
+                    chunk_allocation_zero_fill_elapsed_ms_total
+                ),
+                "transfer_cast_abs_elapsed_ms_total": float(transfer_cast_abs_elapsed_ms_total),
+                "cache_lookup_elapsed_ms_total": float(cache_lookup_elapsed_ms_total),
+                "cache_store_elapsed_ms_total": float(cache_store_elapsed_ms_total),
+                "cache_eviction_elapsed_ms_total": float(cache_eviction_elapsed_ms_total),
+                "row_weight_update_elapsed_ms_total": float(row_weight_update_elapsed_ms_total),
+                "accounted_elapsed_ms_total": accounted_elapsed_ms_total,
+                "unaccounted_elapsed_ms_total": float(
+                    max(0.0, solver_elapsed_ms_total - accounted_elapsed_ms_total)
+                ),
+                "elapsed_residual_ms_total": float(
+                    solver_elapsed_ms_total - accounted_elapsed_ms_total
+                ),
             }
         )
 
