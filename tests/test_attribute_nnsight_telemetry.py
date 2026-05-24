@@ -71,6 +71,96 @@ def test_file_backed_feature_row_store_emits_structured_events() -> None:
     assert "feature_row_store.materialize_dense_slice" in names
 
 
+def test_file_backed_feature_row_store_temp_root_default_and_explicit(tmp_path) -> None:
+    default_store = _FileBackedFeatureRowStore(
+        n_rows=1,
+        n_feature_columns=1,
+        dtype=torch.float32,
+    )
+    try:
+        default_stats = default_store.get_diagnostic_snapshot()
+        assert default_stats["temp_root_policy"] == "default"
+        assert default_stats["temp_root_selected"] is None
+        assert default_stats["temp_root_fallback_reason"] is None
+    finally:
+        default_store.cleanup()
+
+    explicit_root = tmp_path / "rows"
+    explicit_root.mkdir()
+    store = _FileBackedFeatureRowStore(
+        n_rows=1,
+        n_feature_columns=1,
+        dtype=torch.float32,
+        temp_root_policy="env_node_local",
+        temp_root=explicit_root,
+    )
+    try:
+        stats = store.get_diagnostic_snapshot()
+        assert stats["temp_root_policy"] == "env_node_local"
+        assert stats["temp_root_requested"] == os.fspath(explicit_root)
+        assert stats["temp_root_selected"] == os.fspath(explicit_root)
+        assert os.fspath(store.path).startswith(os.fspath(explicit_root))
+    finally:
+        store.cleanup()
+
+
+def test_file_backed_feature_row_store_env_node_local_fallback(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SLURM_TMPDIR", os.fspath(tmp_path / "missing_slurm"))
+    monkeypatch.setenv("TMPDIR", os.fspath(tmp_path / "missing_tmp"))
+    store = _FileBackedFeatureRowStore(
+        n_rows=1,
+        n_feature_columns=1,
+        dtype=torch.float32,
+        temp_root_policy="env_node_local",
+    )
+    try:
+        stats = store.get_diagnostic_snapshot()
+        assert stats["temp_root_policy"] == "env_node_local"
+        assert stats["temp_root_selected"] == "/tmp"
+        assert stats["temp_root_fallback_reason"] is None
+    finally:
+        store.cleanup()
+
+
+def test_file_backed_feature_row_store_preallocation_unavailable(monkeypatch) -> None:
+    monkeypatch.delattr(os, "posix_fallocate", raising=False)
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        preallocate=True,
+    )
+    try:
+        stats = store.get_diagnostic_snapshot()
+        assert stats["preallocate_requested"] == 1
+        assert stats["preallocate_available"] == 0
+        assert stats["preallocate_status"] == "unavailable"
+        assert "unavailable" in str(stats["preallocate_error"])
+    finally:
+        store.cleanup()
+
+
+def test_file_backed_feature_row_store_preallocation_failure(monkeypatch) -> None:
+    def fail_fallocate(fd: int, offset: int, length: int) -> None:
+        raise OSError("synthetic fallocate failure")
+
+    monkeypatch.setattr(os, "posix_fallocate", fail_fallocate, raising=False)
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        preallocate=True,
+    )
+    try:
+        stats = store.get_diagnostic_snapshot()
+        assert stats["preallocate_requested"] == 1
+        assert stats["preallocate_available"] == 1
+        assert stats["preallocate_status"] == "failed"
+        assert "synthetic fallocate failure" in str(stats["preallocate_error"])
+    finally:
+        store.cleanup()
+
+
 def test_file_backed_feature_row_store_read_cache_invalidates_on_overlap_append() -> None:
     store = _FileBackedFeatureRowStore(
         n_rows=4,

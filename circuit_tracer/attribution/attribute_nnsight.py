@@ -258,6 +258,15 @@ _PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE: dict[str, str] = {
 }
 
 _ROW_STORE_CACHE_CONTROL_DEFAULT: Literal["off"] = "off"
+
+_ROW_STORE_TEMP_ROOT_POLICY_DEFAULT: Literal["default"] = "default"
+_ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL: Literal["env_node_local"] = "env_node_local"
+_ROW_STORE_TEMP_ROOT_POLICY_BY_NAME: dict[str, str] = {
+    "default": _ROW_STORE_TEMP_ROOT_POLICY_DEFAULT,
+    "tempfile_default": _ROW_STORE_TEMP_ROOT_POLICY_DEFAULT,
+    "env_node_local": _ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL,
+    "node_local": _ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL,
+}
 _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1: Literal[
     "fadvise_dontneed_after_append_v1"
 ] = "fadvise_dontneed_after_append_v1"
@@ -386,6 +395,15 @@ class _RowStoreCacheControlConfig:
     default_mode: Literal["off"]
     mode_applicable: bool
     effective_behavior: Literal["requested", "off_reference_execution"]
+    fallback_reason: str | None
+
+
+@dataclass(frozen=True)
+class _RowStoreTempRootSelection:
+    policy: Literal["default", "env_node_local"]
+    requested_root: str | None
+    selected_root: str | None
+    selected_path: str
     fallback_reason: str | None
 
 
@@ -536,6 +554,9 @@ class _FileBackedFeatureRowStore:
         row_abs_sum_dtype: torch.dtype = torch.float32,
         read_chunk_cache_bytes: int = 0,
         row_store_cache_control_mode: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+        temp_root_policy: Literal["default", "env_node_local"] = "default",
+        temp_root: str | os.PathLike[str] | None = None,
+        preallocate: bool = False,
         telemetry_recorder: TelemetryRecorder | None = None,
     ) -> None:
         if dtype not in (torch.float32, torch.float64):
@@ -556,12 +577,31 @@ class _FileBackedFeatureRowStore:
 
         self._dtype = dtype
         self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
-        self._tmpdir = tempfile.TemporaryDirectory(prefix="ct_feature_rows_")
+        temp_root_selection, tmpdir = _select_row_store_temp_root(
+            temp_root_policy=temp_root_policy,
+            temp_root=temp_root,
+        )
+        self._tmpdir = tmpdir
         self._path = f"{self._tmpdir.name}/feature_rows.memmap"
         self._row_nbytes = int(np.dtype(self._np_dtype).itemsize * n_feature_columns)
         total_nbytes = int(self._row_nbytes * n_rows)
+        preallocate_requested = bool(preallocate)
+        posix_fallocate = getattr(os, "posix_fallocate", None)
+        preallocate_status = "disabled"
+        preallocate_error: str | None = None
         with open(self._path, "wb") as handle:
             handle.truncate(total_nbytes)
+            if preallocate_requested:
+                if callable(posix_fallocate):
+                    try:
+                        posix_fallocate(handle.fileno(), 0, total_nbytes)
+                        preallocate_status = "succeeded"
+                    except OSError as exc:
+                        preallocate_status = "failed"
+                        preallocate_error = repr(exc)
+                else:
+                    preallocate_status = "unavailable"
+                    preallocate_error = "os.posix_fallocate is unavailable"
         self._write_fd: int | None = os.open(self._path, os.O_RDWR)
         self._row_store_cache_control_effective_mode = row_store_cache_control_mode
         self._fadvise_dontneed_after_append_enabled = bool(
@@ -596,6 +636,16 @@ class _FileBackedFeatureRowStore:
             "row_store_cache_control_advisory_unavailable_count": 0,
             "row_store_cache_control_advisory_skipped_count": 0,
             "row_store_cache_control_advisory_last_error": None,
+            "temp_root_policy": temp_root_selection.policy,
+            "temp_root_requested": temp_root_selection.requested_root,
+            "temp_root_selected": temp_root_selection.selected_root,
+            "temp_root_path": temp_root_selection.selected_path,
+            "temp_root_fallback_reason": temp_root_selection.fallback_reason,
+            "preallocate_requested": int(preallocate_requested),
+            "preallocate_available": int(callable(posix_fallocate)),
+            "preallocate_status": preallocate_status,
+            "preallocate_error": preallocate_error,
+            "preallocate_nbytes": int(total_nbytes) if preallocate_requested else 0,
             "read_call_count": 0,
             "read_row_count": 0,
             "read_last_row_start": None,
@@ -2143,6 +2193,77 @@ def _build_row_store_cache_control_metadata(
             != row_store_cache_control_config.effective_mode
         ),
     }
+
+
+def _resolve_row_store_temp_root_policy(
+    temp_root_policy: str,
+) -> Literal["default", "env_node_local"]:
+    normalized = str(temp_root_policy).strip().lower()
+    if normalized not in _ROW_STORE_TEMP_ROOT_POLICY_BY_NAME:
+        allowed = ", ".join(sorted(_ROW_STORE_TEMP_ROOT_POLICY_BY_NAME))
+        raise ValueError(
+            f"row_store_temp_root_policy must be one of: {allowed} (got {temp_root_policy!r})"
+        )
+    return cast(
+        Literal["default", "env_node_local"],
+        _ROW_STORE_TEMP_ROOT_POLICY_BY_NAME[normalized],
+    )
+
+
+def _is_existing_writable_dir(path: str | os.PathLike[str] | None) -> bool:
+    if path is None:
+        return False
+    try:
+        return os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def _select_row_store_temp_root(
+    *,
+    temp_root_policy: str,
+    temp_root: str | os.PathLike[str] | None,
+) -> tuple[_RowStoreTempRootSelection, tempfile.TemporaryDirectory[str]]:
+    policy = _resolve_row_store_temp_root_policy(temp_root_policy)
+    requested_root = os.fspath(temp_root) if temp_root is not None else None
+    fallback_reason: str | None = None
+
+    if requested_root is not None:
+        if _is_existing_writable_dir(requested_root):
+            selected_root = requested_root
+        else:
+            selected_root = None
+            fallback_reason = (
+                f"requested temp_root is not an existing writable directory: {requested_root}"
+            )
+    elif policy == _ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL:
+        selected_root = None
+        rejected: list[str] = []
+        for label, candidate in (
+            ("SLURM_TMPDIR", os.environ.get("SLURM_TMPDIR")),
+            ("TMPDIR", os.environ.get("TMPDIR")),
+            ("/tmp", "/tmp"),
+        ):
+            if _is_existing_writable_dir(candidate):
+                selected_root = os.fspath(candidate)
+                break
+            if candidate:
+                rejected.append(f"{label}={candidate!r}")
+        if selected_root is None:
+            fallback_reason = "no env_node_local candidate was an existing writable directory"
+            if rejected:
+                fallback_reason += f" (rejected: {', '.join(rejected)})"
+    else:
+        selected_root = None
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="ct_feature_rows_", dir=selected_root)
+    return _RowStoreTempRootSelection(
+        policy=policy,
+        requested_root=requested_root,
+        selected_root=selected_root,
+        selected_path=tmpdir.name,
+        fallback_reason=fallback_reason,
+    ), tmpdir
 
 
 def _resolve_exact_encoder_residency(
@@ -6352,6 +6473,9 @@ def attribute(
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
     row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
+    row_store_temp_root: str | os.PathLike[str] | None = None,
+    row_store_preallocate: bool = False,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase0_activation_threshold_compare_mode: Literal[
@@ -6587,6 +6711,9 @@ def attribute(
             phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
             phase4_ranker=phase4_ranker,
             row_store_cache_control=row_store_cache_control,
+            row_store_temp_root_policy=row_store_temp_root_policy,
+            row_store_temp_root=row_store_temp_root,
+            row_store_preallocate=row_store_preallocate,
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
@@ -6662,6 +6789,9 @@ def _run_attribution(
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
     row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
+    row_store_temp_root: str | os.PathLike[str] | None = None,
+    row_store_preallocate: bool = False,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase0_activation_threshold_compare_mode: Literal[
@@ -6678,6 +6808,9 @@ def _run_attribution(
     )
     phase0_activation_threshold_compare_mode_resolved = (
         _resolve_phase0_activation_threshold_compare_mode(phase0_activation_threshold_compare_mode)
+    )
+    row_store_temp_root_policy_resolved = _resolve_row_store_temp_root_policy(
+        row_store_temp_root_policy
     )
     phase0_replay_mode_resolved = _resolve_phase0_replay_mode(phase0_replay_mode)
     phase0_donor_context_policy_resolved = _resolve_phase0_donor_context_policy(
@@ -7833,6 +7966,9 @@ def _run_attribution(
                 row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
                 read_chunk_cache_bytes=256 * 1024 * 1024,
                 row_store_cache_control_mode=row_store_cache_control_config.effective_mode,
+                temp_root_policy=row_store_temp_root_policy_resolved,
+                temp_root=row_store_temp_root,
+                preallocate=row_store_preallocate,
                 telemetry_recorder=telemetry_recorder,
             )
         else:
@@ -7863,6 +7999,7 @@ def _run_attribution(
                 row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_l1_scaled_shape=f"{tuple(feature_row_store.row_l1_scaled.shape)}",
                 feature_edge_columns=total_active_feats,
+                **feature_row_store.get_diagnostic_snapshot(),
             )
         else:
             phase2_extra.update(

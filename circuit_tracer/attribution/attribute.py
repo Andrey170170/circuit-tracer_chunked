@@ -3,6 +3,7 @@ Unified attribution interface that routes to the correct implementation based on
 """
 
 from collections.abc import Sequence
+import os
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
@@ -158,6 +159,9 @@ def attribute(
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
     row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
+    row_store_temp_root: str | os.PathLike[str] | None = None,
+    row_store_preallocate: bool = False,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
@@ -220,6 +224,9 @@ def attribute(
             Used by ``"deferred_v1"`` on compact exact-trace Phase 4.
         phase4_ranker: Requested Phase-4 ranker implementation.
         row_store_cache_control: Requested compact row-store cache-control mode.
+        row_store_temp_root_policy: Requested compact row-store temp-root policy.
+        row_store_temp_root: Optional explicit temp root for compact row-store files.
+        row_store_preallocate: Enable best-effort compact row-store file preallocation.
         exact_encoder_residency: Requested exact encoder residency mode.
         exact_trace_internal_dtype: Internal dtype used by compact exact-trace
             normalization/ranking internals ("fp32" or "fp64"). Defaults to
@@ -248,6 +255,9 @@ def attribute(
         or phase4_refresh_interval_multiplier != 1
         or phase4_ranker != "argsort"
         or row_store_cache_control != "off"
+        or row_store_temp_root_policy != "default"
+        or row_store_temp_root is not None
+        or bool(row_store_preallocate)
         or exact_encoder_residency != "lazy"
     )
 
@@ -294,6 +304,9 @@ def attribute(
             phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
             phase4_ranker=phase4_ranker,
             row_store_cache_control=row_store_cache_control,
+            row_store_temp_root_policy=row_store_temp_root_policy,
+            row_store_temp_root=row_store_temp_root,
+            row_store_preallocate=row_store_preallocate,
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
         )
