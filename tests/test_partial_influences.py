@@ -816,3 +816,35 @@ def test_compute_partial_feature_influences_streaming_honors_explicit_compute_dt
     )
 
     assert streaming_actual.dtype == torch.float32
+
+
+def test_compute_partial_feature_influences_streaming_reports_preparation_telemetry():
+    edge_matrix = torch.tensor(
+        [
+            [0.2, -0.8, 4.0, 0.0],
+            [-0.6, 0.4, 0.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    row_abs_sums = edge_matrix.abs().sum(dim=1)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([3, 0], dtype=torch.int32)
+    stats: dict[str, int | float | str] = {}
+
+    result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(edge_matrix[:, :2]),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=2,
+        n_logits=1,
+        chunk_reuse_stats=stats,
+    )
+
+    assert torch.all(result >= 0)
+    assert "transfer_cast_abs_elapsed_ms_total" in stats
+    assert "transfer_cast_elapsed_ms_total" in stats
+    assert "abs_elapsed_ms_total" in stats
+    assert isinstance(stats["transfer_cast_abs_elapsed_ms_total"], float)
+    assert isinstance(stats["transfer_cast_elapsed_ms_total"], float)
+    assert isinstance(stats["abs_elapsed_ms_total"], float)

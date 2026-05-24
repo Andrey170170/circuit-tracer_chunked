@@ -1491,12 +1491,71 @@ def test_file_backed_feature_row_store_append_rows_returns_substage_telemetry() 
         "row_store_append_cpu_prepare_elapsed_ms",
         "row_store_append_contiguous_elapsed_ms",
         "row_store_append_numpy_elapsed_ms",
+        "row_store_append_memmap_assign_elapsed_ms",
         "row_store_append_pwrite_elapsed_ms",
         "row_store_append_denominator_copy_elapsed_ms",
         "row_store_append_total_elapsed_ms",
     }
     assert expected_keys <= telemetry.keys()
     assert all(isinstance(telemetry[key], float) for key in expected_keys)
+    assert telemetry["row_store_append_write_backend"] == "memmap_assign"
+
+
+def test_file_backed_feature_row_store_append_rows_reports_pwrite_fallback() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+    )
+    try:
+        assert store._rows is not None
+        store._rows.flags.writeable = False
+        rows = torch.ones((2, 3), dtype=torch.float32)
+        telemetry = store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=(
+                torch.ones(2, dtype=torch.float32),
+                torch.ones(2, dtype=torch.float32),
+            ),
+        )
+        store._rows.flags.writeable = True
+        restored = store.read_feature_rows(0, 2)
+    finally:
+        store.cleanup()
+
+    assert telemetry["row_store_append_write_backend"] == "pwrite"
+    assert telemetry["row_store_append_memmap_assign_elapsed_ms"] == 0.0
+    pwrite_elapsed_ms = telemetry["row_store_append_pwrite_elapsed_ms"]
+    assert isinstance(pwrite_elapsed_ms, float)
+    assert pwrite_elapsed_ms >= 0.0
+    assert torch.allclose(restored, rows)
+
+
+def test_file_backed_feature_row_store_fadvise_mode_uses_pwrite_backend() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        row_store_cache_control_mode="fadvise_dontneed_after_append_v1",
+    )
+    try:
+        rows = torch.ones((2, 3), dtype=torch.float32)
+        telemetry = store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=(
+                torch.ones(2, dtype=torch.float32),
+                torch.ones(2, dtype=torch.float32),
+            ),
+        )
+        restored = store.read_feature_rows(0, 2)
+    finally:
+        store.cleanup()
+
+    assert telemetry["row_store_append_write_backend"] == "pwrite"
+    assert telemetry["row_store_append_memmap_assign_elapsed_ms"] == 0.0
+    assert torch.allclose(restored, rows)
 
 
 def test_row_denominator_scaled_l1_preserve_device_matches_cpu_path() -> None:
