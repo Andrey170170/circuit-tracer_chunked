@@ -222,7 +222,7 @@ _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
 
 _PHASE4_ROW_REDUCTION_VERSION_BY_MODE: dict[str, str] = {
     "off": "off_v1",
-    "gpu_v1": "gpu_v1",
+    "gpu_v1": "gpu_v1_staged",
 }
 
 _PHASE1_TRACE_BATCH_POLICY_DEFAULT: Literal["legacy"] = "legacy"
@@ -766,7 +766,7 @@ class _FileBackedFeatureRowStore:
         row_denominator_scaled_l1: tuple[torch.Tensor, torch.Tensor] | None = None,
         full_row_abs_sums: torch.Tensor | None = None,
         phase: str | None = None,
-    ) -> None:
+    ) -> dict[str, float]:
         if feature_rows.ndim != 2:
             raise ValueError("feature_rows must be rank-2")
         row_count, n_feature_cols = feature_rows.shape
@@ -799,6 +799,13 @@ class _FileBackedFeatureRowStore:
         if row_start < 0 or row_end > self.n_rows:
             raise ValueError("row range is out of bounds for file-backed store")
 
+        append_total_start = time.perf_counter()
+        cpu_prepare_elapsed_ms = 0.0
+        contiguous_elapsed_ms = 0.0
+        numpy_elapsed_ms = 0.0
+        pwrite_elapsed_ms = 0.0
+        denominator_copy_elapsed_ms = 0.0
+
         with self._telemetry_timer(
             name="feature_row_store.append_rows",
             phase=phase,
@@ -810,13 +817,19 @@ class _FileBackedFeatureRowStore:
             },
         ):
             write_fd = self._require_open_write_fd()
+            cpu_prepare_start = time.perf_counter()
             feature_rows_cpu = feature_rows.detach()
             if feature_rows_cpu.device.type != "cpu" or feature_rows_cpu.dtype != self._dtype:
                 feature_rows_cpu = feature_rows_cpu.to(device="cpu", dtype=self._dtype)
+            cpu_prepare_elapsed_ms = (time.perf_counter() - cpu_prepare_start) * 1000.0
 
+            numpy_start = time.perf_counter()
             feature_rows_np = np.asarray(feature_rows_cpu.numpy(), dtype=self._np_dtype, order="C")
+            numpy_elapsed_ms = (time.perf_counter() - numpy_start) * 1000.0
             if not feature_rows_np.flags.c_contiguous:
+                contiguous_start = time.perf_counter()
                 feature_rows_np = np.ascontiguousarray(feature_rows_np, dtype=self._np_dtype)
+                contiguous_elapsed_ms = (time.perf_counter() - contiguous_start) * 1000.0
             payload = memoryview(feature_rows_np).cast("B")
             expected_nbytes = int(row_count * self._row_nbytes)
             if payload.nbytes != expected_nbytes:
@@ -827,17 +840,20 @@ class _FileBackedFeatureRowStore:
 
             byte_offset = int(row_start * self._row_nbytes)
             bytes_written = 0
+            pwrite_start = time.perf_counter()
             while bytes_written < expected_nbytes:
                 wrote = os.pwrite(write_fd, payload[bytes_written:], byte_offset + bytes_written)
                 if wrote <= 0:
                     raise OSError("feature row store append write failed")
                 bytes_written += wrote
+            pwrite_elapsed_ms = (time.perf_counter() - pwrite_start) * 1000.0
             self._apply_row_store_cache_control_after_append(
                 write_fd=write_fd,
                 byte_offset=byte_offset,
                 byte_length=expected_nbytes,
             )
 
+            denominator_copy_start = time.perf_counter()
             row_abs_max_cpu = row_abs_max.detach()
             if (
                 row_abs_max_cpu.device.type != "cpu"
@@ -859,6 +875,7 @@ class _FileBackedFeatureRowStore:
 
             self.row_abs_max[row_start:row_end] = row_abs_max_cpu
             self.row_l1_scaled[row_start:row_end] = row_l1_scaled_cpu
+            denominator_copy_elapsed_ms = (time.perf_counter() - denominator_copy_start) * 1000.0
 
         self._diagnostic_stats["append_call_count"] = (
             int(self._diagnostic_stats["append_call_count"] or 0) + 1
@@ -868,6 +885,16 @@ class _FileBackedFeatureRowStore:
         ) + int(row_count)
         self._evict_overlapping_read_chunks(row_start, row_end)
         self._sync_read_cache_snapshot()
+        return {
+            "row_store_append_cpu_prepare_elapsed_ms": float(cpu_prepare_elapsed_ms),
+            "row_store_append_contiguous_elapsed_ms": float(contiguous_elapsed_ms),
+            "row_store_append_numpy_elapsed_ms": float(numpy_elapsed_ms),
+            "row_store_append_pwrite_elapsed_ms": float(pwrite_elapsed_ms),
+            "row_store_append_denominator_copy_elapsed_ms": float(denominator_copy_elapsed_ms),
+            "row_store_append_total_elapsed_ms": float(
+                (time.perf_counter() - append_total_start) * 1000.0
+            ),
+        }
 
     def read_feature_rows(
         self,
@@ -3680,6 +3707,42 @@ def _copy_rows_to_cpu_staging(
     return rows_cpu, staging_buffer
 
 
+def _copy_feature_rows_to_cpu_staging(
+    rows: torch.Tensor,
+    *,
+    total_active_feats: int,
+    staging_buffer: torch.Tensor | None,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Copy only active feature columns into a reusable CPU staging tensor."""
+
+    target_dtype = rows.dtype if dtype is None else dtype
+    if rows.ndim != 2:
+        raise ValueError("rows must be rank-2")
+    if total_active_feats < 0 or total_active_feats > int(rows.shape[1]):
+        raise ValueError("total_active_feats must fit within rows columns")
+
+    n_rows = int(rows.shape[0])
+    n_cols = int(total_active_feats)
+    source = rows.detach()[:, :n_cols]
+    if source.device.type == "cpu" and source.dtype == target_dtype and source.is_contiguous():
+        return source, staging_buffer
+
+    needs_new_buffer = (
+        staging_buffer is None
+        or staging_buffer.device.type != "cpu"
+        or staging_buffer.dtype != target_dtype
+        or int(staging_buffer.shape[0]) < n_rows
+        or int(staging_buffer.shape[1]) < n_cols
+    )
+    if needs_new_buffer:
+        staging_buffer = torch.empty((n_rows, n_cols), dtype=target_dtype, device="cpu")
+
+    feature_rows_cpu = staging_buffer[:n_rows, :n_cols]
+    feature_rows_cpu.copy_(source, non_blocking=False)
+    return feature_rows_cpu, staging_buffer
+
+
 def _row_denominator_to_row_abs_sums(
     row_denominator: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -6282,7 +6345,7 @@ def attribute(
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
-    phase4_row_reduction: Literal["off", "gpu_v1"] = "off",
+    phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
     phase1_trace_batch_size_max: int | None = None,
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
@@ -6404,7 +6467,8 @@ def attribute(
             refresh row-range reader optimization while preserving exact math.
         phase4_row_executor: Requested Phase-4 row execution mode.
         phase4_row_reduction: Requested Phase-4 row-reduction backend.
-            ``"gpu_v1"`` enables the compact exact Phase-4 prototype.
+            ``"gpu_v1"`` enables the compact exact Phase-4 staged GPU-denominator
+            path and is the default; ``"off"`` keeps the CPU reference path.
             ``"batched"`` keeps current behavior. ``"streaming_v1"`` executes
             compact exact-trace Phase-4 feature rows in smaller compute micro-batches
             while preserving scheduler frontier membership/order semantics.
@@ -6591,7 +6655,7 @@ def _run_attribution(
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
-    phase4_row_reduction: Literal["off", "gpu_v1"] = "off",
+    phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
     phase1_trace_batch_size_max: int | None = None,
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
@@ -8710,6 +8774,7 @@ def _run_attribution(
         # Phase 4: feature attribution
         logger.info("Phase 4: Computing feature attributions")
         phase4_start = time.perf_counter()
+        feature_rows_cpu_staging: torch.Tensor | None = None
         _log_memory_boundary(logger, "Phase 4 start", model.device)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
         phase4_feature_batch_size = effective_feature_batch_size
@@ -9721,9 +9786,12 @@ def _run_attribution(
                                 "phase4_row_reduction='gpu_v1' requires compact Phase-4 row store"
                             )
                         cpu_staging_start = time.perf_counter()
-                        feature_row_slice = rows[:, :total_active_feats].to(
-                            device="cpu",
-                            dtype=rows.dtype,
+                        feature_row_slice, feature_rows_cpu_staging = (
+                            _copy_feature_rows_to_cpu_staging(
+                                rows,
+                                total_active_feats=total_active_feats,
+                                staging_buffer=feature_rows_cpu_staging,
+                            )
                         )
                         executor_cpu_staging_elapsed_ms = (
                             time.perf_counter() - cpu_staging_start
@@ -9735,8 +9803,6 @@ def _run_attribution(
                             dtype=exact_trace_internal_dtype_resolved,
                             preserve_device=True,
                         )
-                        row_abs_max_cpu = row_abs_max_gpu.to(device="cpu")
-                        row_l1_scaled_cpu = row_l1_scaled_gpu.to(device="cpu")
                         executor_denominator_elapsed_ms = (
                             time.perf_counter() - denominator_start
                         ) * 1000.0
@@ -9744,10 +9810,11 @@ def _run_attribution(
                             _build_phase4_gpu_row_reduction_transfer_telemetry(
                                 rows=rows,
                                 feature_row_slice=feature_row_slice,
-                                row_abs_max=row_abs_max_cpu,
-                                row_l1_scaled=row_l1_scaled_cpu,
+                                row_abs_max=row_abs_max_gpu,
+                                row_l1_scaled=row_l1_scaled_gpu,
                             )
                         )
+                        row_denominator_scaled_l1 = (row_abs_max_gpu, row_l1_scaled_gpu)
                     else:
                         cpu_staging_start = time.perf_counter()
                         rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
@@ -9770,6 +9837,7 @@ def _run_attribution(
                             row_input_slice,
                             dtype=exact_trace_internal_dtype_resolved,
                         )
+                        row_denominator_scaled_l1 = (row_abs_max_cpu, row_l1_scaled_cpu)
                         executor_denominator_elapsed_ms = (
                             time.perf_counter() - denominator_start
                         ) * 1000.0
@@ -9805,7 +9873,7 @@ def _run_attribution(
                                     top_k=8,
                                 ),
                                 "row_abs_sum_stats": _build_phase4_normalization_stats(
-                                    (row_abs_max_cpu, row_l1_scaled_cpu),
+                                    row_denominator_scaled_l1,
                                     clamp_epsilon=1e-8,
                                 ),
                             }
@@ -9813,10 +9881,10 @@ def _run_attribution(
                     if use_compact_feature_row_store:
                         assert feature_row_store is not None
                         row_store_write_start = time.perf_counter()
-                        feature_row_store.append_rows(
+                        row_store_append_telemetry = feature_row_store.append_rows(
                             row_start=st,
                             feature_rows=feature_row_slice,
-                            row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
+                            row_denominator_scaled_l1=row_denominator_scaled_l1,
                             phase="phase4",
                         )
                         executor_row_store_write_elapsed_ms = (
@@ -9829,6 +9897,7 @@ def _run_attribution(
                         executor_row_store_write_elapsed_ms = (
                             time.perf_counter() - row_store_write_start
                         ) * 1000.0
+                        row_store_append_telemetry = None
                     row_to_node_index[st:end] = idx_batch
                     visited[idx_batch] = True
                     st = end
@@ -9883,6 +9952,11 @@ def _run_attribution(
                         row_store_write_elapsed_ms=executor_row_store_write_elapsed_ms,
                         batch_elapsed_ms=batch_elapsed_ms,
                     )
+                    if (
+                        row_store_append_telemetry is not None
+                        and phase4_scheduler_config.telemetry_detail in {"normal", "debug"}
+                    ):
+                        executor_substage_telemetry.update(row_store_append_telemetry)
                     executor_streaming_telemetry = {
                         "executor_reference_batch_size": int(reference_idx_batch.numel()),
                         "executor_microbatch_size": int(phase4_executor_microbatch_size),
@@ -9945,7 +10019,7 @@ def _run_attribution(
                             top_k=0,
                         )
                         row_abs_sum_stats = _build_phase4_normalization_stats(
-                            (row_abs_max_cpu, row_l1_scaled_cpu),
+                            row_denominator_scaled_l1,
                             clamp_epsilon=1e-8,
                         )
                         _record_cross_cluster_batch_event(

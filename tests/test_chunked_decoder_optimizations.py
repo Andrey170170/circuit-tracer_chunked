@@ -21,6 +21,8 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_executor_substage_telemetry,
     _build_phase4_normalization_stats,
     _compute_row_denominator_scaled_l1,
+    _copy_feature_rows_to_cpu_staging,
+    _FileBackedFeatureRowStore,
     _build_phase4_planner_v2_candidate_window,
     _build_phase4_refresh_substage_telemetry,
     _select_phase4_planner_v2_membership,
@@ -1395,6 +1397,7 @@ def test_phase4_row_reduction_off_metadata_and_gpu_v1_rejection() -> None:
     )
     assert gpu_metadata["row_reduction_requested"] == "gpu_v1"
     assert gpu_metadata["row_reduction_effective"] == "gpu_v1"
+    assert gpu_metadata["row_reduction_effective_version"] == "gpu_v1_staged"
     assert gpu_metadata["row_reduction_reference_execution"] is False
 
     fallback_metadata = _build_phase4_row_reduction_metadata(
@@ -1427,6 +1430,73 @@ def test_phase4_gpu_row_reduction_transfer_telemetry_counts_compact_bytes() -> N
     assert telemetry["row_reduction_compact_transfer_bytes"] == 56
     assert telemetry["row_reduction_gpu_to_cpu_bytes_saved"] == 24
     assert telemetry["row_transfer_bytes"] == 56
+
+
+def test_copy_feature_rows_to_cpu_staging_reuses_sized_buffer() -> None:
+    rows = torch.arange(20, dtype=torch.float32).reshape(2, 10)
+    feature_rows, staging = _copy_feature_rows_to_cpu_staging(
+        rows,
+        total_active_feats=3,
+        staging_buffer=None,
+        dtype=torch.float64,
+    )
+
+    assert staging is not None
+    assert feature_rows.device.type == "cpu"
+    assert feature_rows.is_contiguous()
+    assert torch.equal(feature_rows, rows[:, :3].to(torch.float64))
+
+    larger = torch.arange(30, dtype=torch.float32).reshape(3, 10)
+    feature_rows_again, staging_again = _copy_feature_rows_to_cpu_staging(
+        larger,
+        total_active_feats=3,
+        staging_buffer=staging,
+        dtype=torch.float64,
+    )
+
+    assert staging_again is not staging
+    assert torch.equal(feature_rows_again, larger[:, :3].to(torch.float64))
+
+    smaller = torch.arange(10, dtype=torch.float32).reshape(1, 10)
+    feature_rows_smaller, staging_smaller = _copy_feature_rows_to_cpu_staging(
+        smaller,
+        total_active_feats=3,
+        staging_buffer=staging_again,
+        dtype=torch.float64,
+    )
+
+    assert staging_smaller is staging_again
+    assert torch.equal(feature_rows_smaller, smaller[:, :3].to(torch.float64))
+
+
+def test_file_backed_feature_row_store_append_rows_returns_substage_telemetry() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+    )
+    try:
+        telemetry = store.append_rows(
+            row_start=0,
+            feature_rows=torch.ones((2, 3), dtype=torch.float32),
+            row_denominator_scaled_l1=(
+                torch.ones(2, dtype=torch.float32),
+                torch.ones(2, dtype=torch.float32),
+            ),
+        )
+    finally:
+        store.cleanup()
+
+    expected_keys = {
+        "row_store_append_cpu_prepare_elapsed_ms",
+        "row_store_append_contiguous_elapsed_ms",
+        "row_store_append_numpy_elapsed_ms",
+        "row_store_append_pwrite_elapsed_ms",
+        "row_store_append_denominator_copy_elapsed_ms",
+        "row_store_append_total_elapsed_ms",
+    }
+    assert expected_keys <= telemetry.keys()
+    assert all(isinstance(telemetry[key], float) for key in expected_keys)
 
 
 def test_row_denominator_scaled_l1_preserve_device_matches_cpu_path() -> None:
