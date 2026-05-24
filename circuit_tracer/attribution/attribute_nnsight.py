@@ -766,7 +766,7 @@ class _FileBackedFeatureRowStore:
         row_denominator_scaled_l1: tuple[torch.Tensor, torch.Tensor] | None = None,
         full_row_abs_sums: torch.Tensor | None = None,
         phase: str | None = None,
-    ) -> dict[str, object]:
+    ) -> dict[str, float]:
         if feature_rows.ndim != 2:
             raise ValueError("feature_rows must be rank-2")
         row_count, n_feature_cols = feature_rows.shape
@@ -804,9 +804,7 @@ class _FileBackedFeatureRowStore:
         contiguous_elapsed_ms = 0.0
         numpy_elapsed_ms = 0.0
         pwrite_elapsed_ms = 0.0
-        memmap_assign_elapsed_ms = 0.0
         denominator_copy_elapsed_ms = 0.0
-        write_backend = "pwrite"
 
         with self._telemetry_timer(
             name="feature_row_store.append_rows",
@@ -841,34 +839,14 @@ class _FileBackedFeatureRowStore:
                 )
 
             byte_offset = int(row_start * self._row_nbytes)
-            rows = self._require_open_rows()
-            can_memmap_assign = (
-                bool(rows.flags.writeable)
-                and not self._fadvise_dontneed_after_append_enabled
-                and rows.dtype == feature_rows_np.dtype
-                and rows.shape[1] == feature_rows_np.shape[1]
-                and feature_rows_np.shape == (row_count, n_feature_cols)
-            )
-            if can_memmap_assign:
-                try:
-                    memmap_assign_start = time.perf_counter()
-                    np.copyto(rows[row_start:row_end], feature_rows_np, casting="no")
-                    memmap_assign_elapsed_ms = (time.perf_counter() - memmap_assign_start) * 1000.0
-                    write_backend = "memmap_assign"
-                except Exception:
-                    write_backend = "pwrite_fallback"
-
-            if write_backend != "memmap_assign":
-                bytes_written = 0
-                pwrite_start = time.perf_counter()
-                while bytes_written < expected_nbytes:
-                    wrote = os.pwrite(
-                        write_fd, payload[bytes_written:], byte_offset + bytes_written
-                    )
-                    if wrote <= 0:
-                        raise OSError("feature row store append write failed")
-                    bytes_written += wrote
-                pwrite_elapsed_ms = (time.perf_counter() - pwrite_start) * 1000.0
+            bytes_written = 0
+            pwrite_start = time.perf_counter()
+            while bytes_written < expected_nbytes:
+                wrote = os.pwrite(write_fd, payload[bytes_written:], byte_offset + bytes_written)
+                if wrote <= 0:
+                    raise OSError("feature row store append write failed")
+                bytes_written += wrote
+            pwrite_elapsed_ms = (time.perf_counter() - pwrite_start) * 1000.0
             self._apply_row_store_cache_control_after_append(
                 write_fd=write_fd,
                 byte_offset=byte_offset,
@@ -911,8 +889,6 @@ class _FileBackedFeatureRowStore:
             "row_store_append_cpu_prepare_elapsed_ms": float(cpu_prepare_elapsed_ms),
             "row_store_append_contiguous_elapsed_ms": float(contiguous_elapsed_ms),
             "row_store_append_numpy_elapsed_ms": float(numpy_elapsed_ms),
-            "row_store_append_write_backend": str(write_backend),
-            "row_store_append_memmap_assign_elapsed_ms": float(memmap_assign_elapsed_ms),
             "row_store_append_pwrite_elapsed_ms": float(pwrite_elapsed_ms),
             "row_store_append_denominator_copy_elapsed_ms": float(denominator_copy_elapsed_ms),
             "row_store_append_total_elapsed_ms": float(

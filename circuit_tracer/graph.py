@@ -826,8 +826,6 @@ def compute_partial_feature_influences_streaming(
     active_row_scan_elapsed_ms_total = 0.0
     chunk_allocation_zero_fill_elapsed_ms_total = 0.0
     transfer_cast_abs_elapsed_ms_total = 0.0
-    transfer_cast_elapsed_ms_total = 0.0
-    abs_elapsed_ms_total = 0.0
     cache_lookup_elapsed_ms_total = 0.0
     cache_store_elapsed_ms_total = 0.0
     cache_eviction_elapsed_ms_total = 0.0
@@ -870,19 +868,6 @@ def compute_partial_feature_influences_streaming(
     def _tensor_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
 
-    def _prepare_chunk_for_compute(chunk: torch.Tensor) -> torch.Tensor:
-        nonlocal transfer_cast_abs_elapsed_ms_total, transfer_cast_elapsed_ms_total
-        nonlocal abs_elapsed_ms_total
-
-        prepare_start = time.perf_counter()
-        prepared = chunk.to(device=device, dtype=dtype, copy=True)
-        transfer_cast_elapsed_ms_total += (time.perf_counter() - prepare_start) * 1000.0
-        abs_start = time.perf_counter()
-        prepared.abs_()
-        abs_elapsed_ms_total += (time.perf_counter() - abs_start) * 1000.0
-        transfer_cast_abs_elapsed_ms_total += (time.perf_counter() - prepare_start) * 1000.0
-        return prepared
-
     def _drop_oldest_chunk() -> None:
         nonlocal chunk_cache_nbytes, chunk_cache_eviction_count, cache_eviction_elapsed_ms_total
         eviction_start = time.perf_counter()
@@ -923,7 +908,17 @@ def compute_partial_feature_influences_streaming(
                             "row_reader must return shape "
                             f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
                         )
-                    chunk = _prepare_chunk_for_compute(chunk)
+                    if chunk.device != device:
+                        transfer_cast_abs_start = time.perf_counter()
+                        chunk = chunk.to(device)
+                        transfer_cast_abs_elapsed_ms_total += (
+                            time.perf_counter() - transfer_cast_abs_start
+                        ) * 1000.0
+                    transfer_cast_abs_start = time.perf_counter()
+                    chunk = chunk.to(dtype=dtype).abs()
+                    transfer_cast_abs_elapsed_ms_total += (
+                        time.perf_counter() - transfer_cast_abs_start
+                    ) * 1000.0
                     cache_store_start = time.perf_counter()
                     if not cache_enabled:
                         chunk_cache_store_skip_disabled_count += 1
@@ -1008,7 +1003,17 @@ def compute_partial_feature_influences_streaming(
                                 f"({sub_end - sub_start}, {n_feature_nodes}) for rows "
                                 f"[{sub_start}, {sub_end})"
                             )
-                        subchunk = _prepare_chunk_for_compute(subchunk)
+                        if subchunk.device != device:
+                            transfer_cast_abs_start = time.perf_counter()
+                            subchunk = subchunk.to(device)
+                            transfer_cast_abs_elapsed_ms_total += (
+                                time.perf_counter() - transfer_cast_abs_start
+                            ) * 1000.0
+                        transfer_cast_abs_start = time.perf_counter()
+                        subchunk = subchunk.to(dtype=dtype).abs()
+                        transfer_cast_abs_elapsed_ms_total += (
+                            time.perf_counter() - transfer_cast_abs_start
+                        ) * 1000.0
                         chunk[sub_start - start : sub_end - start] = subchunk
                     cache_store_start = time.perf_counter()
                     if not cache_enabled:
@@ -1117,8 +1122,6 @@ def compute_partial_feature_influences_streaming(
                     chunk_allocation_zero_fill_elapsed_ms_total
                 ),
                 "transfer_cast_abs_elapsed_ms_total": float(transfer_cast_abs_elapsed_ms_total),
-                "transfer_cast_elapsed_ms_total": float(transfer_cast_elapsed_ms_total),
-                "abs_elapsed_ms_total": float(abs_elapsed_ms_total),
                 "cache_lookup_elapsed_ms_total": float(cache_lookup_elapsed_ms_total),
                 "cache_store_elapsed_ms_total": float(cache_store_elapsed_ms_total),
                 "cache_eviction_elapsed_ms_total": float(cache_eviction_elapsed_ms_total),
