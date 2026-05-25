@@ -705,6 +705,8 @@ def compute_partial_feature_influences_streaming(
     chunk_reuse_stats: dict[str, int | float | str] | None = None,
     compute_dtype: torch.dtype | None = None,
     active_row_only_chunks: bool = False,
+    row_reader_returns_prepared: bool = False,
+    active_row_accumulation: str = "zero_fill",
 ) -> torch.Tensor:
     """Compute feature-only partial influences from streamed dense row chunks.
 
@@ -772,6 +774,12 @@ def compute_partial_feature_influences_streaming(
         raise ValueError("compute_dtype must be float32 or float64 when provided")
     if not isinstance(active_row_only_chunks, bool):
         raise ValueError("active_row_only_chunks must be a bool")
+    if not isinstance(row_reader_returns_prepared, bool):
+        raise ValueError("row_reader_returns_prepared must be a bool")
+    if active_row_accumulation not in ("zero_fill", "direct_v1"):
+        raise ValueError("active_row_accumulation must be 'zero_fill' or 'direct_v1'")
+    if active_row_accumulation == "direct_v1" and not active_row_only_chunks:
+        raise ValueError("active_row_accumulation='direct_v1' requires active_row_only_chunks=True")
 
     if isinstance(row_abs_sums, torch.Tensor):
         row_denominator_device = row_abs_sums.device
@@ -825,6 +833,7 @@ def compute_partial_feature_influences_streaming(
     matmul_elapsed_ms_total = 0.0
     active_row_scan_elapsed_ms_total = 0.0
     chunk_allocation_zero_fill_elapsed_ms_total = 0.0
+    direct_accumulation_elapsed_ms_total = 0.0
     transfer_cast_abs_elapsed_ms_total = 0.0
     cache_lookup_elapsed_ms_total = 0.0
     cache_store_elapsed_ms_total = 0.0
@@ -835,6 +844,31 @@ def compute_partial_feature_influences_streaming(
     row_chunk_strategy = (
         "active_row_contiguous_chunks" if active_row_only_chunks else "fixed_row_chunks"
     )
+    active_row_direct_accumulation = int(active_row_accumulation == "direct_v1")
+    direct_accumulation_subrange_count = 0
+
+    def _prepare_chunk(chunk: torch.Tensor) -> torch.Tensor:
+        nonlocal transfer_cast_abs_elapsed_ms_total
+        if chunk.device != device:
+            transfer_cast_abs_start = time.perf_counter()
+            chunk = chunk.to(device)
+            transfer_cast_abs_elapsed_ms_total += (
+                time.perf_counter() - transfer_cast_abs_start
+            ) * 1000.0
+        if chunk.dtype != dtype:
+            transfer_cast_abs_start = time.perf_counter()
+            chunk = chunk.to(dtype=dtype)
+            transfer_cast_abs_elapsed_ms_total += (
+                time.perf_counter() - transfer_cast_abs_start
+            ) * 1000.0
+        if row_reader_returns_prepared:
+            return chunk
+        transfer_cast_abs_start = time.perf_counter()
+        chunk = chunk.abs()
+        transfer_cast_abs_elapsed_ms_total += (
+            time.perf_counter() - transfer_cast_abs_start
+        ) * 1000.0
+        return chunk
 
     def _iter_active_row_subranges(
         chunk_start: int,
@@ -908,17 +942,7 @@ def compute_partial_feature_influences_streaming(
                             "row_reader must return shape "
                             f"({end - start}, {n_feature_nodes}) for rows [{start}, {end})"
                         )
-                    if chunk.device != device:
-                        transfer_cast_abs_start = time.perf_counter()
-                        chunk = chunk.to(device)
-                        transfer_cast_abs_elapsed_ms_total += (
-                            time.perf_counter() - transfer_cast_abs_start
-                        ) * 1000.0
-                    transfer_cast_abs_start = time.perf_counter()
-                    chunk = chunk.to(dtype=dtype).abs()
-                    transfer_cast_abs_elapsed_ms_total += (
-                        time.perf_counter() - transfer_cast_abs_start
-                    ) * 1000.0
+                    chunk = _prepare_chunk(chunk)
                     cache_store_start = time.perf_counter()
                     if not cache_enabled:
                         chunk_cache_store_skip_disabled_count += 1
@@ -980,6 +1004,47 @@ def compute_partial_feature_influences_streaming(
                 cache_lookup_start = time.perf_counter()
                 cached_chunk = chunk_cache.get(cache_key) if cache_enabled else None
                 cache_lookup_elapsed_ms_total += (time.perf_counter() - cache_lookup_start) * 1000.0
+                if cached_chunk is None and active_row_accumulation == "direct_v1":
+                    chunk_cache_miss_count += 1
+                    for sub_start, sub_end in active_row_subranges:
+                        row_reader_start = time.perf_counter()
+                        subchunk = row_reader(sub_start, sub_end)
+                        row_reader_elapsed_ms_total += (
+                            time.perf_counter() - row_reader_start
+                        ) * 1000.0
+                        row_reader_call_count += 1
+                        row_reader_row_count += int(sub_end - sub_start)
+                        if subchunk.ndim != 2 or subchunk.shape != (
+                            sub_end - sub_start,
+                            n_feature_nodes,
+                        ):
+                            raise ValueError(
+                                "row_reader must return shape "
+                                f"({sub_end - sub_start}, {n_feature_nodes}) for rows "
+                                f"[{sub_start}, {sub_end})"
+                            )
+                        subchunk = _prepare_chunk(subchunk)
+                        normalization_start = time.perf_counter()
+                        sub_weights = _normalize_row_weights_from_denominator(
+                            row_weights[sub_start:sub_end],
+                            denom_mode=denom_mode,
+                            denom_primary=denom_primary[sub_start:sub_end],
+                            denom_secondary=(
+                                denom_secondary[sub_start:sub_end]
+                                if denom_secondary is not None
+                                else None
+                            ),
+                        )
+                        normalization_elapsed_ms_total += (
+                            time.perf_counter() - normalization_start
+                        ) * 1000.0
+                        direct_start = time.perf_counter()
+                        next_feature_prod += sub_weights @ subchunk
+                        direct_accumulation_elapsed_ms_total += (
+                            time.perf_counter() - direct_start
+                        ) * 1000.0
+                        direct_accumulation_subrange_count += 1
+                    continue
                 if cached_chunk is None:
                     allocation_start = time.perf_counter()
                     chunk = torch.zeros((end - start, n_feature_nodes), device=device, dtype=dtype)
@@ -1003,17 +1068,7 @@ def compute_partial_feature_influences_streaming(
                                 f"({sub_end - sub_start}, {n_feature_nodes}) for rows "
                                 f"[{sub_start}, {sub_end})"
                             )
-                        if subchunk.device != device:
-                            transfer_cast_abs_start = time.perf_counter()
-                            subchunk = subchunk.to(device)
-                            transfer_cast_abs_elapsed_ms_total += (
-                                time.perf_counter() - transfer_cast_abs_start
-                            ) * 1000.0
-                        transfer_cast_abs_start = time.perf_counter()
-                        subchunk = subchunk.to(dtype=dtype).abs()
-                        transfer_cast_abs_elapsed_ms_total += (
-                            time.perf_counter() - transfer_cast_abs_start
-                        ) * 1000.0
+                        subchunk = _prepare_chunk(subchunk)
                         chunk[sub_start - start : sub_end - start] = subchunk
                     cache_store_start = time.perf_counter()
                     if not cache_enabled:
@@ -1081,6 +1136,7 @@ def compute_partial_feature_influences_streaming(
             + matmul_elapsed_ms_total
             + active_row_scan_elapsed_ms_total
             + chunk_allocation_zero_fill_elapsed_ms_total
+            + direct_accumulation_elapsed_ms_total
             + transfer_cast_abs_elapsed_ms_total
             + cache_lookup_elapsed_ms_total
             + cache_store_elapsed_ms_total
@@ -1104,6 +1160,11 @@ def compute_partial_feature_influences_streaming(
                 "chunk_cache_nbytes": int(chunk_cache_nbytes),
                 "row_chunk_strategy": row_chunk_strategy,
                 "active_row_only_chunks": int(active_row_only_chunks),
+                "active_row_accumulation_mode": active_row_accumulation,
+                "active_row_direct_accumulation": int(active_row_direct_accumulation),
+                "direct_accumulation_subrange_count": int(direct_accumulation_subrange_count),
+                "direct_accumulation_elapsed_ms_total": float(direct_accumulation_elapsed_ms_total),
+                "prepared_row_reader_enabled": int(row_reader_returns_prepared),
                 "active_row_chunk_count": int(active_row_chunk_count),
                 "active_row_range_count": int(active_row_range_count),
                 "row_weight_nonzero_row_count": int(row_weight_nonzero_row_count),

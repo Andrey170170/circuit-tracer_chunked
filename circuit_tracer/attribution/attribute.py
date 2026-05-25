@@ -151,6 +151,8 @@ def attribute(
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_refresh_prepared_chunk_cache_bytes: int = 0,
+    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "zero_fill",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
     phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
@@ -248,6 +250,8 @@ def attribute(
         or bool(phase4_scheduler_debug)
         or phase4_scheduler_telemetry_detail != "normal"
         or phase4_refresh_optimization != "off"
+        or phase4_refresh_prepared_chunk_cache_bytes != 0
+        or phase4_refresh_active_row_accumulation != "zero_fill"
         or phase4_row_executor != "batched"
         or phase1_trace_batch_policy != "legacy"
         or phase1_trace_batch_size_max is not None
@@ -296,6 +300,8 @@ def attribute(
             phase4_scheduler_debug=phase4_scheduler_debug,
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             phase4_refresh_optimization=phase4_refresh_optimization,
+            phase4_refresh_prepared_chunk_cache_bytes=phase4_refresh_prepared_chunk_cache_bytes,
+            phase4_refresh_active_row_accumulation=phase4_refresh_active_row_accumulation,
             phase4_row_executor=phase4_row_executor,
             phase4_row_reduction=phase4_row_reduction,
             phase1_trace_batch_policy=phase1_trace_batch_policy,

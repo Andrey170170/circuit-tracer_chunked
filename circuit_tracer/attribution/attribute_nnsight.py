@@ -553,6 +553,7 @@ class _FileBackedFeatureRowStore:
         dtype: torch.dtype,
         row_abs_sum_dtype: torch.dtype = torch.float32,
         read_chunk_cache_bytes: int = 0,
+        prepared_read_cache_bytes: int = 0,
         row_store_cache_control_mode: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
         temp_root_policy: Literal["default", "env_node_local"] = "default",
         temp_root: str | os.PathLike[str] | None = None,
@@ -619,6 +620,11 @@ class _FileBackedFeatureRowStore:
         self._read_chunk_cache_max_bytes = max(0, int(read_chunk_cache_bytes))
         self._read_chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
         self._read_chunk_cache_nbytes = 0
+        self._prepared_read_cache_max_bytes = max(0, int(prepared_read_cache_bytes))
+        self._prepared_read_cache: OrderedDict[tuple[str, int, int, str, str], torch.Tensor] = (
+            OrderedDict()
+        )
+        self._prepared_read_cache_nbytes = 0
         self._telemetry_recorder = telemetry_recorder
         self._closed = False
         self._diagnostic_stats: dict[str, object] = {
@@ -663,6 +669,22 @@ class _FileBackedFeatureRowStore:
             "read_cache_entry_count": 0,
             "read_cache_nbytes": 0,
             "read_cache_max_bytes": int(self._read_chunk_cache_max_bytes),
+            "prepared_read_cache_enabled": int(self._prepared_read_cache_max_bytes > 0),
+            "prepared_read_cache_max_bytes": int(self._prepared_read_cache_max_bytes),
+            "prepared_read_cache_entry_count": 0,
+            "prepared_read_cache_nbytes": 0,
+            "prepared_read_cache_hit_count": 0,
+            "prepared_read_cache_miss_count": 0,
+            "prepared_read_cache_hit_row_count": 0,
+            "prepared_read_cache_miss_row_count": 0,
+            "prepared_read_cache_eviction_count": 0,
+            "prepared_read_cache_invalidation_count": 0,
+            "prepared_read_cache_invalidation_entry_count": 0,
+            "prepared_read_cache_store_attempt_count": 0,
+            "prepared_read_cache_store_success_count": 0,
+            "prepared_read_cache_store_skip_disabled_count": 0,
+            "prepared_read_cache_store_skip_too_large_count": 0,
+            "prepared_read_cache_prepare_elapsed_ms_total": 0.0,
             "materialize_call_count": 0,
             "materialize_row_count": 0,
             "materialize_column_count": 0,
@@ -713,6 +735,12 @@ class _FileBackedFeatureRowStore:
         self._diagnostic_stats["read_cache_entry_count"] = int(len(self._read_chunk_cache))
         self._diagnostic_stats["read_cache_nbytes"] = int(self._read_chunk_cache_nbytes)
 
+    def _sync_prepared_read_cache_snapshot(self) -> None:
+        self._diagnostic_stats["prepared_read_cache_entry_count"] = int(
+            len(self._prepared_read_cache)
+        )
+        self._diagnostic_stats["prepared_read_cache_nbytes"] = int(self._prepared_read_cache_nbytes)
+
     def _drop_read_chunk(self, key: tuple[int, int], *, count_eviction: bool = True) -> None:
         chunk = self._read_chunk_cache.pop(key, None)
         if chunk is None:
@@ -725,6 +753,47 @@ class _FileBackedFeatureRowStore:
             self._diagnostic_stats["read_cache_eviction_count"] = (
                 int(self._diagnostic_stats["read_cache_eviction_count"] or 0) + 1
             )
+
+    def _drop_prepared_read_chunk(
+        self,
+        key: tuple[str, int, int, str, str],
+        *,
+        count_eviction: bool = True,
+    ) -> None:
+        chunk = self._prepared_read_cache.pop(key, None)
+        if chunk is None:
+            return
+        self._prepared_read_cache_nbytes = max(
+            0,
+            self._prepared_read_cache_nbytes - self._tensor_nbytes(chunk),
+        )
+        if count_eviction:
+            self._increment_diagnostic_counter("prepared_read_cache_eviction_count")
+
+    def _insert_prepared_read_chunk(
+        self,
+        key: tuple[str, int, int, str, str],
+        chunk: torch.Tensor,
+    ) -> str:
+        self._increment_diagnostic_counter("prepared_read_cache_store_attempt_count")
+        if self._prepared_read_cache_max_bytes <= 0:
+            self._increment_diagnostic_counter("prepared_read_cache_store_skip_disabled_count")
+            return "disabled"
+        chunk_nbytes = self._tensor_nbytes(chunk)
+        if chunk_nbytes > self._prepared_read_cache_max_bytes:
+            self._increment_diagnostic_counter("prepared_read_cache_store_skip_too_large_count")
+            return "too_large"
+        while (
+            self._prepared_read_cache
+            and self._prepared_read_cache_nbytes + chunk_nbytes
+            > self._prepared_read_cache_max_bytes
+        ):
+            self._drop_prepared_read_chunk(next(iter(self._prepared_read_cache)))
+        self._prepared_read_cache[key] = chunk
+        self._prepared_read_cache.move_to_end(key)
+        self._prepared_read_cache_nbytes += chunk_nbytes
+        self._increment_diagnostic_counter("prepared_read_cache_store_success_count")
+        return "stored"
 
     def _insert_read_chunk(self, key: tuple[int, int], chunk: torch.Tensor) -> str:
         self._diagnostic_stats["read_cache_store_attempt_count"] = (
@@ -766,6 +835,21 @@ class _FileBackedFeatureRowStore:
         ]
         for key in overlapping:
             self._drop_read_chunk(key, count_eviction=True)
+
+    def _evict_overlapping_prepared_read_chunks(self, row_start: int, row_end: int) -> None:
+        if not self._prepared_read_cache:
+            return
+        overlapping = [
+            key for key in self._prepared_read_cache if key[1] < row_end and key[2] > row_start
+        ]
+        if overlapping:
+            self._increment_diagnostic_counter("prepared_read_cache_invalidation_count")
+            self._increment_diagnostic_counter(
+                "prepared_read_cache_invalidation_entry_count",
+                delta=len(overlapping),
+            )
+        for key in overlapping:
+            self._drop_prepared_read_chunk(key, count_eviction=False)
 
     def _increment_diagnostic_counter(self, key: str, *, delta: int = 1) -> None:
         self._diagnostic_stats[key] = int(self._diagnostic_stats.get(key, 0) or 0) + int(delta)
@@ -934,7 +1018,9 @@ class _FileBackedFeatureRowStore:
             self._diagnostic_stats["append_row_count"] or 0
         ) + int(row_count)
         self._evict_overlapping_read_chunks(row_start, row_end)
+        self._evict_overlapping_prepared_read_chunks(row_start, row_end)
         self._sync_read_cache_snapshot()
+        self._sync_prepared_read_cache_snapshot()
         return {
             "row_store_append_cpu_prepare_elapsed_ms": float(cpu_prepare_elapsed_ms),
             "row_store_append_contiguous_elapsed_ms": float(contiguous_elapsed_ms),
@@ -1002,6 +1088,61 @@ class _FileBackedFeatureRowStore:
                 int(self._diagnostic_stats["read_cache_miss_row_count"] or 0) + row_count
             )
         self._sync_read_cache_snapshot()
+        return result
+
+    def read_prepared_feature_rows(
+        self,
+        row_start: int,
+        row_end: int,
+        *,
+        device,
+        dtype: torch.dtype,
+        phase: str | None = None,
+    ) -> torch.Tensor:
+        if row_start < 0 or row_end < row_start or row_end > self.n_rows:
+            raise ValueError("requested row slice is out of bounds for file-backed store")
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError("prepared row dtype must be float32 or float64")
+        device_obj = torch.device(device)
+        if device_obj.type == "cuda" and device_obj.index is None and torch.cuda.is_available():
+            device_obj = torch.device("cuda", torch.cuda.current_device())
+        cache_key = ("abs_v1", int(row_start), int(row_end), str(device_obj), str(dtype))
+        cached = self._prepared_read_cache.get(cache_key)
+        cache_hit = cached is not None
+        row_count = int(row_end - row_start)
+        with self._telemetry_timer(
+            name="feature_row_store.read_prepared_rows",
+            phase=phase,
+            attrs={
+                "row_start": row_start,
+                "row_end": row_end,
+                "row_count": row_count,
+                "device": str(device_obj),
+                "dtype": str(dtype),
+                "cache_hit": cache_hit,
+            },
+        ):
+            if cached is not None:
+                self._prepared_read_cache.move_to_end(cache_key)
+                result = cached
+            else:
+                prepare_start = time.perf_counter()
+                result = self.read_feature_rows(row_start, row_end, phase=phase)
+                result = result.to(device=device_obj, dtype=dtype).abs()
+                elapsed = (time.perf_counter() - prepare_start) * 1000.0
+                self._diagnostic_stats["prepared_read_cache_prepare_elapsed_ms_total"] = float(
+                    self._diagnostic_stats["prepared_read_cache_prepare_elapsed_ms_total"] or 0.0
+                ) + float(elapsed)
+                self._insert_prepared_read_chunk(cache_key, result)
+        if cache_hit:
+            self._increment_diagnostic_counter("prepared_read_cache_hit_count")
+            self._increment_diagnostic_counter("prepared_read_cache_hit_row_count", delta=row_count)
+        else:
+            self._increment_diagnostic_counter("prepared_read_cache_miss_count")
+            self._increment_diagnostic_counter(
+                "prepared_read_cache_miss_row_count", delta=row_count
+            )
+        self._sync_prepared_read_cache_snapshot()
         return result
 
     def materialize_dense_feature_slice(
@@ -1108,7 +1249,10 @@ class _FileBackedFeatureRowStore:
 
         self._read_chunk_cache.clear()
         self._read_chunk_cache_nbytes = 0
+        self._prepared_read_cache.clear()
+        self._prepared_read_cache_nbytes = 0
         self._sync_read_cache_snapshot()
+        self._sync_prepared_read_cache_snapshot()
 
         self._tmpdir.cleanup()
 
@@ -4166,6 +4310,7 @@ def _build_phase4_refresh_substage_telemetry(
             for source_key, telemetry_key in {
                 "active_row_scan_elapsed_ms_total": "refresh_active_row_scan_elapsed_ms",
                 "chunk_allocation_zero_fill_elapsed_ms_total": "refresh_chunk_allocation_zero_fill_elapsed_ms",
+                "direct_accumulation_elapsed_ms_total": "refresh_direct_accumulation_elapsed_ms",
                 "transfer_cast_abs_elapsed_ms_total": "refresh_transfer_cast_abs_elapsed_ms",
                 "cache_lookup_elapsed_ms_total": "refresh_cache_lookup_elapsed_ms",
                 "cache_store_elapsed_ms_total": "refresh_cache_store_elapsed_ms",
@@ -4175,6 +4320,14 @@ def _build_phase4_refresh_substage_telemetry(
                 "unaccounted_elapsed_ms_total": "refresh_unaccounted_elapsed_ms",
             }.items():
                 payload[telemetry_key] = _safe_float(streaming_chunk_reuse_stats.get(source_key))
+            for source_key, telemetry_key in {
+                "active_row_accumulation_mode": "refresh_active_row_accumulation_mode",
+                "active_row_direct_accumulation": "refresh_active_row_direct_accumulation",
+                "direct_accumulation_subrange_count": "refresh_direct_accumulation_subrange_count",
+                "prepared_row_reader_enabled": "refresh_prepared_row_reader_enabled",
+            }.items():
+                value = streaming_chunk_reuse_stats.get(source_key)
+                payload[telemetry_key] = value if isinstance(value, str) else _safe_int(value)
     return payload
 
 
@@ -6465,6 +6618,8 @@ def attribute(
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_refresh_prepared_chunk_cache_bytes: int = 0,
+    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "zero_fill",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
     phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
@@ -6703,6 +6858,8 @@ def attribute(
             phase4_scheduler_debug=phase4_scheduler_debug,
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             phase4_refresh_optimization=phase4_refresh_optimization,
+            phase4_refresh_prepared_chunk_cache_bytes=phase4_refresh_prepared_chunk_cache_bytes,
+            phase4_refresh_active_row_accumulation=phase4_refresh_active_row_accumulation,
             phase4_row_executor=phase4_row_executor,
             phase4_row_reduction=phase4_row_reduction,
             phase1_trace_batch_policy=phase1_trace_batch_policy,
@@ -6781,6 +6938,8 @@ def _run_attribution(
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
     phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_refresh_prepared_chunk_cache_bytes: int = 0,
+    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "zero_fill",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
     phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
@@ -6852,6 +7011,12 @@ def _run_attribution(
         raise ValueError("feature_batch_min_free_fraction must be in [0, 1)")
     if feature_batch_probe_batches <= 0:
         raise ValueError("feature_batch_probe_batches must be > 0")
+    if phase4_refresh_prepared_chunk_cache_bytes < 0:
+        raise ValueError("phase4_refresh_prepared_chunk_cache_bytes must be >= 0")
+    if phase4_refresh_active_row_accumulation not in ("zero_fill", "direct_v1"):
+        raise ValueError(
+            "phase4_refresh_active_row_accumulation must be 'zero_fill' or 'direct_v1'"
+        )
     if phase0_replay_mode_resolved == "disabled" and phase0_donor_bundle_path is not None:
         raise ValueError(
             "phase0_donor_bundle was provided but phase0_replay_mode is disabled; "
@@ -6915,6 +7080,35 @@ def _run_attribution(
     )
     phase4_refresh_optimization_metadata = _build_phase4_refresh_optimization_metadata(
         phase4_refresh_optimization_config
+    )
+    phase4_refresh_aux_applicable = bool(
+        use_compact_feature_row_store and phase4_refresh_optimization_config.effective_mode == "v1"
+    )
+    phase4_refresh_prepared_chunk_cache_bytes_effective = (
+        int(phase4_refresh_prepared_chunk_cache_bytes) if phase4_refresh_aux_applicable else 0
+    )
+    phase4_refresh_active_row_accumulation_effective = (
+        phase4_refresh_active_row_accumulation if phase4_refresh_aux_applicable else "zero_fill"
+    )
+    phase4_refresh_aux_fallback_reason = None if phase4_refresh_aux_applicable else "not_applicable"
+    phase4_refresh_optimization_metadata.update(
+        {
+            "refresh_prepared_chunk_cache_bytes_requested": int(
+                phase4_refresh_prepared_chunk_cache_bytes
+            ),
+            "refresh_prepared_chunk_cache_bytes_effective": int(
+                phase4_refresh_prepared_chunk_cache_bytes_effective
+            ),
+            "refresh_prepared_chunk_cache_enabled": bool(
+                phase4_refresh_prepared_chunk_cache_bytes_effective > 0
+            ),
+            "refresh_active_row_accumulation_requested": phase4_refresh_active_row_accumulation,
+            "refresh_active_row_accumulation_effective": (
+                phase4_refresh_active_row_accumulation_effective
+            ),
+            "refresh_active_row_accumulation_fallback_reason": phase4_refresh_aux_fallback_reason,
+            "refresh_active_row_accumulation_applicable": bool(phase4_refresh_aux_applicable),
+        }
     )
     phase4_row_executor_config = _resolve_phase4_row_executor_config(
         phase4_row_executor,
@@ -7965,6 +8159,7 @@ def _run_attribution(
                 dtype=exact_trace_internal_dtype_resolved,
                 row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
                 read_chunk_cache_bytes=256 * 1024 * 1024,
+                prepared_read_cache_bytes=phase4_refresh_prepared_chunk_cache_bytes_effective,
                 row_store_cache_control_mode=row_store_cache_control_config.effective_mode,
                 temp_root_policy=row_store_temp_root_policy_resolved,
                 temp_root=row_store_temp_root,
@@ -9141,12 +9336,30 @@ def _run_attribution(
                         feature_row_store.row_abs_max[:st],
                         feature_row_store.row_l1_scaled[:st],
                     )
+                    refresh_prepared_row_reader = bool(
+                        phase4_refresh_prepared_chunk_cache_bytes_effective > 0
+                    )
+                    if refresh_prepared_row_reader:
+
+                        def refresh_row_reader(row_start: int, row_end: int) -> torch.Tensor:
+                            return feature_row_store.read_prepared_feature_rows(
+                                row_start,
+                                row_end,
+                                device=feature_row_store.row_abs_max.device,
+                                dtype=influence_compute_dtype,
+                                phase="phase4",
+                            )
+                    else:
+
+                        def refresh_row_reader(row_start: int, row_end: int) -> torch.Tensor:
+                            return feature_row_store.read_feature_rows(
+                                row_start,
+                                row_end,
+                                phase="phase4",
+                            )
+
                     feature_influences = compute_partial_feature_influences_streaming(
-                        lambda row_start, row_end: feature_row_store.read_feature_rows(
-                            row_start,
-                            row_end,
-                            phase="phase4",
-                        ),
+                        refresh_row_reader,
                         row_denominator_prefix,
                         phase4_logit_probabilities,
                         row_to_node_index[:st],
@@ -9156,6 +9369,8 @@ def _run_attribution(
                         chunk_reuse_stats=streaming_chunk_reuse_stats,
                         compute_dtype=influence_compute_dtype,
                         active_row_only_chunks=refresh_active_row_only_chunks,
+                        row_reader_returns_prepared=refresh_prepared_row_reader,
+                        active_row_accumulation=phase4_refresh_active_row_accumulation_effective,
                     )
                     refresh_row_store_read_elapsed_ms = _safe_float(
                         streaming_chunk_reuse_stats.get("row_reader_elapsed_ms_total")
@@ -9166,6 +9381,13 @@ def _run_attribution(
                     refresh_influence_matmul_elapsed_ms = _safe_float(
                         streaming_chunk_reuse_stats.get("matmul_elapsed_ms_total")
                     )
+                    refresh_direct_accumulation_elapsed_ms = _safe_float(
+                        streaming_chunk_reuse_stats.get("direct_accumulation_elapsed_ms_total")
+                    )
+                    if refresh_direct_accumulation_elapsed_ms is not None:
+                        refresh_influence_matmul_elapsed_ms = float(
+                            refresh_influence_matmul_elapsed_ms or 0.0
+                        ) + float(refresh_direct_accumulation_elapsed_ms)
                     refresh_chunk_request_count = _safe_int(
                         streaming_chunk_reuse_stats.get("chunk_request_count")
                     )
@@ -10750,6 +10972,21 @@ def _run_attribution(
                 "phase4_refresh_optimization_reference_execution": bool(
                     phase4_refresh_optimization_config.requested_mode
                     != phase4_refresh_optimization_config.effective_mode
+                ),
+                "phase4_refresh_prepared_chunk_cache_bytes_requested": int(
+                    phase4_refresh_prepared_chunk_cache_bytes
+                ),
+                "phase4_refresh_prepared_chunk_cache_bytes_effective": int(
+                    phase4_refresh_prepared_chunk_cache_bytes_effective
+                ),
+                "phase4_refresh_prepared_chunk_cache_enabled": bool(
+                    phase4_refresh_prepared_chunk_cache_bytes_effective > 0
+                ),
+                "phase4_refresh_active_row_accumulation_requested": phase4_refresh_active_row_accumulation,
+                "phase4_refresh_active_row_accumulation_effective": phase4_refresh_active_row_accumulation_effective,
+                "phase4_refresh_active_row_accumulation_fallback_reason": phase4_refresh_aux_fallback_reason,
+                "phase4_refresh_active_row_accumulation_applicable": bool(
+                    phase4_refresh_aux_applicable
                 ),
                 "phase4_row_executor_requested": phase4_row_executor_config.requested_mode,
                 "phase4_row_executor": phase4_row_executor_config.requested_mode,

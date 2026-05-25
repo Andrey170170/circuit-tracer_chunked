@@ -71,6 +71,63 @@ def test_file_backed_feature_row_store_emits_structured_events() -> None:
     assert "feature_row_store.materialize_dense_slice" in names
 
 
+def test_file_backed_feature_row_store_prepared_cache_hits_invalidates_and_skips() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=3,
+        n_feature_columns=2,
+        dtype=torch.float32,
+        prepared_read_cache_bytes=32,
+    )
+    try:
+        rows = torch.tensor([[-1.0, 2.0], [3.0, -4.0], [5.0, 6.0]], dtype=torch.float32)
+        store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=_compute_row_denominator_scaled_l1(rows, dtype=torch.float32),
+        )
+        first = store.read_prepared_feature_rows(0, 2, device="cpu", dtype=torch.float32)
+        second = store.read_prepared_feature_rows(0, 2, device="cpu", dtype=torch.float32)
+        assert torch.equal(first, rows[:2].abs())
+        assert second.data_ptr() == first.data_ptr()
+
+        store.append_rows(
+            row_start=1,
+            feature_rows=torch.tensor([[7.0, -8.0]], dtype=torch.float32),
+            row_denominator_scaled_l1=_compute_row_denominator_scaled_l1(
+                torch.tensor([[7.0, -8.0]], dtype=torch.float32), dtype=torch.float32
+            ),
+        )
+        refreshed = store.read_prepared_feature_rows(0, 2, device="cpu", dtype=torch.float32)
+        assert torch.equal(refreshed, torch.tensor([[1.0, 2.0], [7.0, 8.0]]))
+        stats = store.get_diagnostic_snapshot()
+        assert stats["prepared_read_cache_hit_count"] == 1
+        assert stats["prepared_read_cache_miss_count"] == 2
+        assert stats["prepared_read_cache_invalidation_entry_count"] == 1
+        assert stats["prepared_read_cache_store_success_count"] >= 2
+    finally:
+        store.cleanup()
+
+    tiny_store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=2,
+        dtype=torch.float32,
+        prepared_read_cache_bytes=4,
+    )
+    try:
+        rows = torch.ones((2, 2), dtype=torch.float32)
+        tiny_store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=_compute_row_denominator_scaled_l1(rows, dtype=torch.float32),
+        )
+        tiny_store.read_prepared_feature_rows(0, 2, device="cpu", dtype=torch.float32)
+        tiny_stats = tiny_store.get_diagnostic_snapshot()
+        assert tiny_stats["prepared_read_cache_store_skip_too_large_count"] == 1
+        assert tiny_stats["prepared_read_cache_entry_count"] == 0
+    finally:
+        tiny_store.cleanup()
+
+
 def test_file_backed_feature_row_store_temp_root_default_and_explicit(tmp_path) -> None:
     default_store = _FileBackedFeatureRowStore(
         n_rows=1,
