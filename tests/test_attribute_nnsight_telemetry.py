@@ -448,7 +448,7 @@ def test_phase4_scheduler_defaults_match_between_public_entrypoints() -> None:
     assert (
         entrypoint_sig.parameters["phase4_refresh_optimization"].default
         == nnsight_sig.parameters["phase4_refresh_optimization"].default
-        == "off"
+        == "v1"
     )
     assert (
         entrypoint_sig.parameters["phase4_row_executor"].default

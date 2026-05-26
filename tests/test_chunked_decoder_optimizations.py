@@ -2722,6 +2722,22 @@ def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
             "accounted_elapsed_ms_total": 8.8,
             "unaccounted_elapsed_ms_total": 1.2,
         },
+        feature_row_store_read_stats={
+            "prepared_read_cache_hit_count": 1,
+            "prepared_read_cache_miss_count": 2,
+            "prepared_read_cache_hit_row_count": 3,
+            "prepared_read_cache_miss_row_count": 4,
+            "prepared_read_cache_eviction_count": 5,
+            "prepared_read_cache_invalidation_count": 6,
+            "prepared_read_cache_invalidation_entry_count": 7,
+            "prepared_read_cache_store_attempt_count": 8,
+            "prepared_read_cache_store_success_count": 9,
+            "prepared_read_cache_store_skip_disabled_count": 10,
+            "prepared_read_cache_store_skip_too_large_count": 11,
+            "prepared_read_cache_prepare_elapsed_ms_total": 12.5,
+            "prepared_read_cache_entry_count": 13,
+            "prepared_read_cache_nbytes": 14,
+        },
     )
 
     assert telemetry["refresh_row_store_read_elapsed_ms"] == pytest.approx(4.0)
@@ -2745,6 +2761,22 @@ def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
     assert telemetry["refresh_row_weight_update_elapsed_ms"] == pytest.approx(0.7)
     assert telemetry["refresh_accounted_elapsed_ms"] == pytest.approx(8.8)
     assert telemetry["refresh_unaccounted_elapsed_ms"] == pytest.approx(1.2)
+    assert telemetry["feature_row_store_prepared_read_cache_hits"] == 1
+    assert telemetry["feature_row_store_prepared_read_cache_misses"] == 2
+    assert telemetry["feature_row_store_prepared_read_cache_hit_rows"] == 3
+    assert telemetry["feature_row_store_prepared_read_cache_miss_rows"] == 4
+    assert telemetry["feature_row_store_prepared_read_cache_evictions"] == 5
+    assert telemetry["feature_row_store_prepared_read_cache_invalidations"] == 6
+    assert telemetry["feature_row_store_prepared_read_cache_invalidation_entries"] == 7
+    assert telemetry["feature_row_store_prepared_read_cache_store_attempts"] == 8
+    assert telemetry["feature_row_store_prepared_read_cache_store_success"] == 9
+    assert telemetry["feature_row_store_prepared_read_cache_store_skip_disabled"] == 10
+    assert telemetry["feature_row_store_prepared_read_cache_store_skip_too_large"] == 11
+    assert telemetry["feature_row_store_prepared_read_cache_prepare_elapsed_ms"] == pytest.approx(
+        12.5
+    )
+    assert telemetry["feature_row_store_prepared_read_cache_entry_count"] == 13
+    assert telemetry["feature_row_store_prepared_read_cache_nbytes"] == 14
 
 
 def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
@@ -3041,7 +3073,7 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
         phase4_scheduler_mode="locality",
         phase4_scheduler_debug=False,
         phase4_scheduler_telemetry_detail="normal",
-        phase4_refresh_optimization="off",
+        phase4_refresh_optimization="v1",
         phase4_row_executor="batched",
         phase1_trace_batch_policy="legacy",
         phase1_trace_batch_size_max=None,
@@ -3074,7 +3106,7 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
         {"phase4_scheduler_mode": "planner_v2"},
         {"phase4_scheduler_debug": True},
         {"phase4_scheduler_telemetry_detail": "summary"},
-        {"phase4_refresh_optimization": "v1"},
+        {"phase4_refresh_optimization": "off"},
         {"phase4_row_executor": "streaming_v1"},
         {"phase1_trace_batch_policy": "cap_effective_batches"},
         {"phase1_trace_batch_size_max": 8},

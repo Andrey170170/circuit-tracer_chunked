@@ -4279,6 +4279,7 @@ def _build_phase4_refresh_substage_telemetry(
     row_reader_overread_zero_row_count: int | None = None,
     active_row_range_count: int | None = None,
     streaming_chunk_reuse_stats: dict[str, object] | None = None,
+    feature_row_store_read_stats: dict[str, object] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "refresh_partial_influence_elapsed_ms": float(partial_influence_elapsed_ms),
@@ -4328,6 +4329,26 @@ def _build_phase4_refresh_substage_telemetry(
             }.items():
                 value = streaming_chunk_reuse_stats.get(source_key)
                 payload[telemetry_key] = value if isinstance(value, str) else _safe_int(value)
+        if feature_row_store_read_stats is not None:
+            for source_key, telemetry_key in {
+                "prepared_read_cache_hit_count": "feature_row_store_prepared_read_cache_hits",
+                "prepared_read_cache_miss_count": "feature_row_store_prepared_read_cache_misses",
+                "prepared_read_cache_hit_row_count": "feature_row_store_prepared_read_cache_hit_rows",
+                "prepared_read_cache_miss_row_count": "feature_row_store_prepared_read_cache_miss_rows",
+                "prepared_read_cache_eviction_count": "feature_row_store_prepared_read_cache_evictions",
+                "prepared_read_cache_invalidation_count": "feature_row_store_prepared_read_cache_invalidations",
+                "prepared_read_cache_invalidation_entry_count": "feature_row_store_prepared_read_cache_invalidation_entries",
+                "prepared_read_cache_store_attempt_count": "feature_row_store_prepared_read_cache_store_attempts",
+                "prepared_read_cache_store_success_count": "feature_row_store_prepared_read_cache_store_success",
+                "prepared_read_cache_store_skip_disabled_count": "feature_row_store_prepared_read_cache_store_skip_disabled",
+                "prepared_read_cache_store_skip_too_large_count": "feature_row_store_prepared_read_cache_store_skip_too_large",
+                "prepared_read_cache_entry_count": "feature_row_store_prepared_read_cache_entry_count",
+                "prepared_read_cache_nbytes": "feature_row_store_prepared_read_cache_nbytes",
+            }.items():
+                payload[telemetry_key] = _safe_int(feature_row_store_read_stats.get(source_key))
+            payload["feature_row_store_prepared_read_cache_prepare_elapsed_ms"] = _safe_float(
+                feature_row_store_read_stats.get("prepared_read_cache_prepare_elapsed_ms_total")
+            )
     return payload
 
 
@@ -6617,9 +6638,9 @@ def attribute(
     phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
-    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_refresh_optimization: Literal["off", "v1"] = "v1",
     phase4_refresh_prepared_chunk_cache_bytes: int = 0,
-    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "zero_fill",
+    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "direct_v1",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
     phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
@@ -6630,7 +6651,7 @@ def attribute(
     row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
-    row_store_preallocate: bool = False,
+    row_store_preallocate: bool = True,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase0_activation_threshold_compare_mode: Literal[
@@ -6937,9 +6958,9 @@ def _run_attribution(
     phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
-    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_refresh_optimization: Literal["off", "v1"] = "v1",
     phase4_refresh_prepared_chunk_cache_bytes: int = 0,
-    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "zero_fill",
+    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "direct_v1",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
     phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
@@ -6950,7 +6971,7 @@ def _run_attribution(
     row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
-    row_store_preallocate: bool = False,
+    row_store_preallocate: bool = True,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase0_activation_threshold_compare_mode: Literal[
@@ -9630,6 +9651,7 @@ def _run_attribution(
                     row_reader_overread_zero_row_count=refresh_row_reader_overread_zero_rows,
                     active_row_range_count=refresh_active_row_range_count,
                     streaming_chunk_reuse_stats=streaming_chunk_reuse_stats,
+                    feature_row_store_read_stats=feature_row_store_read_stats,
                 )
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
