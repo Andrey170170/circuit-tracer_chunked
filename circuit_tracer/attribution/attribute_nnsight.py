@@ -7563,6 +7563,7 @@ def _run_attribution(
     )
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
+    nonfeature_row_store: _FileBackedFeatureRowStore | None = None
     compact_output_result: dict[str, object] | None = None
     phase0_donor_bundle_payload: dict[str, object] | None = None
     phase3_seed_bundle_payload: dict[str, object] | None = None
@@ -8285,6 +8286,7 @@ def _run_attribution(
             # Keep dense full-row behavior unchanged for non-compact Graph outputs.
             assert compact_output
             assert exact_chunked_decoder
+            n_nonfeature_columns = int(logit_offset - total_active_feats)
             feature_row_store = _FileBackedFeatureRowStore(
                 n_rows=actual_max_feature_nodes + n_logits,
                 n_feature_columns=total_active_feats,
@@ -8292,6 +8294,19 @@ def _run_attribution(
                 row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
                 read_chunk_cache_bytes=256 * 1024 * 1024,
                 prepared_read_cache_bytes=phase4_refresh_prepared_chunk_cache_bytes_effective,
+                row_store_cache_control_mode=row_store_cache_control_config.effective_mode,
+                temp_root_policy=row_store_temp_root_policy_resolved,
+                temp_root=row_store_temp_root,
+                preallocate=row_store_preallocate,
+                telemetry_recorder=telemetry_recorder,
+            )
+            nonfeature_row_store = _FileBackedFeatureRowStore(
+                n_rows=actual_max_feature_nodes + n_logits,
+                n_feature_columns=n_nonfeature_columns,
+                dtype=exact_trace_internal_dtype_resolved,
+                row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
+                read_chunk_cache_bytes=256 * 1024 * 1024,
+                prepared_read_cache_bytes=0,
                 row_store_cache_control_mode=row_store_cache_control_config.effective_mode,
                 temp_root_policy=row_store_temp_root_policy_resolved,
                 temp_root=row_store_temp_root,
@@ -8319,13 +8334,16 @@ def _run_attribution(
         }
         if use_compact_feature_row_store:
             assert feature_row_store is not None
+            assert nonfeature_row_store is not None
             phase2_extra.update(
                 feature_row_store="dense_memmap",
                 feature_row_store_path=feature_row_store.path,
+                nonfeature_row_store_path=nonfeature_row_store.path,
                 row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_l1_scaled_shape=f"{tuple(feature_row_store.row_l1_scaled.shape)}",
                 feature_edge_columns=total_active_feats,
+                nonfeature_edge_columns=n_nonfeature_columns,
                 **feature_row_store.get_diagnostic_snapshot(),
             )
         else:
@@ -8695,11 +8713,18 @@ def _run_attribution(
                 )
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
+                assert nonfeature_row_store is not None
                 end = i + batch.shape[0]
                 row_store_write_start = time.perf_counter()
                 feature_row_store.append_rows(
                     row_start=i,
                     feature_rows=feature_row_slice,
+                    row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
+                    phase="phase3",
+                )
+                nonfeature_row_store.append_rows(
+                    row_start=i,
+                    feature_rows=rows_cpu[:, total_active_feats:logit_offset],
                     row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                     phase="phase3",
                 )
@@ -10372,10 +10397,17 @@ def _run_attribution(
                         )
                     if use_compact_feature_row_store:
                         assert feature_row_store is not None
+                        assert nonfeature_row_store is not None
                         row_store_write_start = time.perf_counter()
                         row_store_append_telemetry = feature_row_store.append_rows(
                             row_start=st,
                             feature_rows=feature_row_slice,
+                            row_denominator_scaled_l1=row_denominator_scaled_l1,
+                            phase="phase4",
+                        )
+                        nonfeature_row_store.append_rows(
+                            row_start=st,
+                            feature_rows=rows_cpu[:, total_active_feats:logit_offset],
                             row_denominator_scaled_l1=row_denominator_scaled_l1,
                             phase="phase4",
                         )
@@ -11032,8 +11064,15 @@ def _run_attribution(
             else None
         )
         if compact_output:
+            active_features_cpu = activation_matrix.indices().T.detach().cpu()
+            n_active_features = int(active_features_cpu.shape[0])
+            n_error_nodes = int(model.cfg.n_layers * len(input_ids))
+            error_col_start = n_active_features
+            token_col_start = error_col_start + n_error_nodes
+            logit_col_start = token_col_start + len(input_ids)
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
+                assert nonfeature_row_store is not None
                 assert selected_features_cpu is not None
                 feature_feature_edges = feature_row_store.materialize_dense_feature_slice(
                     row_start=n_logits,
@@ -11047,9 +11086,41 @@ def _run_attribution(
                     selected_feature_columns=selected_features_cpu,
                     phase="phase5",
                 )
+                nonfeature_columns = torch.arange(
+                    int(logit_col_start - error_col_start), dtype=torch.long
+                )
+                feature_nonfeature_edges = nonfeature_row_store.materialize_dense_feature_slice(
+                    row_start=n_logits,
+                    row_end=st,
+                    selected_feature_columns=nonfeature_columns,
+                    phase="phase5",
+                )
+                logit_nonfeature_edges = nonfeature_row_store.materialize_dense_feature_slice(
+                    row_start=0,
+                    row_end=n_logits,
+                    selected_feature_columns=nonfeature_columns,
+                    phase="phase5",
+                )
+                n_error_columns = int(token_col_start - error_col_start)
+                feature_error_edges = feature_nonfeature_edges[:, :n_error_columns]
+                feature_token_edges = feature_nonfeature_edges[:, n_error_columns:]
+                logit_error_edges = logit_nonfeature_edges[:, :n_error_columns]
+                logit_token_edges = logit_nonfeature_edges[:, n_error_columns:]
             else:
                 feature_feature_edges = edge_matrix[n_logits:st, selected_features].detach().cpu()
                 logit_feature_edges = edge_matrix[:n_logits, selected_features].detach().cpu()
+                feature_error_edges = (
+                    edge_matrix[n_logits:st, error_col_start:token_col_start].detach().cpu()
+                )
+                feature_token_edges = (
+                    edge_matrix[n_logits:st, token_col_start:logit_col_start].detach().cpu()
+                )
+                logit_error_edges = (
+                    edge_matrix[:n_logits, error_col_start:token_col_start].detach().cpu()
+                )
+                logit_token_edges = (
+                    edge_matrix[:n_logits, token_col_start:logit_col_start].detach().cpu()
+                )
 
             assert selected_features_cpu is not None
             compact_output_result = {
@@ -11058,13 +11129,19 @@ def _run_attribution(
                 "logit_targets": targets.logit_targets,
                 "logit_probabilities": targets.logit_probabilities.detach().cpu(),
                 "vocab_size": targets.vocab_size,
-                "active_features": activation_matrix.indices().T.detach().cpu(),
+                "active_features": active_features_cpu,
                 "activation_values": activation_matrix.values().detach().cpu(),
                 "selected_features": selected_features_cpu,
                 "feature_row_node_indices": row_to_node_index[n_logits:st].detach().cpu(),
                 "logit_row_node_indices": row_to_node_index[:n_logits].detach().cpu(),
                 "feature_feature_edges": feature_feature_edges,
                 "logit_feature_edges": logit_feature_edges,
+                "feature_error_edges": feature_error_edges,
+                "feature_token_edges": feature_token_edges,
+                "logit_error_edges": logit_error_edges,
+                "logit_token_edges": logit_token_edges,
+                "n_error_nodes": n_error_nodes,
+                "n_token_nodes": int(len(input_ids)),
                 "phase4_feature_batch_size": int(phase4_feature_batch_size),
                 "phase4_feature_batch_size_initial": int(
                     batch_size if feature_batch_size is None else feature_batch_size
@@ -11455,6 +11532,8 @@ def _run_attribution(
         teardown_start = time.perf_counter()
         if feature_row_store is not None:
             feature_row_store.cleanup()
+        if nonfeature_row_store is not None:
+            nonfeature_row_store.cleanup()
         if ctx is not None:
             _log_memory_boundary(logger, "Teardown start", model.device)
             cleanup = getattr(ctx, "cleanup", None)
