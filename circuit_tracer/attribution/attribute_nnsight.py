@@ -33,7 +33,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Literal, TypedDict, cast
+from typing import Any, Literal, Mapping, TypedDict, cast
 
 import numpy as np
 import torch
@@ -231,6 +231,107 @@ _PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
     "legacy": "legacy",
     "cap_effective_batches": "cap_effective_batches",
 }
+
+
+class PrefixViewMetadata(TypedDict, total=False):
+    schema_version: int
+    mode: str
+    target_position: int
+    prefix_token_count: int
+    target_token_ids: list[int]
+    prefix_token_ids_sha256: str
+    trace_id: str
+    trajectory_id: str
+
+
+def _hash_token_ids(token_ids: Sequence[int]) -> str:
+    payload = json.dumps([int(token_id) for token_id in token_ids], separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _tokens_from_prompt_for_prefix_view(prompt: str | torch.Tensor | list[int]) -> list[int]:
+    if isinstance(prompt, str):
+        raise ValueError("prefix_view_metadata validation requires token-id prompt, not str")
+    if isinstance(prompt, torch.Tensor):
+        tensor = prompt.detach().cpu().reshape(-1)
+        return [int(token_id) for token_id in tensor.tolist()]
+    return [int(token_id) for token_id in prompt]
+
+
+def _token_ids_from_attribution_targets(
+    attribution_targets: Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None,
+) -> list[int]:
+    if attribution_targets is None:
+        return []
+    if isinstance(attribution_targets, torch.Tensor):
+        return [
+            int(token_id) for token_id in attribution_targets.detach().cpu().reshape(-1).tolist()
+        ]
+    token_ids: list[int] = []
+    for target in attribution_targets:
+        if isinstance(target, int):
+            token_ids.append(int(target))
+        elif isinstance(target, np.integer):
+            token_ids.append(int(target))
+        else:
+            raise ValueError(
+                "prefix_view_metadata target validation requires integer token-id "
+                "attribution_targets"
+            )
+    return token_ids
+
+
+def validate_prefix_view_metadata(
+    *,
+    prompt: str | torch.Tensor | list[int],
+    attribution_targets: Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None,
+    prefix_view_metadata: Mapping[str, Any] | None,
+) -> PrefixViewMetadata | None:
+    """Validate independent-prefix metadata without changing attribution semantics."""
+    if prefix_view_metadata is None:
+        return None
+    prefix_tokens = _tokens_from_prompt_for_prefix_view(prompt)
+    target_ids = _token_ids_from_attribution_targets(attribution_targets)
+    normalized: PrefixViewMetadata = {
+        "schema_version": int(prefix_view_metadata.get("schema_version", 1)),
+        "mode": str(prefix_view_metadata.get("mode", "independent_prefix")),
+        "target_position": int(prefix_view_metadata["target_position"]),
+        "prefix_token_count": int(prefix_view_metadata["prefix_token_count"]),
+        "target_token_ids": [
+            int(token_id) for token_id in prefix_view_metadata["target_token_ids"]
+        ],
+        "prefix_token_ids_sha256": str(prefix_view_metadata["prefix_token_ids_sha256"]),
+    }
+    for key in ("trace_id", "trajectory_id"):
+        if key in prefix_view_metadata and prefix_view_metadata[key] is not None:
+            normalized[key] = str(prefix_view_metadata[key])
+    if normalized["mode"] != "independent_prefix":
+        raise ValueError(
+            f"prefix_view_metadata mode must be 'independent_prefix' (got {normalized['mode']!r})"
+        )
+    if normalized["prefix_token_count"] != len(prefix_tokens):
+        raise ValueError(
+            "prefix_view_metadata prefix_token_count does not match prompt token count "
+            f"({normalized['prefix_token_count']} != {len(prefix_tokens)})"
+        )
+    if normalized["target_position"] != normalized["prefix_token_count"]:
+        raise ValueError(
+            "prefix_view_metadata target_position must equal prefix_token_count for "
+            "independent_prefix mode "
+            f"({normalized['target_position']} != {normalized['prefix_token_count']})"
+        )
+    if normalized["target_token_ids"] != target_ids:
+        raise ValueError(
+            "prefix_view_metadata target_token_ids do not match attribution_targets "
+            f"({normalized['target_token_ids']} != {target_ids})"
+        )
+    actual_hash = _hash_token_ids(prefix_tokens)
+    if normalized["prefix_token_ids_sha256"] != actual_hash:
+        raise ValueError(
+            "prefix_view_metadata prefix_token_ids_sha256 does not match prompt tokens"
+        )
+    return normalized
+
 
 _PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
 _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT = 1
@@ -6657,6 +6758,7 @@ def attribute(
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
+    prefix_view_metadata: Mapping[str, Any] | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -6825,6 +6927,11 @@ def attribute(
         logger.setLevel(logging.WARNING)
 
     offload_handles = []
+    normalized_prefix_view_metadata = validate_prefix_view_metadata(
+        prompt=prompt,
+        attribution_targets=attribution_targets,
+        prefix_view_metadata=prefix_view_metadata,
+    )
     try:
         return _run_attribution(
             model=model,
@@ -6895,6 +7002,7 @@ def attribute(
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
+            prefix_view_metadata=normalized_prefix_view_metadata,
             logger=logger,
         )
     finally:
@@ -6977,6 +7085,7 @@ def _run_attribution(
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
+    prefix_view_metadata: PrefixViewMetadata | None = None,
 ):
     start_time = time.time()
     run_start = time.perf_counter()
@@ -7252,6 +7361,8 @@ def _run_attribution(
             "phase0_donor_bundle_replay_kind": "phase0_active_features_v1",
             "semantic_descriptor_top_k": semantic_descriptor_top_k,
             "semantic_descriptor_dim": semantic_descriptor_dim,
+            "prefix_view_validation_applied": prefix_view_metadata is not None,
+            "prefix_view_metadata": dict(prefix_view_metadata) if prefix_view_metadata else None,
             **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
             **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
         },
@@ -11408,6 +11519,8 @@ def _run_attribution(
             telemetry_export = telemetry_recorder.export(include_events=True)
             compact_output_result["telemetry_summary"] = telemetry_export["summary"]
             compact_output_result["telemetry_events"] = telemetry_export.get("events", [])
+            if prefix_view_metadata is not None:
+                compact_output_result["prefix_view_metadata"] = dict(prefix_view_metadata)
             if anomaly_debug_result is not None:
                 compact_output_result["phase4_anomaly_debug"] = anomaly_debug_result
             if (
