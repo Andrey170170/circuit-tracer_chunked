@@ -11,6 +11,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _compute_row_abs_sums,
     _compute_row_denominator_scaled_l1,
     _FileBackedFeatureRowStore,
+    _build_row_transfer_telemetry,
     _resolve_phase3_effective_row_state,
     _row_abs_sums_to_scaled_l1,
     _resolve_exact_trace_internal_dtype,
@@ -70,6 +71,153 @@ def test_file_backed_feature_row_store_emits_structured_events() -> None:
     assert "feature_row_store.materialize_dense_slice" in names
 
 
+def test_file_backed_feature_row_store_prepared_cache_hits_invalidates_and_skips() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=3,
+        n_feature_columns=2,
+        dtype=torch.float32,
+        prepared_read_cache_bytes=32,
+    )
+    try:
+        rows = torch.tensor([[-1.0, 2.0], [3.0, -4.0], [5.0, 6.0]], dtype=torch.float32)
+        store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=_compute_row_denominator_scaled_l1(rows, dtype=torch.float32),
+        )
+        first = store.read_prepared_feature_rows(0, 2, device="cpu", dtype=torch.float32)
+        second = store.read_prepared_feature_rows(0, 2, device="cpu", dtype=torch.float32)
+        assert torch.equal(first, rows[:2].abs())
+        assert second.data_ptr() == first.data_ptr()
+
+        store.append_rows(
+            row_start=1,
+            feature_rows=torch.tensor([[7.0, -8.0]], dtype=torch.float32),
+            row_denominator_scaled_l1=_compute_row_denominator_scaled_l1(
+                torch.tensor([[7.0, -8.0]], dtype=torch.float32), dtype=torch.float32
+            ),
+        )
+        refreshed = store.read_prepared_feature_rows(0, 2, device="cpu", dtype=torch.float32)
+        assert torch.equal(refreshed, torch.tensor([[1.0, 2.0], [7.0, 8.0]]))
+        stats = store.get_diagnostic_snapshot()
+        assert stats["prepared_read_cache_hit_count"] == 1
+        assert stats["prepared_read_cache_miss_count"] == 2
+        assert stats["prepared_read_cache_invalidation_entry_count"] == 1
+        assert stats["prepared_read_cache_store_success_count"] >= 2
+    finally:
+        store.cleanup()
+
+    tiny_store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=2,
+        dtype=torch.float32,
+        prepared_read_cache_bytes=4,
+    )
+    try:
+        rows = torch.ones((2, 2), dtype=torch.float32)
+        tiny_store.append_rows(
+            row_start=0,
+            feature_rows=rows,
+            row_denominator_scaled_l1=_compute_row_denominator_scaled_l1(rows, dtype=torch.float32),
+        )
+        tiny_store.read_prepared_feature_rows(0, 2, device="cpu", dtype=torch.float32)
+        tiny_stats = tiny_store.get_diagnostic_snapshot()
+        assert tiny_stats["prepared_read_cache_store_skip_too_large_count"] == 1
+        assert tiny_stats["prepared_read_cache_entry_count"] == 0
+    finally:
+        tiny_store.cleanup()
+
+
+def test_file_backed_feature_row_store_temp_root_default_and_explicit(tmp_path) -> None:
+    default_store = _FileBackedFeatureRowStore(
+        n_rows=1,
+        n_feature_columns=1,
+        dtype=torch.float32,
+    )
+    try:
+        default_stats = default_store.get_diagnostic_snapshot()
+        assert default_stats["temp_root_policy"] == "default"
+        assert default_stats["temp_root_selected"] is None
+        assert default_stats["temp_root_fallback_reason"] is None
+    finally:
+        default_store.cleanup()
+
+    explicit_root = tmp_path / "rows"
+    explicit_root.mkdir()
+    store = _FileBackedFeatureRowStore(
+        n_rows=1,
+        n_feature_columns=1,
+        dtype=torch.float32,
+        temp_root_policy="env_node_local",
+        temp_root=explicit_root,
+    )
+    try:
+        stats = store.get_diagnostic_snapshot()
+        assert stats["temp_root_policy"] == "env_node_local"
+        assert stats["temp_root_requested"] == os.fspath(explicit_root)
+        assert stats["temp_root_selected"] == os.fspath(explicit_root)
+        assert os.fspath(store.path).startswith(os.fspath(explicit_root))
+    finally:
+        store.cleanup()
+
+
+def test_file_backed_feature_row_store_env_node_local_fallback(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SLURM_TMPDIR", os.fspath(tmp_path / "missing_slurm"))
+    monkeypatch.setenv("TMPDIR", os.fspath(tmp_path / "missing_tmp"))
+    store = _FileBackedFeatureRowStore(
+        n_rows=1,
+        n_feature_columns=1,
+        dtype=torch.float32,
+        temp_root_policy="env_node_local",
+    )
+    try:
+        stats = store.get_diagnostic_snapshot()
+        assert stats["temp_root_policy"] == "env_node_local"
+        assert stats["temp_root_selected"] == "/tmp"
+        assert stats["temp_root_fallback_reason"] is None
+    finally:
+        store.cleanup()
+
+
+def test_file_backed_feature_row_store_preallocation_unavailable(monkeypatch) -> None:
+    monkeypatch.delattr(os, "posix_fallocate", raising=False)
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        preallocate=True,
+    )
+    try:
+        stats = store.get_diagnostic_snapshot()
+        assert stats["preallocate_requested"] == 1
+        assert stats["preallocate_available"] == 0
+        assert stats["preallocate_status"] == "unavailable"
+        assert "unavailable" in str(stats["preallocate_error"])
+    finally:
+        store.cleanup()
+
+
+def test_file_backed_feature_row_store_preallocation_failure(monkeypatch) -> None:
+    def fail_fallocate(fd: int, offset: int, length: int) -> None:
+        raise OSError("synthetic fallocate failure")
+
+    monkeypatch.setattr(os, "posix_fallocate", fail_fallocate, raising=False)
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        preallocate=True,
+    )
+    try:
+        stats = store.get_diagnostic_snapshot()
+        assert stats["preallocate_requested"] == 1
+        assert stats["preallocate_available"] == 1
+        assert stats["preallocate_status"] == "failed"
+        assert "synthetic fallocate failure" in str(stats["preallocate_error"])
+    finally:
+        store.cleanup()
+
+
 def test_file_backed_feature_row_store_read_cache_invalidates_on_overlap_append() -> None:
     store = _FileBackedFeatureRowStore(
         n_rows=4,
@@ -102,6 +250,41 @@ def test_file_backed_feature_row_store_read_cache_invalidates_on_overlap_append(
     stats = store.get_diagnostic_snapshot()
     assert stats["read_cache_hit_count"] == 1
     assert stats["read_cache_miss_count"] == 2
+
+
+def test_row_transfer_telemetry_reports_shapes_without_cpu_copy_transfer() -> None:
+    rows = torch.ones((2, 4), dtype=torch.float32)
+    telemetry = _build_row_transfer_telemetry(
+        rows=rows,
+        rows_cpu=rows,
+        row_input_slice=rows[:, :3],
+        feature_row_slice=rows[:, :2],
+    )
+
+    assert telemetry["row_transfer_source"] == "cpu"
+    assert telemetry["row_transfer_destination"] == "cpu"
+    assert telemetry["row_transfer_count"] == 2
+    assert telemetry["row_transfer_bytes"] == 0
+    assert telemetry["row_input_bytes"] == 2 * 3 * rows.element_size()
+    assert telemetry["feature_row_bytes"] == 2 * 2 * rows.element_size()
+
+
+def test_row_transfer_telemetry_counts_dtype_materialization_bytes() -> None:
+    rows = torch.ones((2, 4), dtype=torch.float32)
+    rows_cpu = rows.to(dtype=torch.float64)
+    telemetry = _build_row_transfer_telemetry(
+        rows=rows,
+        rows_cpu=rows_cpu,
+        row_input_slice=rows_cpu[:, :3],
+        feature_row_slice=rows_cpu[:, :2],
+    )
+
+    assert telemetry["row_transfer_source"] == "cpu"
+    assert telemetry["row_transfer_destination"] == "cpu"
+    assert telemetry["row_transfer_count"] == 2
+    assert telemetry["row_transfer_bytes"] == rows_cpu.numel() * rows_cpu.element_size()
+    assert telemetry["row_input_bytes"] == 2 * 3 * rows_cpu.element_size()
+    assert telemetry["feature_row_bytes"] == 2 * 2 * rows_cpu.element_size()
 
 
 def test_file_backed_feature_row_store_full_row_abs_sums_uses_scaled_representation() -> None:
@@ -265,7 +448,7 @@ def test_phase4_scheduler_defaults_match_between_public_entrypoints() -> None:
     assert (
         entrypoint_sig.parameters["phase4_refresh_optimization"].default
         == nnsight_sig.parameters["phase4_refresh_optimization"].default
-        == "off"
+        == "v1"
     )
     assert (
         entrypoint_sig.parameters["phase4_row_executor"].default

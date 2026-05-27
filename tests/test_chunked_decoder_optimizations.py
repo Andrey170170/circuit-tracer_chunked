@@ -20,6 +20,9 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_executor_batch_telemetry,
     _build_phase4_executor_substage_telemetry,
     _build_phase4_normalization_stats,
+    _compute_row_denominator_scaled_l1,
+    _copy_feature_rows_to_cpu_staging,
+    _FileBackedFeatureRowStore,
     _build_phase4_planner_v2_candidate_window,
     _build_phase4_refresh_substage_telemetry,
     _select_phase4_planner_v2_membership,
@@ -78,6 +81,10 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _resolve_phase4_row_executor_config,
     _resolve_phase4_streaming_v1_microbatch_size,
     _build_phase4_row_executor_metadata,
+    _resolve_phase4_row_reduction_config,
+    _resolve_phase4_row_reduction_mode,
+    _build_phase4_row_reduction_metadata,
+    _build_phase4_gpu_row_reduction_transfer_telemetry,
     _resolve_phase4_scheduler_mode,
     _resolve_phase4_scheduler_config,
     _resolve_phase4_scheduler_telemetry_detail,
@@ -1363,6 +1370,150 @@ def test_phase4_row_executor_falls_back_to_batched_when_streaming_path_unavailab
     assert metadata["row_executor_effective_behavior"] == "batched_reference_execution"
 
 
+def test_phase4_row_reduction_off_metadata_and_gpu_v1_rejection() -> None:
+    assert _resolve_phase4_row_reduction_mode("off") == "off"
+    assert _resolve_phase4_row_reduction_mode("gpu_v1") == "gpu_v1"
+    with pytest.raises(ValueError, match="phase4_row_reduction must be one of"):
+        _resolve_phase4_row_reduction_mode("gpu_v2")
+
+    metadata = _build_phase4_row_reduction_metadata(
+        _resolve_phase4_row_reduction_config(
+            "off",
+            compact_output=True,
+            exact_chunked_decoder=True,
+        )
+    )
+    assert metadata["row_reduction_requested"] == "off"
+    assert metadata["row_reduction_effective"] == "off"
+    assert metadata["row_reduction_mode_effective"] == "off"
+    assert metadata["row_reduction_reference_execution"] is False
+
+    gpu_metadata = _build_phase4_row_reduction_metadata(
+        _resolve_phase4_row_reduction_config(
+            "gpu_v1",
+            compact_output=True,
+            exact_chunked_decoder=True,
+        )
+    )
+    assert gpu_metadata["row_reduction_requested"] == "gpu_v1"
+    assert gpu_metadata["row_reduction_effective"] == "gpu_v1"
+    assert gpu_metadata["row_reduction_effective_version"] == "gpu_v1_staged"
+    assert gpu_metadata["row_reduction_reference_execution"] is False
+
+    fallback_metadata = _build_phase4_row_reduction_metadata(
+        _resolve_phase4_row_reduction_config(
+            "gpu_v1",
+            compact_output=False,
+            exact_chunked_decoder=True,
+        )
+    )
+    assert fallback_metadata["row_reduction_requested"] == "gpu_v1"
+    assert fallback_metadata["row_reduction_effective"] == "off"
+    assert fallback_metadata["row_reduction_reference_execution"] is True
+
+
+def test_phase4_gpu_row_reduction_transfer_telemetry_counts_compact_bytes() -> None:
+    rows = torch.zeros((2, 10), dtype=torch.float32)
+    feature_rows = rows[:, :3].contiguous()
+    row_abs_max = torch.zeros(2, dtype=torch.float64)
+    row_l1_scaled = torch.zeros(2, dtype=torch.float64)
+
+    telemetry = _build_phase4_gpu_row_reduction_transfer_telemetry(
+        rows=rows,
+        feature_row_slice=feature_rows,
+        row_abs_max=row_abs_max,
+        row_l1_scaled=row_l1_scaled,
+    )
+
+    assert telemetry["row_reduction_backend"] == "gpu_v1"
+    assert telemetry["row_reduction_baseline_full_row_transfer_bytes"] == 80
+    assert telemetry["row_reduction_compact_transfer_bytes"] == 56
+    assert telemetry["row_reduction_gpu_to_cpu_bytes_saved"] == 24
+    assert telemetry["row_transfer_bytes"] == 56
+
+
+def test_copy_feature_rows_to_cpu_staging_reuses_sized_buffer() -> None:
+    rows = torch.arange(20, dtype=torch.float32).reshape(2, 10)
+    feature_rows, staging = _copy_feature_rows_to_cpu_staging(
+        rows,
+        total_active_feats=3,
+        staging_buffer=None,
+        dtype=torch.float64,
+    )
+
+    assert staging is not None
+    assert feature_rows.device.type == "cpu"
+    assert feature_rows.is_contiguous()
+    assert torch.equal(feature_rows, rows[:, :3].to(torch.float64))
+
+    larger = torch.arange(30, dtype=torch.float32).reshape(3, 10)
+    feature_rows_again, staging_again = _copy_feature_rows_to_cpu_staging(
+        larger,
+        total_active_feats=3,
+        staging_buffer=staging,
+        dtype=torch.float64,
+    )
+
+    assert staging_again is not staging
+    assert torch.equal(feature_rows_again, larger[:, :3].to(torch.float64))
+
+    smaller = torch.arange(10, dtype=torch.float32).reshape(1, 10)
+    feature_rows_smaller, staging_smaller = _copy_feature_rows_to_cpu_staging(
+        smaller,
+        total_active_feats=3,
+        staging_buffer=staging_again,
+        dtype=torch.float64,
+    )
+
+    assert staging_smaller is staging_again
+    assert torch.equal(feature_rows_smaller, smaller[:, :3].to(torch.float64))
+
+
+def test_file_backed_feature_row_store_append_rows_returns_substage_telemetry() -> None:
+    store = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=3,
+        dtype=torch.float32,
+    )
+    try:
+        telemetry = store.append_rows(
+            row_start=0,
+            feature_rows=torch.ones((2, 3), dtype=torch.float32),
+            row_denominator_scaled_l1=(
+                torch.ones(2, dtype=torch.float32),
+                torch.ones(2, dtype=torch.float32),
+            ),
+        )
+    finally:
+        store.cleanup()
+
+    expected_keys = {
+        "row_store_append_cpu_prepare_elapsed_ms",
+        "row_store_append_contiguous_elapsed_ms",
+        "row_store_append_numpy_elapsed_ms",
+        "row_store_append_pwrite_elapsed_ms",
+        "row_store_append_denominator_copy_elapsed_ms",
+        "row_store_append_total_elapsed_ms",
+    }
+    assert expected_keys <= telemetry.keys()
+    assert all(isinstance(telemetry[key], float) for key in expected_keys)
+
+
+def test_row_denominator_scaled_l1_preserve_device_matches_cpu_path() -> None:
+    rows = torch.tensor([[1.0, -3.0, 2.0], [0.0, 0.0, 0.0]], dtype=torch.float32)
+    cpu_max, cpu_scaled = _compute_row_denominator_scaled_l1(rows, dtype=torch.float64)
+    same_device_max, same_device_scaled = _compute_row_denominator_scaled_l1(
+        rows,
+        dtype=torch.float64,
+        preserve_device=True,
+    )
+
+    assert same_device_max.device == rows.device
+    assert same_device_scaled.device == rows.device
+    assert torch.equal(cpu_max, same_device_max)
+    assert torch.equal(cpu_scaled, same_device_scaled)
+
+
 def test_phase4_streaming_v1_microbatch_size_is_capped() -> None:
     assert _resolve_phase4_streaming_v1_microbatch_size(1) == 1
     assert _resolve_phase4_streaming_v1_microbatch_size(64) == 64
@@ -2560,6 +2711,33 @@ def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
         row_weight_zero_row_count=1280,
         row_reader_overread_zero_row_count=0,
         active_row_range_count=6,
+        streaming_chunk_reuse_stats={
+            "active_row_scan_elapsed_ms_total": 0.1,
+            "chunk_allocation_zero_fill_elapsed_ms_total": 0.2,
+            "transfer_cast_abs_elapsed_ms_total": 0.3,
+            "cache_lookup_elapsed_ms_total": 0.4,
+            "cache_store_elapsed_ms_total": 0.5,
+            "cache_eviction_elapsed_ms_total": 0.6,
+            "row_weight_update_elapsed_ms_total": 0.7,
+            "accounted_elapsed_ms_total": 8.8,
+            "unaccounted_elapsed_ms_total": 1.2,
+        },
+        feature_row_store_read_stats={
+            "prepared_read_cache_hit_count": 1,
+            "prepared_read_cache_miss_count": 2,
+            "prepared_read_cache_hit_row_count": 3,
+            "prepared_read_cache_miss_row_count": 4,
+            "prepared_read_cache_eviction_count": 5,
+            "prepared_read_cache_invalidation_count": 6,
+            "prepared_read_cache_invalidation_entry_count": 7,
+            "prepared_read_cache_store_attempt_count": 8,
+            "prepared_read_cache_store_success_count": 9,
+            "prepared_read_cache_store_skip_disabled_count": 10,
+            "prepared_read_cache_store_skip_too_large_count": 11,
+            "prepared_read_cache_prepare_elapsed_ms_total": 12.5,
+            "prepared_read_cache_entry_count": 13,
+            "prepared_read_cache_nbytes": 14,
+        },
     )
 
     assert telemetry["refresh_row_store_read_elapsed_ms"] == pytest.approx(4.0)
@@ -2574,11 +2752,37 @@ def test_phase4_refresh_substage_telemetry_includes_detailed_fields() -> None:
     assert telemetry["refresh_row_weight_zero_rows"] == 1280
     assert telemetry["refresh_row_reader_overread_zero_rows"] == 0
     assert telemetry["refresh_active_row_range_count"] == 6
+    assert telemetry["refresh_active_row_scan_elapsed_ms"] == pytest.approx(0.1)
+    assert telemetry["refresh_chunk_allocation_zero_fill_elapsed_ms"] == pytest.approx(0.2)
+    assert telemetry["refresh_transfer_cast_abs_elapsed_ms"] == pytest.approx(0.3)
+    assert telemetry["refresh_cache_lookup_elapsed_ms"] == pytest.approx(0.4)
+    assert telemetry["refresh_cache_store_elapsed_ms"] == pytest.approx(0.5)
+    assert telemetry["refresh_cache_eviction_elapsed_ms"] == pytest.approx(0.6)
+    assert telemetry["refresh_row_weight_update_elapsed_ms"] == pytest.approx(0.7)
+    assert telemetry["refresh_accounted_elapsed_ms"] == pytest.approx(8.8)
+    assert telemetry["refresh_unaccounted_elapsed_ms"] == pytest.approx(1.2)
+    assert telemetry["feature_row_store_prepared_read_cache_hits"] == 1
+    assert telemetry["feature_row_store_prepared_read_cache_misses"] == 2
+    assert telemetry["feature_row_store_prepared_read_cache_hit_rows"] == 3
+    assert telemetry["feature_row_store_prepared_read_cache_miss_rows"] == 4
+    assert telemetry["feature_row_store_prepared_read_cache_evictions"] == 5
+    assert telemetry["feature_row_store_prepared_read_cache_invalidations"] == 6
+    assert telemetry["feature_row_store_prepared_read_cache_invalidation_entries"] == 7
+    assert telemetry["feature_row_store_prepared_read_cache_store_attempts"] == 8
+    assert telemetry["feature_row_store_prepared_read_cache_store_success"] == 9
+    assert telemetry["feature_row_store_prepared_read_cache_store_skip_disabled"] == 10
+    assert telemetry["feature_row_store_prepared_read_cache_store_skip_too_large"] == 11
+    assert telemetry["feature_row_store_prepared_read_cache_prepare_elapsed_ms"] == pytest.approx(
+        12.5
+    )
+    assert telemetry["feature_row_store_prepared_read_cache_entry_count"] == 13
+    assert telemetry["feature_row_store_prepared_read_cache_nbytes"] == 14
 
 
 def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
     summary = _build_phase4_executor_substage_telemetry(
         telemetry_detail="summary",
+        encoder_materialize_elapsed_ms=0.25,
         compute_batch_elapsed_ms=5.0,
         cpu_staging_elapsed_ms=1.0,
         denominator_elapsed_ms=0.5,
@@ -2587,6 +2791,7 @@ def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
     )
     normal = _build_phase4_executor_substage_telemetry(
         telemetry_detail="normal",
+        encoder_materialize_elapsed_ms=0.25,
         compute_batch_elapsed_ms=5.0,
         cpu_staging_elapsed_ms=1.0,
         denominator_elapsed_ms=0.5,
@@ -2594,9 +2799,10 @@ def test_phase4_executor_substage_telemetry_summary_vs_normal() -> None:
         batch_elapsed_ms=8.0,
     )
 
+    assert summary["executor_encoder_materialize_elapsed_ms"] == pytest.approx(0.25)
     assert summary["executor_compute_batch_elapsed_ms"] == pytest.approx(5.0)
-    assert summary["executor_accounted_elapsed_ms"] == pytest.approx(7.25)
-    assert summary["executor_overhead_elapsed_ms"] == pytest.approx(0.75)
+    assert summary["executor_accounted_elapsed_ms"] == pytest.approx(7.5)
+    assert summary["executor_overhead_elapsed_ms"] == pytest.approx(0.5)
     assert "executor_cpu_staging_elapsed_ms" not in summary
 
     assert normal["executor_cpu_staging_elapsed_ms"] == pytest.approx(1.0)
@@ -2867,7 +3073,7 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
         phase4_scheduler_mode="locality",
         phase4_scheduler_debug=False,
         phase4_scheduler_telemetry_detail="normal",
-        phase4_refresh_optimization="off",
+        phase4_refresh_optimization="v1",
         phase4_row_executor="batched",
         phase1_trace_batch_policy="legacy",
         phase1_trace_batch_size_max=None,
@@ -2900,7 +3106,7 @@ def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transforme
         {"phase4_scheduler_mode": "planner_v2"},
         {"phase4_scheduler_debug": True},
         {"phase4_scheduler_telemetry_detail": "summary"},
-        {"phase4_refresh_optimization": "v1"},
+        {"phase4_refresh_optimization": "off"},
         {"phase4_row_executor": "streaming_v1"},
         {"phase1_trace_batch_policy": "cap_effective_batches"},
         {"phase1_trace_batch_size_max": 8},

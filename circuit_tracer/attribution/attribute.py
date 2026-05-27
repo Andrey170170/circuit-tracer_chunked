@@ -3,6 +3,7 @@ Unified attribution interface that routes to the correct implementation based on
 """
 
 from collections.abc import Sequence
+import os
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
@@ -149,14 +150,20 @@ def attribute(
     phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
-    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_refresh_optimization: Literal["off", "v1"] = "v1",
+    phase4_refresh_prepared_chunk_cache_bytes: int = 0,
+    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "direct_v1",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
     phase1_trace_batch_size_max: int | None = None,
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
     row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
+    row_store_temp_root: str | os.PathLike[str] | None = None,
+    row_store_preallocate: bool = True,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
@@ -206,9 +213,16 @@ def attribute(
         phase4_scheduler_telemetry_detail: Scheduler telemetry verbosity for
             Phase-4 planning/batching metadata.
         phase4_refresh_optimization: Requested Phase-4 refresh optimization mode
-            (``"off"`` or ``"v1"``).
+            (defaults to ``"v1"``; pass ``"off"`` for the reference path).
+        phase4_refresh_prepared_chunk_cache_bytes: Experimental/retired
+            Phase-4 prepared refresh cache budget; defaults to 0 (disabled).
+        phase4_refresh_active_row_accumulation: Requested Phase-4 active-row
+            accumulation mode. Defaults to ``"direct_v1"``; ``"zero_fill"``
+            remains available as the fallback/reference path.
         phase4_row_executor: Requested Phase-4 row execution mode
             (``"batched"`` or ``"streaming_v1"``).
+        phase4_row_reduction: Requested Phase-4 row-reduction backend
+            (``"gpu_v1"`` default, or ``"off"`` for the CPU reference path).
         phase1_trace_batch_policy: Requested Phase-1 trace-batch sizing policy.
         phase1_trace_batch_size_max: Optional Phase-1 trace-batch cap.
             Used by ``"cap_effective_batches"``; ignored by legacy execution.
@@ -217,6 +231,10 @@ def attribute(
             Used by ``"deferred_v1"`` on compact exact-trace Phase 4.
         phase4_ranker: Requested Phase-4 ranker implementation.
         row_store_cache_control: Requested compact row-store cache-control mode.
+        row_store_temp_root_policy: Requested compact row-store temp-root policy.
+        row_store_temp_root: Optional explicit temp root for compact row-store files.
+        row_store_preallocate: Enable best-effort compact row-store file preallocation
+            (default; pass ``False`` to disable).
         exact_encoder_residency: Requested exact encoder residency mode.
         exact_trace_internal_dtype: Internal dtype used by compact exact-trace
             normalization/ranking internals ("fp32" or "fp64"). Defaults to
@@ -237,7 +255,9 @@ def attribute(
         phase4_scheduler_mode != "locality"
         or bool(phase4_scheduler_debug)
         or phase4_scheduler_telemetry_detail != "normal"
-        or phase4_refresh_optimization != "off"
+        or phase4_refresh_optimization != "v1"
+        or phase4_refresh_prepared_chunk_cache_bytes != 0
+        or phase4_refresh_active_row_accumulation != "direct_v1"
         or phase4_row_executor != "batched"
         or phase1_trace_batch_policy != "legacy"
         or phase1_trace_batch_size_max is not None
@@ -245,6 +265,9 @@ def attribute(
         or phase4_refresh_interval_multiplier != 1
         or phase4_ranker != "argsort"
         or row_store_cache_control != "off"
+        or row_store_temp_root_policy != "default"
+        or row_store_temp_root is not None
+        or not bool(row_store_preallocate)
         or exact_encoder_residency != "lazy"
     )
 
@@ -283,13 +306,19 @@ def attribute(
             phase4_scheduler_debug=phase4_scheduler_debug,
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             phase4_refresh_optimization=phase4_refresh_optimization,
+            phase4_refresh_prepared_chunk_cache_bytes=phase4_refresh_prepared_chunk_cache_bytes,
+            phase4_refresh_active_row_accumulation=phase4_refresh_active_row_accumulation,
             phase4_row_executor=phase4_row_executor,
+            phase4_row_reduction=phase4_row_reduction,
             phase1_trace_batch_policy=phase1_trace_batch_policy,
             phase1_trace_batch_size_max=phase1_trace_batch_size_max,
             phase4_refresh_policy=phase4_refresh_policy,
             phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
             phase4_ranker=phase4_ranker,
             row_store_cache_control=row_store_cache_control,
+            row_store_temp_root_policy=row_store_temp_root_policy,
+            row_store_temp_root=row_store_temp_root,
+            row_store_preallocate=row_store_preallocate,
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
         )

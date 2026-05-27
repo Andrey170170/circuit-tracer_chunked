@@ -33,7 +33,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Literal, Mapping, TypedDict, cast
 
 import numpy as np
 import torch
@@ -220,12 +220,118 @@ _PHASE4_ROW_EXECUTOR_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "streaming_v1": "streaming_v1",
 }
 
+_PHASE4_ROW_REDUCTION_VERSION_BY_MODE: dict[str, str] = {
+    "off": "off_v1",
+    "gpu_v1": "gpu_v1_staged",
+}
+
 _PHASE1_TRACE_BATCH_POLICY_DEFAULT: Literal["legacy"] = "legacy"
 _PHASE1_TRACE_BATCH_SIZE_MAX_DEFAULT: int | None = None
 _PHASE1_TRACE_BATCH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
     "legacy": "legacy",
     "cap_effective_batches": "cap_effective_batches",
 }
+
+
+class PrefixViewMetadata(TypedDict, total=False):
+    schema_version: int
+    mode: str
+    target_position: int
+    prefix_token_count: int
+    target_token_ids: list[int]
+    prefix_token_ids_sha256: str
+    trace_id: str
+    trajectory_id: str
+
+
+def _hash_token_ids(token_ids: Sequence[int]) -> str:
+    payload = json.dumps([int(token_id) for token_id in token_ids], separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _tokens_from_prompt_for_prefix_view(prompt: str | torch.Tensor | list[int]) -> list[int]:
+    if isinstance(prompt, str):
+        raise ValueError("prefix_view_metadata validation requires token-id prompt, not str")
+    if isinstance(prompt, torch.Tensor):
+        tensor = prompt.detach().cpu().reshape(-1)
+        return [int(token_id) for token_id in tensor.tolist()]
+    return [int(token_id) for token_id in prompt]
+
+
+def _token_ids_from_attribution_targets(
+    attribution_targets: Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None,
+) -> list[int]:
+    if attribution_targets is None:
+        return []
+    if isinstance(attribution_targets, torch.Tensor):
+        return [
+            int(token_id) for token_id in attribution_targets.detach().cpu().reshape(-1).tolist()
+        ]
+    token_ids: list[int] = []
+    for target in attribution_targets:
+        if isinstance(target, int):
+            token_ids.append(int(target))
+        elif isinstance(target, np.integer):
+            token_ids.append(int(target))
+        else:
+            raise ValueError(
+                "prefix_view_metadata target validation requires integer token-id "
+                "attribution_targets"
+            )
+    return token_ids
+
+
+def validate_prefix_view_metadata(
+    *,
+    prompt: str | torch.Tensor | list[int],
+    attribution_targets: Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None,
+    prefix_view_metadata: Mapping[str, Any] | None,
+) -> PrefixViewMetadata | None:
+    """Validate independent-prefix metadata without changing attribution semantics."""
+    if prefix_view_metadata is None:
+        return None
+    prefix_tokens = _tokens_from_prompt_for_prefix_view(prompt)
+    target_ids = _token_ids_from_attribution_targets(attribution_targets)
+    normalized: PrefixViewMetadata = {
+        "schema_version": int(prefix_view_metadata.get("schema_version", 1)),
+        "mode": str(prefix_view_metadata.get("mode", "independent_prefix")),
+        "target_position": int(prefix_view_metadata["target_position"]),
+        "prefix_token_count": int(prefix_view_metadata["prefix_token_count"]),
+        "target_token_ids": [
+            int(token_id) for token_id in prefix_view_metadata["target_token_ids"]
+        ],
+        "prefix_token_ids_sha256": str(prefix_view_metadata["prefix_token_ids_sha256"]),
+    }
+    for key in ("trace_id", "trajectory_id"):
+        if key in prefix_view_metadata and prefix_view_metadata[key] is not None:
+            normalized[key] = str(prefix_view_metadata[key])
+    if normalized["mode"] != "independent_prefix":
+        raise ValueError(
+            f"prefix_view_metadata mode must be 'independent_prefix' (got {normalized['mode']!r})"
+        )
+    if normalized["prefix_token_count"] != len(prefix_tokens):
+        raise ValueError(
+            "prefix_view_metadata prefix_token_count does not match prompt token count "
+            f"({normalized['prefix_token_count']} != {len(prefix_tokens)})"
+        )
+    if normalized["target_position"] != normalized["prefix_token_count"]:
+        raise ValueError(
+            "prefix_view_metadata target_position must equal prefix_token_count for "
+            "independent_prefix mode "
+            f"({normalized['target_position']} != {normalized['prefix_token_count']})"
+        )
+    if normalized["target_token_ids"] != target_ids:
+        raise ValueError(
+            "prefix_view_metadata target_token_ids do not match attribution_targets "
+            f"({normalized['target_token_ids']} != {target_ids})"
+        )
+    actual_hash = _hash_token_ids(prefix_tokens)
+    if normalized["prefix_token_ids_sha256"] != actual_hash:
+        raise ValueError(
+            "prefix_view_metadata prefix_token_ids_sha256 does not match prompt tokens"
+        )
+    return normalized
+
 
 _PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
 _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT = 1
@@ -253,6 +359,15 @@ _PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE: dict[str, str] = {
 }
 
 _ROW_STORE_CACHE_CONTROL_DEFAULT: Literal["off"] = "off"
+
+_ROW_STORE_TEMP_ROOT_POLICY_DEFAULT: Literal["default"] = "default"
+_ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL: Literal["env_node_local"] = "env_node_local"
+_ROW_STORE_TEMP_ROOT_POLICY_BY_NAME: dict[str, str] = {
+    "default": _ROW_STORE_TEMP_ROOT_POLICY_DEFAULT,
+    "tempfile_default": _ROW_STORE_TEMP_ROOT_POLICY_DEFAULT,
+    "env_node_local": _ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL,
+    "node_local": _ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL,
+}
 _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1: Literal[
     "fadvise_dontneed_after_append_v1"
 ] = "fadvise_dontneed_after_append_v1"
@@ -306,6 +421,15 @@ class _Phase4RowExecutorConfig:
     version: str
     effective_version: str
     effective_behavior: Literal["requested", "batched_reference_execution"]
+
+
+@dataclass(frozen=True)
+class _Phase4RowReductionConfig:
+    requested_mode: Literal["off", "gpu_v1"]
+    effective_mode: Literal["off", "gpu_v1"]
+    version: str
+    effective_version: str
+    effective_behavior: Literal["requested", "off_reference_execution"]
 
 
 @dataclass(frozen=True)
@@ -372,6 +496,15 @@ class _RowStoreCacheControlConfig:
     default_mode: Literal["off"]
     mode_applicable: bool
     effective_behavior: Literal["requested", "off_reference_execution"]
+    fallback_reason: str | None
+
+
+@dataclass(frozen=True)
+class _RowStoreTempRootSelection:
+    policy: Literal["default", "env_node_local"]
+    requested_root: str | None
+    selected_root: str | None
+    selected_path: str
     fallback_reason: str | None
 
 
@@ -521,7 +654,11 @@ class _FileBackedFeatureRowStore:
         dtype: torch.dtype,
         row_abs_sum_dtype: torch.dtype = torch.float32,
         read_chunk_cache_bytes: int = 0,
+        prepared_read_cache_bytes: int = 0,
         row_store_cache_control_mode: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+        temp_root_policy: Literal["default", "env_node_local"] = "default",
+        temp_root: str | os.PathLike[str] | None = None,
+        preallocate: bool = False,
         telemetry_recorder: TelemetryRecorder | None = None,
     ) -> None:
         if dtype not in (torch.float32, torch.float64):
@@ -542,12 +679,31 @@ class _FileBackedFeatureRowStore:
 
         self._dtype = dtype
         self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
-        self._tmpdir = tempfile.TemporaryDirectory(prefix="ct_feature_rows_")
+        temp_root_selection, tmpdir = _select_row_store_temp_root(
+            temp_root_policy=temp_root_policy,
+            temp_root=temp_root,
+        )
+        self._tmpdir = tmpdir
         self._path = f"{self._tmpdir.name}/feature_rows.memmap"
         self._row_nbytes = int(np.dtype(self._np_dtype).itemsize * n_feature_columns)
         total_nbytes = int(self._row_nbytes * n_rows)
+        preallocate_requested = bool(preallocate)
+        posix_fallocate = getattr(os, "posix_fallocate", None)
+        preallocate_status = "disabled"
+        preallocate_error: str | None = None
         with open(self._path, "wb") as handle:
             handle.truncate(total_nbytes)
+            if preallocate_requested:
+                if callable(posix_fallocate):
+                    try:
+                        posix_fallocate(handle.fileno(), 0, total_nbytes)
+                        preallocate_status = "succeeded"
+                    except OSError as exc:
+                        preallocate_status = "failed"
+                        preallocate_error = repr(exc)
+                else:
+                    preallocate_status = "unavailable"
+                    preallocate_error = "os.posix_fallocate is unavailable"
         self._write_fd: int | None = os.open(self._path, os.O_RDWR)
         self._row_store_cache_control_effective_mode = row_store_cache_control_mode
         self._fadvise_dontneed_after_append_enabled = bool(
@@ -565,6 +721,11 @@ class _FileBackedFeatureRowStore:
         self._read_chunk_cache_max_bytes = max(0, int(read_chunk_cache_bytes))
         self._read_chunk_cache: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
         self._read_chunk_cache_nbytes = 0
+        self._prepared_read_cache_max_bytes = max(0, int(prepared_read_cache_bytes))
+        self._prepared_read_cache: OrderedDict[tuple[str, int, int, str, str], torch.Tensor] = (
+            OrderedDict()
+        )
+        self._prepared_read_cache_nbytes = 0
         self._telemetry_recorder = telemetry_recorder
         self._closed = False
         self._diagnostic_stats: dict[str, object] = {
@@ -582,6 +743,16 @@ class _FileBackedFeatureRowStore:
             "row_store_cache_control_advisory_unavailable_count": 0,
             "row_store_cache_control_advisory_skipped_count": 0,
             "row_store_cache_control_advisory_last_error": None,
+            "temp_root_policy": temp_root_selection.policy,
+            "temp_root_requested": temp_root_selection.requested_root,
+            "temp_root_selected": temp_root_selection.selected_root,
+            "temp_root_path": temp_root_selection.selected_path,
+            "temp_root_fallback_reason": temp_root_selection.fallback_reason,
+            "preallocate_requested": int(preallocate_requested),
+            "preallocate_available": int(callable(posix_fallocate)),
+            "preallocate_status": preallocate_status,
+            "preallocate_error": preallocate_error,
+            "preallocate_nbytes": int(total_nbytes) if preallocate_requested else 0,
             "read_call_count": 0,
             "read_row_count": 0,
             "read_last_row_start": None,
@@ -599,6 +770,22 @@ class _FileBackedFeatureRowStore:
             "read_cache_entry_count": 0,
             "read_cache_nbytes": 0,
             "read_cache_max_bytes": int(self._read_chunk_cache_max_bytes),
+            "prepared_read_cache_enabled": int(self._prepared_read_cache_max_bytes > 0),
+            "prepared_read_cache_max_bytes": int(self._prepared_read_cache_max_bytes),
+            "prepared_read_cache_entry_count": 0,
+            "prepared_read_cache_nbytes": 0,
+            "prepared_read_cache_hit_count": 0,
+            "prepared_read_cache_miss_count": 0,
+            "prepared_read_cache_hit_row_count": 0,
+            "prepared_read_cache_miss_row_count": 0,
+            "prepared_read_cache_eviction_count": 0,
+            "prepared_read_cache_invalidation_count": 0,
+            "prepared_read_cache_invalidation_entry_count": 0,
+            "prepared_read_cache_store_attempt_count": 0,
+            "prepared_read_cache_store_success_count": 0,
+            "prepared_read_cache_store_skip_disabled_count": 0,
+            "prepared_read_cache_store_skip_too_large_count": 0,
+            "prepared_read_cache_prepare_elapsed_ms_total": 0.0,
             "materialize_call_count": 0,
             "materialize_row_count": 0,
             "materialize_column_count": 0,
@@ -649,6 +836,12 @@ class _FileBackedFeatureRowStore:
         self._diagnostic_stats["read_cache_entry_count"] = int(len(self._read_chunk_cache))
         self._diagnostic_stats["read_cache_nbytes"] = int(self._read_chunk_cache_nbytes)
 
+    def _sync_prepared_read_cache_snapshot(self) -> None:
+        self._diagnostic_stats["prepared_read_cache_entry_count"] = int(
+            len(self._prepared_read_cache)
+        )
+        self._diagnostic_stats["prepared_read_cache_nbytes"] = int(self._prepared_read_cache_nbytes)
+
     def _drop_read_chunk(self, key: tuple[int, int], *, count_eviction: bool = True) -> None:
         chunk = self._read_chunk_cache.pop(key, None)
         if chunk is None:
@@ -661,6 +854,47 @@ class _FileBackedFeatureRowStore:
             self._diagnostic_stats["read_cache_eviction_count"] = (
                 int(self._diagnostic_stats["read_cache_eviction_count"] or 0) + 1
             )
+
+    def _drop_prepared_read_chunk(
+        self,
+        key: tuple[str, int, int, str, str],
+        *,
+        count_eviction: bool = True,
+    ) -> None:
+        chunk = self._prepared_read_cache.pop(key, None)
+        if chunk is None:
+            return
+        self._prepared_read_cache_nbytes = max(
+            0,
+            self._prepared_read_cache_nbytes - self._tensor_nbytes(chunk),
+        )
+        if count_eviction:
+            self._increment_diagnostic_counter("prepared_read_cache_eviction_count")
+
+    def _insert_prepared_read_chunk(
+        self,
+        key: tuple[str, int, int, str, str],
+        chunk: torch.Tensor,
+    ) -> str:
+        self._increment_diagnostic_counter("prepared_read_cache_store_attempt_count")
+        if self._prepared_read_cache_max_bytes <= 0:
+            self._increment_diagnostic_counter("prepared_read_cache_store_skip_disabled_count")
+            return "disabled"
+        chunk_nbytes = self._tensor_nbytes(chunk)
+        if chunk_nbytes > self._prepared_read_cache_max_bytes:
+            self._increment_diagnostic_counter("prepared_read_cache_store_skip_too_large_count")
+            return "too_large"
+        while (
+            self._prepared_read_cache
+            and self._prepared_read_cache_nbytes + chunk_nbytes
+            > self._prepared_read_cache_max_bytes
+        ):
+            self._drop_prepared_read_chunk(next(iter(self._prepared_read_cache)))
+        self._prepared_read_cache[key] = chunk
+        self._prepared_read_cache.move_to_end(key)
+        self._prepared_read_cache_nbytes += chunk_nbytes
+        self._increment_diagnostic_counter("prepared_read_cache_store_success_count")
+        return "stored"
 
     def _insert_read_chunk(self, key: tuple[int, int], chunk: torch.Tensor) -> str:
         self._diagnostic_stats["read_cache_store_attempt_count"] = (
@@ -702,6 +936,21 @@ class _FileBackedFeatureRowStore:
         ]
         for key in overlapping:
             self._drop_read_chunk(key, count_eviction=True)
+
+    def _evict_overlapping_prepared_read_chunks(self, row_start: int, row_end: int) -> None:
+        if not self._prepared_read_cache:
+            return
+        overlapping = [
+            key for key in self._prepared_read_cache if key[1] < row_end and key[2] > row_start
+        ]
+        if overlapping:
+            self._increment_diagnostic_counter("prepared_read_cache_invalidation_count")
+            self._increment_diagnostic_counter(
+                "prepared_read_cache_invalidation_entry_count",
+                delta=len(overlapping),
+            )
+        for key in overlapping:
+            self._drop_prepared_read_chunk(key, count_eviction=False)
 
     def _increment_diagnostic_counter(self, key: str, *, delta: int = 1) -> None:
         self._diagnostic_stats[key] = int(self._diagnostic_stats.get(key, 0) or 0) + int(delta)
@@ -752,7 +1001,7 @@ class _FileBackedFeatureRowStore:
         row_denominator_scaled_l1: tuple[torch.Tensor, torch.Tensor] | None = None,
         full_row_abs_sums: torch.Tensor | None = None,
         phase: str | None = None,
-    ) -> None:
+    ) -> dict[str, float]:
         if feature_rows.ndim != 2:
             raise ValueError("feature_rows must be rank-2")
         row_count, n_feature_cols = feature_rows.shape
@@ -785,6 +1034,13 @@ class _FileBackedFeatureRowStore:
         if row_start < 0 or row_end > self.n_rows:
             raise ValueError("row range is out of bounds for file-backed store")
 
+        append_total_start = time.perf_counter()
+        cpu_prepare_elapsed_ms = 0.0
+        contiguous_elapsed_ms = 0.0
+        numpy_elapsed_ms = 0.0
+        pwrite_elapsed_ms = 0.0
+        denominator_copy_elapsed_ms = 0.0
+
         with self._telemetry_timer(
             name="feature_row_store.append_rows",
             phase=phase,
@@ -796,13 +1052,19 @@ class _FileBackedFeatureRowStore:
             },
         ):
             write_fd = self._require_open_write_fd()
+            cpu_prepare_start = time.perf_counter()
             feature_rows_cpu = feature_rows.detach()
             if feature_rows_cpu.device.type != "cpu" or feature_rows_cpu.dtype != self._dtype:
                 feature_rows_cpu = feature_rows_cpu.to(device="cpu", dtype=self._dtype)
+            cpu_prepare_elapsed_ms = (time.perf_counter() - cpu_prepare_start) * 1000.0
 
+            numpy_start = time.perf_counter()
             feature_rows_np = np.asarray(feature_rows_cpu.numpy(), dtype=self._np_dtype, order="C")
+            numpy_elapsed_ms = (time.perf_counter() - numpy_start) * 1000.0
             if not feature_rows_np.flags.c_contiguous:
+                contiguous_start = time.perf_counter()
                 feature_rows_np = np.ascontiguousarray(feature_rows_np, dtype=self._np_dtype)
+                contiguous_elapsed_ms = (time.perf_counter() - contiguous_start) * 1000.0
             payload = memoryview(feature_rows_np).cast("B")
             expected_nbytes = int(row_count * self._row_nbytes)
             if payload.nbytes != expected_nbytes:
@@ -813,17 +1075,20 @@ class _FileBackedFeatureRowStore:
 
             byte_offset = int(row_start * self._row_nbytes)
             bytes_written = 0
+            pwrite_start = time.perf_counter()
             while bytes_written < expected_nbytes:
                 wrote = os.pwrite(write_fd, payload[bytes_written:], byte_offset + bytes_written)
                 if wrote <= 0:
                     raise OSError("feature row store append write failed")
                 bytes_written += wrote
+            pwrite_elapsed_ms = (time.perf_counter() - pwrite_start) * 1000.0
             self._apply_row_store_cache_control_after_append(
                 write_fd=write_fd,
                 byte_offset=byte_offset,
                 byte_length=expected_nbytes,
             )
 
+            denominator_copy_start = time.perf_counter()
             row_abs_max_cpu = row_abs_max.detach()
             if (
                 row_abs_max_cpu.device.type != "cpu"
@@ -845,6 +1110,7 @@ class _FileBackedFeatureRowStore:
 
             self.row_abs_max[row_start:row_end] = row_abs_max_cpu
             self.row_l1_scaled[row_start:row_end] = row_l1_scaled_cpu
+            denominator_copy_elapsed_ms = (time.perf_counter() - denominator_copy_start) * 1000.0
 
         self._diagnostic_stats["append_call_count"] = (
             int(self._diagnostic_stats["append_call_count"] or 0) + 1
@@ -853,7 +1119,19 @@ class _FileBackedFeatureRowStore:
             self._diagnostic_stats["append_row_count"] or 0
         ) + int(row_count)
         self._evict_overlapping_read_chunks(row_start, row_end)
+        self._evict_overlapping_prepared_read_chunks(row_start, row_end)
         self._sync_read_cache_snapshot()
+        self._sync_prepared_read_cache_snapshot()
+        return {
+            "row_store_append_cpu_prepare_elapsed_ms": float(cpu_prepare_elapsed_ms),
+            "row_store_append_contiguous_elapsed_ms": float(contiguous_elapsed_ms),
+            "row_store_append_numpy_elapsed_ms": float(numpy_elapsed_ms),
+            "row_store_append_pwrite_elapsed_ms": float(pwrite_elapsed_ms),
+            "row_store_append_denominator_copy_elapsed_ms": float(denominator_copy_elapsed_ms),
+            "row_store_append_total_elapsed_ms": float(
+                (time.perf_counter() - append_total_start) * 1000.0
+            ),
+        }
 
     def read_feature_rows(
         self,
@@ -911,6 +1189,61 @@ class _FileBackedFeatureRowStore:
                 int(self._diagnostic_stats["read_cache_miss_row_count"] or 0) + row_count
             )
         self._sync_read_cache_snapshot()
+        return result
+
+    def read_prepared_feature_rows(
+        self,
+        row_start: int,
+        row_end: int,
+        *,
+        device,
+        dtype: torch.dtype,
+        phase: str | None = None,
+    ) -> torch.Tensor:
+        if row_start < 0 or row_end < row_start or row_end > self.n_rows:
+            raise ValueError("requested row slice is out of bounds for file-backed store")
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError("prepared row dtype must be float32 or float64")
+        device_obj = torch.device(device)
+        if device_obj.type == "cuda" and device_obj.index is None and torch.cuda.is_available():
+            device_obj = torch.device("cuda", torch.cuda.current_device())
+        cache_key = ("abs_v1", int(row_start), int(row_end), str(device_obj), str(dtype))
+        cached = self._prepared_read_cache.get(cache_key)
+        cache_hit = cached is not None
+        row_count = int(row_end - row_start)
+        with self._telemetry_timer(
+            name="feature_row_store.read_prepared_rows",
+            phase=phase,
+            attrs={
+                "row_start": row_start,
+                "row_end": row_end,
+                "row_count": row_count,
+                "device": str(device_obj),
+                "dtype": str(dtype),
+                "cache_hit": cache_hit,
+            },
+        ):
+            if cached is not None:
+                self._prepared_read_cache.move_to_end(cache_key)
+                result = cached
+            else:
+                prepare_start = time.perf_counter()
+                result = self.read_feature_rows(row_start, row_end, phase=phase)
+                result = result.to(device=device_obj, dtype=dtype).abs()
+                elapsed = (time.perf_counter() - prepare_start) * 1000.0
+                self._diagnostic_stats["prepared_read_cache_prepare_elapsed_ms_total"] = float(
+                    self._diagnostic_stats["prepared_read_cache_prepare_elapsed_ms_total"] or 0.0
+                ) + float(elapsed)
+                self._insert_prepared_read_chunk(cache_key, result)
+        if cache_hit:
+            self._increment_diagnostic_counter("prepared_read_cache_hit_count")
+            self._increment_diagnostic_counter("prepared_read_cache_hit_row_count", delta=row_count)
+        else:
+            self._increment_diagnostic_counter("prepared_read_cache_miss_count")
+            self._increment_diagnostic_counter(
+                "prepared_read_cache_miss_row_count", delta=row_count
+            )
+        self._sync_prepared_read_cache_snapshot()
         return result
 
     def materialize_dense_feature_slice(
@@ -1017,7 +1350,10 @@ class _FileBackedFeatureRowStore:
 
         self._read_chunk_cache.clear()
         self._read_chunk_cache_nbytes = 0
+        self._prepared_read_cache.clear()
+        self._prepared_read_cache_nbytes = 0
         self._sync_read_cache_snapshot()
+        self._sync_prepared_read_cache_snapshot()
 
         self._tmpdir.cleanup()
 
@@ -1444,6 +1780,63 @@ def _build_phase4_row_executor_metadata(
         "row_executor_effective_behavior": phase4_row_executor_config.effective_behavior,
         "row_executor_reference_execution": bool(
             phase4_row_executor_config.requested_mode != phase4_row_executor_config.effective_mode
+        ),
+    }
+
+
+def _resolve_phase4_row_reduction_mode(
+    phase4_row_reduction: str,
+) -> Literal["off", "gpu_v1"]:
+    normalized = str(phase4_row_reduction).strip().lower()
+    allowed_values = {"off", "gpu_v1"}
+    if normalized not in allowed_values:
+        allowed = ", ".join(sorted(allowed_values))
+        raise ValueError(
+            f"phase4_row_reduction must be one of: {allowed} (got {phase4_row_reduction!r})"
+        )
+    return cast(Literal["off", "gpu_v1"], normalized)
+
+
+def _resolve_phase4_row_reduction_config(
+    phase4_row_reduction: str,
+    *,
+    compact_output: bool,
+    exact_chunked_decoder: bool,
+) -> _Phase4RowReductionConfig:
+    requested_mode = _resolve_phase4_row_reduction_mode(phase4_row_reduction)
+    gpu_v1_applicable = bool(compact_output and exact_chunked_decoder)
+    effective_mode = cast(
+        Literal["off", "gpu_v1"],
+        requested_mode if requested_mode == "off" or gpu_v1_applicable else "off",
+    )
+    effective_behavior: Literal["requested", "off_reference_execution"] = (
+        "off_reference_execution" if requested_mode != effective_mode else "requested"
+    )
+    return _Phase4RowReductionConfig(
+        requested_mode=requested_mode,
+        effective_mode=effective_mode,
+        version=_PHASE4_ROW_REDUCTION_VERSION_BY_MODE[requested_mode],
+        effective_version=_PHASE4_ROW_REDUCTION_VERSION_BY_MODE[effective_mode],
+        effective_behavior=effective_behavior,
+    )
+
+
+def _build_phase4_row_reduction_metadata(
+    phase4_row_reduction_config: _Phase4RowReductionConfig,
+) -> dict[str, object]:
+    return {
+        "row_reduction_requested": phase4_row_reduction_config.requested_mode,
+        "row_reduction_mode_requested": phase4_row_reduction_config.requested_mode,
+        "row_reduction": phase4_row_reduction_config.requested_mode,
+        "row_reduction_version": phase4_row_reduction_config.version,
+        "row_reduction_version_requested": phase4_row_reduction_config.version,
+        "row_reduction_effective": phase4_row_reduction_config.effective_mode,
+        "row_reduction_mode_effective": phase4_row_reduction_config.effective_mode,
+        "row_reduction_effective_version": phase4_row_reduction_config.effective_version,
+        "row_reduction_version_effective": phase4_row_reduction_config.effective_version,
+        "row_reduction_effective_behavior": phase4_row_reduction_config.effective_behavior,
+        "row_reduction_reference_execution": bool(
+            phase4_row_reduction_config.requested_mode != phase4_row_reduction_config.effective_mode
         ),
     }
 
@@ -2045,6 +2438,77 @@ def _build_row_store_cache_control_metadata(
             != row_store_cache_control_config.effective_mode
         ),
     }
+
+
+def _resolve_row_store_temp_root_policy(
+    temp_root_policy: str,
+) -> Literal["default", "env_node_local"]:
+    normalized = str(temp_root_policy).strip().lower()
+    if normalized not in _ROW_STORE_TEMP_ROOT_POLICY_BY_NAME:
+        allowed = ", ".join(sorted(_ROW_STORE_TEMP_ROOT_POLICY_BY_NAME))
+        raise ValueError(
+            f"row_store_temp_root_policy must be one of: {allowed} (got {temp_root_policy!r})"
+        )
+    return cast(
+        Literal["default", "env_node_local"],
+        _ROW_STORE_TEMP_ROOT_POLICY_BY_NAME[normalized],
+    )
+
+
+def _is_existing_writable_dir(path: str | os.PathLike[str] | None) -> bool:
+    if path is None:
+        return False
+    try:
+        return os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def _select_row_store_temp_root(
+    *,
+    temp_root_policy: str,
+    temp_root: str | os.PathLike[str] | None,
+) -> tuple[_RowStoreTempRootSelection, tempfile.TemporaryDirectory[str]]:
+    policy = _resolve_row_store_temp_root_policy(temp_root_policy)
+    requested_root = os.fspath(temp_root) if temp_root is not None else None
+    fallback_reason: str | None = None
+
+    if requested_root is not None:
+        if _is_existing_writable_dir(requested_root):
+            selected_root = requested_root
+        else:
+            selected_root = None
+            fallback_reason = (
+                f"requested temp_root is not an existing writable directory: {requested_root}"
+            )
+    elif policy == _ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL:
+        selected_root = None
+        rejected: list[str] = []
+        for label, candidate in (
+            ("SLURM_TMPDIR", os.environ.get("SLURM_TMPDIR")),
+            ("TMPDIR", os.environ.get("TMPDIR")),
+            ("/tmp", "/tmp"),
+        ):
+            if _is_existing_writable_dir(candidate):
+                selected_root = os.fspath(candidate)
+                break
+            if candidate:
+                rejected.append(f"{label}={candidate!r}")
+        if selected_root is None:
+            fallback_reason = "no env_node_local candidate was an existing writable directory"
+            if rejected:
+                fallback_reason += f" (rejected: {', '.join(rejected)})"
+    else:
+        selected_root = None
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="ct_feature_rows_", dir=selected_root)
+    return _RowStoreTempRootSelection(
+        policy=policy,
+        requested_root=requested_root,
+        selected_root=selected_root,
+        selected_path=tmpdir.name,
+        fallback_reason=fallback_reason,
+    ), tmpdir
 
 
 def _resolve_exact_encoder_residency(
@@ -3403,6 +3867,7 @@ def _compute_row_denominator_scaled_l1(
     row_values: torch.Tensor,
     *,
     dtype: torch.dtype = torch.float64,
+    preserve_device: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build stable row-L1 denominator representation.
 
@@ -3414,19 +3879,20 @@ def _compute_row_denominator_scaled_l1(
     row_values_cpu = row_values.detach()
     if row_values_cpu.ndim != 2:
         raise ValueError("row_values must be rank-2")
-    if row_values_cpu.device.type != "cpu" or row_values_cpu.dtype != resolved_dtype:
-        row_values_cpu = row_values_cpu.to(device="cpu", dtype=resolved_dtype)
+    target_device = row_values_cpu.device if preserve_device else torch.device("cpu")
+    if row_values_cpu.device != target_device or row_values_cpu.dtype != resolved_dtype:
+        row_values_cpu = row_values_cpu.to(device=target_device, dtype=resolved_dtype)
 
     n_rows = int(row_values_cpu.shape[0])
     n_cols = int(row_values_cpu.shape[1])
     if n_cols == 0:
-        row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
-        row_l1_scaled = torch.zeros(n_rows, dtype=resolved_dtype)
+        row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype, device=target_device)
+        row_l1_scaled = torch.zeros(n_rows, dtype=resolved_dtype, device=target_device)
         return row_abs_max, row_l1_scaled
 
     # Two-pass chunked reduction to avoid materializing a full abs() matrix copy.
     col_chunk_size = min(max(n_cols, 1), 4096)
-    row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype)
+    row_abs_max = torch.zeros(n_rows, dtype=resolved_dtype, device=target_device)
     for col_start in range(0, n_cols, col_chunk_size):
         col_end = min(col_start + col_chunk_size, n_cols)
         chunk_abs_max = row_values_cpu[:, col_start:col_end].abs().amax(dim=1)
@@ -3436,7 +3902,9 @@ def _compute_row_denominator_scaled_l1(
     nonzero_rows = (row_abs_max > 0) & torch.isfinite(row_abs_max)
     if bool(nonzero_rows.any()):
         nonzero_denom = row_abs_max[nonzero_rows].unsqueeze(1)
-        nonzero_scaled_sum = torch.zeros(nonzero_denom.shape[0], dtype=resolved_dtype)
+        nonzero_scaled_sum = torch.zeros(
+            nonzero_denom.shape[0], dtype=resolved_dtype, device=target_device
+        )
         for col_start in range(0, n_cols, col_chunk_size):
             col_end = min(col_start + col_chunk_size, n_cols)
             chunk = row_values_cpu[nonzero_rows, col_start:col_end].abs()
@@ -3605,6 +4073,42 @@ def _copy_rows_to_cpu_staging(
     return rows_cpu, staging_buffer
 
 
+def _copy_feature_rows_to_cpu_staging(
+    rows: torch.Tensor,
+    *,
+    total_active_feats: int,
+    staging_buffer: torch.Tensor | None,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Copy only active feature columns into a reusable CPU staging tensor."""
+
+    target_dtype = rows.dtype if dtype is None else dtype
+    if rows.ndim != 2:
+        raise ValueError("rows must be rank-2")
+    if total_active_feats < 0 or total_active_feats > int(rows.shape[1]):
+        raise ValueError("total_active_feats must fit within rows columns")
+
+    n_rows = int(rows.shape[0])
+    n_cols = int(total_active_feats)
+    source = rows.detach()[:, :n_cols]
+    if source.device.type == "cpu" and source.dtype == target_dtype and source.is_contiguous():
+        return source, staging_buffer
+
+    needs_new_buffer = (
+        staging_buffer is None
+        or staging_buffer.device.type != "cpu"
+        or staging_buffer.dtype != target_dtype
+        or int(staging_buffer.shape[0]) < n_rows
+        or int(staging_buffer.shape[1]) < n_cols
+    )
+    if needs_new_buffer:
+        staging_buffer = torch.empty((n_rows, n_cols), dtype=target_dtype, device="cpu")
+
+    feature_rows_cpu = staging_buffer[:n_rows, :n_cols]
+    feature_rows_cpu.copy_(source, non_blocking=False)
+    return feature_rows_cpu, staging_buffer
+
+
 def _row_denominator_to_row_abs_sums(
     row_denominator: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -3762,6 +4266,101 @@ def _safe_int(value: object) -> int | None:
     return None
 
 
+def _tensor_nbytes_estimate(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    return int(torch.empty((), dtype=dtype).element_size())
+
+
+def _build_tensor_transfer_estimate(
+    *,
+    prefix: str,
+    source: torch.Tensor,
+    destination_device: torch.device | str,
+    destination_dtype: torch.dtype | None = None,
+) -> dict[str, object]:
+    dest_device = torch.device(destination_device)
+    dest_dtype = source.dtype if destination_dtype is None else destination_dtype
+    estimated_bytes = int(source.numel() * _dtype_element_size(dest_dtype))
+    transfer_bytes = (
+        estimated_bytes
+        if source.device.type != dest_device.type or source.dtype != dest_dtype
+        else 0
+    )
+    return {
+        f"{prefix}_source": str(source.device.type),
+        f"{prefix}_destination": str(dest_device.type),
+        f"{prefix}_dtype_source": str(source.dtype),
+        f"{prefix}_dtype_destination": str(dest_dtype),
+        f"{prefix}_bytes": int(estimated_bytes),
+        f"{prefix}_transfer_bytes": int(transfer_bytes),
+    }
+
+
+class _RowTransferTelemetry(TypedDict):
+    row_transfer_source: str
+    row_transfer_destination: str
+    row_transfer_count: int
+    row_transfer_bytes: int
+    row_input_bytes: int
+    feature_row_bytes: int
+
+
+def _build_row_transfer_telemetry(
+    *,
+    rows: torch.Tensor,
+    rows_cpu: torch.Tensor,
+    row_input_slice: torch.Tensor,
+    feature_row_slice: torch.Tensor,
+) -> _RowTransferTelemetry:
+    source = str(rows.device.type)
+    destination = str(rows_cpu.device.type)
+    transferred = source != destination or rows.dtype != rows_cpu.dtype
+    return {
+        "row_transfer_source": source,
+        "row_transfer_destination": destination,
+        "row_transfer_count": int(rows.shape[0]),
+        "row_transfer_bytes": int(_tensor_nbytes_estimate(rows_cpu) if transferred else 0),
+        "row_input_bytes": int(_tensor_nbytes_estimate(row_input_slice)),
+        "feature_row_bytes": int(_tensor_nbytes_estimate(feature_row_slice)),
+    }
+
+
+def _build_phase4_gpu_row_reduction_transfer_telemetry(
+    *,
+    rows: torch.Tensor,
+    feature_row_slice: torch.Tensor,
+    row_abs_max: torch.Tensor,
+    row_l1_scaled: torch.Tensor,
+) -> dict[str, object]:
+    compact_transfer_bytes = (
+        _tensor_nbytes_estimate(feature_row_slice)
+        + _tensor_nbytes_estimate(row_abs_max)
+        + _tensor_nbytes_estimate(row_l1_scaled)
+    )
+    baseline_full_row_transfer_bytes = _tensor_nbytes_estimate(rows)
+    return {
+        "row_transfer_source": str(rows.device.type),
+        "row_transfer_destination": "cpu",
+        "row_transfer_count": int(rows.shape[0]),
+        "row_transfer_bytes": int(compact_transfer_bytes),
+        "row_input_bytes": int(
+            _tensor_nbytes_estimate(row_abs_max) + _tensor_nbytes_estimate(row_l1_scaled)
+        ),
+        "feature_row_bytes": int(_tensor_nbytes_estimate(feature_row_slice)),
+        "row_reduction_backend": "gpu_v1",
+        "row_reduction_baseline_full_row_transfer_bytes": int(baseline_full_row_transfer_bytes),
+        "row_reduction_compact_transfer_bytes": int(compact_transfer_bytes),
+        "row_reduction_gpu_to_cpu_bytes_saved": int(
+            max(0, baseline_full_row_transfer_bytes - compact_transfer_bytes)
+        ),
+    }
+
+
 def _build_phase4_refresh_substage_telemetry(
     *,
     telemetry_detail: Literal["summary", "normal", "debug"],
@@ -3780,6 +4379,8 @@ def _build_phase4_refresh_substage_telemetry(
     row_weight_zero_row_count: int | None = None,
     row_reader_overread_zero_row_count: int | None = None,
     active_row_range_count: int | None = None,
+    streaming_chunk_reuse_stats: dict[str, object] | None = None,
+    feature_row_store_read_stats: dict[str, object] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "refresh_partial_influence_elapsed_ms": float(partial_influence_elapsed_ms),
@@ -3807,12 +4408,55 @@ def _build_phase4_refresh_substage_telemetry(
                 "refresh_active_row_range_count": _safe_int(active_row_range_count),
             }
         )
+        if streaming_chunk_reuse_stats is not None:
+            for source_key, telemetry_key in {
+                "active_row_scan_elapsed_ms_total": "refresh_active_row_scan_elapsed_ms",
+                "chunk_allocation_zero_fill_elapsed_ms_total": "refresh_chunk_allocation_zero_fill_elapsed_ms",
+                "direct_accumulation_elapsed_ms_total": "refresh_direct_accumulation_elapsed_ms",
+                "transfer_cast_abs_elapsed_ms_total": "refresh_transfer_cast_abs_elapsed_ms",
+                "cache_lookup_elapsed_ms_total": "refresh_cache_lookup_elapsed_ms",
+                "cache_store_elapsed_ms_total": "refresh_cache_store_elapsed_ms",
+                "cache_eviction_elapsed_ms_total": "refresh_cache_eviction_elapsed_ms",
+                "row_weight_update_elapsed_ms_total": "refresh_row_weight_update_elapsed_ms",
+                "accounted_elapsed_ms_total": "refresh_accounted_elapsed_ms",
+                "unaccounted_elapsed_ms_total": "refresh_unaccounted_elapsed_ms",
+            }.items():
+                payload[telemetry_key] = _safe_float(streaming_chunk_reuse_stats.get(source_key))
+            for source_key, telemetry_key in {
+                "active_row_accumulation_mode": "refresh_active_row_accumulation_mode",
+                "active_row_direct_accumulation": "refresh_active_row_direct_accumulation",
+                "direct_accumulation_subrange_count": "refresh_direct_accumulation_subrange_count",
+                "prepared_row_reader_enabled": "refresh_prepared_row_reader_enabled",
+            }.items():
+                value = streaming_chunk_reuse_stats.get(source_key)
+                payload[telemetry_key] = value if isinstance(value, str) else _safe_int(value)
+        if feature_row_store_read_stats is not None:
+            for source_key, telemetry_key in {
+                "prepared_read_cache_hit_count": "feature_row_store_prepared_read_cache_hits",
+                "prepared_read_cache_miss_count": "feature_row_store_prepared_read_cache_misses",
+                "prepared_read_cache_hit_row_count": "feature_row_store_prepared_read_cache_hit_rows",
+                "prepared_read_cache_miss_row_count": "feature_row_store_prepared_read_cache_miss_rows",
+                "prepared_read_cache_eviction_count": "feature_row_store_prepared_read_cache_evictions",
+                "prepared_read_cache_invalidation_count": "feature_row_store_prepared_read_cache_invalidations",
+                "prepared_read_cache_invalidation_entry_count": "feature_row_store_prepared_read_cache_invalidation_entries",
+                "prepared_read_cache_store_attempt_count": "feature_row_store_prepared_read_cache_store_attempts",
+                "prepared_read_cache_store_success_count": "feature_row_store_prepared_read_cache_store_success",
+                "prepared_read_cache_store_skip_disabled_count": "feature_row_store_prepared_read_cache_store_skip_disabled",
+                "prepared_read_cache_store_skip_too_large_count": "feature_row_store_prepared_read_cache_store_skip_too_large",
+                "prepared_read_cache_entry_count": "feature_row_store_prepared_read_cache_entry_count",
+                "prepared_read_cache_nbytes": "feature_row_store_prepared_read_cache_nbytes",
+            }.items():
+                payload[telemetry_key] = _safe_int(feature_row_store_read_stats.get(source_key))
+            payload["feature_row_store_prepared_read_cache_prepare_elapsed_ms"] = _safe_float(
+                feature_row_store_read_stats.get("prepared_read_cache_prepare_elapsed_ms_total")
+            )
     return payload
 
 
 def _build_phase4_executor_substage_telemetry(
     *,
     telemetry_detail: Literal["summary", "normal", "debug"],
+    encoder_materialize_elapsed_ms: float,
     compute_batch_elapsed_ms: float,
     cpu_staging_elapsed_ms: float,
     denominator_elapsed_ms: float,
@@ -3820,12 +4464,14 @@ def _build_phase4_executor_substage_telemetry(
     batch_elapsed_ms: float,
 ) -> dict[str, object]:
     accounted_elapsed_ms = (
-        compute_batch_elapsed_ms
+        encoder_materialize_elapsed_ms
+        + compute_batch_elapsed_ms
         + cpu_staging_elapsed_ms
         + denominator_elapsed_ms
         + row_store_write_elapsed_ms
     )
     payload: dict[str, object] = {
+        "executor_encoder_materialize_elapsed_ms": float(encoder_materialize_elapsed_ms),
         "executor_compute_batch_elapsed_ms": float(compute_batch_elapsed_ms),
         "executor_accounted_elapsed_ms": float(accounted_elapsed_ms),
         "executor_overhead_elapsed_ms": float(max(0.0, batch_elapsed_ms - accounted_elapsed_ms)),
@@ -6093,19 +6739,26 @@ def attribute(
     phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
-    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_refresh_optimization: Literal["off", "v1"] = "v1",
+    phase4_refresh_prepared_chunk_cache_bytes: int = 0,
+    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "direct_v1",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
     phase1_trace_batch_size_max: int | None = None,
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
     row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
+    row_store_temp_root: str | os.PathLike[str] | None = None,
+    row_store_preallocate: bool = True,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
+    prefix_view_metadata: Mapping[str, Any] | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -6215,6 +6868,9 @@ def attribute(
             ``"off"`` keeps current behavior. ``"v1"`` enables the compact
             refresh row-range reader optimization while preserving exact math.
         phase4_row_executor: Requested Phase-4 row execution mode.
+        phase4_row_reduction: Requested Phase-4 row-reduction backend.
+            ``"gpu_v1"`` enables the compact exact Phase-4 staged GPU-denominator
+            path and is the default; ``"off"`` keeps the CPU reference path.
             ``"batched"`` keeps current behavior. ``"streaming_v1"`` executes
             compact exact-trace Phase-4 feature rows in smaller compute micro-batches
             while preserving scheduler frontier membership/order semantics.
@@ -6271,6 +6927,11 @@ def attribute(
         logger.setLevel(logging.WARNING)
 
     offload_handles = []
+    normalized_prefix_view_metadata = validate_prefix_view_metadata(
+        prompt=prompt,
+        attribution_targets=attribution_targets,
+        prefix_view_metadata=prefix_view_metadata,
+    )
     try:
         return _run_attribution(
             model=model,
@@ -6325,16 +6986,23 @@ def attribute(
             phase4_scheduler_debug=phase4_scheduler_debug,
             phase4_scheduler_telemetry_detail=phase4_scheduler_telemetry_detail,
             phase4_refresh_optimization=phase4_refresh_optimization,
+            phase4_refresh_prepared_chunk_cache_bytes=phase4_refresh_prepared_chunk_cache_bytes,
+            phase4_refresh_active_row_accumulation=phase4_refresh_active_row_accumulation,
             phase4_row_executor=phase4_row_executor,
+            phase4_row_reduction=phase4_row_reduction,
             phase1_trace_batch_policy=phase1_trace_batch_policy,
             phase1_trace_batch_size_max=phase1_trace_batch_size_max,
             phase4_refresh_policy=phase4_refresh_policy,
             phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
             phase4_ranker=phase4_ranker,
             row_store_cache_control=row_store_cache_control,
+            row_store_temp_root_policy=row_store_temp_root_policy,
+            row_store_temp_root=row_store_temp_root,
+            row_store_preallocate=row_store_preallocate,
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
+            prefix_view_metadata=normalized_prefix_view_metadata,
             logger=logger,
         )
     finally:
@@ -6398,19 +7066,26 @@ def _run_attribution(
     phase4_scheduler_mode: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality",
     phase4_scheduler_debug: bool = False,
     phase4_scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal",
-    phase4_refresh_optimization: Literal["off", "v1"] = "off",
+    phase4_refresh_optimization: Literal["off", "v1"] = "v1",
+    phase4_refresh_prepared_chunk_cache_bytes: int = 0,
+    phase4_refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "direct_v1",
     phase4_row_executor: Literal["batched", "streaming_v1"] = "batched",
+    phase4_row_reduction: Literal["off", "gpu_v1"] = "gpu_v1",
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy",
     phase1_trace_batch_size_max: int | None = None,
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
     row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
+    row_store_temp_root: str | os.PathLike[str] | None = None,
+    row_store_preallocate: bool = True,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
+    prefix_view_metadata: PrefixViewMetadata | None = None,
 ):
     start_time = time.time()
     run_start = time.perf_counter()
@@ -6422,6 +7097,9 @@ def _run_attribution(
     )
     phase0_activation_threshold_compare_mode_resolved = (
         _resolve_phase0_activation_threshold_compare_mode(phase0_activation_threshold_compare_mode)
+    )
+    row_store_temp_root_policy_resolved = _resolve_row_store_temp_root_policy(
+        row_store_temp_root_policy
     )
     phase0_replay_mode_resolved = _resolve_phase0_replay_mode(phase0_replay_mode)
     phase0_donor_context_policy_resolved = _resolve_phase0_donor_context_policy(
@@ -6463,6 +7141,12 @@ def _run_attribution(
         raise ValueError("feature_batch_min_free_fraction must be in [0, 1)")
     if feature_batch_probe_batches <= 0:
         raise ValueError("feature_batch_probe_batches must be > 0")
+    if phase4_refresh_prepared_chunk_cache_bytes < 0:
+        raise ValueError("phase4_refresh_prepared_chunk_cache_bytes must be >= 0")
+    if phase4_refresh_active_row_accumulation not in ("zero_fill", "direct_v1"):
+        raise ValueError(
+            "phase4_refresh_active_row_accumulation must be 'zero_fill' or 'direct_v1'"
+        )
     if phase0_replay_mode_resolved == "disabled" and phase0_donor_bundle_path is not None:
         raise ValueError(
             "phase0_donor_bundle was provided but phase0_replay_mode is disabled; "
@@ -6527,12 +7211,49 @@ def _run_attribution(
     phase4_refresh_optimization_metadata = _build_phase4_refresh_optimization_metadata(
         phase4_refresh_optimization_config
     )
+    phase4_refresh_aux_applicable = bool(
+        use_compact_feature_row_store and phase4_refresh_optimization_config.effective_mode == "v1"
+    )
+    phase4_refresh_prepared_chunk_cache_bytes_effective = (
+        int(phase4_refresh_prepared_chunk_cache_bytes) if phase4_refresh_aux_applicable else 0
+    )
+    phase4_refresh_active_row_accumulation_effective = (
+        phase4_refresh_active_row_accumulation if phase4_refresh_aux_applicable else "zero_fill"
+    )
+    phase4_refresh_aux_fallback_reason = None if phase4_refresh_aux_applicable else "not_applicable"
+    phase4_refresh_optimization_metadata.update(
+        {
+            "refresh_prepared_chunk_cache_bytes_requested": int(
+                phase4_refresh_prepared_chunk_cache_bytes
+            ),
+            "refresh_prepared_chunk_cache_bytes_effective": int(
+                phase4_refresh_prepared_chunk_cache_bytes_effective
+            ),
+            "refresh_prepared_chunk_cache_enabled": bool(
+                phase4_refresh_prepared_chunk_cache_bytes_effective > 0
+            ),
+            "refresh_active_row_accumulation_requested": phase4_refresh_active_row_accumulation,
+            "refresh_active_row_accumulation_effective": (
+                phase4_refresh_active_row_accumulation_effective
+            ),
+            "refresh_active_row_accumulation_fallback_reason": phase4_refresh_aux_fallback_reason,
+            "refresh_active_row_accumulation_applicable": bool(phase4_refresh_aux_applicable),
+        }
+    )
     phase4_row_executor_config = _resolve_phase4_row_executor_config(
         phase4_row_executor,
         compact_output=compact_output,
         exact_chunked_decoder=exact_chunked_decoder,
     )
     phase4_row_executor_metadata = _build_phase4_row_executor_metadata(phase4_row_executor_config)
+    phase4_row_reduction_config = _resolve_phase4_row_reduction_config(
+        phase4_row_reduction,
+        compact_output=compact_output,
+        exact_chunked_decoder=exact_chunked_decoder,
+    )
+    phase4_row_reduction_metadata = _build_phase4_row_reduction_metadata(
+        phase4_row_reduction_config
+    )
     phase1_trace_batch_config = _resolve_phase1_trace_batch_config(
         phase1_trace_batch_policy=phase1_trace_batch_policy,
         phase1_trace_batch_size_max=phase1_trace_batch_size_max,
@@ -6584,6 +7305,7 @@ def _run_attribution(
         **phase4_scheduler_metadata,
         **phase4_refresh_optimization_metadata,
         **phase4_row_executor_metadata,
+        **phase4_row_reduction_metadata,
         **phase4_refresh_policy_metadata,
         **phase4_ranker_metadata,
         **row_store_cache_control_metadata,
@@ -6639,6 +7361,8 @@ def _run_attribution(
             "phase0_donor_bundle_replay_kind": "phase0_active_features_v1",
             "semantic_descriptor_top_k": semantic_descriptor_top_k,
             "semantic_descriptor_dim": semantic_descriptor_dim,
+            "prefix_view_validation_applied": prefix_view_metadata is not None,
+            "prefix_view_metadata": dict(prefix_view_metadata) if prefix_view_metadata else None,
             **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
             **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
         },
@@ -7567,7 +8291,11 @@ def _run_attribution(
                 dtype=exact_trace_internal_dtype_resolved,
                 row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
                 read_chunk_cache_bytes=256 * 1024 * 1024,
+                prepared_read_cache_bytes=phase4_refresh_prepared_chunk_cache_bytes_effective,
                 row_store_cache_control_mode=row_store_cache_control_config.effective_mode,
+                temp_root_policy=row_store_temp_root_policy_resolved,
+                temp_root=row_store_temp_root,
+                preallocate=row_store_preallocate,
                 telemetry_recorder=telemetry_recorder,
             )
         else:
@@ -7598,6 +8326,7 @@ def _run_attribution(
                 row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_l1_scaled_shape=f"{tuple(feature_row_store.row_l1_scaled.shape)}",
                 feature_edge_columns=total_active_feats,
+                **feature_row_store.get_diagnostic_snapshot(),
             )
         else:
             phase2_extra.update(
@@ -7806,23 +8535,49 @@ def _run_attribution(
         phase3_error_abs_sum_batches: list[torch.Tensor] = []
         phase3_token_abs_sum_batches: list[torch.Tensor] = []
         rows_cpu_staging: torch.Tensor | None = None
+        phase3_compute_batch_elapsed_ms_total = 0.0
+        phase3_cpu_staging_elapsed_ms_total = 0.0
+        phase3_denominator_elapsed_ms_total = 0.0
+        phase3_row_store_write_elapsed_ms_total = 0.0
+        phase3_gpu_to_cpu_bytes_total = 0
+        phase3_cpu_to_gpu_bytes_total = 0
+        phase3_copy_count = 0
         for i in range(0, len(targets), effective_logit_batch_size):
             batch = targets.logit_vectors[i : i + effective_logit_batch_size]
             ctx_before = _snapshot_diagnostics(ctx) if profile else None
             transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
             batch_start = time.perf_counter()
+            batch_memory_before = get_memory_snapshot(model.device)
             if phase3_gradient_replay_mode_resolved == "donor":
                 setattr(ctx, "phase3_gradient_replay_column_offset", int(i))
+            phase3_inject_transfer_telemetry = _build_tensor_transfer_estimate(
+                prefix="inject_values",
+                source=batch,
+                destination_device=model.device,
+            )
+            if (
+                phase3_inject_transfer_telemetry["inject_values_source"] == "cpu"
+                and phase3_inject_transfer_telemetry["inject_values_destination"] == "cuda"
+            ):
+                phase3_cpu_to_gpu_bytes_total += int(
+                    phase3_inject_transfer_telemetry["inject_values_transfer_bytes"]
+                )
+            compute_batch_start = time.perf_counter()
             rows = ctx.compute_batch(
                 layers=torch.full((batch.shape[0],), n_layers),
                 positions=torch.full((batch.shape[0],), n_pos - 1),
                 inject_values=batch,
                 phase_label="phase3_logits",
             )
+            phase3_compute_batch_elapsed_ms = (time.perf_counter() - compute_batch_start) * 1000.0
+            phase3_compute_batch_elapsed_ms_total += phase3_compute_batch_elapsed_ms
+            cpu_staging_start = time.perf_counter()
             rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
                 rows,
                 staging_buffer=rows_cpu_staging,
             )
+            phase3_cpu_staging_elapsed_ms = (time.perf_counter() - cpu_staging_start) * 1000.0
+            phase3_cpu_staging_elapsed_ms_total += phase3_cpu_staging_elapsed_ms
             donor_feature_rows: torch.Tensor | None = None
             donor_row_abs_sums: torch.Tensor | None = None
             donor_feature_abs_sums: torch.Tensor | None = None
@@ -7850,6 +8605,7 @@ def _run_attribution(
                     torch.Tensor,
                     loaded_phase3_row_donor_bundle["token_abs_sums"],
                 )[i:end]
+            denominator_start = time.perf_counter()
             (
                 rows_cpu,
                 row_input_slice,
@@ -7864,6 +8620,24 @@ def _run_attribution(
                 donor_feature_rows=donor_feature_rows,
                 donor_row_abs_sums=donor_row_abs_sums,
             )
+            phase3_denominator_elapsed_ms = (time.perf_counter() - denominator_start) * 1000.0
+            phase3_denominator_elapsed_ms_total += phase3_denominator_elapsed_ms
+            phase3_row_transfer_telemetry = _build_row_transfer_telemetry(
+                rows=rows,
+                rows_cpu=rows_cpu,
+                row_input_slice=row_input_slice,
+                feature_row_slice=feature_row_slice,
+            )
+            if phase3_row_transfer_telemetry["row_transfer_source"] == "cuda":
+                phase3_gpu_to_cpu_bytes_total += int(
+                    phase3_row_transfer_telemetry["row_transfer_bytes"]
+                )
+            if phase3_row_transfer_telemetry["row_transfer_destination"] == "cuda":
+                phase3_cpu_to_gpu_bytes_total += int(
+                    phase3_row_transfer_telemetry["row_transfer_bytes"]
+                )
+            if int(phase3_row_transfer_telemetry["row_transfer_bytes"]) > 0:
+                phase3_copy_count += 1
             if capture_phase3_row_bundle_enabled:
                 feature_rows_cpu = feature_row_slice.contiguous()
                 error_start = int(total_active_feats)
@@ -7922,18 +8696,28 @@ def _run_attribution(
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
                 end = i + batch.shape[0]
+                row_store_write_start = time.perf_counter()
                 feature_row_store.append_rows(
                     row_start=i,
                     feature_rows=feature_row_slice,
                     row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                     phase="phase3",
                 )
+                phase3_row_store_write_elapsed_ms = (
+                    time.perf_counter() - row_store_write_start
+                ) * 1000.0
             else:
+                row_store_write_start = time.perf_counter()
                 edge_matrix[i : i + batch.shape[0], :logit_offset] = rows_cpu
+                phase3_row_store_write_elapsed_ms = (
+                    time.perf_counter() - row_store_write_start
+                ) * 1000.0
+            phase3_row_store_write_elapsed_ms_total += phase3_row_store_write_elapsed_ms
             row_to_node_index[i : i + batch.shape[0]] = (
                 torch.arange(i, i + batch.shape[0]) + logit_offset
             )
             batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+            batch_memory_after = get_memory_snapshot(model.device)
             telemetry_recorder.record_event(
                 scope="batch",
                 name="phase3.logit_batch",
@@ -7944,6 +8728,17 @@ def _run_attribution(
                     "batch_rows": int(batch.shape[0]),
                     "batch_start_index": int(i),
                     "total_logit_batches": int(total_logit_batches),
+                    "compute_batch_elapsed_ms": float(phase3_compute_batch_elapsed_ms),
+                    "cpu_staging_elapsed_ms": float(phase3_cpu_staging_elapsed_ms),
+                    "denominator_elapsed_ms": float(phase3_denominator_elapsed_ms),
+                    "row_store_write_elapsed_ms": float(phase3_row_store_write_elapsed_ms),
+                    **phase3_inject_transfer_telemetry,
+                    **phase3_row_transfer_telemetry,
+                    **build_memory_before_after_attrs(
+                        before=batch_memory_before,
+                        after=batch_memory_after,
+                        keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
+                    ),
                 },
             )
             telemetry_recorder.record_wall_clock_duration(
@@ -8008,7 +8803,21 @@ def _run_attribution(
             name="phase3.logit_attribution",
             phase="phase3",
             elapsed_ms=phase3_elapsed_ms,
-            attrs={"logit_count": int(len(targets)), "batches": int(total_logit_batches)},
+            attrs={
+                "logit_count": int(len(targets)),
+                "batches": int(total_logit_batches),
+                "phase3_compute_batch_elapsed_ms_total": float(
+                    phase3_compute_batch_elapsed_ms_total
+                ),
+                "phase3_cpu_staging_elapsed_ms_total": float(phase3_cpu_staging_elapsed_ms_total),
+                "phase3_denominator_elapsed_ms_total": float(phase3_denominator_elapsed_ms_total),
+                "phase3_row_store_write_elapsed_ms_total": float(
+                    phase3_row_store_write_elapsed_ms_total
+                ),
+                "phase3_gpu_to_cpu_bytes_total": int(phase3_gpu_to_cpu_bytes_total),
+                "phase3_cpu_to_gpu_bytes_total": int(phase3_cpu_to_gpu_bytes_total),
+                "phase3_copy_count": int(phase3_copy_count),
+            },
         )
         telemetry_recorder.record_wall_clock_duration(
             scope="phase",
@@ -8429,6 +9238,7 @@ def _run_attribution(
         # Phase 4: feature attribution
         logger.info("Phase 4: Computing feature attributions")
         phase4_start = time.perf_counter()
+        feature_rows_cpu_staging: torch.Tensor | None = None
         _log_memory_boundary(logger, "Phase 4 start", model.device)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
         phase4_feature_batch_size = effective_feature_batch_size
@@ -8564,6 +9374,15 @@ def _run_attribution(
         phase4_refresh_frontier_plan_elapsed_ms_total = 0.0
         phase4_refresh_influence_normalization_elapsed_ms_total = 0.0
         phase4_refresh_influence_matmul_elapsed_ms_total = 0.0
+        phase4_executor_encoder_materialize_elapsed_ms_total = 0.0
+        phase4_executor_compute_batch_elapsed_ms_total = 0.0
+        phase4_executor_cpu_staging_elapsed_ms_total = 0.0
+        phase4_executor_denominator_elapsed_ms_total = 0.0
+        phase4_executor_row_store_write_elapsed_ms_total = 0.0
+        phase4_gpu_to_cpu_bytes_total = 0
+        phase4_row_reduction_gpu_to_cpu_bytes_saved_total = 0
+        phase4_cpu_to_gpu_bytes_total = 0
+        phase4_copy_count = 0
         phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
         previous_phase4_pending: torch.Tensor | None = None
         first_phase4_pending: torch.Tensor | None = None
@@ -8649,12 +9468,30 @@ def _run_attribution(
                         feature_row_store.row_abs_max[:st],
                         feature_row_store.row_l1_scaled[:st],
                     )
+                    refresh_prepared_row_reader = bool(
+                        phase4_refresh_prepared_chunk_cache_bytes_effective > 0
+                    )
+                    if refresh_prepared_row_reader:
+
+                        def refresh_row_reader(row_start: int, row_end: int) -> torch.Tensor:
+                            return feature_row_store.read_prepared_feature_rows(
+                                row_start,
+                                row_end,
+                                device=feature_row_store.row_abs_max.device,
+                                dtype=influence_compute_dtype,
+                                phase="phase4",
+                            )
+                    else:
+
+                        def refresh_row_reader(row_start: int, row_end: int) -> torch.Tensor:
+                            return feature_row_store.read_feature_rows(
+                                row_start,
+                                row_end,
+                                phase="phase4",
+                            )
+
                     feature_influences = compute_partial_feature_influences_streaming(
-                        lambda row_start, row_end: feature_row_store.read_feature_rows(
-                            row_start,
-                            row_end,
-                            phase="phase4",
-                        ),
+                        refresh_row_reader,
                         row_denominator_prefix,
                         phase4_logit_probabilities,
                         row_to_node_index[:st],
@@ -8664,6 +9501,8 @@ def _run_attribution(
                         chunk_reuse_stats=streaming_chunk_reuse_stats,
                         compute_dtype=influence_compute_dtype,
                         active_row_only_chunks=refresh_active_row_only_chunks,
+                        row_reader_returns_prepared=refresh_prepared_row_reader,
+                        active_row_accumulation=phase4_refresh_active_row_accumulation_effective,
                     )
                     refresh_row_store_read_elapsed_ms = _safe_float(
                         streaming_chunk_reuse_stats.get("row_reader_elapsed_ms_total")
@@ -8674,6 +9513,13 @@ def _run_attribution(
                     refresh_influence_matmul_elapsed_ms = _safe_float(
                         streaming_chunk_reuse_stats.get("matmul_elapsed_ms_total")
                     )
+                    refresh_direct_accumulation_elapsed_ms = _safe_float(
+                        streaming_chunk_reuse_stats.get("direct_accumulation_elapsed_ms_total")
+                    )
+                    if refresh_direct_accumulation_elapsed_ms is not None:
+                        refresh_influence_matmul_elapsed_ms = float(
+                            refresh_influence_matmul_elapsed_ms or 0.0
+                        ) + float(refresh_direct_accumulation_elapsed_ms)
                     refresh_chunk_request_count = _safe_int(
                         streaming_chunk_reuse_stats.get("chunk_request_count")
                     )
@@ -8915,6 +9761,8 @@ def _run_attribution(
                     row_weight_zero_row_count=refresh_row_weight_zero_rows,
                     row_reader_overread_zero_row_count=refresh_row_reader_overread_zero_rows,
                     active_row_range_count=refresh_active_row_range_count,
+                    streaming_chunk_reuse_stats=streaming_chunk_reuse_stats,
+                    feature_row_store_read_stats=feature_row_store_read_stats,
                 )
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
@@ -8986,6 +9834,19 @@ def _run_attribution(
                         "feature_row_store_read_rows": _safe_float(
                             (feature_row_store_read_stats or {}).get("read_row_count")
                         ),
+                        "feature_row_store_read_bytes": (
+                            int(
+                                float(
+                                    (feature_row_store_read_stats or {}).get("read_row_count") or 0
+                                )
+                                * int(total_active_feats)
+                                * torch.empty(
+                                    (), dtype=exact_trace_internal_dtype_resolved
+                                ).element_size()
+                            )
+                            if use_compact_feature_row_store
+                            else None
+                        ),
                         "feature_row_store_read_cache_hits": _safe_float(
                             (feature_row_store_read_stats or {}).get("read_cache_hit_count")
                         ),
@@ -9021,6 +9882,26 @@ def _run_attribution(
                         ),
                         "streaming_chunk_cache_misses": _safe_float(
                             (streaming_chunk_reuse_stats or {}).get("chunk_cache_miss_count")
+                        ),
+                        "streaming_row_reader_calls": _safe_int(
+                            (streaming_chunk_reuse_stats or {}).get("row_reader_call_count")
+                        ),
+                        "streaming_row_reader_rows": _safe_int(
+                            (streaming_chunk_reuse_stats or {}).get("row_reader_row_count")
+                        ),
+                        "streaming_row_reader_estimated_bytes": (
+                            int(
+                                float(
+                                    (streaming_chunk_reuse_stats or {}).get("row_reader_row_count")
+                                    or 0
+                                )
+                                * int(total_active_feats)
+                                * torch.empty(
+                                    (), dtype=exact_trace_internal_dtype_resolved
+                                ).element_size()
+                            )
+                            if streaming_chunk_reuse_stats is not None
+                            else None
                         ),
                         "streaming_chunk_cache_store_success": _safe_float(
                             (streaming_chunk_reuse_stats or {}).get(
@@ -9336,11 +10217,52 @@ def _run_attribution(
                         _snapshot_diagnostics(model.transcoders) if profile else None
                     )
                     batch_start = time.perf_counter()
+                    batch_memory_before = get_memory_snapshot(model.device)
+                    encoder_vectors_source_device = None
+                    encoder_vectors_source_dtype = None
+                    if (
+                        getattr(ctx, "encoder_vecs", None) is not None
+                        and ctx.encoder_vecs.numel() > 0
+                    ):
+                        encoder_vectors_source_device = str(ctx.encoder_vecs.device.type)
+                        encoder_vectors_source_dtype = ctx.encoder_vecs.dtype
+                    encoder_materialize_start = time.perf_counter()
+                    encoder_vectors = ctx.materialize_encoder_vectors(idx_batch)
+                    executor_encoder_materialize_elapsed_ms = (
+                        time.perf_counter() - encoder_materialize_start
+                    ) * 1000.0
+                    encoder_vectors_transfer_bytes = (
+                        _tensor_nbytes_estimate(encoder_vectors)
+                        if encoder_vectors_source_device is not None
+                        and (
+                            encoder_vectors_source_device != encoder_vectors.device.type
+                            or encoder_vectors_source_dtype != encoder_vectors.dtype
+                        )
+                        else 0
+                    )
+                    encoder_vectors_transfer_telemetry = {
+                        "encoder_vectors_source": encoder_vectors_source_device,
+                        "encoder_vectors_destination": str(encoder_vectors.device.type),
+                        "encoder_vectors_dtype_source": str(encoder_vectors_source_dtype)
+                        if encoder_vectors_source_dtype is not None
+                        else None,
+                        "encoder_vectors_dtype_destination": str(encoder_vectors.dtype),
+                        "encoder_vectors_bytes": int(_tensor_nbytes_estimate(encoder_vectors)),
+                        "encoder_vectors_transfer_bytes": int(encoder_vectors_transfer_bytes),
+                        "encoder_vectors_materialize_elapsed_ms": float(
+                            executor_encoder_materialize_elapsed_ms
+                        ),
+                    }
+                    if (
+                        encoder_vectors_source_device == "cpu"
+                        and encoder_vectors.device.type == "cuda"
+                    ):
+                        phase4_cpu_to_gpu_bytes_total += int(encoder_vectors_transfer_bytes)
                     compute_batch_start = time.perf_counter()
                     rows = ctx.compute_batch(
                         layers=feat_layers[idx_batch],
                         positions=feat_pos[idx_batch],
-                        inject_values=ctx.materialize_encoder_vectors(idx_batch),
+                        inject_values=encoder_vectors,
                         retain_graph=n_visited < actual_max_feature_nodes,
                         phase_label="phase4_features",
                     )
@@ -9350,24 +10272,83 @@ def _run_attribution(
 
                     row_count = rows.shape[0]
                     end = st + row_count
-                    cpu_staging_start = time.perf_counter()
-                    rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
-                        rows,
-                        staging_buffer=rows_cpu_staging,
+                    if phase4_row_reduction_config.effective_mode == "gpu_v1":
+                        if not use_compact_feature_row_store:
+                            raise RuntimeError(
+                                "phase4_row_reduction='gpu_v1' requires compact Phase-4 row store"
+                            )
+                        cpu_staging_start = time.perf_counter()
+                        feature_row_slice, feature_rows_cpu_staging = (
+                            _copy_feature_rows_to_cpu_staging(
+                                rows,
+                                total_active_feats=total_active_feats,
+                                staging_buffer=feature_rows_cpu_staging,
+                            )
+                        )
+                        executor_cpu_staging_elapsed_ms = (
+                            time.perf_counter() - cpu_staging_start
+                        ) * 1000.0
+                        row_input_slice = rows[:, :logit_offset]
+                        denominator_start = time.perf_counter()
+                        row_abs_max_gpu, row_l1_scaled_gpu = _compute_row_denominator_scaled_l1(
+                            row_input_slice,
+                            dtype=exact_trace_internal_dtype_resolved,
+                            preserve_device=True,
+                        )
+                        executor_denominator_elapsed_ms = (
+                            time.perf_counter() - denominator_start
+                        ) * 1000.0
+                        executor_row_transfer_telemetry = (
+                            _build_phase4_gpu_row_reduction_transfer_telemetry(
+                                rows=rows,
+                                feature_row_slice=feature_row_slice,
+                                row_abs_max=row_abs_max_gpu,
+                                row_l1_scaled=row_l1_scaled_gpu,
+                            )
+                        )
+                        row_denominator_scaled_l1 = (row_abs_max_gpu, row_l1_scaled_gpu)
+                    else:
+                        cpu_staging_start = time.perf_counter()
+                        rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                            rows,
+                            staging_buffer=rows_cpu_staging,
+                        )
+                        executor_cpu_staging_elapsed_ms = (
+                            time.perf_counter() - cpu_staging_start
+                        ) * 1000.0
+                        row_input_slice = rows_cpu[:, :logit_offset]
+                        feature_row_slice = rows_cpu[:, :total_active_feats]
+                        executor_row_transfer_telemetry = _build_row_transfer_telemetry(
+                            rows=rows,
+                            rows_cpu=rows_cpu,
+                            row_input_slice=row_input_slice,
+                            feature_row_slice=feature_row_slice,
+                        )
+                        denominator_start = time.perf_counter()
+                        row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
+                            row_input_slice,
+                            dtype=exact_trace_internal_dtype_resolved,
+                        )
+                        row_denominator_scaled_l1 = (row_abs_max_cpu, row_l1_scaled_cpu)
+                        executor_denominator_elapsed_ms = (
+                            time.perf_counter() - denominator_start
+                        ) * 1000.0
+                    if executor_row_transfer_telemetry["row_transfer_source"] == "cuda":
+                        phase4_gpu_to_cpu_bytes_total += int(
+                            executor_row_transfer_telemetry["row_transfer_bytes"]
+                        )
+                    phase4_row_reduction_gpu_to_cpu_bytes_saved_total += int(
+                        executor_row_transfer_telemetry.get(
+                            "row_reduction_gpu_to_cpu_bytes_saved",
+                            0,
+                        )
                     )
-                    executor_cpu_staging_elapsed_ms = (
-                        time.perf_counter() - cpu_staging_start
-                    ) * 1000.0
-                    row_input_slice = rows_cpu[:, :logit_offset]
-                    feature_row_slice = rows_cpu[:, :total_active_feats]
-                    denominator_start = time.perf_counter()
-                    row_abs_max_cpu, row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
-                        row_input_slice,
-                        dtype=exact_trace_internal_dtype_resolved,
-                    )
-                    executor_denominator_elapsed_ms = (
-                        time.perf_counter() - denominator_start
-                    ) * 1000.0
+                    if executor_row_transfer_telemetry["row_transfer_destination"] == "cuda":
+                        phase4_cpu_to_gpu_bytes_total += int(
+                            executor_row_transfer_telemetry["row_transfer_bytes"]
+                        )
+                    if int(executor_row_transfer_telemetry["row_transfer_bytes"]) > 0:
+                        phase4_copy_count += 1
                     if anomaly_debug_result is not None and phase4_executor_microbatch_count <= 2:
                         feature_row_batches = anomaly_debug_result.setdefault(
                             "phase4_feature_row_batches",
@@ -9384,7 +10365,7 @@ def _run_attribution(
                                     top_k=8,
                                 ),
                                 "row_abs_sum_stats": _build_phase4_normalization_stats(
-                                    (row_abs_max_cpu, row_l1_scaled_cpu),
+                                    row_denominator_scaled_l1,
                                     clamp_epsilon=1e-8,
                                 ),
                             }
@@ -9392,21 +10373,23 @@ def _run_attribution(
                     if use_compact_feature_row_store:
                         assert feature_row_store is not None
                         row_store_write_start = time.perf_counter()
-                        feature_row_store.append_rows(
+                        row_store_append_telemetry = feature_row_store.append_rows(
                             row_start=st,
                             feature_rows=feature_row_slice,
-                            row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
+                            row_denominator_scaled_l1=row_denominator_scaled_l1,
                             phase="phase4",
                         )
                         executor_row_store_write_elapsed_ms = (
                             time.perf_counter() - row_store_write_start
                         ) * 1000.0
                     else:
+                        assert phase4_row_reduction_config.effective_mode == "off"
                         row_store_write_start = time.perf_counter()
                         edge_matrix[st:end, :logit_offset] = rows_cpu
                         executor_row_store_write_elapsed_ms = (
                             time.perf_counter() - row_store_write_start
                         ) * 1000.0
+                        row_store_append_telemetry = None
                     row_to_node_index[st:end] = idx_batch
                     visited[idx_batch] = True
                     st = end
@@ -9429,7 +10412,19 @@ def _run_attribution(
                             )
                     batch_number = executor_microbatch_index
                     batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+                    batch_memory_after = get_memory_snapshot(model.device)
                     phase4_feature_batch_elapsed_ms_total += batch_elapsed_ms
+                    phase4_executor_encoder_materialize_elapsed_ms_total += (
+                        executor_encoder_materialize_elapsed_ms
+                    )
+                    phase4_executor_compute_batch_elapsed_ms_total += (
+                        executor_compute_batch_elapsed_ms
+                    )
+                    phase4_executor_cpu_staging_elapsed_ms_total += executor_cpu_staging_elapsed_ms
+                    phase4_executor_denominator_elapsed_ms_total += executor_denominator_elapsed_ms
+                    phase4_executor_row_store_write_elapsed_ms_total += (
+                        executor_row_store_write_elapsed_ms
+                    )
                     executor_batch_telemetry = _build_phase4_executor_batch_telemetry(
                         scheduler_reference_batch_index=scheduler_reference_batch_index,
                         scheduler_reference_batch_count=phase4_scheduler_reference_batch_count,
@@ -9442,12 +10437,18 @@ def _run_attribution(
                     )
                     executor_substage_telemetry = _build_phase4_executor_substage_telemetry(
                         telemetry_detail=phase4_scheduler_config.telemetry_detail,
+                        encoder_materialize_elapsed_ms=executor_encoder_materialize_elapsed_ms,
                         compute_batch_elapsed_ms=executor_compute_batch_elapsed_ms,
                         cpu_staging_elapsed_ms=executor_cpu_staging_elapsed_ms,
                         denominator_elapsed_ms=executor_denominator_elapsed_ms,
                         row_store_write_elapsed_ms=executor_row_store_write_elapsed_ms,
                         batch_elapsed_ms=batch_elapsed_ms,
                     )
+                    if (
+                        row_store_append_telemetry is not None
+                        and phase4_scheduler_config.telemetry_detail in {"normal", "debug"}
+                    ):
+                        executor_substage_telemetry.update(row_store_append_telemetry)
                     executor_streaming_telemetry = {
                         "executor_reference_batch_size": int(reference_idx_batch.numel()),
                         "executor_microbatch_size": int(phase4_executor_microbatch_size),
@@ -9489,6 +10490,13 @@ def _run_attribution(
                             **executor_streaming_telemetry,
                             **batch_locality_summary,
                             **executor_substage_telemetry,
+                            **encoder_vectors_transfer_telemetry,
+                            **executor_row_transfer_telemetry,
+                            **build_memory_before_after_attrs(
+                                before=batch_memory_before,
+                                after=batch_memory_after,
+                                keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
+                            ),
                         },
                     )
                     telemetry_recorder.record_wall_clock_duration(
@@ -9503,7 +10511,7 @@ def _run_attribution(
                             top_k=0,
                         )
                         row_abs_sum_stats = _build_phase4_normalization_stats(
-                            (row_abs_max_cpu, row_l1_scaled_cpu),
+                            row_denominator_scaled_l1,
                             clamp_epsilon=1e-8,
                         )
                         _record_cross_cluster_batch_event(
@@ -9594,6 +10602,27 @@ def _run_attribution(
                 "phase4_refresh_influence_matmul_elapsed_ms_total": float(
                     phase4_refresh_influence_matmul_elapsed_ms_total
                 ),
+                "phase4_executor_encoder_materialize_elapsed_ms_total": float(
+                    phase4_executor_encoder_materialize_elapsed_ms_total
+                ),
+                "phase4_executor_compute_batch_elapsed_ms_total": float(
+                    phase4_executor_compute_batch_elapsed_ms_total
+                ),
+                "phase4_executor_cpu_staging_elapsed_ms_total": float(
+                    phase4_executor_cpu_staging_elapsed_ms_total
+                ),
+                "phase4_executor_denominator_elapsed_ms_total": float(
+                    phase4_executor_denominator_elapsed_ms_total
+                ),
+                "phase4_executor_row_store_write_elapsed_ms_total": float(
+                    phase4_executor_row_store_write_elapsed_ms_total
+                ),
+                "phase4_gpu_to_cpu_bytes_total": int(phase4_gpu_to_cpu_bytes_total),
+                "phase4_row_reduction_gpu_to_cpu_bytes_saved_total": int(
+                    phase4_row_reduction_gpu_to_cpu_bytes_saved_total
+                ),
+                "phase4_cpu_to_gpu_bytes_total": int(phase4_cpu_to_gpu_bytes_total),
+                "phase4_copy_count": int(phase4_copy_count),
                 **phase4_execution_metadata,
                 **(phase4_no_refresh_plan_telemetry or {}),
             },
@@ -10077,6 +11106,21 @@ def _run_attribution(
                     phase4_refresh_optimization_config.requested_mode
                     != phase4_refresh_optimization_config.effective_mode
                 ),
+                "phase4_refresh_prepared_chunk_cache_bytes_requested": int(
+                    phase4_refresh_prepared_chunk_cache_bytes
+                ),
+                "phase4_refresh_prepared_chunk_cache_bytes_effective": int(
+                    phase4_refresh_prepared_chunk_cache_bytes_effective
+                ),
+                "phase4_refresh_prepared_chunk_cache_enabled": bool(
+                    phase4_refresh_prepared_chunk_cache_bytes_effective > 0
+                ),
+                "phase4_refresh_active_row_accumulation_requested": phase4_refresh_active_row_accumulation,
+                "phase4_refresh_active_row_accumulation_effective": phase4_refresh_active_row_accumulation_effective,
+                "phase4_refresh_active_row_accumulation_fallback_reason": phase4_refresh_aux_fallback_reason,
+                "phase4_refresh_active_row_accumulation_applicable": bool(
+                    phase4_refresh_aux_applicable
+                ),
                 "phase4_row_executor_requested": phase4_row_executor_config.requested_mode,
                 "phase4_row_executor": phase4_row_executor_config.requested_mode,
                 "phase4_row_executor_mode_requested": phase4_row_executor_config.requested_mode,
@@ -10090,6 +11134,20 @@ def _run_attribution(
                 "phase4_row_executor_reference_execution": bool(
                     phase4_row_executor_config.requested_mode
                     != phase4_row_executor_config.effective_mode
+                ),
+                "phase4_row_reduction_requested": phase4_row_reduction_config.requested_mode,
+                "phase4_row_reduction": phase4_row_reduction_config.requested_mode,
+                "phase4_row_reduction_mode_requested": phase4_row_reduction_config.requested_mode,
+                "phase4_row_reduction_effective": phase4_row_reduction_config.effective_mode,
+                "phase4_row_reduction_mode_effective": phase4_row_reduction_config.effective_mode,
+                "phase4_row_reduction_version": phase4_row_reduction_config.version,
+                "phase4_row_reduction_version_requested": phase4_row_reduction_config.version,
+                "phase4_row_reduction_effective_version": phase4_row_reduction_config.effective_version,
+                "phase4_row_reduction_version_effective": phase4_row_reduction_config.effective_version,
+                "phase4_row_reduction_effective_behavior": phase4_row_reduction_config.effective_behavior,
+                "phase4_row_reduction_reference_execution": bool(
+                    phase4_row_reduction_config.requested_mode
+                    != phase4_row_reduction_config.effective_mode
                 ),
                 **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
                 "phase4_executor_configured_reference_batch_size": int(
@@ -10461,6 +11519,8 @@ def _run_attribution(
             telemetry_export = telemetry_recorder.export(include_events=True)
             compact_output_result["telemetry_summary"] = telemetry_export["summary"]
             compact_output_result["telemetry_events"] = telemetry_export.get("events", [])
+            if prefix_view_metadata is not None:
+                compact_output_result["prefix_view_metadata"] = dict(prefix_view_metadata)
             if anomaly_debug_result is not None:
                 compact_output_result["phase4_anomaly_debug"] = anomaly_debug_result
             if (

@@ -23,6 +23,7 @@ from circuit_tracer.utils.telemetry import TelemetryRecorder
 
 
 DEFAULT_EXACT_DECODER_CHUNK_SIZE = 1024
+DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES = 8589934592
 
 
 class DecoderChunkCache:
@@ -121,7 +122,7 @@ class CrossLayerTranscoder(torch.nn.Module):
         weight_format: str = "standard",
         exact_chunked_decoder: bool = False,
         decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
-        cross_batch_decoder_cache_bytes: int | None = None,
+        cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
     ):
         super().__init__()
 
@@ -139,7 +140,7 @@ class CrossLayerTranscoder(torch.nn.Module):
         self.exact_chunked_decoder = exact_chunked_decoder
         self.decoder_chunk_size = decoder_chunk_size
         if cross_batch_decoder_cache_bytes is None:
-            cross_batch_decoder_cache_bytes = 0
+            cross_batch_decoder_cache_bytes = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES
         self.cross_batch_decoder_cache_bytes = max(0, int(cross_batch_decoder_cache_bytes))
         self._diagnostic_stats = self._make_empty_diagnostic_stats()
         self._trace_logger = None

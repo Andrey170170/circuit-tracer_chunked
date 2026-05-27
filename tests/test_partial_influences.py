@@ -697,6 +697,98 @@ def test_streaming_active_row_chunks_match_default_and_reduce_row_reads() -> Non
     assert default_stats["row_reader_overread_zero_row_count"] > 0
 
 
+def test_streaming_prepared_row_reader_matches_default_and_skips_abs() -> None:
+    feature_rows = torch.tensor(
+        [[0.0, -2.0, 0.0], [0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    row_abs_sums = torch.ones(feature_rows.shape[0], dtype=torch.float32)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([3, 1, 0], dtype=torch.int32)
+
+    default_result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(feature_rows),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=3,
+        n_logits=1,
+        row_chunk_size=2,
+    )
+
+    prepared_stats: dict[str, int | float | str] = {}
+    prepared_result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(feature_rows.abs()),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=3,
+        n_logits=1,
+        row_chunk_size=2,
+        chunk_reuse_stats=prepared_stats,
+        row_reader_returns_prepared=True,
+    )
+
+    negative_prepared_result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(feature_rows),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=3,
+        n_logits=1,
+        row_chunk_size=2,
+        row_reader_returns_prepared=True,
+    )
+
+    assert torch.equal(prepared_result, default_result)
+    assert prepared_stats["prepared_row_reader_enabled"] == 1
+    assert not torch.equal(negative_prepared_result, default_result)
+
+
+def test_streaming_direct_active_row_accumulation_matches_zero_fill() -> None:
+    feature_rows = torch.tensor(
+        [[0.0, 2.0, 0.0, 1.0], [0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    row_abs_sums = torch.ones(feature_rows.shape[0], dtype=torch.float32)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([4, 1, 0], dtype=torch.int32)
+
+    zero_stats: dict[str, int | float | str] = {}
+    zero_result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(feature_rows),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=4,
+        n_logits=1,
+        row_chunk_size=3,
+        chunk_reuse_stats=zero_stats,
+        active_row_only_chunks=True,
+    )
+    direct_stats: dict[str, int | float | str] = {}
+    direct_result = compute_partial_feature_influences_streaming(
+        _dense_row_reader(feature_rows),
+        row_abs_sums,
+        logit_p,
+        row_to_node_index,
+        n_feature_nodes=4,
+        n_logits=1,
+        row_chunk_size=3,
+        chunk_reuse_stats=direct_stats,
+        active_row_only_chunks=True,
+        active_row_accumulation="direct_v1",
+    )
+
+    assert torch.equal(direct_result, zero_result)
+    assert direct_stats["active_row_accumulation_mode"] == "direct_v1"
+    assert direct_stats["active_row_direct_accumulation"] == 1
+    assert (
+        direct_stats["direct_accumulation_subrange_count"] == zero_stats["active_row_range_count"]
+    )
+    assert direct_stats["chunk_allocation_zero_fill_elapsed_ms_total"] == 0.0
+
+
 def test_compute_partial_feature_influences_streaming_solver_cache_disabled_is_explicit():
     n_features = 3
     n_logits = 1
