@@ -10332,6 +10332,7 @@ def _run_attribution(
                             )
                         )
                         row_denominator_scaled_l1 = (row_abs_max_gpu, row_l1_scaled_gpu)
+                        nonfeature_row_slice = rows[:, total_active_feats:logit_offset]
                     else:
                         cpu_staging_start = time.perf_counter()
                         rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
@@ -10343,6 +10344,7 @@ def _run_attribution(
                         ) * 1000.0
                         row_input_slice = rows_cpu[:, :logit_offset]
                         feature_row_slice = rows_cpu[:, :total_active_feats]
+                        nonfeature_row_slice = rows_cpu[:, total_active_feats:logit_offset]
                         executor_row_transfer_telemetry = _build_row_transfer_telemetry(
                             rows=rows,
                             rows_cpu=rows_cpu,
@@ -10407,7 +10409,7 @@ def _run_attribution(
                         )
                         nonfeature_row_store.append_rows(
                             row_start=st,
-                            feature_rows=rows_cpu[:, total_active_feats:logit_offset],
+                            feature_rows=nonfeature_row_slice,
                             row_denominator_scaled_l1=row_denominator_scaled_l1,
                             phase="phase4",
                         )
