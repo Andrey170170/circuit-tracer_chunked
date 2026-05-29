@@ -238,8 +238,12 @@ class PrefixViewMetadata(TypedDict, total=False):
     mode: str
     target_position: int
     prefix_token_count: int
+    output_position: int
     target_token_ids: list[int]
     prefix_token_ids_sha256: str
+    input_token_count: int
+    full_sequence_token_count: int
+    input_token_ids_sha256: str
     trace_id: str
     trajectory_id: str
 
@@ -305,32 +309,109 @@ def validate_prefix_view_metadata(
     for key in ("trace_id", "trajectory_id"):
         if key in prefix_view_metadata and prefix_view_metadata[key] is not None:
             normalized[key] = str(prefix_view_metadata[key])
-    if normalized["mode"] != "independent_prefix":
+    for key in ("output_position", "input_token_count", "full_sequence_token_count"):
+        if key in prefix_view_metadata and prefix_view_metadata[key] is not None:
+            normalized[key] = int(prefix_view_metadata[key])
+    if (
+        "input_token_ids_sha256" in prefix_view_metadata
+        and prefix_view_metadata["input_token_ids_sha256"] is not None
+    ):
+        normalized["input_token_ids_sha256"] = str(prefix_view_metadata["input_token_ids_sha256"])
+    if normalized["mode"] not in ("independent_prefix", "full_sequence_target_position"):
         raise ValueError(
-            f"prefix_view_metadata mode must be 'independent_prefix' (got {normalized['mode']!r})"
+            "prefix_view_metadata mode must be 'independent_prefix' or "
+            f"'full_sequence_target_position' (got {normalized['mode']!r})"
         )
-    if normalized["prefix_token_count"] != len(prefix_tokens):
+    if normalized["mode"] == "independent_prefix" and normalized["prefix_token_count"] != len(
+        prefix_tokens
+    ):
         raise ValueError(
             "prefix_view_metadata prefix_token_count does not match prompt token count "
             f"({normalized['prefix_token_count']} != {len(prefix_tokens)})"
         )
+    if normalized["prefix_token_count"] > len(prefix_tokens):
+        raise ValueError(
+            "prefix_view_metadata prefix_token_count exceeds prompt token count "
+            f"({normalized['prefix_token_count']} > {len(prefix_tokens)})"
+        )
     if normalized["target_position"] != normalized["prefix_token_count"]:
         raise ValueError(
-            "prefix_view_metadata target_position must equal prefix_token_count for "
-            "independent_prefix mode "
+            "prefix_view_metadata target_position must equal prefix_token_count "
             f"({normalized['target_position']} != {normalized['prefix_token_count']})"
+        )
+    expected_output_position = normalized["target_position"] - 1
+    if (
+        "output_position" in normalized
+        and normalized["output_position"] != expected_output_position
+    ):
+        raise ValueError(
+            "prefix_view_metadata output_position must equal target_position - 1 "
+            f"({normalized['output_position']} != {expected_output_position})"
         )
     if normalized["target_token_ids"] != target_ids:
         raise ValueError(
             "prefix_view_metadata target_token_ids do not match attribution_targets "
             f"({normalized['target_token_ids']} != {target_ids})"
         )
-    actual_hash = _hash_token_ids(prefix_tokens)
+    prefix_for_hash = prefix_tokens[: normalized["prefix_token_count"]]
+    actual_hash = _hash_token_ids(prefix_for_hash)
     if normalized["prefix_token_ids_sha256"] != actual_hash:
         raise ValueError(
             "prefix_view_metadata prefix_token_ids_sha256 does not match prompt tokens"
         )
+    for key in ("input_token_count", "full_sequence_token_count"):
+        if key in normalized and normalized[key] != len(prefix_tokens):
+            raise ValueError(
+                f"prefix_view_metadata {key} does not match prompt token count "
+                f"({normalized[key]} != {len(prefix_tokens)})"
+            )
+    if "input_token_ids_sha256" in normalized:
+        input_hash = _hash_token_ids(prefix_tokens)
+        if normalized["input_token_ids_sha256"] != input_hash:
+            raise ValueError(
+                "prefix_view_metadata input_token_ids_sha256 does not match prompt tokens"
+            )
     return normalized
+
+
+def _resolve_prefix_view_output_position(
+    normalized_prefix_view_metadata: PrefixViewMetadata | None,
+    output_position: int | None,
+) -> int | None:
+    if normalized_prefix_view_metadata is None:
+        return output_position
+
+    effective_output_position = None if output_position is None else int(output_position)
+    metadata_output_position = normalized_prefix_view_metadata.get("output_position")
+    if metadata_output_position is not None:
+        metadata_output_position = int(metadata_output_position)
+        if (
+            effective_output_position is not None
+            and effective_output_position != metadata_output_position
+        ):
+            raise ValueError(
+                "output_position does not match prefix_view_metadata output_position "
+                f"({effective_output_position} != {metadata_output_position})"
+            )
+
+    if normalized_prefix_view_metadata.get("mode") == "full_sequence_target_position":
+        expected_output_position = int(normalized_prefix_view_metadata["target_position"]) - 1
+        if effective_output_position is None:
+            return expected_output_position
+        if effective_output_position != expected_output_position:
+            raise ValueError(
+                "output_position must equal target_position - 1 for full_sequence_target_position "
+                f"({effective_output_position} != {expected_output_position})"
+            )
+
+    return effective_output_position
+
+
+def _apply_prefix_view_activation_mask(ctx: Any, target_position: int) -> dict[str, int]:
+    apply_prefix_view_state = getattr(ctx, "apply_prefix_view_state", None)
+    if not callable(apply_prefix_view_state):
+        raise RuntimeError("Attribution context does not support prefix-view state truncation")
+    return apply_prefix_view_state(int(target_position))
 
 
 _PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
@@ -4649,6 +4730,103 @@ def _build_phase4_cutoff_debug(
     }
 
 
+def _build_phase3_frontier_buffer_metadata(
+    *,
+    seed_feature_influences: torch.Tensor | None,
+    base_max_feature_nodes: int,
+    total_active_features: int,
+    relative_epsilon: float | None,
+    max_extra: int,
+) -> dict[str, object]:
+    requested = relative_epsilon is not None or max_extra > 0
+    metadata: dict[str, object] = {
+        "schema_version": 1,
+        "requested": bool(requested),
+        "enabled": False,
+        "effective": False,
+        "base_max_feature_nodes": int(base_max_feature_nodes),
+        "actual_max_feature_nodes": int(base_max_feature_nodes),
+        "total_active_features": int(total_active_features),
+        "relative_epsilon": None if relative_epsilon is None else float(relative_epsilon),
+        "max_extra": int(max_extra),
+        "extra_feature_count": 0,
+        "cutoff_rank": None,
+        "cutoff_score": None,
+        "next_score": None,
+        "cutoff_gap": None,
+        "relative_cutoff_gap": None,
+        "near_cutoff_counts": {"0.001": 0, "0.01": 0, "0.05": 0},
+        "status": "disabled",
+        "fallback_reason": None,
+    }
+    if relative_epsilon is None or max_extra <= 0:
+        metadata["fallback_reason"] = "epsilon_or_max_extra_not_enabled"
+        return metadata
+    metadata["enabled"] = True
+    if relative_epsilon < 0:
+        metadata["status"] = "fallback"
+        metadata["fallback_reason"] = "relative_epsilon_negative"
+        return metadata
+    if base_max_feature_nodes >= total_active_features:
+        metadata["status"] = "skipped_all_features_included"
+        metadata["fallback_reason"] = "all_features_included"
+        return metadata
+    if seed_feature_influences is None or seed_feature_influences.numel() == 0:
+        metadata["status"] = "fallback"
+        metadata["fallback_reason"] = "seed_feature_influences_unavailable"
+        return metadata
+
+    scores = torch.sort(
+        seed_feature_influences.detach().to(device="cpu", dtype=torch.float64).flatten(),
+        descending=True,
+    ).values
+    if scores.numel() <= 0 or base_max_feature_nodes <= 0:
+        metadata["status"] = "fallback"
+        metadata["fallback_reason"] = "empty_or_nonpositive_base_budget"
+        return metadata
+    cutoff_rank = min(base_max_feature_nodes - 1, int(scores.numel()) - 1)
+    cutoff_score = float(scores[cutoff_rank].item())
+    next_score = float(scores[cutoff_rank + 1].item()) if cutoff_rank + 1 < scores.numel() else None
+    cutoff_gap = None if next_score is None else float(cutoff_score - next_score)
+    relative_cutoff_gap = None
+    if cutoff_gap is not None and cutoff_score > 0:
+        relative_cutoff_gap = float(cutoff_gap / cutoff_score)
+    metadata.update(
+        {
+            "cutoff_rank": int(cutoff_rank),
+            "cutoff_score": cutoff_score,
+            "next_score": next_score,
+            "cutoff_gap": cutoff_gap,
+            "relative_cutoff_gap": relative_cutoff_gap,
+        }
+    )
+
+    below = scores[base_max_feature_nodes:]
+    near_counts: dict[str, int] = {}
+    for eps in (0.001, 0.01, 0.05):
+        near_counts[str(eps)] = (
+            int((below >= cutoff_score * (1.0 - eps)).sum().item()) if cutoff_score > 0 else 0
+        )
+    metadata["near_cutoff_counts"] = near_counts
+    # Relative thresholds around zero/negative cutoffs can include an unbounded tail
+    # of weakly negative candidates. Keep the experiment conservative and record a
+    # fallback rather than switching to an absolute threshold with different meaning.
+    if cutoff_score <= 0:
+        metadata["status"] = "fallback"
+        metadata["fallback_reason"] = "nonpositive_cutoff_score"
+        return metadata
+    extra_count = min(
+        int((below >= cutoff_score * (1.0 - float(relative_epsilon))).sum().item()),
+        int(max_extra),
+        int(total_active_features - base_max_feature_nodes),
+    )
+    metadata["extra_feature_count"] = int(extra_count)
+    metadata["actual_max_feature_nodes"] = int(base_max_feature_nodes + extra_count)
+    metadata["effective"] = bool(extra_count > 0)
+    metadata["status"] = "expanded" if extra_count > 0 else "no_extra_candidates"
+    return metadata
+
+
 def _build_phase0_donor_bundle_payload(
     *,
     activation_matrix: torch.Tensor,
@@ -6755,10 +6933,13 @@ def attribute(
     row_store_preallocate: bool = True,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
+    phase3_frontier_buffer_relative_epsilon: float | None = None,
+    phase3_frontier_buffer_max_extra: int = 0,
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
     prefix_view_metadata: Mapping[str, Any] | None = None,
+    output_position: int | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -6932,6 +7113,10 @@ def attribute(
         attribution_targets=attribution_targets,
         prefix_view_metadata=prefix_view_metadata,
     )
+    output_position = _resolve_prefix_view_output_position(
+        normalized_prefix_view_metadata,
+        output_position,
+    )
     try:
         return _run_attribution(
             model=model,
@@ -7001,8 +7186,11 @@ def attribute(
             row_store_preallocate=row_store_preallocate,
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
+            phase3_frontier_buffer_relative_epsilon=phase3_frontier_buffer_relative_epsilon,
+            phase3_frontier_buffer_max_extra=phase3_frontier_buffer_max_extra,
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
             prefix_view_metadata=normalized_prefix_view_metadata,
+            output_position=output_position,
             logger=logger,
         )
     finally:
@@ -7082,10 +7270,13 @@ def _run_attribution(
     row_store_preallocate: bool = True,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
+    phase3_frontier_buffer_relative_epsilon: float | None = None,
+    phase3_frontier_buffer_max_extra: int = 0,
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
     prefix_view_metadata: PrefixViewMetadata | None = None,
+    output_position: int | None = None,
 ):
     start_time = time.time()
     run_start = time.perf_counter()
@@ -7143,6 +7334,13 @@ def _run_attribution(
         raise ValueError("feature_batch_probe_batches must be > 0")
     if phase4_refresh_prepared_chunk_cache_bytes < 0:
         raise ValueError("phase4_refresh_prepared_chunk_cache_bytes must be >= 0")
+    if phase3_frontier_buffer_max_extra < 0:
+        raise ValueError("phase3_frontier_buffer_max_extra must be >= 0")
+    if (
+        phase3_frontier_buffer_relative_epsilon is not None
+        and phase3_frontier_buffer_relative_epsilon < 0
+    ):
+        raise ValueError("phase3_frontier_buffer_relative_epsilon must be >= 0 when provided")
     if phase4_refresh_active_row_accumulation not in ("zero_fill", "direct_v1"):
         raise ValueError(
             "phase4_refresh_active_row_accumulation must be 'zero_fill' or 'direct_v1'"
@@ -7563,6 +7761,7 @@ def _run_attribution(
     )
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
+    nonfeature_row_store: _FileBackedFeatureRowStore | None = None
     compact_output_result: dict[str, object] | None = None
     phase0_donor_bundle_payload: dict[str, object] | None = None
     phase3_seed_bundle_payload: dict[str, object] | None = None
@@ -7599,6 +7798,13 @@ def _run_attribution(
     logger.info("Phase 0: Precomputing activations and vectors")
     phase_start = time.perf_counter()
     input_ids = model.ensure_tokenized(prompt)
+    n_input_pos = int(input_ids.shape[-1])
+    if output_position is not None:
+        output_position = int(output_position)
+        if output_position < 0 or output_position >= n_input_pos:
+            raise ValueError(
+                f"output_position must be in [0, {n_input_pos}) (got {output_position})"
+            )
     _log_memory_boundary(logger, "Phase 0 start", model.device)
 
     configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
@@ -7665,7 +7871,7 @@ def _run_attribution(
     ctx = model.setup_attribution(
         input_ids,
         sparsification=sparsification,
-        retain_full_logits=False,
+        retain_full_logits=output_position is not None and output_position != n_input_pos - 1,
         chunked_feature_replay_window=chunked_feature_replay_window,
         error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
         stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
@@ -7674,6 +7880,12 @@ def _run_attribution(
         exact_encoder_residency=exact_encoder_residency_config.requested_mode,
         internal_precision_requested=internal_precision_requested,
         resolved_dtype_map=resolved_dtype_map,
+        prefix_view_length=(
+            int(prefix_view_metadata["target_position"])
+            if prefix_view_metadata is not None
+            and prefix_view_metadata.get("mode") == "full_sequence_target_position"
+            else None
+        ),
     )
     exact_encoder_runtime_metadata = {
         "exact_encoder_staging_destination": getattr(
@@ -7713,6 +7925,24 @@ def _run_attribution(
                 "phase4_execution": dict(phase4_execution_metadata),
             }
         )
+
+    prefix_view_activation_mask_metadata: dict[str, int] | None = None
+    if (
+        prefix_view_metadata is not None
+        and prefix_view_metadata.get("mode") == "full_sequence_target_position"
+    ):
+        replace_phase0_activation_state = getattr(ctx, "replace_phase0_activation_state", None)
+        if not callable(replace_phase0_activation_state):
+            raise RuntimeError(
+                "Attribution context does not support Phase-0 activation-state replacement"
+            )
+        prefix_view_activation_mask_metadata = _apply_prefix_view_activation_mask(
+            ctx, int(prefix_view_metadata["target_position"])
+        )
+        if isinstance(getattr(ctx, "setup_diagnostic_stats", None), dict):
+            ctx.setup_diagnostic_stats["prefix_view_activation_mask"] = dict(
+                prefix_view_activation_mask_metadata
+            )
 
     if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
         before_cap, after_cap = ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
@@ -8014,10 +8244,14 @@ def _run_attribution(
         _log_memory_boundary(logger, "Phase 2 start", model.device)
 
         # Create AttributionTargets using NNSight's unembed_weight accessor
-        last_token_logits = ctx.get_last_token_logits()[0]
+        output_logits = (
+            ctx.get_logits_at_position(output_position)[0]
+            if output_position is not None and output_position != n_input_pos - 1
+            else ctx.get_last_token_logits()[0]
+        )
         targets = AttributionTargets(
             attribution_targets=attribution_targets,
-            logits=last_token_logits,
+            logits=output_logits,
             unembed_proj=cast(torch.Tensor, model.unembed_weight),  # NNSight uses unembed_weight
             tokenizer=model.tokenizer,
             max_n_logits=max_n_logits,
@@ -8028,7 +8262,7 @@ def _run_attribution(
         target_token_ids_tensor = torch.tensor(
             [int(target.vocab_idx) for target in targets.logit_targets],
             dtype=torch.int64,
-            device=last_token_logits.device,
+            device=output_logits.device,
         )
 
         host_activation_matrix = activation_matrix.coalesce()
@@ -8161,10 +8395,10 @@ def _run_attribution(
 
         if capture_phase0_donor_bundle_enabled:
             valid_target_mask = (target_token_ids_tensor >= 0) & (
-                target_token_ids_tensor < int(last_token_logits.shape[0])
+                target_token_ids_tensor < int(output_logits.shape[0])
             )
             target_logits = (
-                last_token_logits[target_token_ids_tensor[valid_target_mask]]
+                output_logits[target_token_ids_tensor[valid_target_mask]]
                 if bool(valid_target_mask.any().item())
                 else None
             )
@@ -8275,7 +8509,24 @@ def _run_attribution(
         n_logits = len(targets)
         total_nodes = logit_offset + n_logits
 
-        actual_max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
+        base_max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
+        actual_max_feature_nodes = base_max_feature_nodes
+        phase3_frontier_buffer_metadata = _build_phase3_frontier_buffer_metadata(
+            seed_feature_influences=None,
+            base_max_feature_nodes=int(base_max_feature_nodes),
+            total_active_features=int(total_active_feats),
+            relative_epsilon=phase3_frontier_buffer_relative_epsilon,
+            max_extra=int(phase3_frontier_buffer_max_extra),
+        )
+        row_store_capacity_feature_nodes = min(
+            base_max_feature_nodes
+            + (
+                int(phase3_frontier_buffer_max_extra)
+                if phase3_frontier_buffer_relative_epsilon is not None
+                else 0
+            ),
+            total_active_feats,
+        )
         logger.info(
             f"Will include {actual_max_feature_nodes} of {total_active_feats} feature nodes"
         )
@@ -8285,8 +8536,9 @@ def _run_attribution(
             # Keep dense full-row behavior unchanged for non-compact Graph outputs.
             assert compact_output
             assert exact_chunked_decoder
+            n_nonfeature_columns = int(logit_offset - total_active_feats)
             feature_row_store = _FileBackedFeatureRowStore(
-                n_rows=actual_max_feature_nodes + n_logits,
+                n_rows=row_store_capacity_feature_nodes + n_logits,
                 n_feature_columns=total_active_feats,
                 dtype=exact_trace_internal_dtype_resolved,
                 row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
@@ -8298,12 +8550,27 @@ def _run_attribution(
                 preallocate=row_store_preallocate,
                 telemetry_recorder=telemetry_recorder,
             )
+            nonfeature_row_store = _FileBackedFeatureRowStore(
+                n_rows=row_store_capacity_feature_nodes + n_logits,
+                n_feature_columns=n_nonfeature_columns,
+                dtype=exact_trace_internal_dtype_resolved,
+                row_abs_sum_dtype=exact_trace_internal_dtype_resolved,
+                read_chunk_cache_bytes=256 * 1024 * 1024,
+                prepared_read_cache_bytes=0,
+                row_store_cache_control_mode=row_store_cache_control_config.effective_mode,
+                temp_root_policy=row_store_temp_root_policy_resolved,
+                temp_root=row_store_temp_root,
+                preallocate=row_store_preallocate,
+                telemetry_recorder=telemetry_recorder,
+            )
         else:
-            edge_matrix = torch.zeros(actual_max_feature_nodes + n_logits, total_nodes)
+            edge_matrix = torch.zeros(row_store_capacity_feature_nodes + n_logits, total_nodes)
 
         # Maps stored row indices to original feature/node indices.
         # First populated with logit node IDs, then feature IDs in attribution order
-        row_to_node_index = torch.zeros(actual_max_feature_nodes + n_logits, dtype=torch.int32)
+        row_to_node_index = torch.zeros(
+            row_store_capacity_feature_nodes + n_logits, dtype=torch.int32
+        )
 
         phase2_extra: dict[str, object] = {
             "row_store_mode": (
@@ -8319,13 +8586,16 @@ def _run_attribution(
         }
         if use_compact_feature_row_store:
             assert feature_row_store is not None
+            assert nonfeature_row_store is not None
             phase2_extra.update(
                 feature_row_store="dense_memmap",
                 feature_row_store_path=feature_row_store.path,
+                nonfeature_row_store_path=nonfeature_row_store.path,
                 row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
                 row_l1_scaled_shape=f"{tuple(feature_row_store.row_l1_scaled.shape)}",
                 feature_edge_columns=total_active_feats,
+                nonfeature_edge_columns=n_nonfeature_columns,
                 **feature_row_store.get_diagnostic_snapshot(),
             )
         else:
@@ -8565,7 +8835,10 @@ def _run_attribution(
             compute_batch_start = time.perf_counter()
             rows = ctx.compute_batch(
                 layers=torch.full((batch.shape[0],), n_layers),
-                positions=torch.full((batch.shape[0],), n_pos - 1),
+                positions=torch.full(
+                    (batch.shape[0],),
+                    output_position if output_position is not None else n_pos - 1,
+                ),
                 inject_values=batch,
                 phase_label="phase3_logits",
             )
@@ -8695,11 +8968,18 @@ def _run_attribution(
                 )
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
+                assert nonfeature_row_store is not None
                 end = i + batch.shape[0]
                 row_store_write_start = time.perf_counter()
                 feature_row_store.append_rows(
                     row_start=i,
                     feature_rows=feature_row_slice,
+                    row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
+                    phase="phase3",
+                )
+                nonfeature_row_store.append_rows(
+                    row_start=i,
+                    feature_rows=rows_cpu[:, total_active_feats:logit_offset],
                     row_denominator_scaled_l1=(row_abs_max_cpu, row_l1_scaled_cpu),
                     phase="phase3",
                 )
@@ -8877,6 +9157,7 @@ def _run_attribution(
             cross_cluster_debug_summary is not None
             or capture_phase3_seed_bundle_enabled
             or capture_feature_semantic_descriptors_enabled
+            or phase3_frontier_buffer_metadata["enabled"]
         ):
             phase3_runtime_summary: dict[str, object] = {}
             phase3_runtime_stream: dict[str, object] = {}
@@ -8952,6 +9233,19 @@ def _run_attribution(
                     descending=True,
                 ).cpu()
                 candidate_scores = seed_feature_influences[unvisited_feature_rank].detach().cpu()
+                phase3_frontier_buffer_metadata = _build_phase3_frontier_buffer_metadata(
+                    seed_feature_influences=seed_feature_influences,
+                    base_max_feature_nodes=int(base_max_feature_nodes),
+                    total_active_features=int(total_active_feats),
+                    relative_epsilon=phase3_frontier_buffer_relative_epsilon,
+                    max_extra=int(phase3_frontier_buffer_max_extra),
+                )
+                actual_max_feature_nodes = int(
+                    phase3_frontier_buffer_metadata["actual_max_feature_nodes"]
+                )
+                phase3_seed_summary["phase3_frontier_buffer_metadata"] = (
+                    phase3_frontier_buffer_metadata
+                )
                 queue_size = min(
                     _compute_phase4_refresh_queue_window_size(
                         update_interval=update_interval,
@@ -9111,6 +9405,8 @@ def _run_attribution(
                             shadow_pending,
                         )
             else:
+                phase3_frontier_buffer_metadata["status"] = "skipped_all_features_included"
+                phase3_frontier_buffer_metadata["fallback_reason"] = "all_features_included"
                 phase3_seed_summary.update(
                     {
                         "status": "skipped_all_features_included",
@@ -9615,6 +9911,49 @@ def _run_attribution(
                     "ranker_frontier_tie_at_cutoff": bool(rank_selection.tie_at_cutoff),
                     "ranker_frontier_tie_behavior": rank_selection.tie_behavior,
                 }
+                if (
+                    (
+                        cross_cluster_debug_enabled
+                        or phase4_scheduler_config.telemetry_detail == "debug"
+                    )
+                    and rank_selection.cutoff_score is not None
+                    and rank_selection.cutoff_score > 0
+                ):
+                    unvisited_scores_for_cutoff = (
+                        feature_influences[
+                            _rank_phase4_unvisited_features_argsort(feature_influences, visited)
+                        ]
+                        .detach()
+                        .to(device="cpu", dtype=torch.float64)
+                    )
+                    cutoff_score_for_profile = float(rank_selection.cutoff_score)
+                    below_cutoff_scores = unvisited_scores_for_cutoff[
+                        int(rank_selection.selected_count) :
+                    ]
+                    near_cutoff_counts = {
+                        str(eps): int(
+                            (below_cutoff_scores >= cutoff_score_for_profile * (1.0 - float(eps)))
+                            .sum()
+                            .item()
+                        )
+                        for eps in (0.001, 0.01, 0.05)
+                    }
+                    next_score = (
+                        float(
+                            unvisited_scores_for_cutoff[int(rank_selection.selected_count)].item()
+                        )
+                        if int(rank_selection.selected_count) < unvisited_scores_for_cutoff.numel()
+                        else None
+                    )
+                    cutoff_gap = (
+                        None if next_score is None else float(cutoff_score_for_profile - next_score)
+                    )
+                    ranker_refresh_telemetry["ranker_frontier_near_cutoff_counts"] = (
+                        near_cutoff_counts
+                    )
+                    ranker_refresh_telemetry["ranker_frontier_relative_cutoff_gap"] = (
+                        None if cutoff_gap is None else float(cutoff_gap / cutoff_score_for_profile)
+                    )
                 candidate_scores: torch.Tensor | None = None
                 rank_signal_stats: dict[str, object] | None = None
                 normalization_input_stats: dict[str, object] | None = None
@@ -9956,6 +10295,14 @@ def _run_attribution(
                             "pending_count": int(pending.numel()),
                             "pending_hash": (
                                 _hash_index_tensor(pending) if pending.numel() > 0 else None
+                            ),
+                            "pending_sample": [
+                                int(value) for value in pending.detach().cpu()[:16].tolist()
+                            ],
+                            "pending_full": (
+                                [int(value) for value in pending.detach().cpu().tolist()]
+                                if phase4_scheduler_config.telemetry_detail == "debug"
+                                else None
                             ),
                             "planner_v2_candidate_window_size": int(
                                 planner_v2_candidate_window.numel()
@@ -10307,6 +10654,7 @@ def _run_attribution(
                             )
                         )
                         row_denominator_scaled_l1 = (row_abs_max_gpu, row_l1_scaled_gpu)
+                        nonfeature_row_slice = rows[:, total_active_feats:logit_offset]
                     else:
                         cpu_staging_start = time.perf_counter()
                         rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
@@ -10318,6 +10666,7 @@ def _run_attribution(
                         ) * 1000.0
                         row_input_slice = rows_cpu[:, :logit_offset]
                         feature_row_slice = rows_cpu[:, :total_active_feats]
+                        nonfeature_row_slice = rows_cpu[:, total_active_feats:logit_offset]
                         executor_row_transfer_telemetry = _build_row_transfer_telemetry(
                             rows=rows,
                             rows_cpu=rows_cpu,
@@ -10372,10 +10721,17 @@ def _run_attribution(
                         )
                     if use_compact_feature_row_store:
                         assert feature_row_store is not None
+                        assert nonfeature_row_store is not None
                         row_store_write_start = time.perf_counter()
                         row_store_append_telemetry = feature_row_store.append_rows(
                             row_start=st,
                             feature_rows=feature_row_slice,
+                            row_denominator_scaled_l1=row_denominator_scaled_l1,
+                            phase="phase4",
+                        )
+                        nonfeature_row_store.append_rows(
+                            row_start=st,
+                            feature_rows=nonfeature_row_slice,
                             row_denominator_scaled_l1=row_denominator_scaled_l1,
                             phase="phase4",
                         )
@@ -11032,8 +11388,15 @@ def _run_attribution(
             else None
         )
         if compact_output:
+            active_features_cpu = activation_matrix.indices().T.detach().cpu()
+            n_active_features = int(active_features_cpu.shape[0])
+            n_error_nodes = int(n_layers * n_pos)
+            error_col_start = n_active_features
+            token_col_start = error_col_start + n_error_nodes
+            logit_col_start = token_col_start + n_pos
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
+                assert nonfeature_row_store is not None
                 assert selected_features_cpu is not None
                 feature_feature_edges = feature_row_store.materialize_dense_feature_slice(
                     row_start=n_logits,
@@ -11047,24 +11410,63 @@ def _run_attribution(
                     selected_feature_columns=selected_features_cpu,
                     phase="phase5",
                 )
+                nonfeature_columns = torch.arange(
+                    int(logit_col_start - error_col_start), dtype=torch.long
+                )
+                feature_nonfeature_edges = nonfeature_row_store.materialize_dense_feature_slice(
+                    row_start=n_logits,
+                    row_end=st,
+                    selected_feature_columns=nonfeature_columns,
+                    phase="phase5",
+                )
+                logit_nonfeature_edges = nonfeature_row_store.materialize_dense_feature_slice(
+                    row_start=0,
+                    row_end=n_logits,
+                    selected_feature_columns=nonfeature_columns,
+                    phase="phase5",
+                )
+                n_error_columns = int(token_col_start - error_col_start)
+                feature_error_edges = feature_nonfeature_edges[:, :n_error_columns]
+                feature_token_edges = feature_nonfeature_edges[:, n_error_columns:]
+                logit_error_edges = logit_nonfeature_edges[:, :n_error_columns]
+                logit_token_edges = logit_nonfeature_edges[:, n_error_columns:]
             else:
                 feature_feature_edges = edge_matrix[n_logits:st, selected_features].detach().cpu()
                 logit_feature_edges = edge_matrix[:n_logits, selected_features].detach().cpu()
+                feature_error_edges = (
+                    edge_matrix[n_logits:st, error_col_start:token_col_start].detach().cpu()
+                )
+                feature_token_edges = (
+                    edge_matrix[n_logits:st, token_col_start:logit_col_start].detach().cpu()
+                )
+                logit_error_edges = (
+                    edge_matrix[:n_logits, error_col_start:token_col_start].detach().cpu()
+                )
+                logit_token_edges = (
+                    edge_matrix[:n_logits, token_col_start:logit_col_start].detach().cpu()
+                )
 
             assert selected_features_cpu is not None
             compact_output_result = {
                 "input_string": model.tokenizer.decode(input_ids),
-                "input_tokens": input_ids.detach().cpu(),
+                "input_tokens": input_ids[:n_pos].detach().cpu(),
+                "full_input_tokens": input_ids.detach().cpu(),
                 "logit_targets": targets.logit_targets,
                 "logit_probabilities": targets.logit_probabilities.detach().cpu(),
                 "vocab_size": targets.vocab_size,
-                "active_features": activation_matrix.indices().T.detach().cpu(),
+                "active_features": active_features_cpu,
                 "activation_values": activation_matrix.values().detach().cpu(),
                 "selected_features": selected_features_cpu,
                 "feature_row_node_indices": row_to_node_index[n_logits:st].detach().cpu(),
                 "logit_row_node_indices": row_to_node_index[:n_logits].detach().cpu(),
                 "feature_feature_edges": feature_feature_edges,
                 "logit_feature_edges": logit_feature_edges,
+                "feature_error_edges": feature_error_edges,
+                "feature_token_edges": feature_token_edges,
+                "logit_error_edges": logit_error_edges,
+                "logit_token_edges": logit_token_edges,
+                "n_error_nodes": n_error_nodes,
+                "n_token_nodes": int(n_pos),
                 "phase4_feature_batch_size": int(phase4_feature_batch_size),
                 "phase4_feature_batch_size_initial": int(
                     batch_size if feature_batch_size is None else feature_batch_size
@@ -11228,6 +11630,7 @@ def _run_attribution(
                 "semantic_descriptor_top_k": int(semantic_descriptor_top_k),
                 "semantic_descriptor_dim": int(semantic_descriptor_dim),
                 "phase4_refresh_count": int(phase4_refresh_count),
+                "phase3_frontier_buffer_metadata": phase3_frontier_buffer_metadata,
                 "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
                 "phase4_batches": int(phase4_scheduler_reference_batch_count),
                 "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
@@ -11268,6 +11671,9 @@ def _run_attribution(
                 phase3_gradient_replay_metadata
             )
             compact_output_result["phase3_row_replay_metadata"] = phase3_row_replay_metadata
+            compact_output_result["phase3_frontier_buffer_metadata"] = (
+                phase3_frontier_buffer_metadata
+            )
             if capture_phase0_donor_bundle_enabled:
                 compact_output_result["phase0_donor_bundle"] = phase0_donor_bundle_payload
             if capture_phase3_seed_bundle_enabled:
@@ -11455,6 +11861,8 @@ def _run_attribution(
         teardown_start = time.perf_counter()
         if feature_row_store is not None:
             feature_row_store.cleanup()
+        if nonfeature_row_store is not None:
+            nonfeature_row_store.cleanup()
         if ctx is not None:
             _log_memory_boundary(logger, "Teardown start", model.device)
             cleanup = getattr(ctx, "cleanup", None)
