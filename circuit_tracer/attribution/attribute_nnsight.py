@@ -4827,6 +4827,102 @@ def _build_phase3_frontier_buffer_metadata(
     return metadata
 
 
+def _build_phase4_frontier_buffer_decision(
+    *,
+    candidate_scores: torch.Tensor,
+    base_frontier_size: int,
+    actual_max_feature_nodes: int,
+    capacity_feature_nodes: int,
+    total_active_features: int,
+    used_total: int,
+    epsilon: float | None,
+    max_per_refresh: int,
+    max_total: int,
+    refresh_index: int,
+    visited_before: int,
+) -> dict[str, object]:
+    requested = epsilon is not None or max_per_refresh > 0 or max_total > 0
+    event: dict[str, object] = {
+        "refresh_index": int(refresh_index),
+        "visited_before": int(visited_before),
+        "base_frontier_size": int(base_frontier_size),
+        "expanded_frontier_size": int(base_frontier_size),
+        "extra_feature_count": 0,
+        "cutoff_score": None,
+        "next_score": None,
+        "relative_cutoff_gap": None,
+        "near_cutoff_counts": {"0.001": 0, "0.01": 0, "0.05": 0},
+        "fallback_reason": None,
+    }
+    decision: dict[str, object] = {
+        "requested": bool(requested),
+        "enabled": bool(epsilon is not None and max_per_refresh > 0 and max_total > 0),
+        "effective": False,
+        "extra_feature_count": 0,
+        "expanded_frontier_size": int(base_frontier_size),
+        "event": event,
+    }
+    if not decision["enabled"]:
+        event["fallback_reason"] = "epsilon_or_budget_not_enabled"
+        return decision
+    if base_frontier_size <= 0:
+        event["fallback_reason"] = "empty_base_frontier"
+        return decision
+
+    scores = torch.sort(
+        candidate_scores.detach().to(device="cpu", dtype=torch.float64).flatten(),
+        descending=True,
+    ).values
+    if scores.numel() <= 0:
+        event["fallback_reason"] = "empty_candidates"
+        return decision
+    cutoff_rank = min(int(base_frontier_size) - 1, int(scores.numel()) - 1)
+    cutoff_score = float(scores[cutoff_rank].item())
+    next_score = float(scores[cutoff_rank + 1].item()) if cutoff_rank + 1 < scores.numel() else None
+    cutoff_gap = None if next_score is None else float(cutoff_score - next_score)
+    relative_cutoff_gap = None
+    if cutoff_gap is not None and cutoff_score > 0:
+        relative_cutoff_gap = float(cutoff_gap / cutoff_score)
+    below = scores[int(base_frontier_size) :]
+    near_counts = {
+        str(eps): int((below >= cutoff_score * (1.0 - float(eps))).sum().item())
+        if cutoff_score > 0
+        else 0
+        for eps in (0.001, 0.01, 0.05)
+    }
+    event.update(
+        {
+            "cutoff_score": cutoff_score,
+            "next_score": next_score,
+            "relative_cutoff_gap": relative_cutoff_gap,
+            "near_cutoff_counts": near_counts,
+        }
+    )
+    if cutoff_score <= 0:
+        event["fallback_reason"] = "nonpositive_cutoff_score"
+        return decision
+    remaining = min(
+        int(max_total - used_total),
+        int(total_active_features - actual_max_feature_nodes),
+        int(capacity_feature_nodes - actual_max_feature_nodes),
+    )
+    if remaining <= 0:
+        event["fallback_reason"] = "capacity_or_budget_exhausted"
+        return decision
+    near_count = int((below >= cutoff_score * (1.0 - float(epsilon))).sum().item())
+    extra = min(near_count, int(max_per_refresh), remaining)
+    if extra <= 0:
+        event["fallback_reason"] = "no_extra_candidates"
+        return decision
+    expanded = int(base_frontier_size + extra)
+    event["extra_feature_count"] = int(extra)
+    event["expanded_frontier_size"] = expanded
+    decision.update(
+        {"effective": True, "extra_feature_count": int(extra), "expanded_frontier_size": expanded}
+    )
+    return decision
+
+
 def _build_phase0_donor_bundle_payload(
     *,
     activation_matrix: torch.Tensor,
@@ -6935,6 +7031,9 @@ def attribute(
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase3_frontier_buffer_relative_epsilon: float | None = None,
     phase3_frontier_buffer_max_extra: int = 0,
+    phase4_frontier_buffer_relative_epsilon: float | None = None,
+    phase4_frontier_buffer_max_extra_per_refresh: int = 0,
+    phase4_frontier_buffer_max_extra_total: int = 0,
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
@@ -7188,6 +7287,9 @@ def attribute(
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             phase3_frontier_buffer_relative_epsilon=phase3_frontier_buffer_relative_epsilon,
             phase3_frontier_buffer_max_extra=phase3_frontier_buffer_max_extra,
+            phase4_frontier_buffer_relative_epsilon=phase4_frontier_buffer_relative_epsilon,
+            phase4_frontier_buffer_max_extra_per_refresh=phase4_frontier_buffer_max_extra_per_refresh,
+            phase4_frontier_buffer_max_extra_total=phase4_frontier_buffer_max_extra_total,
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
             prefix_view_metadata=normalized_prefix_view_metadata,
             output_position=output_position,
@@ -7272,6 +7374,9 @@ def _run_attribution(
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase3_frontier_buffer_relative_epsilon: float | None = None,
     phase3_frontier_buffer_max_extra: int = 0,
+    phase4_frontier_buffer_relative_epsilon: float | None = None,
+    phase4_frontier_buffer_max_extra_per_refresh: int = 0,
+    phase4_frontier_buffer_max_extra_total: int = 0,
     phase0_activation_threshold_compare_mode: Literal[
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline",
@@ -7341,6 +7446,15 @@ def _run_attribution(
         and phase3_frontier_buffer_relative_epsilon < 0
     ):
         raise ValueError("phase3_frontier_buffer_relative_epsilon must be >= 0 when provided")
+    if phase4_frontier_buffer_max_extra_per_refresh < 0:
+        raise ValueError("phase4_frontier_buffer_max_extra_per_refresh must be >= 0")
+    if phase4_frontier_buffer_max_extra_total < 0:
+        raise ValueError("phase4_frontier_buffer_max_extra_total must be >= 0")
+    if (
+        phase4_frontier_buffer_relative_epsilon is not None
+        and phase4_frontier_buffer_relative_epsilon < 0
+    ):
+        raise ValueError("phase4_frontier_buffer_relative_epsilon must be >= 0 when provided")
     if phase4_refresh_active_row_accumulation not in ("zero_fill", "direct_v1"):
         raise ValueError(
             "phase4_refresh_active_row_accumulation must be 'zero_fill' or 'direct_v1'"
@@ -8524,9 +8638,40 @@ def _run_attribution(
                 int(phase3_frontier_buffer_max_extra)
                 if phase3_frontier_buffer_relative_epsilon is not None
                 else 0
+            )
+            + (
+                int(phase4_frontier_buffer_max_extra_total)
+                if phase4_frontier_buffer_relative_epsilon is not None
+                else 0
             ),
             total_active_feats,
         )
+        phase4_frontier_buffer_metadata: dict[str, object] = {
+            "schema_version": 1,
+            "requested": bool(
+                phase4_frontier_buffer_relative_epsilon is not None
+                or phase4_frontier_buffer_max_extra_per_refresh > 0
+                or phase4_frontier_buffer_max_extra_total > 0
+            ),
+            "enabled": bool(
+                phase4_frontier_buffer_relative_epsilon is not None
+                and phase4_frontier_buffer_max_extra_per_refresh > 0
+                and phase4_frontier_buffer_max_extra_total > 0
+            ),
+            "effective": False,
+            "relative_epsilon": None
+            if phase4_frontier_buffer_relative_epsilon is None
+            else float(phase4_frontier_buffer_relative_epsilon),
+            "max_extra_per_refresh": int(phase4_frontier_buffer_max_extra_per_refresh),
+            "max_extra_total": int(phase4_frontier_buffer_max_extra_total),
+            "extra_feature_count_total": 0,
+            "expanded_refresh_count": 0,
+            "fallback_count": 0,
+            "capacity_feature_nodes": int(row_store_capacity_feature_nodes),
+            "initial_target_feature_nodes": int(base_max_feature_nodes),
+            "final_actual_max_feature_nodes": int(actual_max_feature_nodes),
+            "events": [],
+        }
         logger.info(
             f"Will include {actual_max_feature_nodes} of {total_active_feats} feature nodes"
         )
@@ -9534,6 +9679,12 @@ def _run_attribution(
         # Phase 4: feature attribution
         logger.info("Phase 4: Computing feature attributions")
         phase4_start = time.perf_counter()
+        phase4_frontier_buffer_metadata["initial_target_feature_nodes"] = int(
+            actual_max_feature_nodes
+        )
+        phase4_frontier_buffer_metadata["final_actual_max_feature_nodes"] = int(
+            actual_max_feature_nodes
+        )
         feature_rows_cpu_staging: torch.Tensor | None = None
         _log_memory_boundary(logger, "Phase 4 start", model.device)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
@@ -9662,6 +9813,7 @@ def _run_attribution(
         phase4_scheduler_reference_batch_count = 0
         phase4_executor_microbatch_count = 0
         phase4_refresh_count = 0
+        phase4_frontier_buffer_extra_used_total = 0
         phase4_refresh_elapsed_ms_total = 0.0
         phase4_feature_batch_elapsed_ms_total = 0.0
         phase4_refresh_partial_influence_elapsed_ms_total = 0.0
@@ -9879,6 +10031,51 @@ def _run_attribution(
                     ),
                     int(actual_max_feature_nodes - n_visited),
                 )
+
+                phase4_frontier_buffer_event: dict[str, object] | None = None
+                if bool(phase4_frontier_buffer_metadata["enabled"]):
+                    unvisited_scores_for_buffer = feature_influences[
+                        _rank_phase4_unvisited_features_argsort(feature_influences, visited)
+                    ]
+                    buffer_decision = _build_phase4_frontier_buffer_decision(
+                        candidate_scores=unvisited_scores_for_buffer,
+                        base_frontier_size=int(max_frontier_size),
+                        actual_max_feature_nodes=int(actual_max_feature_nodes),
+                        capacity_feature_nodes=int(row_store_capacity_feature_nodes),
+                        total_active_features=int(total_active_feats),
+                        used_total=int(phase4_frontier_buffer_extra_used_total),
+                        epsilon=phase4_frontier_buffer_relative_epsilon,
+                        max_per_refresh=int(phase4_frontier_buffer_max_extra_per_refresh),
+                        max_total=int(phase4_frontier_buffer_max_extra_total),
+                        refresh_index=refresh_index,
+                        visited_before=int(n_visited),
+                    )
+                    extra = int(buffer_decision["extra_feature_count"])
+                    phase4_frontier_buffer_event = cast(dict[str, object], buffer_decision["event"])
+                    cast(list[dict[str, object]], phase4_frontier_buffer_metadata["events"]).append(
+                        phase4_frontier_buffer_event
+                    )
+                    if extra > 0:
+                        phase4_frontier_buffer_extra_used_total += extra
+                        actual_max_feature_nodes += extra
+                        max_frontier_size = int(buffer_decision["expanded_frontier_size"])
+                        phase4_frontier_buffer_metadata["extra_feature_count_total"] = int(
+                            phase4_frontier_buffer_extra_used_total
+                        )
+                        phase4_frontier_buffer_metadata["expanded_refresh_count"] = (
+                            int(phase4_frontier_buffer_metadata["expanded_refresh_count"]) + 1
+                        )
+                        phase4_frontier_buffer_metadata["effective"] = True
+                        phase4_frontier_buffer_metadata["final_actual_max_feature_nodes"] = int(
+                            actual_max_feature_nodes
+                        )
+                        if getattr(pbar, "total", None) is not None:
+                            pbar.total = int(actual_max_feature_nodes)
+                            pbar.refresh()
+                    elif phase4_frontier_buffer_event.get("fallback_reason") is not None:
+                        phase4_frontier_buffer_metadata["fallback_count"] = (
+                            int(phase4_frontier_buffer_metadata["fallback_count"]) + 1
+                        )
 
                 rank_topk_start = time.perf_counter()
                 rank_selection = _select_phase4_frontier_rank_selection(
@@ -10118,6 +10315,15 @@ def _run_attribution(
                         "visited_features": int(n_visited),
                         "frontier_candidate_count": int(rank_selection.candidate_count),
                         "queue_size": int(queue_size),
+                        "phase4_frontier_buffer_extra_count": int(
+                            0
+                            if phase4_frontier_buffer_event is None
+                            else phase4_frontier_buffer_event.get("extra_feature_count", 0)
+                        ),
+                        "phase4_frontier_buffer_extra_used_total": int(
+                            phase4_frontier_buffer_extra_used_total
+                        ),
+                        "phase4_frontier_buffer_expanded_frontier_size": int(max_frontier_size),
                         "pending_count": int(pending.numel()),
                         "pending_hash": _hash_index_tensor(pending)
                         if pending.numel() > 0
@@ -11631,6 +11837,7 @@ def _run_attribution(
                 "semantic_descriptor_dim": int(semantic_descriptor_dim),
                 "phase4_refresh_count": int(phase4_refresh_count),
                 "phase3_frontier_buffer_metadata": phase3_frontier_buffer_metadata,
+                "phase4_frontier_buffer_metadata": phase4_frontier_buffer_metadata,
                 "phase4_batch_count": int(phase4_scheduler_reference_batch_count),
                 "phase4_batches": int(phase4_scheduler_reference_batch_count),
                 "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
@@ -11673,6 +11880,9 @@ def _run_attribution(
             compact_output_result["phase3_row_replay_metadata"] = phase3_row_replay_metadata
             compact_output_result["phase3_frontier_buffer_metadata"] = (
                 phase3_frontier_buffer_metadata
+            )
+            compact_output_result["phase4_frontier_buffer_metadata"] = (
+                phase4_frontier_buffer_metadata
             )
             if capture_phase0_donor_bundle_enabled:
                 compact_output_result["phase0_donor_bundle"] = phase0_donor_bundle_payload
