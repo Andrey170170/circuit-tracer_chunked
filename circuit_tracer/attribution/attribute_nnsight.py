@@ -414,6 +414,40 @@ def _apply_prefix_view_activation_mask(ctx: Any, target_position: int) -> dict[s
     return apply_prefix_view_state(int(target_position))
 
 
+def _compact_selected_feature_columns(
+    selected_features: torch.Tensor,
+    *,
+    n_feature_columns: int,
+) -> torch.Tensor:
+    """Return selected compact feature columns visible to the row store.
+
+    Full-sequence target-position traces may retain full-sequence bookkeeping for
+    audit metadata while the compact feature row store is intentionally laid out
+    like the causal prefix view.  Drop any stale/full-sequence feature ordinals
+    before materializing typed compact graph columns; keeping them would either
+    address columns beyond the prefix-visible row-store width or admit future
+    position nodes into the compact graph.
+    """
+    selected_features = selected_features.detach().to(device="cpu", dtype=torch.long)
+    if selected_features.numel() == 0:
+        return selected_features
+    return selected_features[
+        (selected_features >= 0) & (selected_features < int(n_feature_columns))
+    ].contiguous()
+
+
+def _compact_nonfeature_column_counts(
+    *, n_layers: int, compact_token_count: int
+) -> tuple[int, int, int]:
+    """Return error/token/total nonfeature column counts for compact output."""
+    compact_token_count = int(compact_token_count)
+    if compact_token_count < 0:
+        raise ValueError("compact_token_count must be non-negative")
+    n_error_columns = int(n_layers) * compact_token_count
+    n_token_columns = compact_token_count
+    return n_error_columns, n_token_columns, n_error_columns + n_token_columns
+
+
 _PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
 _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT = 1
 _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
@@ -11581,6 +11615,12 @@ def _run_attribution(
         # Phase 5: packaging graph / compact output
         phase5_start = time.perf_counter()
         selected_features = torch.where(visited)[0]
+        if use_compact_feature_row_store:
+            assert feature_row_store is not None
+            selected_features = _compact_selected_feature_columns(
+                selected_features,
+                n_feature_columns=feature_row_store.n_feature_columns,
+            )
         if capture_feature_semantic_descriptors_enabled and isinstance(
             feature_semantic_descriptors_payload, dict
         ):
@@ -11596,10 +11636,14 @@ def _run_attribution(
         if compact_output:
             active_features_cpu = activation_matrix.indices().T.detach().cpu()
             n_active_features = int(active_features_cpu.shape[0])
-            n_error_nodes = int(model.cfg.n_layers * len(input_ids))
+            compact_token_count = int(n_pos)
+            n_error_nodes, _n_token_nodes, n_nonfeature_nodes = _compact_nonfeature_column_counts(
+                n_layers=int(model.cfg.n_layers),
+                compact_token_count=compact_token_count,
+            )
             error_col_start = n_active_features
             token_col_start = error_col_start + n_error_nodes
-            logit_col_start = token_col_start + len(input_ids)
+            logit_col_start = token_col_start + compact_token_count
             if use_compact_feature_row_store:
                 assert feature_row_store is not None
                 assert nonfeature_row_store is not None
@@ -11616,9 +11660,12 @@ def _run_attribution(
                     selected_feature_columns=selected_features_cpu,
                     phase="phase5",
                 )
-                nonfeature_columns = torch.arange(
-                    int(logit_col_start - error_col_start), dtype=torch.long
-                )
+                if int(nonfeature_row_store.n_feature_columns) != int(n_nonfeature_nodes):
+                    raise ValueError(
+                        "compact nonfeature row-store width does not match "
+                        "prefix-visible error/token column count"
+                    )
+                nonfeature_columns = torch.arange(n_nonfeature_nodes, dtype=torch.long)
                 feature_nonfeature_edges = nonfeature_row_store.materialize_dense_feature_slice(
                     row_start=n_logits,
                     row_end=st,

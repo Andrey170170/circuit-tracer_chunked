@@ -5,6 +5,8 @@ import torch
 
 from circuit_tracer.attribution.context_nnsight import AttributionContext
 from circuit_tracer.attribution.attribute_nnsight import (
+    _compact_nonfeature_column_counts,
+    _compact_selected_feature_columns,
     _hash_token_ids,
     _resolve_prefix_view_output_position,
     validate_prefix_view_metadata,
@@ -219,3 +221,19 @@ def test_prefix_view_state_compacts_feature_row_state() -> None:
         ctx.decoder_locations,
         torch.tensor([[0, 1], [0, 2]], dtype=torch.long),
     )
+
+
+def test_compact_selected_feature_columns_drops_future_position_ordinals() -> None:
+    selected = torch.tensor([0, 2, 4, 5, 8], dtype=torch.long)
+
+    compact = _compact_selected_feature_columns(selected, n_feature_columns=5)
+
+    assert torch.equal(compact, torch.tensor([0, 2, 4], dtype=torch.long))
+
+
+def test_compact_nonfeature_columns_use_prefix_visible_positions() -> None:
+    n_error, n_token, total = _compact_nonfeature_column_counts(n_layers=26, compact_token_count=73)
+
+    assert n_error == 26 * 73
+    assert n_token == 73
+    assert total == 27 * 73
