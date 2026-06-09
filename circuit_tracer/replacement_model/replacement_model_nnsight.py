@@ -619,6 +619,7 @@ class NNSightReplacementModel(LanguageModel):
         exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
         internal_precision_requested: str | None = None,
         resolved_dtype_map: dict[str, str] | None = None,
+        prefix_view_length: int | None = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
@@ -636,6 +637,14 @@ class NNSightReplacementModel(LanguageModel):
 
         assert isinstance(tokens, torch.Tensor), "Tokens must be a tensor"
         assert tokens.ndim == 1, "Tokens must be a 1D tensor"
+        prefix_view_length_int = None if prefix_view_length is None else int(prefix_view_length)
+        if prefix_view_length_int is not None and (
+            prefix_view_length_int <= 0 or prefix_view_length_int > int(tokens.numel())
+        ):
+            raise ValueError(
+                "prefix_view_length must be in [1, token_count] "
+                f"({prefix_view_length_int} not in [1, {int(tokens.numel())}])"
+            )
 
         mlp_in_cache = [None] * self.cfg.n_layers
         mlp_out_cache = [None] * self.cfg.n_layers
@@ -682,6 +691,16 @@ class NNSightReplacementModel(LanguageModel):
             if collect_phase0_pre_clt_input_fingerprints
             else None
         )
+        phase0_tokens = tokens
+        if prefix_view_length_int is not None:
+            mlp_in_cache = mlp_in_cache[..., :prefix_view_length_int, :].contiguous()
+            mlp_out_cache = mlp_out_cache[..., :prefix_view_length_int, :].contiguous()
+            phase0_tokens = tokens[:prefix_view_length_int].contiguous()
+            phase0_pre_clt_input_fingerprints = (
+                _build_phase0_pre_clt_input_fingerprints(mlp_in_cache)
+                if collect_phase0_pre_clt_input_fingerprints
+                else None
+            )
 
         component_start = time.perf_counter()
         if callable(trace_event):
@@ -756,7 +775,7 @@ class NNSightReplacementModel(LanguageModel):
 
         error_vectors[:, self.zero_positions] = 0
         token_vectors = self.embed_weight[  # type: ignore
-            tokens
+            phase0_tokens
         ].detach()  # (n_pos, d_model)  # type: ignore
         retained_logits = logits
         full_logits = logits if retain_full_logits else None
@@ -833,6 +852,8 @@ class NNSightReplacementModel(LanguageModel):
         ctx.setup_diagnostic_stats = {
             "backend": "nnsight",
             "token_count": int(tokens.numel()),
+            "phase0_token_count": int(phase0_tokens.numel()),
+            "prefix_view_length": prefix_view_length_int,
             "trace_seconds": trace_seconds,
             "component_seconds": component_seconds,
             "error_seconds": error_seconds,

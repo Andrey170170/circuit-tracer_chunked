@@ -309,6 +309,14 @@ class AttributionContext:
             return self.logits[:, -1]
         return self.logits
 
+    def get_logits_at_position(self, position: int) -> torch.Tensor:
+        logit_source = self.full_logits if self.full_logits is not None else self.logits
+        if self.logits.ndim < 2:
+            if int(position) != 0:
+                raise IndexError("logits are unpositioned; only position 0 is available")
+            return logit_source
+        return logit_source[:, int(position)]
+
     def materialize_encoder_vectors(
         self,
         indices: torch.Tensor | slice,
@@ -727,6 +735,90 @@ class AttributionContext:
             "n_positions": int(n_pos),
         }
 
+    def apply_prefix_view_state(self, target_position: int) -> dict[str, int]:
+        """Truncate position-indexed Phase-0 state to a causal prefix view.
+
+        Stage-A full-sequence experiments keep full logits available for explicit
+        target-position selection, but per-target attribution rows should be laid
+        out exactly like an independent-prefix trace.  This method removes active
+        features at target/future positions and slices error/token vectors to
+        positions ``0..target_position-1`` before rebuilding derived feature-row
+        state.
+        """
+        activation_matrix = self.activation_matrix.coalesce()
+        n_layers, n_pos, n_features = activation_matrix.shape
+        target_position = int(target_position)
+        if target_position <= 0 or target_position > int(n_pos):
+            raise ValueError(
+                "target_position must be in [1, n_positions] for prefix view "
+                f"({target_position} not in [1, {int(n_pos)}])"
+            )
+
+        old_active_feature_count = int(activation_matrix._nnz())
+        old_position_count = int(n_pos)
+        indices = activation_matrix.indices()
+        values = activation_matrix.values()
+        keep = indices[1] < target_position
+        kept_rows = keep.nonzero(as_tuple=False).flatten()
+        filtered_activation_matrix = torch.sparse_coo_tensor(
+            indices[:, keep],
+            values[keep],
+            size=(int(n_layers), target_position, int(n_features)),
+            device=activation_matrix.device,
+            dtype=activation_matrix.dtype,
+        ).coalesce()
+
+        if self.error_vectors.ndim >= 2 and int(self.error_vectors.shape[1]) == int(n_pos):
+            self.error_vectors = self.error_vectors[:, :target_position].contiguous()
+        if self.token_vectors.ndim >= 1 and int(self.token_vectors.shape[0]) == int(n_pos):
+            self.token_vectors = self.token_vectors[:target_position].contiguous()
+        self._materialized_error_vector_layers.clear()
+
+        if self.encoder_vecs.numel() > 0:
+            self.encoder_vecs = self.encoder_vecs[
+                kept_rows.to(device=self.encoder_vecs.device, dtype=torch.long)
+            ]
+            self.exact_encoder_pinned_effective = bool(
+                self.exact_encoder_pinned_requested and self.encoder_vecs.is_pinned()
+            )
+            self.exact_encoder_staging_destination = self._resolve_encoder_staging_destination(
+                self.encoder_vecs,
+                exact_chunked_mode=self.chunked_decoder_state is not None,
+                encoder_residency=self.exact_encoder_residency_effective,
+            )
+
+        if self.chunked_decoder_state is None and self.encoder_to_decoder_map.numel():
+            old_to_new = torch.full(
+                (old_active_feature_count,),
+                -1,
+                device=self.encoder_to_decoder_map.device,
+                dtype=torch.long,
+            )
+            kept_rows_on_map_device = kept_rows.to(device=old_to_new.device, dtype=torch.long)
+            old_to_new[kept_rows_on_map_device] = torch.arange(
+                int(kept_rows.numel()), device=old_to_new.device, dtype=torch.long
+            )
+            keep_decoder = old_to_new[self.encoder_to_decoder_map.long()] >= 0
+            self.decoder_vecs = self.decoder_vecs[keep_decoder.to(device=self.decoder_vecs.device)]
+            self.decoder_locations = self.decoder_locations[
+                :, keep_decoder.to(device=self.decoder_locations.device)
+            ]
+            self.encoder_to_decoder_map = old_to_new[
+                self.encoder_to_decoder_map[keep_decoder].long()
+            ]
+
+        stats = self.replace_phase0_activation_state(filtered_activation_matrix)
+        stats.update(
+            {
+                "old_position_count": old_position_count,
+                "new_position_count": target_position,
+                "old_active_feature_count": old_active_feature_count,
+                "masked_active_feature_count": int((~keep).sum().item()),
+                "prefix_view_target_position": target_position,
+            }
+        )
+        return stats
+
     def _compute_chunked_feature_attributions_from_grads(
         self,
         output_layer_grads: list[torch.Tensor | None],
@@ -1018,6 +1110,7 @@ class AttributionContext:
             grads,
             self.get_error_vectors_for_layer(layer, device=grads.device),
             write_index=np.s_[error_offset(layer) : error_offset(layer + 1)],
+            read_index=np.s_[:, :n_pos],
         )
 
     def compute_token_attributions(self, grads):
@@ -1032,6 +1125,7 @@ class AttributionContext:
             grads,
             self.token_vectors,
             write_index=np.s_[tok_start : tok_start + n_pos],
+            read_index=np.s_[:, :n_pos],
         )
 
     def compute_batch(
