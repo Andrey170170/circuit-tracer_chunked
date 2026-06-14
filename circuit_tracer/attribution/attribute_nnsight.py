@@ -7494,6 +7494,9 @@ class FullSequenceWindowAttributionSession:
                 raise ValueError(
                     "window reuse requires full_sequence_target_position prefix metadata"
                 )
+        if self.decoder_chunk_cache is not None:
+            attribute_kwargs.setdefault("decoder_chunk_cache", self.decoder_chunk_cache)
+            attribute_kwargs.setdefault("decoder_cache_fingerprint", self.decoder_cache_fingerprint)
 
         if not self.reuse_phase0_window_state and not self.reuse_target_logits:
             prompt_tokens = (
