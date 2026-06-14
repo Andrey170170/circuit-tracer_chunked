@@ -545,9 +545,18 @@ _ROW_STORE_TEMP_ROOT_POLICY_BY_NAME: dict[str, str] = {
 _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1: Literal[
     "fadvise_dontneed_after_append_v1"
 ] = "fadvise_dontneed_after_append_v1"
+_ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_AND_READ_V1: Literal[
+    "fadvise_dontneed_after_append_and_read_v1"
+] = "fadvise_dontneed_after_append_and_read_v1"
+_RowStoreCacheControlMode = Literal[
+    "off",
+    "fadvise_dontneed_after_append_v1",
+    "fadvise_dontneed_after_append_and_read_v1",
+]
 _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "off": "off",
     "fadvise_dontneed_after_append_v1": "fadvise_dontneed_after_append_v1",
+    "fadvise_dontneed_after_append_and_read_v1": ("fadvise_dontneed_after_append_and_read_v1"),
 }
 
 _EXACT_ENCODER_RESIDENCY_DEFAULT: Literal["lazy"] = "lazy"
@@ -665,8 +674,8 @@ class _Phase4RankerConfig:
 
 @dataclass(frozen=True)
 class _RowStoreCacheControlConfig:
-    requested_mode: Literal["off", "fadvise_dontneed_after_append_v1"]
-    effective_mode: Literal["off", "fadvise_dontneed_after_append_v1"]
+    requested_mode: _RowStoreCacheControlMode
+    effective_mode: _RowStoreCacheControlMode
     default_mode: Literal["off"]
     mode_applicable: bool
     effective_behavior: Literal["requested", "off_reference_execution"]
@@ -829,7 +838,7 @@ class _FileBackedFeatureRowStore:
         row_abs_sum_dtype: torch.dtype = torch.float32,
         read_chunk_cache_bytes: int = 0,
         prepared_read_cache_bytes: int = 0,
-        row_store_cache_control_mode: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+        row_store_cache_control_mode: _RowStoreCacheControlMode = "off",
         temp_root_policy: Literal["default", "env_node_local"] = "default",
         temp_root: str | os.PathLike[str] | None = None,
         preallocate: bool = False,
@@ -882,7 +891,14 @@ class _FileBackedFeatureRowStore:
         self._row_store_cache_control_effective_mode = row_store_cache_control_mode
         self._fadvise_dontneed_after_append_enabled = bool(
             row_store_cache_control_mode
-            == _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1
+            in {
+                _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1,
+                _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_AND_READ_V1,
+            }
+        )
+        self._fadvise_dontneed_after_read_enabled = bool(
+            row_store_cache_control_mode
+            == _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_AND_READ_V1
         )
         self._posix_fadvise = getattr(os, "posix_fadvise", None)
         self._posix_fadvise_dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
@@ -917,6 +933,16 @@ class _FileBackedFeatureRowStore:
             "row_store_cache_control_advisory_unavailable_count": 0,
             "row_store_cache_control_advisory_skipped_count": 0,
             "row_store_cache_control_advisory_last_error": None,
+            "row_store_cache_control_append_advisory_call_count": 0,
+            "row_store_cache_control_append_advisory_bytes": 0,
+            "row_store_cache_control_append_advisory_failure_count": 0,
+            "row_store_cache_control_append_advisory_unavailable_count": 0,
+            "row_store_cache_control_append_advisory_skipped_count": 0,
+            "row_store_cache_control_read_advisory_call_count": 0,
+            "row_store_cache_control_read_advisory_bytes": 0,
+            "row_store_cache_control_read_advisory_failure_count": 0,
+            "row_store_cache_control_read_advisory_unavailable_count": 0,
+            "row_store_cache_control_read_advisory_skipped_count": 0,
             "temp_root_policy": temp_root_selection.policy,
             "temp_root_requested": temp_root_selection.requested_root,
             "temp_root_selected": temp_root_selection.selected_root,
@@ -1129,15 +1155,20 @@ class _FileBackedFeatureRowStore:
     def _increment_diagnostic_counter(self, key: str, *, delta: int = 1) -> None:
         self._diagnostic_stats[key] = int(self._diagnostic_stats.get(key, 0) or 0) + int(delta)
 
-    def _apply_row_store_cache_control_after_append(
+    def _apply_row_store_cache_control_advisory(
         self,
         *,
         write_fd: int,
         byte_offset: int,
         byte_length: int,
+        enabled: bool,
+        counter_prefix: str,
     ) -> None:
-        if byte_length <= 0 or not self._fadvise_dontneed_after_append_enabled:
+        if byte_length <= 0 or not enabled:
             self._increment_diagnostic_counter("row_store_cache_control_advisory_skipped_count")
+            self._increment_diagnostic_counter(
+                f"row_store_cache_control_{counter_prefix}_advisory_skipped_count"
+            )
             return
 
         posix_fadvise = self._posix_fadvise
@@ -1145,6 +1176,9 @@ class _FileBackedFeatureRowStore:
         if not callable(posix_fadvise) or dontneed_flag is None:
             self._diagnostic_stats["row_store_cache_control_advisory_available"] = 0
             self._increment_diagnostic_counter("row_store_cache_control_advisory_unavailable_count")
+            self._increment_diagnostic_counter(
+                f"row_store_cache_control_{counter_prefix}_advisory_unavailable_count"
+            )
             return
 
         try:
@@ -1156,6 +1190,9 @@ class _FileBackedFeatureRowStore:
             )
         except Exception as exc:
             self._increment_diagnostic_counter("row_store_cache_control_advisory_failure_count")
+            self._increment_diagnostic_counter(
+                f"row_store_cache_control_{counter_prefix}_advisory_failure_count"
+            )
             self._diagnostic_stats["row_store_cache_control_advisory_last_error"] = (
                 f"{type(exc).__name__}: {exc}"
             )
@@ -1163,8 +1200,44 @@ class _FileBackedFeatureRowStore:
 
         self._increment_diagnostic_counter("row_store_cache_control_advisory_call_count")
         self._increment_diagnostic_counter(
+            f"row_store_cache_control_{counter_prefix}_advisory_call_count"
+        )
+        self._increment_diagnostic_counter(
             "row_store_cache_control_advisory_bytes",
             delta=int(byte_length),
+        )
+        self._increment_diagnostic_counter(
+            f"row_store_cache_control_{counter_prefix}_advisory_bytes",
+            delta=int(byte_length),
+        )
+
+    def _apply_row_store_cache_control_after_append(
+        self,
+        *,
+        write_fd: int,
+        byte_offset: int,
+        byte_length: int,
+    ) -> None:
+        self._apply_row_store_cache_control_advisory(
+            write_fd=write_fd,
+            byte_offset=byte_offset,
+            byte_length=byte_length,
+            enabled=self._fadvise_dontneed_after_append_enabled,
+            counter_prefix="append",
+        )
+
+    def _apply_row_store_cache_control_after_safe_read(
+        self,
+        *,
+        row_start: int,
+        row_end: int,
+    ) -> None:
+        self._apply_row_store_cache_control_advisory(
+            write_fd=self._require_open_write_fd(),
+            byte_offset=int(row_start * self._row_nbytes),
+            byte_length=int((row_end - row_start) * self._row_nbytes),
+            enabled=self._fadvise_dontneed_after_read_enabled,
+            counter_prefix="read",
         )
 
     def append_rows(
@@ -1404,6 +1477,10 @@ class _FileBackedFeatureRowStore:
                 prepare_start = time.perf_counter()
                 result = self.read_feature_rows(row_start, row_end, phase=phase)
                 result = result.to(device=device_obj, dtype=dtype).abs()
+                self._apply_row_store_cache_control_after_safe_read(
+                    row_start=row_start,
+                    row_end=row_end,
+                )
                 elapsed = (time.perf_counter() - prepare_start) * 1000.0
                 self._diagnostic_stats["prepared_read_cache_prepare_elapsed_ms_total"] = float(
                     self._diagnostic_stats["prepared_read_cache_prepare_elapsed_ms_total"] or 0.0
@@ -1474,6 +1551,10 @@ class _FileBackedFeatureRowStore:
                 else:
                     chunk_np = np.asarray(row_slice[:, cols_np], dtype=self._np_dtype)
                     dense[:, col_start:col_end] = torch.from_numpy(chunk_np)
+            self._apply_row_store_cache_control_after_safe_read(
+                row_start=row_start,
+                row_end=row_end,
+            )
 
         self._diagnostic_stats["materialize_call_count"] = (
             int(self._diagnostic_stats["materialize_call_count"] or 0) + 1
@@ -2547,15 +2628,15 @@ def _select_phase4_frontier_rank_selection(
 
 def _resolve_row_store_cache_control(
     row_store_cache_control: str,
-) -> Literal["off", "fadvise_dontneed_after_append_v1"]:
+) -> _RowStoreCacheControlMode:
     normalized = str(row_store_cache_control).strip().lower()
-    allowed_values = {"off", "fadvise_dontneed_after_append_v1"}
+    allowed_values = set(_ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE)
     if normalized not in allowed_values:
         allowed = ", ".join(sorted(allowed_values))
         raise ValueError(
             f"row_store_cache_control must be one of: {allowed} (got {row_store_cache_control!r})"
         )
-    return cast(Literal["off", "fadvise_dontneed_after_append_v1"], normalized)
+    return cast(_RowStoreCacheControlMode, normalized)
 
 
 def _resolve_row_store_cache_control_config(
@@ -2567,18 +2648,15 @@ def _resolve_row_store_cache_control_config(
     requested_mode = _resolve_row_store_cache_control(row_store_cache_control)
     mode_applicable = bool(compact_output and exact_chunked_decoder)
     fallback_reason: str | None = None
-    if (
-        requested_mode == _ROW_STORE_CACHE_CONTROL_FADVISE_DONTNEED_AFTER_APPEND_V1
-        and not mode_applicable
-    ):
-        effective_mode = cast(Literal["off", "fadvise_dontneed_after_append_v1"], "off")
+    if requested_mode != "off" and not mode_applicable:
+        effective_mode = cast(_RowStoreCacheControlMode, "off")
         fallback_reason = (
-            "fadvise_dontneed_after_append_v1 requires compact_output=True and "
+            f"{requested_mode} requires compact_output=True and "
             "exact_chunked_decoder=True; falling back to off execution"
         )
     else:
         effective_mode = cast(
-            Literal["off", "fadvise_dontneed_after_append_v1"],
+            _RowStoreCacheControlMode,
             _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE[requested_mode],
         )
     effective_behavior: Literal["requested", "off_reference_execution"] = (
@@ -7121,7 +7199,7 @@ def attribute(
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
-    row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_cache_control: _RowStoreCacheControlMode = "off",
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
     row_store_preallocate: bool = True,
@@ -7280,8 +7358,11 @@ def attribute(
             For equal scores at the cutoff, membership may differ from argsort.
         row_store_cache_control: Requested compact row-store cache control mode.
             ``"off"`` keeps current behavior;
-            ``"fadvise_dontneed_after_append_v1"`` is currently validated/
-            plumbed only and falls back to ``"off"`` execution.
+            ``"fadvise_dontneed_after_append_v1"`` asks the file-backed dense
+            row store to drop appended byte ranges from the page cache after
+            writes; ``"fadvise_dontneed_after_append_and_read_v1"`` also drops
+            safely materialized read ranges after copying them out of the
+            memmap-backed store.
         exact_encoder_residency: Requested exact encoder residency mode.
             ``"lazy"`` keeps current behavior. ``"active_cpu"`` and
             ``"active_pinned_cpu"`` materialize active encoder rows during
@@ -7613,7 +7694,7 @@ def _run_attribution(
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
-    row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_cache_control: _RowStoreCacheControlMode = "off",
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
     row_store_preallocate: bool = True,

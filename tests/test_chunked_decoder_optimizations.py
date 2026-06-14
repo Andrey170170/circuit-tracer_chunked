@@ -1263,6 +1263,10 @@ def test_row_store_cache_control_config_validates_and_tracks_effective_mode() ->
         _resolve_row_store_cache_control("fadvise_dontneed_after_append_v1")
         == "fadvise_dontneed_after_append_v1"
     )
+    assert (
+        _resolve_row_store_cache_control("fadvise_dontneed_after_append_and_read_v1")
+        == "fadvise_dontneed_after_append_and_read_v1"
+    )
     with pytest.raises(ValueError, match="row_store_cache_control must be one of"):
         _resolve_row_store_cache_control("fadvise")
 
@@ -1278,6 +1282,17 @@ def test_row_store_cache_control_config_validates_and_tracks_effective_mode() ->
     assert metadata["row_store_cache_control_reference_execution"] is False
     assert metadata["row_store_cache_control_applicable"] is True
     assert metadata["row_store_cache_control_fallback_reason"] is None
+
+    read_config = _resolve_row_store_cache_control_config(
+        "fadvise_dontneed_after_append_and_read_v1",
+        compact_output=True,
+        exact_chunked_decoder=True,
+    )
+    read_metadata = _build_row_store_cache_control_metadata(read_config)
+    assert (
+        read_metadata["row_store_cache_control_effective"]
+        == "fadvise_dontneed_after_append_and_read_v1"
+    )
 
     fallback_config = _resolve_row_store_cache_control_config(
         "fadvise_dontneed_after_append_v1",

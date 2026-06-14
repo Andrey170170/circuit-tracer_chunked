@@ -375,8 +375,57 @@ def test_file_backed_feature_row_store_cache_control_fadvise_tracks_append_byte_
     assert stats["row_store_cache_control_effective_mode"] == "fadvise_dontneed_after_append_v1"
     assert stats["row_store_cache_control_advisory_call_count"] == 1
     assert stats["row_store_cache_control_advisory_bytes"] == 24
+    assert stats["row_store_cache_control_append_advisory_call_count"] == 1
+    assert stats["row_store_cache_control_append_advisory_bytes"] == 24
+    assert stats["row_store_cache_control_read_advisory_call_count"] == 0
     assert stats["row_store_cache_control_advisory_failure_count"] == 0
     assert stats["row_store_cache_control_advisory_unavailable_count"] == 0
+
+
+def test_file_backed_feature_row_store_cache_control_fadvise_tracks_safe_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int, int, int]] = []
+
+    def _fake_posix_fadvise(fd: int, offset: int, length: int, advice: int) -> int:
+        calls.append((fd, offset, length, advice))
+        return 0
+
+    monkeypatch.setattr(os, "posix_fadvise", _fake_posix_fadvise, raising=False)
+    monkeypatch.setattr(os, "POSIX_FADV_DONTNEED", 7, raising=False)
+
+    store = _FileBackedFeatureRowStore(
+        n_rows=4,
+        n_feature_columns=3,
+        dtype=torch.float32,
+        row_store_cache_control_mode="fadvise_dontneed_after_append_and_read_v1",
+    )
+
+    try:
+        store.append_rows(
+            row_start=1,
+            feature_rows=torch.tensor([[1.0, -2.0, 3.0], [4.0, -5.0, 6.0]], dtype=torch.float32),
+            full_row_abs_sums=torch.tensor([6.0, 15.0], dtype=torch.float32),
+        )
+        prepared = store.read_prepared_feature_rows(1, 3, device="cpu", dtype=torch.float32)
+        assert torch.equal(
+            prepared,
+            torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32),
+        )
+    finally:
+        store.cleanup()
+
+    assert [(offset, length, advice) for _, offset, length, advice in calls] == [
+        (12, 24, 7),
+        (12, 24, 7),
+    ]
+    stats = store.get_diagnostic_snapshot()
+    assert stats["row_store_cache_control_append_advisory_call_count"] == 1
+    assert stats["row_store_cache_control_append_advisory_bytes"] == 24
+    assert stats["row_store_cache_control_read_advisory_call_count"] == 1
+    assert stats["row_store_cache_control_read_advisory_bytes"] == 24
+    assert stats["row_store_cache_control_advisory_call_count"] == 2
+    assert stats["row_store_cache_control_advisory_bytes"] == 48
 
 
 def test_file_backed_feature_row_store_cache_control_unavailable_is_noop(
@@ -555,6 +604,8 @@ def test_phase4_execution_flag_type_hints_include_new_modes() -> None:
     )
     assert "fadvise_dontneed_after_append_v1" in entry_row_store_modes
     assert "fadvise_dontneed_after_append_v1" in nnsight_row_store_modes
+    assert "fadvise_dontneed_after_append_and_read_v1" in entry_row_store_modes
+    assert "fadvise_dontneed_after_append_and_read_v1" in nnsight_row_store_modes
 
     entry_encoder_residency_modes = set(
         get_args(entrypoint_sig.parameters["exact_encoder_residency"].annotation)

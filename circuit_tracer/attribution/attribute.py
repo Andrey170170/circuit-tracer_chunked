@@ -160,7 +160,11 @@ def attribute(
     phase4_refresh_policy: Literal["standard", "deferred_v1"] = "standard",
     phase4_refresh_interval_multiplier: int = 1,
     phase4_ranker: Literal["argsort", "topk_v1"] = "argsort",
-    row_store_cache_control: Literal["off", "fadvise_dontneed_after_append_v1"] = "off",
+    row_store_cache_control: Literal[
+        "off",
+        "fadvise_dontneed_after_append_v1",
+        "fadvise_dontneed_after_append_and_read_v1",
+    ] = "off",
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
     row_store_preallocate: bool = True,
