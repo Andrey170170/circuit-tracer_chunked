@@ -657,6 +657,107 @@ class AttributionContext:
             self.clear_decoder_cache()
             self.decoder_chunk_cache = self._create_decoder_cache()
 
+    def derive_prefix_view_context(self, target_position: int) -> "AttributionContext":
+        """Return a non-mutating causal prefix view of this Phase-0 state.
+
+        The source context may cover a longer window.  The derived context keeps
+        only active features with ``position < target_position`` and slices
+        position-indexed token/error state to the same prefix length.  Full logits
+        are intentionally preserved so callers can still read target-position
+        logits from the cached window pass.  Any decoder cache is shared but not
+        owned by the returned context.
+        """
+
+        activation_matrix = self.activation_matrix.coalesce()
+        n_layers, n_pos, n_features = activation_matrix.shape
+        target_position = int(target_position)
+        if target_position <= 0 or target_position > int(n_pos):
+            raise ValueError(
+                "target_position must be in [1, n_positions] for prefix view "
+                f"({target_position} not in [1, {int(n_pos)}])"
+            )
+
+        if self.error_vectors.ndim < 2 or int(self.error_vectors.shape[1]) < target_position:
+            raise ValueError("error_vectors do not contain the requested prefix")
+        if self.token_vectors.ndim < 1 or int(self.token_vectors.shape[0]) < target_position:
+            raise ValueError("token_vectors do not contain the requested prefix")
+
+        indices = activation_matrix.indices()
+        values = activation_matrix.values()
+        keep = indices[1] < target_position
+        kept_rows = keep.nonzero(as_tuple=False).flatten()
+        filtered_activation_matrix = torch.sparse_coo_tensor(
+            indices[:, keep],
+            values[keep],
+            size=(int(n_layers), target_position, int(n_features)),
+            device=activation_matrix.device,
+            dtype=activation_matrix.dtype,
+        ).coalesce()
+
+        chunked_decoder_state = None
+        if self.chunked_decoder_state is not None:
+            kept_indices = filtered_activation_matrix.indices()
+            chunked_decoder_state = {
+                "source_layers": kept_indices[0].contiguous(),
+                "positions": kept_indices[1].contiguous(),
+                "feature_ids": kept_indices[2].contiguous(),
+                "activation_values": filtered_activation_matrix.values().contiguous(),
+            }
+
+        encoder_vecs = self.encoder_vecs
+        if encoder_vecs.numel() > 0:
+            encoder_vecs = encoder_vecs[kept_rows.to(device=encoder_vecs.device, dtype=torch.long)]
+
+        decoder_vecs = self.decoder_vecs
+        encoder_to_decoder_map = self.encoder_to_decoder_map
+        decoder_locations = self.decoder_locations
+        if chunked_decoder_state is None and encoder_to_decoder_map.numel():
+            old_to_new = torch.full(
+                (int(activation_matrix._nnz()),),
+                -1,
+                device=encoder_to_decoder_map.device,
+                dtype=torch.long,
+            )
+            kept_rows_on_map_device = kept_rows.to(device=old_to_new.device, dtype=torch.long)
+            old_to_new[kept_rows_on_map_device] = torch.arange(
+                int(kept_rows.numel()), device=old_to_new.device, dtype=torch.long
+            )
+            keep_decoder = old_to_new[encoder_to_decoder_map.long()] >= 0
+            decoder_vecs = decoder_vecs[keep_decoder.to(device=decoder_vecs.device)]
+            decoder_locations = decoder_locations[
+                :, keep_decoder.to(device=decoder_locations.device)
+            ]
+            encoder_to_decoder_map = old_to_new[encoder_to_decoder_map[keep_decoder].long()]
+
+        shared_cache = self.decoder_chunk_cache
+        if shared_cache is not None and self.decoder_cache_fingerprint is None:
+            raise ValueError("cannot share decoder cache without fingerprint metadata")
+
+        return AttributionContext(
+            activation_matrix=filtered_activation_matrix,
+            error_vectors=self.error_vectors[:, :target_position].contiguous(),
+            token_vectors=self.token_vectors[:target_position].contiguous(),
+            decoder_vecs=decoder_vecs,
+            encoder_vecs=encoder_vecs,
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=decoder_locations,
+            logits=self.logits,
+            full_logits=self.full_logits,
+            decoder_provider=self.decoder_provider,
+            chunked_decoder_state=chunked_decoder_state,
+            stage_encoder_vecs_on_cpu=self._stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=self._stage_error_vectors_on_cpu,
+            error_vector_prefetch_lookahead=self._error_vector_prefetch_lookahead,
+            chunked_feature_replay_window=self._chunked_feature_replay_window,
+            row_subchunk_size=self._row_subchunk_size,
+            exact_encoder_residency=self.exact_encoder_residency_requested,
+            materialized_encoder_vecs_during_phase0=self.exact_encoder_materialized_during_phase0,
+            internal_precision_requested=self.internal_precision_requested,
+            resolved_dtype_map=self.resolved_dtype_map,
+            decoder_chunk_cache=shared_cache,
+            decoder_cache_fingerprint=self.decoder_cache_fingerprint,
+        )
+
     def apply_diagnostic_feature_cap(self, max_features: int) -> tuple[int, int]:
         total_active_feats = self.activation_matrix._nnz()
         if max_features >= total_active_feats:

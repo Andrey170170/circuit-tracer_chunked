@@ -7139,6 +7139,9 @@ def attribute(
     output_position: int | None = None,
     decoder_chunk_cache: object | None = None,
     decoder_cache_fingerprint: object | None = None,
+    _phase0_context_override: object | None = None,
+    _target_logits_override: torch.Tensor | None = None,
+    _target_logit_source: str | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -7395,6 +7398,9 @@ def attribute(
             output_position=output_position,
             decoder_chunk_cache=decoder_chunk_cache,
             decoder_cache_fingerprint=decoder_cache_fingerprint,
+            phase0_context_override=_phase0_context_override,
+            target_logits_override=_target_logits_override,
+            target_logit_source=_target_logit_source,
             logger=logger,
         )
     finally:
@@ -7403,6 +7409,124 @@ def attribute(
 
         if handler:
             logger.removeHandler(handler)
+
+
+class FullSequenceWindowAttributionSession:
+    """Small resource session for per-target full-sequence window attribution.
+
+    When both reuse toggles are disabled, calls delegate to ``attribute()`` so
+    existing behavior/resource handling remains the fallback.  Otherwise a
+    max-prefix Phase-0 context is built lazily and per-target calls use causal
+    prefix-view contexts and/or cached window logits.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: NNSightReplacementModel,
+        full_token_ids: torch.Tensor | list[int],
+        window_max_prefix_len: int,
+        decoder_chunk_cache: object | None = None,
+        decoder_cache_fingerprint: object | None = None,
+        reuse_phase0_window_state: bool = False,
+        reuse_target_logits: bool = False,
+        reference_check_metadata: Mapping[str, Any] | None = None,
+        **setup_kwargs: Any,
+    ) -> None:
+        self.model = model
+        self.full_token_ids = (
+            full_token_ids.detach().clone().to(dtype=torch.long).reshape(-1)
+            if isinstance(full_token_ids, torch.Tensor)
+            else torch.tensor([int(v) for v in full_token_ids], dtype=torch.long)
+        )
+        self.window_max_prefix_len = int(window_max_prefix_len)
+        if self.window_max_prefix_len <= 0:
+            raise ValueError("window_max_prefix_len must be > 0")
+        if self.window_max_prefix_len > int(self.full_token_ids.numel()):
+            raise ValueError("window_max_prefix_len exceeds full_token_ids length")
+        self.decoder_chunk_cache = decoder_chunk_cache
+        self.decoder_cache_fingerprint = decoder_cache_fingerprint
+        self.reuse_phase0_window_state = bool(reuse_phase0_window_state)
+        self.reuse_target_logits = bool(reuse_target_logits)
+        self.reference_check_metadata = dict(reference_check_metadata or {})
+        self.setup_kwargs = dict(setup_kwargs)
+        self._window_context = None
+
+    def _get_window_context(self):
+        if self._window_context is None:
+            self._window_context = self.model.setup_attribution(
+                self.full_token_ids[: self.window_max_prefix_len],
+                retain_full_logits=True,
+                decoder_chunk_cache=self.decoder_chunk_cache,
+                decoder_cache_fingerprint=self.decoder_cache_fingerprint,
+                **self.setup_kwargs,
+            )
+        return self._window_context
+
+    def attribute_target_position(
+        self,
+        target_position: int,
+        *,
+        attribution_targets: Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None = None,
+        prefix_view_metadata: Mapping[str, Any] | None = None,
+        **attribute_kwargs: Any,
+    ) -> Graph:
+        target_position = int(target_position)
+        if target_position <= 0 or target_position >= int(self.full_token_ids.numel()):
+            raise ValueError("target_position must select a non-initial token in full_token_ids")
+        if target_position > self.window_max_prefix_len:
+            raise ValueError("target_position exceeds window_max_prefix_len")
+
+        if not self.reuse_phase0_window_state and not self.reuse_target_logits:
+            prompt_tokens = (
+                self.full_token_ids
+                if isinstance(prefix_view_metadata, Mapping)
+                and prefix_view_metadata.get("mode") == "full_sequence_target_position"
+                else self.full_token_ids[:target_position]
+            )
+            return attribute(
+                prompt_tokens,
+                self.model,
+                attribution_targets=attribution_targets,
+                prefix_view_metadata=prefix_view_metadata,
+                output_position=target_position - 1,
+                **attribute_kwargs,
+            )
+
+        window_ctx = self._get_window_context()
+        phase0_override = None
+        if self.reuse_phase0_window_state:
+            derive = getattr(window_ctx, "derive_prefix_view_context", None)
+            if not callable(derive):
+                raise RuntimeError("AttributionContext does not support prefix-view derivation")
+            phase0_override = derive(target_position)
+
+        target_logits_override = None
+        target_logit_source = None
+        if self.reuse_target_logits:
+            target_logits_override = window_ctx.get_logits_at_position(target_position - 1)[
+                0
+            ].detach()
+            target_logit_source = "full_sequence_window_logits"
+
+        return attribute(
+            self.full_token_ids,
+            self.model,
+            attribution_targets=attribution_targets,
+            prefix_view_metadata=prefix_view_metadata,
+            output_position=target_position - 1,
+            _phase0_context_override=phase0_override,
+            _target_logits_override=target_logits_override,
+            _target_logit_source=target_logit_source,
+            **attribute_kwargs,
+        )
+
+    def cleanup(self) -> None:
+        if self._window_context is not None:
+            cleanup = getattr(self._window_context, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+            self._window_context = None
 
 
 def _run_attribution(
@@ -7486,6 +7610,9 @@ def _run_attribution(
     output_position: int | None = None,
     decoder_chunk_cache: object | None = None,
     decoder_cache_fingerprint: object | None = None,
+    phase0_context_override: object | None = None,
+    target_logits_override: torch.Tensor | None = None,
+    target_logit_source: str | None = None,
 ):
     start_time = time.time()
     run_start = time.perf_counter()
@@ -7779,6 +7906,10 @@ def _run_attribution(
             "semantic_descriptor_dim": semantic_descriptor_dim,
             "prefix_view_validation_applied": prefix_view_metadata is not None,
             "prefix_view_metadata": dict(prefix_view_metadata) if prefix_view_metadata else None,
+            "phase0_window_state_reuse_requested": phase0_context_override is not None,
+            "phase0_window_state_reuse_effective": phase0_context_override is not None,
+            "target_logit_source": target_logit_source
+            or ("override" if target_logits_override is not None else "context"),
             **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
             **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
         },
@@ -8090,22 +8221,25 @@ def _run_attribution(
             f"trace_batch_cap_reason={phase1_trace_batch_metadata.get('trace_batch_cap_reason')}"
         )
 
-    ctx = model.setup_attribution(
-        input_ids,
-        sparsification=sparsification,
-        retain_full_logits=output_position is not None and output_position != n_input_pos - 1,
-        chunked_feature_replay_window=chunked_feature_replay_window,
-        error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
-        stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
-        stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
-        row_subchunk_size=row_subchunk_size,
-        exact_encoder_residency=exact_encoder_residency_config.requested_mode,
-        internal_precision_requested=internal_precision_requested,
-        resolved_dtype_map=resolved_dtype_map,
-        prefix_view_length=prefix_view_length,
-        decoder_chunk_cache=decoder_chunk_cache,
-        decoder_cache_fingerprint=decoder_cache_fingerprint,
-    )
+    if phase0_context_override is not None:
+        ctx = phase0_context_override
+    else:
+        ctx = model.setup_attribution(
+            input_ids,
+            sparsification=sparsification,
+            retain_full_logits=output_position is not None and output_position != n_input_pos - 1,
+            chunked_feature_replay_window=chunked_feature_replay_window,
+            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            row_subchunk_size=row_subchunk_size,
+            exact_encoder_residency=exact_encoder_residency_config.requested_mode,
+            internal_precision_requested=internal_precision_requested,
+            resolved_dtype_map=resolved_dtype_map,
+            prefix_view_length=prefix_view_length,
+            decoder_chunk_cache=decoder_chunk_cache,
+            decoder_cache_fingerprint=decoder_cache_fingerprint,
+        )
     exact_encoder_runtime_metadata = {
         "exact_encoder_staging_destination": getattr(
             ctx, "exact_encoder_staging_destination", "none"
@@ -8468,6 +8602,8 @@ def _run_attribution(
             if output_position is not None and output_position != n_input_pos - 1
             else ctx.get_last_token_logits()[0]
         )
+        if target_logits_override is not None:
+            output_logits = target_logits_override.to(device=output_logits.device)
         targets = AttributionTargets(
             attribution_targets=attribution_targets,
             logits=output_logits,
@@ -12136,6 +12272,15 @@ def _run_attribution(
                 validate_compact_prefix_view_output(
                     compact_output_result, n_layers=int(model.cfg.n_layers)
                 )
+            compact_output_result["phase0_window_state_reuse_requested"] = (
+                phase0_context_override is not None
+            )
+            compact_output_result["phase0_window_state_reuse_effective"] = (
+                phase0_context_override is not None
+            )
+            compact_output_result["target_logit_source"] = target_logit_source or (
+                "override" if target_logits_override is not None else "context"
+            )
             return compact_output_result
 
         non_feature_nodes = torch.arange(total_active_feats, total_nodes)
