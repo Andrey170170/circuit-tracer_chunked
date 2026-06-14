@@ -620,6 +620,8 @@ class NNSightReplacementModel(LanguageModel):
         internal_precision_requested: str | None = None,
         resolved_dtype_map: dict[str, str] | None = None,
         prefix_view_length: int | None = None,
+        decoder_chunk_cache=None,
+        decoder_cache_fingerprint: object | None = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
@@ -829,6 +831,8 @@ class NNSightReplacementModel(LanguageModel):
             materialized_encoder_vecs_during_phase0=materialize_encoder_vecs_phase0,
             internal_precision_requested=internal_precision_requested,
             resolved_dtype_map=resolved_dtype_map,
+            decoder_chunk_cache=decoder_chunk_cache,
+            decoder_cache_fingerprint=decoder_cache_fingerprint,
         )
         encoder_move_memory_after_stage = (
             get_memory_snapshot(memory_device) if materialize_encoder_vecs_phase0 else None

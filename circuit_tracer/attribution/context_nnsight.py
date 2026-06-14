@@ -102,6 +102,8 @@ class AttributionContext:
         materialized_encoder_vecs_during_phase0: bool = False,
         internal_precision_requested: str | None = None,
         resolved_dtype_map: dict[str, str] | None = None,
+        decoder_chunk_cache=None,
+        decoder_cache_fingerprint: object | None = None,
     ) -> None:
         n_layers, n_pos, _ = activation_matrix.shape
 
@@ -228,7 +230,22 @@ class AttributionContext:
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
         self._refresh_chunked_layer_spans()
-        self.decoder_chunk_cache = self._create_decoder_cache()
+        self._owns_decoder_chunk_cache = decoder_chunk_cache is None
+        self.decoder_cache_fingerprint = decoder_cache_fingerprint
+        if decoder_chunk_cache is not None:
+            expected = decoder_cache_fingerprint
+            if expected is None:
+                raise ValueError("shared decoder cache requires fingerprint metadata")
+            actual = getattr(decoder_chunk_cache, "fingerprint", None)
+            if not hasattr(decoder_chunk_cache, "fingerprint"):
+                raise ValueError("shared decoder cache is missing fingerprint metadata")
+            if actual != expected:
+                raise ValueError(
+                    f"shared decoder cache fingerprint mismatch ({actual!r} != {expected!r})"
+                )
+            self.decoder_chunk_cache = decoder_chunk_cache
+        else:
+            self.decoder_chunk_cache = self._create_decoder_cache()
 
     @staticmethod
     def _stage_tensor_on_cpu(tensor: torch.Tensor) -> torch.Tensor:
@@ -627,14 +644,18 @@ class AttributionContext:
         return max(1, int(chunk_size))
 
     def clear_decoder_cache(self) -> None:
+        if not self._owns_decoder_chunk_cache:
+            self.decoder_chunk_cache = None
+            return
         clear_decoder_cache = getattr(self.decoder_provider, "clear_decoder_block_cache", None)
         if callable(clear_decoder_cache):
             clear_decoder_cache(self.decoder_chunk_cache)
         self.decoder_chunk_cache = None
 
     def reset_decoder_cache(self) -> None:
-        self.clear_decoder_cache()
-        self.decoder_chunk_cache = self._create_decoder_cache()
+        if self._owns_decoder_chunk_cache:
+            self.clear_decoder_cache()
+            self.decoder_chunk_cache = self._create_decoder_cache()
 
     def apply_diagnostic_feature_cap(self, max_features: int) -> tuple[int, int]:
         total_active_feats = self.activation_matrix._nnz()

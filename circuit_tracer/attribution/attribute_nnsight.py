@@ -448,6 +448,45 @@ def _compact_nonfeature_column_counts(
     return n_error_columns, n_token_columns, n_error_columns + n_token_columns
 
 
+def validate_compact_prefix_view_output(compact: Mapping[str, Any], *, n_layers: int) -> None:
+    """Validate compact-output shape/position invariants for prefix-view traces."""
+    metadata = compact.get("prefix_view_metadata")
+    if not isinstance(metadata, Mapping):
+        return
+    target_position = int(metadata["target_position"])
+    prefix_len = int(metadata["prefix_token_count"])
+    if int(compact["n_token_nodes"]) != prefix_len:
+        raise ValueError("compact prefix-view n_token_nodes does not match prefix length")
+    if int(compact["n_error_nodes"]) != int(n_layers) * prefix_len:
+        raise ValueError("compact prefix-view n_error_nodes does not match prefix length")
+    for key in ("feature_token_edges", "logit_token_edges"):
+        if int(compact[key].shape[1]) != prefix_len:
+            raise ValueError(f"compact prefix-view {key} width does not match prefix length")
+    for key in ("feature_error_edges", "logit_error_edges"):
+        if int(compact[key].shape[1]) != int(n_layers) * prefix_len:
+            raise ValueError(f"compact prefix-view {key} width does not match prefix length")
+    for key in (
+        "active_features",
+        "selected_features",
+        "feature_row_node_indices",
+        "logit_row_node_indices",
+    ):
+        tensor = compact.get(key)
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            continue
+        if key == "active_features":
+            positions = tensor[:, 1]
+        elif key == "selected_features":
+            active = compact.get("active_features")
+            if not isinstance(active, torch.Tensor) or active.numel() == 0:
+                continue
+            positions = active[tensor.to(dtype=torch.long), 1]
+        else:
+            positions = (tensor.to(dtype=torch.long) % prefix_len) if prefix_len else tensor
+        if bool(torch.any(positions >= target_position)):
+            raise ValueError(f"compact prefix-view {key} contains future positions")
+
+
 _PHASE4_REFRESH_POLICY_DEFAULT: Literal["standard"] = "standard"
 _PHASE4_REFRESH_INTERVAL_MULTIPLIER_DEFAULT = 1
 _PHASE4_REFRESH_POLICY_EFFECTIVE_POLICY_BY_POLICY: dict[str, str] = {
@@ -7073,6 +7112,8 @@ def attribute(
     ] = "baseline",
     prefix_view_metadata: Mapping[str, Any] | None = None,
     output_position: int | None = None,
+    decoder_chunk_cache: object | None = None,
+    decoder_cache_fingerprint: object | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -7327,6 +7368,8 @@ def attribute(
             phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode,
             prefix_view_metadata=normalized_prefix_view_metadata,
             output_position=output_position,
+            decoder_chunk_cache=decoder_chunk_cache,
+            decoder_cache_fingerprint=decoder_cache_fingerprint,
             logger=logger,
         )
     finally:
@@ -7416,6 +7459,8 @@ def _run_attribution(
     ] = "baseline",
     prefix_view_metadata: PrefixViewMetadata | None = None,
     output_position: int | None = None,
+    decoder_chunk_cache: object | None = None,
+    decoder_cache_fingerprint: object | None = None,
 ):
     start_time = time.time()
     run_start = time.perf_counter()
@@ -8034,6 +8079,8 @@ def _run_attribution(
             and prefix_view_metadata.get("mode") == "full_sequence_target_position"
             else None
         ),
+        decoder_chunk_cache=decoder_chunk_cache,
+        decoder_cache_fingerprint=decoder_cache_fingerprint,
     )
     exact_encoder_runtime_metadata = {
         "exact_encoder_staging_destination": getattr(
@@ -11719,7 +11766,7 @@ def _run_attribution(
                 "logit_error_edges": logit_error_edges,
                 "logit_token_edges": logit_token_edges,
                 "n_error_nodes": n_error_nodes,
-                "n_token_nodes": int(len(input_ids)),
+                "n_token_nodes": int(n_pos),
                 "phase4_feature_batch_size": int(phase4_feature_batch_size),
                 "phase4_feature_batch_size_initial": int(
                     batch_size if feature_batch_size is None else feature_batch_size
@@ -12060,6 +12107,11 @@ def _run_attribution(
                 phase="phase5",
                 elapsed_ms=phase5_elapsed_ms,
             )
+            if prefix_view_metadata is not None:
+                compact_output_result["prefix_view_metadata"] = dict(prefix_view_metadata)
+                validate_compact_prefix_view_output(
+                    compact_output_result, n_layers=int(model.cfg.n_layers)
+                )
             return compact_output_result
 
         non_feature_nodes = torch.arange(total_active_feats, total_nodes)
@@ -12077,8 +12129,8 @@ def _run_attribution(
         full_edge_matrix[-n_logits:] = edge_matrix[:n_logits, :][:, col_read]
 
         graph = Graph(
-            input_string=model.tokenizer.decode(input_ids),
-            input_tokens=input_ids,
+            input_string=model.tokenizer.decode(input_ids[:n_pos]),
+            input_tokens=input_ids[:n_pos],
             logit_targets=targets.logit_targets,
             logit_probabilities=targets.logit_probabilities,
             vocab_size=targets.vocab_size,

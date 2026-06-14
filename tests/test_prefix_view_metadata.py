@@ -9,6 +9,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _compact_selected_feature_columns,
     _hash_token_ids,
     _resolve_prefix_view_output_position,
+    validate_compact_prefix_view_output,
     validate_prefix_view_metadata,
 )
 
@@ -237,3 +238,130 @@ def test_compact_nonfeature_columns_use_prefix_visible_positions() -> None:
     assert n_error == 26 * 73
     assert n_token == 73
     assert total == 27 * 73
+
+
+def _compact_prefix_payload(**overrides):
+    payload = {
+        "prefix_view_metadata": _metadata(mode="full_sequence_target_position"),
+        "n_token_nodes": 3,
+        "n_error_nodes": 2 * 3,
+        "active_features": torch.tensor([[0, 0, 7], [1, 2, 9]], dtype=torch.long),
+        "selected_features": torch.tensor([0, 1], dtype=torch.long),
+        "feature_row_node_indices": torch.tensor([0, 5], dtype=torch.long),
+        "logit_row_node_indices": torch.tensor([2], dtype=torch.long),
+        "feature_error_edges": torch.zeros(2, 6),
+        "logit_error_edges": torch.zeros(1, 6),
+        "feature_token_edges": torch.zeros(2, 3),
+        "logit_token_edges": torch.zeros(1, 3),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_validate_compact_prefix_view_output_accepts_prefix_shapes() -> None:
+    validate_compact_prefix_view_output(_compact_prefix_payload(), n_layers=2)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"n_token_nodes": 5}, "n_token_nodes"),
+        ({"n_error_nodes": 10}, "n_error_nodes"),
+        ({"feature_token_edges": torch.zeros(2, 5)}, "feature_token_edges"),
+        ({"active_features": torch.tensor([[0, 3, 7]])}, "future positions"),
+    ],
+)
+def test_validate_compact_prefix_view_output_rejects_mismatch(overrides, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_compact_prefix_view_output(_compact_prefix_payload(**overrides), n_layers=2)
+
+
+class _FakeDecoderProvider:
+    decoder_chunk_size = 16
+
+    def __init__(self) -> None:
+        self.created = 0
+        self.cleared = 0
+
+    def create_decoder_block_cache(self):
+        self.created += 1
+        return {"cache": self.created}
+
+    def clear_decoder_block_cache(self, cache) -> None:
+        if cache is not None:
+            self.cleared += 1
+
+
+def _context_with_cache(provider, cache=None, fingerprint=None):
+    return AttributionContext(
+        activation_matrix=torch.sparse_coo_tensor(
+            indices=torch.tensor([[0], [0], [0]], dtype=torch.long),
+            values=torch.ones(1),
+            size=(1, 1, 4),
+        ).coalesce(),
+        error_vectors=torch.randn(1, 1, 2),
+        token_vectors=torch.randn(1, 2),
+        decoder_vecs=torch.randn(1, 2),
+        encoder_vecs=torch.randn(1, 2),
+        encoder_to_decoder_map=torch.tensor([0], dtype=torch.long),
+        decoder_locations=torch.tensor([[0], [0]], dtype=torch.long),
+        logits=torch.randn(1, 1, 8),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": torch.tensor([0]),
+            "feature_ids": torch.tensor([0]),
+        },
+        stage_error_vectors_on_cpu=False,
+        decoder_chunk_cache=cache,
+        decoder_cache_fingerprint=fingerprint,
+    )
+
+
+def test_shared_decoder_cache_is_not_cleared_on_context_cleanup() -> None:
+    provider = _FakeDecoderProvider()
+
+    class Cache:
+        fingerprint = ("model", 16)
+
+    shared = Cache()
+
+    ctx = _context_with_cache(provider, cache=shared, fingerprint=("model", 16))
+
+    assert ctx.decoder_chunk_cache is shared
+    assert provider.created == 0
+    ctx.cleanup()
+    assert provider.cleared == 0
+
+
+def test_owned_decoder_cache_preserves_default_cleanup_behavior() -> None:
+    provider = _FakeDecoderProvider()
+
+    ctx = _context_with_cache(provider)
+
+    assert provider.created == 1
+    ctx.cleanup()
+    assert provider.cleared == 1
+
+
+def test_shared_decoder_cache_fingerprint_mismatch_rejected() -> None:
+    class Cache:
+        fingerprint = "actual"
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        _context_with_cache(_FakeDecoderProvider(), cache=Cache(), fingerprint="expected")
+
+
+def test_shared_decoder_cache_without_fingerprint_rejected_when_expected() -> None:
+    class Cache:
+        pass
+
+    with pytest.raises(ValueError, match="missing fingerprint"):
+        _context_with_cache(_FakeDecoderProvider(), cache=Cache(), fingerprint="expected")
+
+
+def test_shared_decoder_cache_requires_expected_fingerprint() -> None:
+    class Cache:
+        fingerprint = "actual"
+
+    with pytest.raises(ValueError, match="requires fingerprint"):
+        _context_with_cache(_FakeDecoderProvider(), cache=Cache())

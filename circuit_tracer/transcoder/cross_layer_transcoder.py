@@ -27,8 +27,9 @@ DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES = 8589934592
 
 
 class DecoderChunkCache:
-    def __init__(self, max_bytes: int) -> None:
+    def __init__(self, max_bytes: int, *, fingerprint: object | None = None) -> None:
         self.max_bytes = max(0, int(max_bytes))
+        self.fingerprint = fingerprint
         self.bytes_resident = 0
         self._entries: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
 
@@ -668,7 +669,9 @@ class CrossLayerTranscoder(torch.nn.Module):
 
         return tensor.to(device=self.device, dtype=self.dtype)
 
-    def create_decoder_block_cache(self, max_bytes: int | None = None) -> DecoderChunkCache | None:
+    def create_decoder_block_cache(
+        self, max_bytes: int | None = None, *, fingerprint: object | None = None
+    ) -> DecoderChunkCache | None:
         if not self.lazy_decoder:
             return None
 
@@ -680,7 +683,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             return None
 
         self.emit_trace_event("decoder.cache.init", max_bytes=cache_budget)
-        return DecoderChunkCache(cache_budget)
+        return DecoderChunkCache(cache_budget, fingerprint=fingerprint)
 
     def clear_decoder_block_cache(self, cache: DecoderChunkCache | None) -> None:
         if cache is None:
