@@ -7476,6 +7476,24 @@ class FullSequenceWindowAttributionSession:
             raise ValueError("target_position must select a non-initial token in full_token_ids")
         if target_position > self.window_max_prefix_len:
             raise ValueError("target_position exceeds window_max_prefix_len")
+        supplied_output_position = attribute_kwargs.pop("output_position", None)
+        if (
+            supplied_output_position is not None
+            and int(supplied_output_position) != target_position - 1
+        ):
+            raise ValueError("output_position must equal target_position - 1")
+        if prefix_view_metadata is not None:
+            metadata_target_position = int(prefix_view_metadata.get("target_position", -1))
+            if metadata_target_position != target_position:
+                raise ValueError(
+                    "prefix_view_metadata target_position must match session target_position"
+                )
+            if (
+                self.reuse_phase0_window_state or self.reuse_target_logits
+            ) and prefix_view_metadata.get("mode") != "full_sequence_target_position":
+                raise ValueError(
+                    "window reuse requires full_sequence_target_position prefix metadata"
+                )
 
         if not self.reuse_phase0_window_state and not self.reuse_target_logits:
             prompt_tokens = (
