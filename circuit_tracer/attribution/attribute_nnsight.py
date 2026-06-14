@@ -407,6 +407,26 @@ def _resolve_prefix_view_output_position(
     return effective_output_position
 
 
+def _resolve_prefix_view_trace_input_ids(
+    input_ids: torch.Tensor,
+    normalized_prefix_view_metadata: PrefixViewMetadata | None,
+) -> tuple[torch.Tensor, int | None]:
+    """Return the effective token IDs to feed to NNsight traces.
+
+    Full-sequence prefix views carry the complete audited input for provenance,
+    but causal trace execution only needs the prefix visible to the target.
+    """
+
+    if (
+        normalized_prefix_view_metadata is None
+        or normalized_prefix_view_metadata.get("mode") != "full_sequence_target_position"
+    ):
+        return input_ids, None
+
+    prefix_view_length = int(normalized_prefix_view_metadata["target_position"])
+    return input_ids[:prefix_view_length].contiguous(), prefix_view_length
+
+
 def _apply_prefix_view_activation_mask(ctx: Any, target_position: int) -> dict[str, int]:
     apply_prefix_view_state = getattr(ctx, "apply_prefix_view_state", None)
     if not callable(apply_prefix_view_state):
@@ -6752,6 +6772,7 @@ def _plan_phase4_feature_batch_size_preflight(
     row_abs_sum_dtype: torch.dtype = torch.float64,
     planner_compute_dtype: torch.dtype = torch.float64,
     telemetry_recorder: TelemetryRecorder | None = None,
+    prefix_view_metadata: PrefixViewMetadata | None = None,
 ) -> int:
     planner_start = time.perf_counter()
     exact_trace_internal_dtype_name = _exact_trace_internal_dtype_name(exact_trace_internal_dtype)
@@ -6789,6 +6810,9 @@ def _plan_phase4_feature_batch_size_preflight(
         )
 
     input_ids = model.ensure_tokenized(prompt)
+    trace_input_ids, prefix_view_length = _resolve_prefix_view_trace_input_ids(
+        input_ids, prefix_view_metadata
+    )
     ctx = None
     observed_peak_reserved_bytes = 0
     total_cuda_bytes: int | None = None
@@ -6822,6 +6846,7 @@ def _plan_phase4_feature_batch_size_preflight(
             exact_encoder_residency=exact_encoder_residency,
             internal_precision_requested=internal_precision_requested,
             resolved_dtype_map=resolved_dtype_map,
+            prefix_view_length=prefix_view_length,
         )
         if hasattr(ctx, "set_diagnostic_mode"):
             ctx.set_diagnostic_mode(False)
@@ -6850,7 +6875,7 @@ def _plan_phase4_feature_batch_size_preflight(
         trace_batch_size = max(batch_size, initial_feature_batch_size, effective_logit_batch_size)
 
         with model.trace() as tracer:
-            with tracer.invoke(input_ids.expand(trace_batch_size, -1)):
+            with tracer.invoke(trace_input_ids.expand(trace_batch_size, -1)):
                 pass
 
             detach_barrier = tracer.barrier(2)
@@ -7940,6 +7965,7 @@ def _run_attribution(
                 row_abs_sum_dtype=row_abs_sum_dtype,
                 planner_compute_dtype=planner_compute_dtype,
                 telemetry_recorder=telemetry_recorder,
+                prefix_view_metadata=prefix_view_metadata,
             )
             planner_status = "executed"
 
@@ -7998,6 +8024,9 @@ def _run_attribution(
             raise ValueError(
                 f"output_position must be in [0, {n_input_pos}) (got {output_position})"
             )
+    trace_input_ids, prefix_view_length = _resolve_prefix_view_trace_input_ids(
+        input_ids, prefix_view_metadata
+    )
     _log_memory_boundary(logger, "Phase 0 start", model.device)
 
     configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
@@ -8073,12 +8102,7 @@ def _run_attribution(
         exact_encoder_residency=exact_encoder_residency_config.requested_mode,
         internal_precision_requested=internal_precision_requested,
         resolved_dtype_map=resolved_dtype_map,
-        prefix_view_length=(
-            int(prefix_view_metadata["target_position"])
-            if prefix_view_metadata is not None
-            and prefix_view_metadata.get("mode") == "full_sequence_target_position"
-            else None
-        ),
+        prefix_view_length=prefix_view_length,
         decoder_chunk_cache=decoder_chunk_cache,
         decoder_cache_fingerprint=decoder_cache_fingerprint,
     )
@@ -8396,7 +8420,7 @@ def _run_attribution(
         phase_start = time.perf_counter()
         _log_memory_boundary(logger, "Phase 1 start", model.device)
         with model.trace() as tracer:
-            with tracer.invoke(input_ids.expand(trace_batch_size, -1)):
+            with tracer.invoke(trace_input_ids.expand(trace_batch_size, -1)):
                 pass
 
             detach_barrier = tracer.barrier(2)

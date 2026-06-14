@@ -656,13 +656,20 @@ class NNSightReplacementModel(LanguageModel):
         collect_phase0_pre_clt_input_fingerprints = bool(
             getattr(transcoders, "_phase0_threshold_membership_debug_enabled", False)
         )
+        trace_tokens = tokens
+        if prefix_view_length_int is not None:
+            trace_tokens = tokens[:prefix_view_length_int].contiguous()
+
         trace_start = time.perf_counter()
         if callable(trace_event):
             trace_event(
-                "phase0.setup.trace_start", backend="nnsight", token_count=int(tokens.numel())
+                "phase0.setup.trace_start",
+                backend="nnsight",
+                token_count=int(trace_tokens.numel()),
+                original_token_count=int(tokens.numel()),
             )
 
-        with self.trace(tokens):
+        with self.trace(trace_tokens):
             mlp_in_cache, mlp_out_cache = [], []
             for feature_input_loc, feature_output_loc in zip(
                 self.feature_input_locs, self.feature_output_locs
@@ -693,11 +700,10 @@ class NNSightReplacementModel(LanguageModel):
             if collect_phase0_pre_clt_input_fingerprints
             else None
         )
-        phase0_tokens = tokens
+        phase0_tokens = trace_tokens
         if prefix_view_length_int is not None:
             mlp_in_cache = mlp_in_cache[..., :prefix_view_length_int, :].contiguous()
             mlp_out_cache = mlp_out_cache[..., :prefix_view_length_int, :].contiguous()
-            phase0_tokens = tokens[:prefix_view_length_int].contiguous()
             phase0_pre_clt_input_fingerprints = (
                 _build_phase0_pre_clt_input_fingerprints(mlp_in_cache)
                 if collect_phase0_pre_clt_input_fingerprints

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,9 +11,14 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _compact_selected_feature_columns,
     _hash_token_ids,
     _resolve_prefix_view_output_position,
+    _resolve_prefix_view_trace_input_ids,
     validate_compact_prefix_view_output,
     validate_prefix_view_metadata,
 )
+from circuit_tracer.replacement_model import (
+    replacement_model_nnsight as replacement_model_nnsight_module,
+)
+from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 
 
 def _metadata(**overrides):
@@ -146,6 +153,35 @@ def test_resolve_prefix_view_output_position_rejects_argument_mismatch() -> None
         _resolve_prefix_view_output_position(normalized, 3)
 
 
+def test_resolve_prefix_view_trace_input_ids_truncates_full_sequence() -> None:
+    input_ids = torch.arange(8)
+    metadata = _metadata(
+        mode="full_sequence_target_position",
+        target_position=3,
+        prefix_token_count=3,
+        input_token_count=8,
+        full_sequence_token_count=8,
+        input_token_ids_sha256=_hash_token_ids(input_ids.tolist()),
+    )
+
+    trace_input_ids, prefix_view_length = _resolve_prefix_view_trace_input_ids(input_ids, metadata)
+
+    assert prefix_view_length == 3
+    assert trace_input_ids.tolist() == [0, 1, 2]
+    assert trace_input_ids.is_contiguous()
+
+
+def test_resolve_prefix_view_trace_input_ids_keeps_independent_prefix() -> None:
+    input_ids = torch.arange(3)
+
+    trace_input_ids, prefix_view_length = _resolve_prefix_view_trace_input_ids(
+        input_ids, _metadata()
+    )
+
+    assert prefix_view_length is None
+    assert trace_input_ids is input_ids
+
+
 def test_prefix_view_state_truncates_position_indexed_context() -> None:
     activation_matrix = torch.sparse_coo_tensor(
         indices=torch.tensor(
@@ -184,6 +220,71 @@ def test_prefix_view_state_truncates_position_indexed_context() -> None:
     assert tuple(ctx.token_vectors.shape) == (3, 3)
     assert ctx._row_size == int(ctx.activation_matrix._nnz()) + (2 + 1) * 3
     assert torch.equal(ctx.get_logits_at_position(2), full_logits[:, 2])
+
+
+def test_setup_attribution_prefix_view_traces_only_prefix(monkeypatch) -> None:
+    class FakeTrace:
+        def __init__(self, model, tokens: torch.Tensor) -> None:
+            self.model = model
+            self.tokens = tokens
+
+        def __enter__(self):
+            token_count = int(self.tokens.numel())
+            self.model.traced_tokens = self.tokens.detach().clone()
+            self.model.feature_input_locs = [
+                SimpleNamespace(output=torch.ones(1, token_count, 3) * layer)
+                for layer in range(self.model.cfg.n_layers)
+            ]
+            self.model.feature_output_locs = [
+                SimpleNamespace(output=torch.ones(1, token_count, 3) * (layer + 1))
+                for layer in range(self.model.cfg.n_layers)
+            ]
+            self.model.output = SimpleNamespace(logits=torch.randn(1, token_count, 20))
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeTranscoders:
+        def compute_attribution_components(self, mlp_in_cache, zero_positions, **kwargs):
+            n_layers, n_pos, d_model = mlp_in_cache.shape
+            return {
+                "activation_matrix": torch.sparse_coo_tensor(
+                    torch.empty((3, 0), dtype=torch.long),
+                    torch.empty(0),
+                    size=(n_layers, n_pos, 4),
+                ).coalesce(),
+                "reconstruction": torch.zeros_like(mlp_in_cache),
+                "decoder_vecs": torch.empty(0, d_model),
+                "encoder_vecs": torch.empty(0, d_model),
+                "encoder_to_decoder_map": torch.empty(0, dtype=torch.long),
+                "decoder_locations": torch.empty(2, 0, dtype=torch.long),
+            }
+
+    monkeypatch.setattr(replacement_model_nnsight_module, "save", lambda tensor: tensor)
+
+    model = SimpleNamespace()
+    model.cfg = SimpleNamespace(n_layers=2)
+    model.device = torch.device("cpu")
+    model.zero_positions = []
+    model.embed_weight = torch.randn(20, 3)
+    model.transcoders = FakeTranscoders()
+    model.trace = lambda tokens: FakeTrace(model, tokens)
+
+    ctx = NNSightReplacementModel.setup_attribution(
+        model,  # type: ignore[arg-type]
+        torch.arange(8),
+        prefix_view_length=3,
+        retain_full_logits=True,
+    )
+
+    assert model.traced_tokens.tolist() == [0, 1, 2]
+    assert ctx.setup_diagnostic_stats["token_count"] == 8
+    assert ctx.setup_diagnostic_stats["phase0_token_count"] == 3
+    assert tuple(ctx.full_logits.shape) == (1, 3, 20)
+    assert ctx.logit_source_shape == (1, 3, 20)
+    assert tuple(ctx.token_vectors.shape) == (3, 3)
+    assert torch.equal(ctx.get_logits_at_position(2), ctx.get_last_token_logits())
 
 
 def test_prefix_view_state_compacts_feature_row_state() -> None:
