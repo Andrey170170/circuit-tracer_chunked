@@ -7,9 +7,11 @@ import torch
 from safetensors.torch import save_file
 
 from circuit_tracer.transcoder.single_layer_transcoder import (
+    load_gemma_scope_2_transcoder,
     load_relu_transcoder,
     load_transcoder_set,
 )
+from circuit_tracer.transcoder.provider import provider_fingerprint
 
 
 @pytest.fixture(autouse=True)
@@ -290,3 +292,101 @@ def test_lazy_loading_both(create_test_transcoder_file):
     assert W_dec.shape == expected_state["W_dec"].shape
     assert torch.allclose(W_enc, expected_state["W_enc"])
     assert torch.allclose(W_dec, expected_state["W_dec"])
+
+
+def test_gemma_scope_2_lazy_lowercase_rows_and_chunks():
+    d_model = 4
+    d_sae = 6
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as f:
+        path = f.name
+    state = {
+        "w_enc": torch.arange(d_model * d_sae, dtype=torch.float32).reshape(d_model, d_sae),
+        "w_dec": torch.arange(d_sae * d_model, dtype=torch.float32).reshape(d_sae, d_model) / 10,
+        "b_enc": torch.randn(d_sae),
+        "b_dec": torch.randn(d_model),
+        "threshold": torch.zeros(d_sae),
+        "affine_skip_connection": torch.eye(d_model),
+    }
+    save_file(state, path)
+    try:
+        eager = load_gemma_scope_2_transcoder(
+            path, 0, device=torch.device("cpu"), lazy_encoder=False, lazy_decoder=False
+        )
+        lazy = load_gemma_scope_2_transcoder(
+            path, 0, device=torch.device("cpu"), lazy_encoder=True, lazy_decoder=True
+        )
+        assert torch.allclose(lazy.W_enc, eager.W_enc)
+        assert torch.allclose(lazy.W_dec, eager.W_dec)
+        feature_ids = torch.tensor([4, 1, 4, 0])
+        assert torch.allclose(
+            lazy.materialize_encoder_rows(feature_ids), state["w_enc"][:, feature_ids].T
+        )
+        assert torch.allclose(lazy.get_decoder_chunk(1, 2), state["w_dec"][2:4].unsqueeze(1))
+    finally:
+        os.unlink(path)
+
+
+def test_transcoder_set_exact_plt_provider_components(create_test_transcoder_file):
+    paths = {}
+    for layer in range(2):
+        path, _ = create_test_transcoder_file(d_model=5, d_sae=7)
+        paths[layer] = path
+    eager = load_transcoder_set(
+        paths,
+        "scan",
+        "in",
+        "out",
+        device=torch.device("cpu"),
+        lazy_encoder=False,
+        lazy_decoder=False,
+    )
+    exact = load_transcoder_set(
+        paths,
+        "scan",
+        "in",
+        "out",
+        device=torch.device("cpu"),
+        lazy_encoder=True,
+        lazy_decoder=True,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    mlp_inputs = torch.randn(2, 4, 5)
+    base = eager.compute_attribution_components(mlp_inputs, zero_positions=slice(0, 1))
+    got = exact.compute_attribution_components(mlp_inputs, zero_positions=slice(0, 1))
+    assert torch.allclose(got["reconstruction"], base["reconstruction"])
+    assert got["decoder_vecs"].numel() == 0
+    assert got["encoder_to_decoder_map"].numel() == 0
+    assert torch.equal(
+        got["chunked_decoder_state"]["source_layers"], got["activation_matrix"].indices()[0]
+    )
+    assert torch.equal(
+        got["chunked_decoder_state"]["feature_ids"], got["activation_matrix"].indices()[2]
+    )
+    assert torch.equal(
+        got["chunked_decoder_state"]["activation_values"], got["activation_matrix"].values()
+    )
+    no_enc = exact.compute_attribution_components(
+        mlp_inputs, zero_positions=slice(0, 1), materialize_encoder_vecs=False
+    )
+    assert no_enc["encoder_vecs"].numel() == 0
+    idx = got["activation_matrix"].indices()
+    rows = exact.materialize_encoder_rows(idx[0].tolist(), idx[2].tolist())
+    assert torch.allclose(rows, base["encoder_vecs"])
+
+
+def test_transcoder_set_plt_provider_topology(create_test_transcoder_file):
+    path, _ = create_test_transcoder_file(d_model=3, d_sae=4)
+    provider = load_transcoder_set(
+        {0: path}, "scan", "in", "out", device=torch.device("cpu"), exact_chunked_provider=True
+    )
+    assert provider.architecture == "plt"
+    assert provider.capabilities.decoder_output_topology == "same_layer"
+    assert provider.decoder_output_layers_for_source(0) == [0]
+    assert provider.decoder_output_layers_for_source(0, active_output_layers=[]) == []
+    assert provider.decoder_output_slot(0, 0) == 0
+    with pytest.raises(ValueError):
+        provider.decoder_output_slot(0, 1)
+    fp = provider_fingerprint(provider)
+    assert fp["architecture"] == "plt"
+    assert fp["decoder_output_topology"] == "same_layer"
