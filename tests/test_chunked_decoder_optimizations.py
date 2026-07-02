@@ -8,6 +8,9 @@ import yaml
 from safetensors.torch import save_file
 
 from circuit_tracer.attribution.attribute import attribute as attribute_top_level
+from circuit_tracer.attribution.context_transformerlens import (
+    AttributionContext as TransformerLensAttributionContext,
+)
 from circuit_tracer.attribution.attribute_nnsight import (
     _annotate_phase4_selection_on_feature_semantic_descriptors,
     _build_cross_cluster_runtime_snapshot,
@@ -115,10 +118,12 @@ class FakeDecoderProvider:
         chunk_size: int = 1,
         *,
         enable_cache: bool = True,
+        decoder_output_topology: str = "cross_layer",
     ) -> None:
         self.blocks = blocks
         self.decoder_chunk_size = chunk_size
         self.enable_cache = enable_cache
+        self.decoder_output_topology = decoder_output_topology
         self.load_calls: list[tuple[int, int]] = []
         self.clear_calls = 0
 
@@ -142,6 +147,28 @@ class FakeDecoderProvider:
         if decoder_cache is not None:
             decoder_cache[cache_key] = result
         return result
+
+    def decoder_output_layers_for_source(self, source_layer: int, active_output_layers=None):
+        if self.decoder_output_topology == "same_layer":
+            if active_output_layers is not None and source_layer not in active_output_layers:
+                return []
+            return [source_layer]
+        candidates = (
+            range(max(self.blocks) + 1) if active_output_layers is None else active_output_layers
+        )
+        return [int(layer) for layer in candidates if int(layer) >= source_layer]
+
+    def decoder_output_slot(self, source_layer: int, output_layer: int) -> int:
+        if self.decoder_output_topology == "same_layer":
+            if output_layer != source_layer:
+                raise ValueError("same-layer fake provider only supports same-layer outputs")
+            return 0
+        if output_layer < source_layer:
+            raise ValueError("cross-layer fake provider cannot decode to earlier output layers")
+        return output_layer - source_layer
+
+    def materialize_encoder_rows(self, source_layers, feature_ids):
+        return torch.stack([source_layers.to(torch.float32), feature_ids.to(torch.float32)], dim=1)
 
 
 def test_clt_provider_capabilities_topology_and_fingerprint() -> None:
@@ -913,6 +940,44 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
     assert ctx.encoder_vecs.data_ptr() != staged_encoder_source.data_ptr()
     batch = ctx.materialize_encoder_vectors(torch.tensor([2, 0]), device=torch.device("cpu"))
     assert torch.equal(batch, encoder_vecs[torch.tensor([2, 0])])
+
+
+def test_transformerlens_context_materializes_lazy_same_layer_provider_rows() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 1, 1], [0, 0, 1], [1, 0, 1]]),
+        values=torch.tensor([1.0, 2.0, 3.0]),
+        size=(2, 2, 4),
+        check_invariants=True,
+    ).coalesce()
+    provider = FakeDecoderProvider(
+        {0: torch.zeros(4, 1, 2), 1: torch.zeros(4, 1, 2)},
+        chunk_size=2,
+        decoder_output_topology="same_layer",
+    )
+    ctx = TransformerLensAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 2, 2),
+        token_vectors=torch.zeros(2, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.empty((0, 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1, 2, 5),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+
+    assert provider.decoder_output_layers_for_source(1, [0, 1]) == [1]
+    assert provider.decoder_output_slot(1, 1) == 0
+    batch = ctx.materialize_encoder_vectors(torch.tensor([2, 0]))
+    assert torch.equal(batch, torch.tensor([[1.0, 1.0], [0.0, 1.0]]))
+    before, after = ctx.apply_diagnostic_feature_cap(2)
+    assert (before, after) == (3, 2)
 
 
 def test_exact_chunked_active_cpu_encoder_residency_stages_materialized_table() -> None:

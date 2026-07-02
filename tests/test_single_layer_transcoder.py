@@ -4,6 +4,7 @@ import tempfile
 
 import pytest
 import torch
+import yaml
 from safetensors.torch import save_file
 
 from circuit_tracer.transcoder.single_layer_transcoder import (
@@ -12,6 +13,7 @@ from circuit_tracer.transcoder.single_layer_transcoder import (
     load_transcoder_set,
 )
 from circuit_tracer.transcoder.provider import provider_fingerprint
+from circuit_tracer.utils.caching import load_transcoders_from_cache
 
 
 @pytest.fixture(autouse=True)
@@ -125,6 +127,70 @@ def test_transcoder_set_attribution_components(create_test_transcoder_file, skip
     # Check decoder locations
     decoder_locs = components["decoder_locations"]
     assert decoder_locs.shape == (2, n_active)
+
+
+def test_transcoder_set_exact_provider_cache_metadata_round_trip(
+    tmp_path, create_test_transcoder_file
+):
+    cache_root = tmp_path / "cache"
+    cache_path = cache_root / "org" / "plt-set"
+    cache_path.mkdir(parents=True)
+    paths = {}
+    for layer in range(2):
+        src, _ = create_test_transcoder_file(d_model=4, d_sae=6)
+        transcoder = load_relu_transcoder(
+            src, layer, device=torch.device("cpu"), lazy_encoder=False, lazy_decoder=False
+        )
+        dst = cache_path / f"layer_{layer}.safetensors"
+        transcoder.to_safetensors(str(dst))
+        paths[layer] = str(dst)
+
+    expected = load_transcoder_set(
+        paths,
+        scan="test_scan",
+        feature_input_hook="hook_resid_mid",
+        feature_output_hook="hook_mlp_out",
+        device=torch.device("cpu"),
+        lazy_encoder=False,
+        lazy_decoder=False,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    fingerprint = provider_fingerprint(
+        expected, checkpoint_format="standard", checkpoint_identity="test_scan"
+    )
+    config = {
+        "model_kind": "transcoder_set",
+        "scan": "test_scan",
+        "feature_input_hook": "hook_resid_mid",
+        "feature_output_hook": "hook_mlp_out",
+        "decoder_chunk_size": 3,
+        "cross_batch_decoder_cache_bytes": 8589934592,
+        "transcoder_provider_fingerprint": fingerprint,
+    }
+    (cache_path / "config.yaml").write_text(yaml.safe_dump(config))
+
+    loaded, loaded_config = load_transcoders_from_cache(
+        "org/plt-set",
+        cache_dir=cache_root,
+        device=torch.device("cpu"),
+        lazy_decoder=False,
+    )
+
+    assert loaded_config["transcoder_provider_fingerprint"] == fingerprint
+    assert loaded.architecture == "plt"
+    assert loaded.capabilities.decoder_output_topology == "same_layer"
+    assert loaded.capabilities.supports_exact_chunked_provider is True
+    assert (
+        provider_fingerprint(loaded, checkpoint_format="standard", checkpoint_identity="test_scan")
+        == fingerprint
+    )
+
+    bad_config = dict(config)
+    bad_config["transcoder_provider_fingerprint"] = dict(fingerprint, decoder_chunk_size=4)
+    (cache_path / "config.yaml").write_text(yaml.safe_dump(bad_config))
+    with pytest.raises(ValueError, match="provider fingerprint"):
+        load_transcoders_from_cache("org/plt-set", cache_dir=cache_root)
 
 
 def test_sparse_encode_decode(create_test_transcoder_file):

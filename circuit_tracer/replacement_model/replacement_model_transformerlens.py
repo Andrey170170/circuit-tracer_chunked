@@ -16,6 +16,7 @@ from circuit_tracer.attribution.context_transformerlens import AttributionContex
 from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
+from circuit_tracer.transcoder.provider import require_exact_chunked_provider
 from circuit_tracer.utils import get_default_device
 from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
 
@@ -482,10 +483,12 @@ class TransformerLensReplacementModel(HookedTransformer):
         component_start = time.perf_counter()
         if callable(trace_event):
             trace_event("phase0.setup.components_start", backend="transformerlens")
+        exact_provider_mode = require_exact_chunked_provider(self.transcoders)
         attribution_data = self.transcoders.compute_attribution_components(
             mlp_in_cache,
             self.zero_positions,
             sparsification=sparsification,
+            materialize_encoder_vecs=not exact_provider_mode,
         )
         component_seconds = time.perf_counter() - component_start
         if callable(trace_event):
@@ -524,9 +527,7 @@ class TransformerLensReplacementModel(HookedTransformer):
             encoder_vecs=attribution_data["encoder_vecs"],
             encoder_to_decoder_map=attribution_data["encoder_to_decoder_map"],
             decoder_locations=attribution_data["decoder_locations"],
-            decoder_provider=self.transcoders
-            if getattr(self.transcoders, "exact_chunked_decoder", False)
-            else None,
+            decoder_provider=self.transcoders if exact_provider_mode else None,
             chunked_decoder_state=chunked_decoder_state,
         )
         ctx.setup_diagnostic_stats = {

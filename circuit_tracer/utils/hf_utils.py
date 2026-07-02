@@ -25,7 +25,7 @@ def _record_transcoder_provider_metadata(config: dict, transcoder: object) -> No
     config["transcoder_capabilities"] = dict(capabilities.__dict__)
 
 
-def _resolve_exact_chunked_provider_requested(config: dict) -> bool:
+def _resolve_exact_chunked_provider_requested(config: dict, *, legacy_repo_scan: bool = True) -> bool:
     explicit_value = config.get(
         "supports_exact_chunked_provider",
         config.get("exact_chunked_provider", config.get("exact_chunked_decoder")),
@@ -33,6 +33,10 @@ def _resolve_exact_chunked_provider_requested(config: dict) -> bool:
     if explicit_value is not None:
         config["transcoder_capability_source"] = "config"
         return bool(explicit_value)
+
+    if not legacy_repo_scan:
+        config["transcoder_capability_source"] = "default"
+        return False
 
     # Compatibility fallback for older CLT configs that predate explicit provider metadata.
     config["transcoder_capability_source"] = "legacy_repo_scan"
@@ -170,7 +174,10 @@ def load_transcoders(
         else:
             special_load_fn = None
 
-        return load_transcoder_set(
+        exact_chunked_provider = _resolve_exact_chunked_provider_requested(
+            config, legacy_repo_scan=False
+        )
+        transcoder = load_transcoder_set(
             transcoder_paths,
             scan=config["scan"],
             feature_input_hook=config["feature_input_hook"],
@@ -180,7 +187,12 @@ def load_transcoders(
             device=device,
             lazy_encoder=lazy_encoder,
             lazy_decoder=lazy_decoder,
+            exact_chunked_provider=exact_chunked_provider,
+            decoder_chunk_size=int(config.get("decoder_chunk_size") or 1024),
+            cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
+        _record_transcoder_provider_metadata(config, transcoder)
+        return transcoder
     elif model_kind == "cross_layer_transcoder":
         from circuit_tracer.transcoder.cross_layer_transcoder import (
             load_clt,
