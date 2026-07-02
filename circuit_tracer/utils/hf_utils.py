@@ -25,7 +25,27 @@ def _record_transcoder_provider_metadata(config: dict, transcoder: object) -> No
     config["transcoder_capabilities"] = dict(capabilities.__dict__)
 
 
-def _resolve_exact_chunked_provider_requested(config: dict, *, legacy_repo_scan: bool = True) -> bool:
+def _validate_configured_provider_fingerprint(config: dict, transcoder: object) -> None:
+    expected = config.get("transcoder_provider_fingerprint")
+    if expected is None:
+        return
+    if not isinstance(expected, dict):
+        raise ValueError("Configured transcoder_provider_fingerprint is malformed")
+    from circuit_tracer.transcoder.provider import provider_fingerprint
+
+    current = provider_fingerprint(
+        transcoder,
+        checkpoint_format=str(expected.get("checkpoint_format", "standard")),
+        checkpoint_identity=expected.get("checkpoint_identity"),
+        dtype=expected.get("dtype"),
+    )
+    if expected != current:
+        raise ValueError("Configured transcoder_provider_fingerprint mismatch")
+
+
+def _resolve_exact_chunked_provider_requested(
+    config: dict, *, legacy_repo_scan: bool = True
+) -> bool:
     explicit_value = config.get(
         "supports_exact_chunked_provider",
         config.get("exact_chunked_provider", config.get("exact_chunked_decoder")),
@@ -177,6 +197,8 @@ def load_transcoders(
         exact_chunked_provider = _resolve_exact_chunked_provider_requested(
             config, legacy_repo_scan=False
         )
+        effective_lazy_encoder = True if exact_chunked_provider else lazy_encoder
+        effective_lazy_decoder = True if exact_chunked_provider else lazy_decoder
         transcoder = load_transcoder_set(
             transcoder_paths,
             scan=config["scan"],
@@ -185,12 +207,13 @@ def load_transcoders(
             special_load_fn=special_load_fn,
             dtype=dtype,
             device=device,
-            lazy_encoder=lazy_encoder,
-            lazy_decoder=lazy_decoder,
+            lazy_encoder=effective_lazy_encoder,
+            lazy_decoder=effective_lazy_decoder,
             exact_chunked_provider=exact_chunked_provider,
             decoder_chunk_size=int(config.get("decoder_chunk_size") or 1024),
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
+        _validate_configured_provider_fingerprint(config, transcoder)
         _record_transcoder_provider_metadata(config, transcoder)
         return transcoder
     elif model_kind == "cross_layer_transcoder":
@@ -213,6 +236,7 @@ def load_transcoders(
                 device=device,
                 cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
             )
+            _validate_configured_provider_fingerprint(config, transcoder)
             _record_transcoder_provider_metadata(config, transcoder)
             return transcoder
 
@@ -245,6 +269,7 @@ def load_transcoders(
             exact_chunked_decoder=exact_chunked_decoder,
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
+        _validate_configured_provider_fingerprint(config, transcoder)
         _record_transcoder_provider_metadata(config, transcoder)
         return transcoder
     else:

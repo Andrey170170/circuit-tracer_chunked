@@ -17,10 +17,8 @@ from circuit_tracer.transcoder.cross_layer_transcoder import (
 )
 from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
 from circuit_tracer.transcoder.single_layer_transcoder import (
-    load_gemma_scope_2_transcoder,
-    load_gemma_scope_transcoder,
-    load_relu_transcoder,
     load_transcoder_set,
+    select_single_layer_transcoder_load_fn,
 )
 from circuit_tracer.utils.hf_utils import (
     HfUri,
@@ -242,7 +240,8 @@ def _save_transcoder_set_to_cache(
         # Uses snapshot_download pattern - iterate through paths
         saved_paths: dict[int, str] = {}
         for layer_idx, local_path in iter_transcoder_paths(config):
-            transcoder = load_relu_transcoder(
+            load_fn = select_single_layer_transcoder_load_fn(local_path)
+            transcoder = load_fn(
                 local_path,
                 layer_idx,
                 device=device,
@@ -273,14 +272,7 @@ def _save_transcoder_set_to_cache(
             else:
                 local_path = hf_path
 
-            npz_format = Path(local_path).suffix == ".npz"
-
-            if special_load_fn == "gemma-scope" and npz_format:
-                load_fn = load_gemma_scope_transcoder
-            elif special_load_fn == "gemma-scope-2":
-                load_fn = load_gemma_scope_2_transcoder
-            else:
-                load_fn = load_relu_transcoder
+            load_fn = select_single_layer_transcoder_load_fn(local_path, special_load_fn)
 
             transcoder = load_fn(
                 local_path,
@@ -307,14 +299,7 @@ def _save_transcoder_set_to_cache(
             transcoder_paths[i] = local_map.get(path) or path
 
         for layer_idx, local_path in transcoder_paths.items():
-            npz_format = Path(local_path).suffix == ".npz"
-
-            if special_load_fn == "gemma-scope" and npz_format:
-                load_fn = load_gemma_scope_transcoder
-            elif special_load_fn == "gemma-scope-2":
-                load_fn = load_gemma_scope_2_transcoder
-            else:
-                load_fn = load_relu_transcoder
+            load_fn = select_single_layer_transcoder_load_fn(local_path, special_load_fn)
 
             transcoder = load_fn(
                 local_path,
@@ -358,8 +343,8 @@ def _record_transcoder_set_cache_metadata(
         feature_output_hook=config["feature_output_hook"],
         device=device,
         dtype=dtype,
-        lazy_encoder=False,
-        lazy_decoder=False,
+        lazy_encoder=True,
+        lazy_decoder=True,
         exact_chunked_provider=True,
         decoder_chunk_size=decoder_chunk_size,
         cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
@@ -531,9 +516,30 @@ def load_transcoders_from_cache(
                 "Cached decoder_chunk_size does not match transcoder_set provider fingerprint; "
                 "clear and rebuild cache"
             )
+        explicit_exact = bool(
+            config.get(
+                "supports_exact_chunked_provider",
+                config.get(
+                    "exact_chunked_provider",
+                    config.get(
+                        "exact_chunked_decoder",
+                        (config.get("transcoder_capabilities") or {}).get(
+                            "supports_exact_chunked_provider", False
+                        ),
+                    ),
+                ),
+            )
+        )
+        if provider_fp is None and explicit_exact:
+            raise ValueError(
+                "Cached transcoder_set exact provider metadata lacks "
+                "transcoder_provider_fingerprint; clear and rebuild cache"
+            )
         exact_chunked_provider = (
             bool(provider_fp.get("supports_exact_chunked_provider")) if provider_fp else False
         )
+        effective_lazy_encoder = True if exact_chunked_provider else lazy_encoder
+        effective_lazy_decoder = True if exact_chunked_provider else lazy_decoder
         decoder_chunk_size = int(
             (provider_fp or {}).get("decoder_chunk_size")
             or config.get("decoder_chunk_size")
@@ -546,8 +552,8 @@ def load_transcoders_from_cache(
             feature_output_hook=config["feature_output_hook"],
             device=device,
             dtype=dtype,
-            lazy_encoder=lazy_encoder,
-            lazy_decoder=lazy_decoder,
+            lazy_encoder=effective_lazy_encoder,
+            lazy_decoder=effective_lazy_decoder,
             exact_chunked_provider=exact_chunked_provider,
             decoder_chunk_size=decoder_chunk_size,
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),

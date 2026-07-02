@@ -21,6 +21,29 @@ from circuit_tracer.transcoder.provider import TranscoderCapabilities
 from circuit_tracer.utils import get_default_device
 
 
+DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES = 8589934592
+
+
+def safetensors_has_gemmascope2_plt_keys(path: str) -> bool:
+    if Path(path).suffix != ".safetensors":
+        return False
+    with safe_open(path, framework="pt", device="cpu") as f:
+        keys = set(f.keys())
+    return {"w_enc", "w_dec", "threshold"}.issubset(keys)
+
+
+def select_single_layer_transcoder_load_fn(
+    path: str,
+    special_load_fn: Literal["gemma-scope", "gemma-scope-2", None] = None,
+):
+    npz_format = Path(path).suffix == ".npz"
+    if special_load_fn == "gemma-scope" and npz_format:
+        return load_gemma_scope_transcoder
+    if special_load_fn == "gemma-scope-2" or safetensors_has_gemmascope2_plt_keys(path):
+        return load_gemma_scope_2_transcoder
+    return load_relu_transcoder
+
+
 class SingleLayerTranscoder(nn.Module):
     """
     A per-layer transcoder (PLT) that replaces MLP computation with interpretable features.
@@ -316,7 +339,9 @@ class TranscoderSet(nn.Module):
         self.exact_chunked_provider = exact_chunked_provider
         self.decoder_chunk_size = decoder_chunk_size
         self.cross_batch_decoder_cache_bytes = (
-            0 if cross_batch_decoder_cache_bytes is None else int(cross_batch_decoder_cache_bytes)
+            DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES
+            if cross_batch_decoder_cache_bytes is None
+            else int(cross_batch_decoder_cache_bytes)
         )
 
     @property
@@ -867,14 +892,7 @@ def load_transcoder_set(
 
     transcoders = {}
     for layer in range(len(transcoder_paths)):
-        npz_format = Path(transcoder_paths[layer]).suffix == ".npz"
-
-        if special_load_fn == "gemma-scope" and npz_format:
-            load_fn = load_gemma_scope_transcoder
-        elif special_load_fn == "gemma-scope-2":
-            load_fn = load_gemma_scope_2_transcoder
-        else:
-            load_fn = load_relu_transcoder
+        load_fn = select_single_layer_transcoder_load_fn(transcoder_paths[layer], special_load_fn)
 
         transcoders[layer] = load_fn(
             transcoder_paths[layer],
