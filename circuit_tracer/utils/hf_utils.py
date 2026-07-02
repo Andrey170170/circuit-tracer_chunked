@@ -62,6 +62,16 @@ def _resolve_exact_chunked_provider_requested(
         config["transcoder_capability_source"] = "config"
         return bool(explicit_value)
 
+    capabilities = config.get("transcoder_capabilities")
+    if isinstance(capabilities, dict) and "supports_exact_chunked_provider" in capabilities:
+        config["transcoder_capability_source"] = "provider_metadata"
+        return bool(capabilities["supports_exact_chunked_provider"])
+
+    provider_fp = config.get("transcoder_provider_fingerprint")
+    if isinstance(provider_fp, dict) and "supports_exact_chunked_provider" in provider_fp:
+        config["transcoder_capability_source"] = "provider_fingerprint"
+        return bool(provider_fp["supports_exact_chunked_provider"])
+
     if not legacy_repo_scan:
         config["transcoder_capability_source"] = "default"
         return False

@@ -75,6 +75,49 @@ def test_lowercase_gemmascope2_without_exact_stays_non_exact(tmp_path: Path):
     assert transcoders[0].lazy_decoder is False
 
 
+def test_provider_metadata_only_exact_config_enables_lazy_exact(tmp_path: Path):
+    layer_path = tmp_path / "layer_0.safetensors"
+    _write_gemmascope2_plt(layer_path)
+    config = _config(layer_path)
+    config["transcoder_capabilities"] = {"supports_exact_chunked_provider": True}
+
+    transcoders = load_transcoders(
+        config,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        lazy_encoder=False,
+        lazy_decoder=False,
+    )
+
+    assert transcoders.exact_chunked_provider is True
+    assert transcoders[0].lazy_encoder is True
+    assert transcoders[0].lazy_decoder is True
+    assert config["transcoder_capability_source"] == "provider_metadata"
+
+
+def test_provider_fingerprint_only_exact_config_enables_lazy_exact(tmp_path: Path):
+    layer_path = tmp_path / "layer_0.safetensors"
+    _write_gemmascope2_plt(layer_path)
+    source_config = _config(layer_path, exact=True)
+    load_transcoders(source_config, device=torch.device("cpu"), dtype=torch.float32)
+    fingerprint = source_config["transcoder_provider_fingerprint"]
+
+    config = _config(layer_path)
+    config["transcoder_provider_fingerprint"] = fingerprint
+    transcoders = load_transcoders(
+        config,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        lazy_encoder=False,
+        lazy_decoder=False,
+    )
+
+    assert transcoders.exact_chunked_provider is True
+    assert transcoders[0].lazy_encoder is True
+    assert transcoders[0].lazy_decoder is True
+    assert config["transcoder_capability_source"] == "provider_fingerprint"
+
+
 def _write_cached_config(cache_path: Path, *, exact: bool, capability_only: bool = False) -> None:
     cache_path.mkdir(parents=True)
     _write_gemmascope2_plt(cache_path / "layer_0.safetensors")
