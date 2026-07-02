@@ -17,6 +17,31 @@ from tqdm.contrib.concurrent import thread_map
 logger = logging.getLogger(__name__)
 
 
+def _record_transcoder_provider_metadata(config: dict, transcoder: object) -> None:
+    from circuit_tracer.transcoder.provider import get_transcoder_capabilities
+
+    capabilities = get_transcoder_capabilities(transcoder)
+    config["transcoder_architecture"] = capabilities.architecture
+    config["transcoder_capabilities"] = dict(capabilities.__dict__)
+
+
+def _resolve_exact_chunked_provider_requested(config: dict) -> bool:
+    explicit_value = config.get(
+        "supports_exact_chunked_provider",
+        config.get("exact_chunked_provider", config.get("exact_chunked_decoder")),
+    )
+    if explicit_value is not None:
+        config["transcoder_capability_source"] = "config"
+        return bool(explicit_value)
+
+    # Compatibility fallback for older CLT configs that predate explicit provider metadata.
+    config["transcoder_capability_source"] = "legacy_repo_scan"
+    return bool(
+        "gemma-scope-2" in str(config.get("repo_id", ""))
+        or "gemma-scope-2" in str(config.get("scan", ""))
+    )
+
+
 class HfUri(NamedTuple):
     """Structured representation of a HuggingFace URI."""
 
@@ -165,7 +190,7 @@ def load_transcoders(
         if "gemma-scope-2" in config["repo_id"] and "transcoders" in config:
             transcoder_paths = resolve_transcoder_paths(config)
             local_path = transcoder_paths
-            return load_gemma_scope_2_clt(
+            transcoder = load_gemma_scope_2_clt(
                 local_path,  # type:ignore
                 scan=config["scan"],
                 feature_input_hook=config["feature_input_hook"],
@@ -176,6 +201,8 @@ def load_transcoders(
                 device=device,
                 cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
             )
+            _record_transcoder_provider_metadata(config, transcoder)
+            return transcoder
 
         subfolder = config.get("subfolder")
         if subfolder:
@@ -192,12 +219,9 @@ def load_transcoders(
         if subfolder:
             local_path = os.path.join(local_path, subfolder)
 
-        exact_chunked_decoder = bool(
-            "gemma-scope-2" in str(config.get("repo_id", ""))
-            or "gemma-scope-2" in str(config.get("scan", ""))
-        )
+        exact_chunked_decoder = _resolve_exact_chunked_provider_requested(config)
 
-        return load_clt(
+        transcoder = load_clt(
             local_path,
             scan=config["scan"],
             feature_input_hook=config["feature_input_hook"],
@@ -209,6 +233,8 @@ def load_transcoders(
             exact_chunked_decoder=exact_chunked_decoder,
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
+        _record_transcoder_provider_metadata(config, transcoder)
+        return transcoder
     else:
         raise ValueError(f"Unknown model kind: {model_kind}")
 

@@ -10,7 +10,12 @@ import torch
 import yaml
 from huggingface_hub import hf_hub_download, snapshot_download
 
-from circuit_tracer.transcoder.cross_layer_transcoder import load_clt, load_gemma_scope_2_clt
+from circuit_tracer.transcoder.cross_layer_transcoder import (
+    DEFAULT_EXACT_DECODER_CHUNK_SIZE,
+    load_clt,
+    load_gemma_scope_2_clt,
+)
+from circuit_tracer.transcoder.provider import provider_fingerprint
 from circuit_tracer.transcoder.single_layer_transcoder import (
     load_gemma_scope_2_transcoder,
     load_gemma_scope_transcoder,
@@ -26,6 +31,10 @@ from circuit_tracer.utils.hf_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_checkpoint_identity(config: dict) -> object:
+    return config.get("scan") or config.get("repo_id") or "unknown"
 
 
 def get_cache_dir(cache_dir: str | Path | None = None) -> Path:
@@ -340,9 +349,24 @@ def _save_clt_to_cache(
             dtype=dtype,
             lazy_decoder=False,
             lazy_encoder=False,
+            decoder_chunk_size=int(
+                config.get("decoder_chunk_size") or DEFAULT_EXACT_DECODER_CHUNK_SIZE
+            ),
+            cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
 
         clt.to_safetensors(str(cache_path))
+        checkpoint_identity = _provider_checkpoint_identity(config)
+        config["transcoder_source_provider_fingerprint"] = provider_fingerprint(
+            clt,
+            checkpoint_identity=checkpoint_identity,
+        )
+        config["transcoder_provider_fingerprint"] = provider_fingerprint(
+            clt,
+            checkpoint_format="standard",
+            checkpoint_identity=checkpoint_identity,
+        )
+        config["decoder_chunk_size"] = int(clt.decoder_chunk_size)
 
         if delete_hf_cache:
             for i, hf_path in enumerate(config["transcoders"]):
@@ -374,9 +398,24 @@ def _save_clt_to_cache(
             dtype=dtype,
             lazy_decoder=False,
             lazy_encoder=False,
+            decoder_chunk_size=int(
+                config.get("decoder_chunk_size") or DEFAULT_EXACT_DECODER_CHUNK_SIZE
+            ),
+            cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
 
         clt.to_safetensors(str(cache_path))
+        checkpoint_identity = _provider_checkpoint_identity(config)
+        config["transcoder_source_provider_fingerprint"] = provider_fingerprint(
+            clt,
+            checkpoint_identity=checkpoint_identity,
+        )
+        config["transcoder_provider_fingerprint"] = provider_fingerprint(
+            clt,
+            checkpoint_format="standard",
+            checkpoint_identity=checkpoint_identity,
+        )
+        config["decoder_chunk_size"] = int(clt.decoder_chunk_size)
 
 
 def load_transcoders_from_cache(
@@ -427,7 +466,27 @@ def load_transcoders_from_cache(
             lazy_decoder=lazy_decoder,
         )
     elif model_kind == "cross_layer_transcoder":
-        exact_chunked_decoder = "gemma-scope-2" in str(config.get("scan", cache_path))
+        provider_fp = config.get("transcoder_provider_fingerprint")
+        if provider_fp is None:
+            raise ValueError(
+                "Cached cross-layer transcoder metadata lacks transcoder_provider_fingerprint; "
+                "clear and rebuild this cache so exact/chunked provider metadata is explicit"
+            )
+        if not isinstance(provider_fp, dict):
+            raise ValueError(
+                "Cached cross-layer transcoder provider fingerprint is malformed; "
+                "clear and rebuild cache"
+            )
+        if (
+            config.get("decoder_chunk_size") is not None
+            and provider_fp.get("decoder_chunk_size") is not None
+            and int(config["decoder_chunk_size"]) != int(provider_fp["decoder_chunk_size"])
+        ):
+            raise ValueError(
+                "Cached decoder_chunk_size does not match provider fingerprint; "
+                "clear and rebuild cache"
+            )
+        exact_chunked_decoder = bool(provider_fp.get("supports_exact_chunked_provider"))
         transcoder = load_clt(
             str(cache_path),
             feature_input_hook=config["feature_input_hook"],
@@ -438,8 +497,23 @@ def load_transcoders_from_cache(
             lazy_decoder=lazy_decoder,
             lazy_encoder=lazy_encoder,
             exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=int(
+                provider_fp.get("decoder_chunk_size")
+                or config.get("decoder_chunk_size")
+                or DEFAULT_EXACT_DECODER_CHUNK_SIZE
+            ),
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
+        current_fp = provider_fingerprint(
+            transcoder,
+            checkpoint_format=str(provider_fp.get("checkpoint_format", "standard")),
+            checkpoint_identity=provider_fp.get("checkpoint_identity"),
+            dtype=provider_fp.get("dtype"),
+        )
+        if provider_fp != current_fp:
+            raise ValueError(
+                "Cached transcoder provider fingerprint mismatch; clear and rebuild cache"
+            )
     else:
         raise ValueError(f"Unknown model kind: {model_kind}")
 

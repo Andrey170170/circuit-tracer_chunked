@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Protocol, runtime_checkable
+
+
+TranscoderArchitecture = Literal["clt", "plt"]
+DecoderOutputTopology = Literal["cross_layer", "same_layer"]
+
+
+@dataclass(frozen=True)
+class TranscoderCapabilities:
+    architecture: TranscoderArchitecture
+    checkpoint_format: str
+    supports_exact_chunked_provider: bool = False
+    supports_compact_row_store: bool = False
+    supports_decoder_chunk_cache: bool = False
+    supports_exact_encoder_residency: bool = False
+    supports_encoder_row_materialization: bool = False
+    supports_lazy_decoder: bool = False
+    supports_lazy_encoder: bool = False
+    supports_lazy_decoder_chunks: bool = False
+    supports_lazy_encoder_rows: bool = False
+    decoder_output_topology: DecoderOutputTopology = "cross_layer"
+    default_decoder_chunk_size: int | None = None
+    default_cross_batch_decoder_cache_bytes: int | None = None
+    legacy_exact_chunked_decoder: bool | None = None
+
+    @property
+    def supports_encoder_residency(self) -> bool:
+        return self.supports_exact_encoder_residency
+
+
+@runtime_checkable
+class ExactChunkedProvider(Protocol):
+    architecture: TranscoderArchitecture
+    capabilities: TranscoderCapabilities
+
+    def decoder_output_layers_for_source(
+        self, source_layer: int, active_output_layers: list[int] | None = None
+    ) -> list[int]: ...
+
+    def decoder_output_slot(self, source_layer: int, output_layer: int) -> int: ...
+
+    def get_decoder_chunk(self, layer_id: int, chunk_id: int, **kwargs): ...
+
+    def compute_attribution_components(self, *args, **kwargs) -> dict[str, object]: ...
+
+    def materialize_encoder_rows(self, source_layers, feature_ids): ...
+
+    def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None): ...
+
+    def clear_decoder_block_cache(self, cache) -> None: ...
+
+
+def get_transcoder_capabilities(obj: object) -> TranscoderCapabilities:
+    capabilities = getattr(obj, "capabilities", None)
+    if isinstance(capabilities, TranscoderCapabilities):
+        return capabilities
+    legacy_exact = bool(getattr(obj, "exact_chunked_decoder", False))
+    architecture = getattr(obj, "architecture", "clt")
+    if architecture not in ("clt", "plt"):
+        architecture = "clt"
+    return TranscoderCapabilities(
+        architecture=architecture,
+        checkpoint_format=str(getattr(obj, "weight_format", "unknown")),
+        supports_exact_chunked_provider=legacy_exact,
+        supports_compact_row_store=legacy_exact,
+        supports_decoder_chunk_cache=legacy_exact,
+        supports_exact_encoder_residency=legacy_exact,
+        supports_encoder_row_materialization=bool(
+            hasattr(obj, "materialize_encoder_rows") or hasattr(obj, "materialize_encoder_vectors")
+        ),
+        supports_lazy_decoder=bool(getattr(obj, "lazy_decoder", False)),
+        supports_lazy_encoder=bool(getattr(obj, "lazy_encoder", False)),
+        supports_lazy_decoder_chunks=legacy_exact,
+        supports_lazy_encoder_rows=legacy_exact,
+        decoder_output_topology="cross_layer",
+        default_decoder_chunk_size=getattr(obj, "decoder_chunk_size", None),
+        default_cross_batch_decoder_cache_bytes=getattr(
+            obj, "cross_batch_decoder_cache_bytes", None
+        ),
+        legacy_exact_chunked_decoder=legacy_exact,
+    )
+
+
+def supports_exact_chunked_provider(obj: object) -> bool:
+    return bool(get_transcoder_capabilities(obj).supports_exact_chunked_provider)
+
+
+def provider_contract_missing_methods(obj: object | None) -> tuple[str, ...]:
+    if obj is None:
+        return (
+            "compute_attribution_components",
+            "get_decoder_chunk",
+            "decoder_output_layers_for_source",
+            "decoder_output_slot",
+        )
+    caps = get_transcoder_capabilities(obj)
+    required = [
+        "compute_attribution_components",
+        "get_decoder_chunk",
+        "decoder_output_layers_for_source",
+        "decoder_output_slot",
+    ]
+    if caps.supports_decoder_chunk_cache:
+        required.extend(("create_decoder_block_cache", "clear_decoder_block_cache"))
+    required.append("materialize_encoder_rows")
+    return tuple(name for name in required if not callable(getattr(obj, name, None)))
+
+
+def exact_chunked_provider_usable(obj: object | None) -> bool:
+    if obj is None:
+        return False
+    caps = get_transcoder_capabilities(obj)
+    return bool(caps.supports_exact_chunked_provider and not provider_contract_missing_methods(obj))
+
+
+def require_exact_chunked_provider(obj: object | None) -> bool:
+    if exact_chunked_provider_usable(obj):
+        return True
+    if obj is not None and supports_exact_chunked_provider(obj):
+        missing = ", ".join(provider_contract_missing_methods(obj))
+        raise TypeError(f"exact chunked provider is missing required methods: {missing}")
+    return False
+
+
+def provider_fingerprint(
+    obj: object,
+    *,
+    checkpoint_format: str | None = None,
+    checkpoint_identity: object | None = None,
+    dtype: object | None = None,
+) -> dict[str, object]:
+    caps = get_transcoder_capabilities(obj)
+    if checkpoint_identity is None:
+        checkpoint_identity = getattr(obj, "scan", None)
+    if dtype is None:
+        dtype = getattr(obj, "dtype", None)
+    return {
+        "schema_version": 1,
+        "architecture": caps.architecture,
+        "checkpoint_format": checkpoint_format or caps.checkpoint_format,
+        "checkpoint_identity": checkpoint_identity,
+        "dtype": None if dtype is None else str(dtype),
+        "n_layers": getattr(obj, "n_layers", None),
+        "d_model": getattr(obj, "d_model", None),
+        "d_transcoder": getattr(obj, "d_transcoder", None),
+        "decoder_output_topology": caps.decoder_output_topology,
+        "supports_exact_chunked_provider": caps.supports_exact_chunked_provider,
+        "supports_compact_row_store": caps.supports_compact_row_store,
+        "supports_decoder_chunk_cache": caps.supports_decoder_chunk_cache,
+        "supports_exact_encoder_residency": caps.supports_exact_encoder_residency,
+        "supports_encoder_row_materialization": caps.supports_encoder_row_materialization,
+        "supports_lazy_decoder_chunks": caps.supports_lazy_decoder_chunks,
+        "supports_lazy_encoder_rows": caps.supports_lazy_encoder_rows,
+        "decoder_chunk_size": caps.default_decoder_chunk_size,
+        "cross_batch_decoder_cache_bytes": caps.default_cross_batch_decoder_cache_bytes,
+        "legacy_exact_chunked_decoder": caps.legacy_exact_chunked_decoder,
+    }
