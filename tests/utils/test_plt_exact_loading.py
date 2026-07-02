@@ -53,7 +53,8 @@ def test_lowercase_gemmascope2_exact_forces_lazy_flags_and_defaults(tmp_path: Pa
     assert transcoders[0].lazy_encoder is True
     assert transcoders[0].lazy_decoder is True
     assert transcoders.capabilities.decoder_output_topology == "same_layer"
-    assert transcoders.capabilities.default_cross_batch_decoder_cache_bytes == 8 * 1024**3
+    assert transcoders.capabilities.default_cross_batch_decoder_cache_bytes == 0
+    assert transcoders.create_decoder_block_cache() is None
 
 
 def test_lowercase_gemmascope2_without_exact_stays_non_exact(tmp_path: Path):

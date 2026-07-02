@@ -18,11 +18,19 @@ logger = logging.getLogger(__name__)
 
 
 def _record_transcoder_provider_metadata(config: dict, transcoder: object) -> None:
-    from circuit_tracer.transcoder.provider import get_transcoder_capabilities
+    from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
 
     capabilities = get_transcoder_capabilities(transcoder)
     config["transcoder_architecture"] = capabilities.architecture
     config["transcoder_capabilities"] = dict(capabilities.__dict__)
+    if (
+        capabilities.supports_exact_chunked_provider
+        and "transcoder_provider_fingerprint" not in config
+    ):
+        config["transcoder_provider_fingerprint"] = provider_fingerprint(
+            transcoder,
+            checkpoint_identity=config.get("scan") or config.get("repo_id"),
+        )
 
 
 def _validate_configured_provider_fingerprint(config: dict, transcoder: object) -> None:

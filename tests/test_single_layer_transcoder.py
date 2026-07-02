@@ -165,7 +165,7 @@ def test_transcoder_set_exact_provider_cache_metadata_round_trip(
         "feature_input_hook": "hook_resid_mid",
         "feature_output_hook": "hook_mlp_out",
         "decoder_chunk_size": 3,
-        "cross_batch_decoder_cache_bytes": 8589934592,
+        "cross_batch_decoder_cache_bytes": 0,
         "transcoder_provider_fingerprint": fingerprint,
     }
     (cache_path / "config.yaml").write_text(yaml.safe_dump(config))
@@ -221,6 +221,20 @@ def test_sparse_encode_decode(create_test_transcoder_file):
 
     assert reconstruction.shape == (n_pos, d_model)
     assert len(scaled_decoders) == sparse_acts._nnz()
+
+
+def test_sparse_encode_can_skip_active_encoder_row_gather(create_test_transcoder_file):
+    path, _ = create_test_transcoder_file(d_model=8, d_sae=16)
+    transcoder = load_relu_transcoder(
+        path, layer=0, device=torch.device("cpu"), lazy_encoder=False, lazy_decoder=True
+    )
+
+    sparse_acts, active_encoders = transcoder.encode_sparse(
+        torch.randn(3, 8), return_encoder_vectors=False
+    )
+
+    assert sparse_acts.is_sparse
+    assert active_encoders is None
 
 
 def test_decoder_slice_access(create_test_transcoder_file):

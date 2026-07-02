@@ -21,7 +21,7 @@ from circuit_tracer.transcoder.provider import TranscoderCapabilities
 from circuit_tracer.utils import get_default_device
 
 
-DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES = 8589934592
+DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES = 0
 
 
 def safetensors_has_gemmascope2_plt_keys(path: str) -> bool:
@@ -209,7 +209,13 @@ class SingleLayerTranscoder(nn.Module):
 
         return decoded
 
-    def encode_sparse(self, input_acts, zero_positions: slice = slice(0, 1)):
+    def encode_sparse(
+        self,
+        input_acts,
+        zero_positions: slice = slice(0, 1),
+        *,
+        return_encoder_vectors: bool = True,
+    ):
         """Encode and return sparse activations with active encoder vectors.
 
         Args:
@@ -228,7 +234,7 @@ class SingleLayerTranscoder(nn.Module):
 
         sparse_acts = acts.to_sparse()
         _, feat_idx = sparse_acts.indices()
-        active_encoders = W_enc[feat_idx]
+        active_encoders = W_enc[feat_idx] if return_encoder_vectors else None
 
         return sparse_acts, active_encoders
 
@@ -311,7 +317,7 @@ class TranscoderSet(nn.Module):
         scan: str | list[str] | None = None,
         exact_chunked_provider: bool = False,
         decoder_chunk_size: int = 1024,
-        cross_batch_decoder_cache_bytes: int | None = 8589934592,
+        cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
     ):
         super().__init__()
         # Validate that we have continuous layers from 0 to max
@@ -443,10 +449,10 @@ class TranscoderSet(nn.Module):
     def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None):
         from circuit_tracer.transcoder.cross_layer_transcoder import DecoderChunkCache
 
-        return DecoderChunkCache(
-            self.cross_batch_decoder_cache_bytes if max_bytes is None else max_bytes,
-            fingerprint=fingerprint,
-        )
+        cache_bytes = self.cross_batch_decoder_cache_bytes if max_bytes is None else int(max_bytes)
+        if cache_bytes <= 0:
+            return None
+        return DecoderChunkCache(cache_bytes, fingerprint=fingerprint)
 
     def clear_decoder_block_cache(self, cache) -> None:
         if cache is not None:
@@ -593,7 +599,7 @@ class TranscoderSet(nn.Module):
 
         for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
             sparse_acts, _ = transcoder.encode_sparse(
-                mlp_inputs[layer], zero_positions=zero_positions
+                mlp_inputs[layer], zero_positions=zero_positions, return_encoder_vectors=False
             )
             sparse_acts_list.append(sparse_acts)
 
@@ -869,7 +875,7 @@ def load_transcoder_set(
     lazy_decoder: bool = True,
     exact_chunked_provider: bool = False,
     decoder_chunk_size: int = 1024,
-    cross_batch_decoder_cache_bytes: int | None = 8589934592,
+    cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
 ) -> TranscoderSet:
     if device is None:
         device = get_default_device()
