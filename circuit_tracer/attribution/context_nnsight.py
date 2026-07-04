@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from einops import einsum
 
-from circuit_tracer.transcoder.provider import provider_fingerprint
+from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
 from circuit_tracer.utils.telemetry import (
     TelemetryRecorder,
     build_memory_before_after_attrs,
@@ -234,8 +234,8 @@ class AttributionContext:
         self._refresh_chunked_layer_spans()
         self._owns_decoder_chunk_cache = decoder_chunk_cache is None
         if decoder_cache_fingerprint is None and decoder_provider is not None:
-            caps = getattr(decoder_provider, "capabilities", None)
-            if bool(getattr(caps, "supports_exact_chunked_provider", False)):
+            caps = get_transcoder_capabilities(decoder_provider)
+            if bool(caps.supports_exact_chunked_provider):
                 decoder_cache_fingerprint = provider_fingerprint(decoder_provider)
         self.decoder_cache_fingerprint = decoder_cache_fingerprint
         if decoder_chunk_cache is not None:

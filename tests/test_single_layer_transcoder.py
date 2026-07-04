@@ -455,6 +455,22 @@ def test_transcoder_set_exact_plt_provider_components(create_test_transcoder_fil
     assert torch.allclose(rows, base["encoder_vecs"])
 
 
+def test_transcoder_set_rejects_non_positive_decoder_chunk_size(
+    create_test_transcoder_file,
+):
+    path, _ = create_test_transcoder_file(d_model=5, d_sae=7)
+    with pytest.raises(ValueError, match="decoder_chunk_size must be positive"):
+        load_transcoder_set(
+            {0: path},
+            "scan",
+            "in",
+            "out",
+            device=torch.device("cpu"),
+            exact_chunked_provider=True,
+            decoder_chunk_size=0,
+        )
+
+
 def test_transcoder_set_plt_provider_topology(create_test_transcoder_file):
     path, _ = create_test_transcoder_file(d_model=3, d_sae=4)
     provider = load_transcoder_set(

@@ -253,6 +253,7 @@ def load_transcoders(
                 dtype=dtype,
                 device=device,
                 cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
+                decoder_chunk_size=int(config.get("decoder_chunk_size") or 1024),
             )
             _validate_configured_provider_fingerprint(config, transcoder)
             _record_transcoder_provider_metadata(config, transcoder)
@@ -285,6 +286,7 @@ def load_transcoders(
             dtype=dtype,
             device=device,
             exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=int(config.get("decoder_chunk_size") or 1024),
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
         _validate_configured_provider_fingerprint(config, transcoder)

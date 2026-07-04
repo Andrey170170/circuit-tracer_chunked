@@ -35,6 +35,25 @@ def _provider_checkpoint_identity(config: dict) -> object:
     return config.get("scan") or config.get("repo_id") or "unknown"
 
 
+def _config_requests_exact_chunked_provider(config: dict) -> bool:
+    explicit_value = config.get(
+        "supports_exact_chunked_provider",
+        config.get("exact_chunked_provider", config.get("exact_chunked_decoder")),
+    )
+    if explicit_value is not None:
+        return bool(explicit_value)
+
+    capabilities = config.get("transcoder_capabilities")
+    if isinstance(capabilities, dict) and "supports_exact_chunked_provider" in capabilities:
+        return bool(capabilities["supports_exact_chunked_provider"])
+
+    provider_fp = config.get("transcoder_provider_fingerprint")
+    if isinstance(provider_fp, dict) and "supports_exact_chunked_provider" in provider_fp:
+        return bool(provider_fp["supports_exact_chunked_provider"])
+
+    return False
+
+
 def get_cache_dir(cache_dir: str | Path | None = None) -> Path:
     """Get the cache directory for circuit tracer.
 
@@ -228,12 +247,7 @@ def _save_transcoder_set_to_cache(
     delete_hf_cache: bool,
 ):
     """Save a transcoder set to the cache."""
-    exact_chunked_provider = bool(
-        config.get(
-            "supports_exact_chunked_provider",
-            config.get("exact_chunked_provider", config.get("exact_chunked_decoder", False)),
-        )
-    )
+    exact_chunked_provider = _config_requests_exact_chunked_provider(config)
     decoder_chunk_size = int(config.get("decoder_chunk_size") or 1024)
 
     if "transcoders" not in config:
@@ -370,6 +384,8 @@ def _save_clt_to_cache(
     delete_hf_cache: bool,
 ):
     """Save a cross-layer transcoder to the cache."""
+    exact_chunked_decoder = _config_requests_exact_chunked_provider(config)
+    decoder_chunk_size = int(config.get("decoder_chunk_size") or DEFAULT_EXACT_DECODER_CHUNK_SIZE)
     if "gemma-scope-2" in config.get("repo_id", "") and "transcoders" in config:
         # GemmaScope2 CLT format
         paths: dict[int, str] = {}
@@ -395,9 +411,7 @@ def _save_clt_to_cache(
             dtype=dtype,
             lazy_decoder=False,
             lazy_encoder=False,
-            decoder_chunk_size=int(
-                config.get("decoder_chunk_size") or DEFAULT_EXACT_DECODER_CHUNK_SIZE
-            ),
+            decoder_chunk_size=decoder_chunk_size,
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
 
@@ -444,9 +458,8 @@ def _save_clt_to_cache(
             dtype=dtype,
             lazy_decoder=False,
             lazy_encoder=False,
-            decoder_chunk_size=int(
-                config.get("decoder_chunk_size") or DEFAULT_EXACT_DECODER_CHUNK_SIZE
-            ),
+            exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=decoder_chunk_size,
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
 
@@ -516,20 +529,7 @@ def load_transcoders_from_cache(
                 "Cached decoder_chunk_size does not match transcoder_set provider fingerprint; "
                 "clear and rebuild cache"
             )
-        explicit_exact = bool(
-            config.get(
-                "supports_exact_chunked_provider",
-                config.get(
-                    "exact_chunked_provider",
-                    config.get(
-                        "exact_chunked_decoder",
-                        (config.get("transcoder_capabilities") or {}).get(
-                            "supports_exact_chunked_provider", False
-                        ),
-                    ),
-                ),
-            )
-        )
+        explicit_exact = _config_requests_exact_chunked_provider(config)
         if provider_fp is None and explicit_exact:
             raise ValueError(
                 "Cached transcoder_set exact provider metadata lacks "

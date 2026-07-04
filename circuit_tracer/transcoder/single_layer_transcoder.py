@@ -24,6 +24,33 @@ from circuit_tracer.utils import get_default_device
 DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES = 0
 
 
+def _validate_decoder_chunk_size(decoder_chunk_size: int) -> int:
+    decoder_chunk_size = int(decoder_chunk_size)
+    if decoder_chunk_size <= 0:
+        raise ValueError(f"decoder_chunk_size must be positive, got {decoder_chunk_size}")
+    return decoder_chunk_size
+
+
+def _slice_rows(safe_slice, row_ids, *, device: torch.device) -> torch.Tensor:
+    if isinstance(row_ids, torch.Tensor):
+        row_ids = row_ids.detach().cpu().reshape(-1).tolist()
+    rows = [safe_slice[int(row_id) : int(row_id) + 1] for row_id in row_ids]
+    if not rows:
+        shape = safe_slice.get_shape()
+        return torch.empty((0, shape[1]), device=device)
+    return torch.cat(rows, dim=0)
+
+
+def _slice_columns_transposed(safe_slice, column_ids, *, device: torch.device) -> torch.Tensor:
+    if isinstance(column_ids, torch.Tensor):
+        column_ids = column_ids.detach().cpu().reshape(-1).tolist()
+    rows = [safe_slice[:, int(column_id) : int(column_id) + 1].T for column_id in column_ids]
+    if not rows:
+        shape = safe_slice.get_shape()
+        return torch.empty((0, shape[0]), device=device)
+    return torch.cat(rows, dim=0).contiguous()
+
+
 def safetensors_has_gemmascope2_plt_keys(path: str) -> bool:
     if Path(path).suffix != ".safetensors":
         return False
@@ -149,7 +176,9 @@ class SingleLayerTranscoder(nn.Module):
             to_read = to_read.cpu()
         with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
             key = "w_dec" if self.weight_format == "gemmascope2" else "W_dec"
-            return f.get_slice(key)[to_read].to(self.dtype)
+            if isinstance(to_read, slice):
+                return f.get_slice(key)[to_read].to(self.dtype)
+            return _slice_rows(f.get_slice(key), to_read, device=self.device).to(self.dtype)
 
     def materialize_encoder_rows(self, feature_ids) -> torch.Tensor:
         if isinstance(feature_ids, torch.Tensor):
@@ -161,8 +190,12 @@ class SingleLayerTranscoder(nn.Module):
         assert self.transcoder_path is not None
         with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
             if self.weight_format == "gemmascope2":
-                return f.get_slice("w_enc")[:, feature_ids_read].T.contiguous().to(self.dtype)
-            return f.get_slice("W_enc")[feature_ids_read].to(self.dtype)
+                return _slice_columns_transposed(
+                    f.get_slice("w_enc"), feature_ids_read, device=self.device
+                ).to(self.dtype)
+            return _slice_rows(f.get_slice("W_enc"), feature_ids_read, device=self.device).to(
+                self.dtype
+            )
 
     def get_decoder_chunk(self, chunk_id: int, decoder_chunk_size: int) -> torch.Tensor:
         start = chunk_id * decoder_chunk_size
@@ -320,6 +353,8 @@ class TranscoderSet(nn.Module):
         cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
     ):
         super().__init__()
+        if exact_chunked_provider:
+            decoder_chunk_size = _validate_decoder_chunk_size(decoder_chunk_size)
         # Validate that we have continuous layers from 0 to max
         assert set(transcoders.keys()) == set(range(max(transcoders.keys()) + 1)), (
             f"Each layer should have a transcoder, but got transcoders for layers "
@@ -343,7 +378,7 @@ class TranscoderSet(nn.Module):
         self.scan = scan
         self.skip_connection = self.transcoders[0].W_skip is not None
         self.exact_chunked_provider = exact_chunked_provider
-        self.decoder_chunk_size = decoder_chunk_size
+        self.decoder_chunk_size = int(decoder_chunk_size)
         self.cross_batch_decoder_cache_bytes = (
             DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES
             if cross_batch_decoder_cache_bytes is None
@@ -895,6 +930,8 @@ def load_transcoder_set(
     Returns:
         TranscoderSet: The loaded transcoder set with all configuration
     """
+    if exact_chunked_provider:
+        decoder_chunk_size = _validate_decoder_chunk_size(decoder_chunk_size)
 
     transcoders = {}
     for layer in range(len(transcoder_paths)):
