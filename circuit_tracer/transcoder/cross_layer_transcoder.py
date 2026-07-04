@@ -18,6 +18,7 @@ from circuit_tracer.attribution.sparsification import (
     select_candidate_feature_indices,
 )
 from circuit_tracer.transcoder.activation_functions import JumpReLU
+from circuit_tracer.transcoder.provider import TranscoderCapabilities
 from circuit_tracer.utils import get_default_device
 from circuit_tracer.utils.telemetry import TelemetryRecorder
 
@@ -201,6 +202,51 @@ class CrossLayerTranscoder(torch.nn.Module):
             )
         else:
             self.W_skip = None
+
+    @property
+    def architecture(self):
+        return "clt"
+
+    @property
+    def capabilities(self) -> TranscoderCapabilities:
+        exact_provider = bool(self.exact_chunked_decoder)
+        return TranscoderCapabilities(
+            architecture="clt",
+            checkpoint_format=self.weight_format,
+            supports_exact_chunked_provider=exact_provider,
+            supports_compact_row_store=exact_provider,
+            supports_decoder_chunk_cache=exact_provider,
+            supports_exact_encoder_residency=exact_provider,
+            supports_encoder_row_materialization=exact_provider,
+            supports_lazy_decoder=bool(self.lazy_decoder),
+            supports_lazy_encoder=bool(self.lazy_encoder),
+            supports_lazy_decoder_chunks=exact_provider,
+            supports_lazy_encoder_rows=exact_provider,
+            decoder_output_topology="cross_layer",
+            default_decoder_chunk_size=int(self.decoder_chunk_size),
+            default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),
+            legacy_exact_chunked_decoder=bool(self.exact_chunked_decoder),
+        )
+
+    def decoder_output_layers_for_source(
+        self, source_layer: int, active_output_layers: list[int] | None = None
+    ) -> list[int]:
+        if source_layer < 0 or source_layer >= self.n_layers:
+            raise ValueError(f"source_layer out of range: {source_layer}")
+        candidates = range(self.n_layers) if active_output_layers is None else active_output_layers
+        output_layers = [int(layer) for layer in candidates if int(layer) >= source_layer]
+        for output_layer in output_layers:
+            self.decoder_output_slot(source_layer, output_layer)
+        return output_layers
+
+    def decoder_output_slot(self, source_layer: int, output_layer: int) -> int:
+        if source_layer < 0 or source_layer >= self.n_layers:
+            raise ValueError(f"source_layer out of range: {source_layer}")
+        if output_layer < source_layer or output_layer >= self.n_layers:
+            raise ValueError(
+                f"output_layer {output_layer} is not valid for CLT source_layer {source_layer}"
+            )
+        return output_layer - source_layer
 
     @property
     def device(self):
@@ -646,6 +692,24 @@ class CrossLayerTranscoder(torch.nn.Module):
         snapshot: dict[str, object] = {}
         for key, value in self._diagnostic_stats.items():
             snapshot[key] = dict(value) if isinstance(value, dict) else value
+        caps = self.capabilities
+        snapshot.update(
+            {
+                "architecture": caps.architecture,
+                "checkpoint_format": caps.checkpoint_format,
+                "decoder_output_topology": caps.decoder_output_topology,
+                "supports_exact_chunked_provider": caps.supports_exact_chunked_provider,
+                "supports_decoder_chunk_cache": caps.supports_decoder_chunk_cache,
+                "supports_compact_row_store": caps.supports_compact_row_store,
+                "supports_exact_encoder_residency": caps.supports_exact_encoder_residency,
+                "supports_encoder_row_materialization": caps.supports_encoder_row_materialization,
+                "supports_lazy_decoder_chunks": caps.supports_lazy_decoder_chunks,
+                "supports_lazy_encoder_rows": caps.supports_lazy_encoder_rows,
+                "decoder_chunk_size": caps.default_decoder_chunk_size,
+                "cross_batch_decoder_cache_bytes": caps.default_cross_batch_decoder_cache_bytes,
+                "legacy_exact_chunked_decoder": caps.legacy_exact_chunked_decoder,
+            }
+        )
         return snapshot
 
     def _add_diagnostic_value(self, key: str, value: float) -> None:

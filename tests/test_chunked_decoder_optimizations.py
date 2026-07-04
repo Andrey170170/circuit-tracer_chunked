@@ -4,9 +4,13 @@ from typing import cast
 import numpy as np
 import pytest
 import torch
+import yaml
 from safetensors.torch import save_file
 
 from circuit_tracer.attribution.attribute import attribute as attribute_top_level
+from circuit_tracer.attribution.context_transformerlens import (
+    AttributionContext as TransformerLensAttributionContext,
+)
 from circuit_tracer.attribution.attribute_nnsight import (
     _annotate_phase4_selection_on_feature_semantic_descriptors,
     _build_cross_cluster_runtime_snapshot,
@@ -93,10 +97,18 @@ from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
 )
 from circuit_tracer.transcoder.cross_layer_transcoder import (
+    CrossLayerTranscoder,
     DecoderChunkCache,
     load_clt,
     load_gemma_scope_2_clt,
 )
+from circuit_tracer.transcoder.provider import (
+    TranscoderCapabilities,
+    provider_fingerprint,
+    require_exact_chunked_provider,
+    supports_exact_chunked_provider,
+)
+from circuit_tracer.utils.caching import load_transcoders_from_cache
 
 
 class FakeDecoderProvider:
@@ -106,10 +118,12 @@ class FakeDecoderProvider:
         chunk_size: int = 1,
         *,
         enable_cache: bool = True,
+        decoder_output_topology: str = "cross_layer",
     ) -> None:
         self.blocks = blocks
         self.decoder_chunk_size = chunk_size
         self.enable_cache = enable_cache
+        self.decoder_output_topology = decoder_output_topology
         self.load_calls: list[tuple[int, int]] = []
         self.clear_calls = 0
 
@@ -133,6 +147,205 @@ class FakeDecoderProvider:
         if decoder_cache is not None:
             decoder_cache[cache_key] = result
         return result
+
+    def decoder_output_layers_for_source(self, source_layer: int, active_output_layers=None):
+        if self.decoder_output_topology == "same_layer":
+            if active_output_layers is not None and source_layer not in active_output_layers:
+                return []
+            return [source_layer]
+        candidates = (
+            range(max(self.blocks) + 1) if active_output_layers is None else active_output_layers
+        )
+        return [int(layer) for layer in candidates if int(layer) >= source_layer]
+
+    def decoder_output_slot(self, source_layer: int, output_layer: int) -> int:
+        if self.decoder_output_topology == "same_layer":
+            if output_layer != source_layer:
+                raise ValueError("same-layer fake provider only supports same-layer outputs")
+            return 0
+        if output_layer < source_layer:
+            raise ValueError("cross-layer fake provider cannot decode to earlier output layers")
+        return output_layer - source_layer
+
+    def materialize_encoder_rows(self, source_layers, feature_ids):
+        return torch.stack([source_layers.to(torch.float32), feature_ids.to(torch.float32)], dim=1)
+
+
+def test_clt_provider_capabilities_topology_and_fingerprint() -> None:
+    clt = CrossLayerTranscoder(
+        n_layers=4,
+        d_transcoder=8,
+        d_model=3,
+        lazy_decoder=True,
+        weight_format="gemmascope2",
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+        cross_batch_decoder_cache_bytes=128,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    caps = clt.capabilities
+    assert clt.architecture == "clt"
+    assert caps.architecture == "clt"
+    assert caps.checkpoint_format == "gemmascope2"
+    assert caps.decoder_output_topology == "cross_layer"
+    assert caps.supports_exact_chunked_provider is True
+    assert supports_exact_chunked_provider(clt) is True
+    assert clt.decoder_output_layers_for_source(2, [0, 2, 3]) == [2, 3]
+    assert clt.decoder_output_slot(2, 3) == 1
+    with pytest.raises(ValueError):
+        clt.decoder_output_slot(2, 1)
+
+    fingerprint = provider_fingerprint(clt)
+    assert fingerprint["architecture"] == "clt"
+    assert fingerprint["checkpoint_format"] == "gemmascope2"
+    assert fingerprint["supports_exact_chunked_provider"] is True
+    assert fingerprint["decoder_chunk_size"] == 2
+    assert fingerprint["n_layers"] == 4
+    assert fingerprint["d_model"] == 3
+    assert fingerprint["d_transcoder"] == 8
+
+
+def test_provider_contract_accepts_capability_object_without_legacy_flag() -> None:
+    class MinimalProvider:
+        architecture = "clt"
+        decoder_chunk_size = 2
+        capabilities = TranscoderCapabilities(
+            architecture="clt",
+            checkpoint_format="synthetic",
+            supports_exact_chunked_provider=True,
+            supports_compact_row_store=True,
+            supports_decoder_chunk_cache=True,
+            supports_exact_encoder_residency=True,
+            decoder_output_topology="cross_layer",
+            default_decoder_chunk_size=2,
+        )
+
+        def get_decoder_chunk(self, layer_id: int, chunk_id: int, **kwargs):
+            return torch.zeros((2, 1, 1))
+
+        def compute_attribution_components(self, *args, **kwargs):
+            return {}
+
+        def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None):
+            return None
+
+        def clear_decoder_block_cache(self, cache) -> None:
+            return None
+
+        def materialize_encoder_rows(self, source_layers, feature_ids):
+            return torch.empty((0, 1))
+
+        def decoder_output_layers_for_source(self, source_layer: int, active_output_layers=None):
+            return []
+
+        def decoder_output_slot(self, source_layer: int, output_layer: int) -> int:
+            return 0
+
+    provider = MinimalProvider()
+
+    assert not hasattr(provider, "exact_chunked_decoder")
+    assert supports_exact_chunked_provider(provider) is True
+    assert require_exact_chunked_provider(provider) is True
+
+
+def test_load_cached_clt_preserves_exact_provider_fingerprint(tmp_path: Path) -> None:
+    cache_ref = "toy-cache"
+    cache_path = tmp_path / cache_ref
+    clt = CrossLayerTranscoder(
+        n_layers=2,
+        d_transcoder=4,
+        d_model=3,
+        lazy_decoder=False,
+        exact_chunked_decoder=True,
+        decoder_chunk_size=2,
+        cross_batch_decoder_cache_bytes=128,
+        scan=cache_ref,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    clt.to_safetensors(str(cache_path))
+
+    fingerprint = provider_fingerprint(
+        clt,
+        checkpoint_format="standard",
+        checkpoint_identity=cache_ref,
+    )
+    config = {
+        "model_kind": "cross_layer_transcoder",
+        "feature_input_hook": "hook_resid_mid",
+        "feature_output_hook": "hook_mlp_out",
+        "scan": cache_ref,
+        "cross_batch_decoder_cache_bytes": 128,
+        "decoder_chunk_size": 2,
+        "transcoder_provider_fingerprint": fingerprint,
+    }
+    with open(cache_path / "config.yaml", "w") as f:
+        yaml.safe_dump(config, f)
+
+    loaded, _ = load_transcoders_from_cache(
+        cache_ref,
+        cache_dir=tmp_path,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        lazy_decoder=True,
+    )
+
+    assert loaded.exact_chunked_decoder is True
+    assert require_exact_chunked_provider(loaded) is True
+    assert (
+        provider_fingerprint(
+            loaded,
+            checkpoint_format="standard",
+            checkpoint_identity=cache_ref,
+        )
+        == fingerprint
+    )
+
+
+def test_legacy_cached_clt_without_provider_fingerprint_is_rejected(tmp_path: Path) -> None:
+    cache_ref = "legacy-cache"
+    cache_path = tmp_path / cache_ref
+    cache_path.mkdir()
+    config = {
+        "model_kind": "cross_layer_transcoder",
+        "feature_input_hook": "hook_resid_mid",
+        "feature_output_hook": "hook_mlp_out",
+        "scan": cache_ref,
+    }
+    with open(cache_path / "config.yaml", "w") as f:
+        yaml.safe_dump(config, f)
+
+    with pytest.raises(ValueError, match="transcoder_provider_fingerprint"):
+        load_transcoders_from_cache(cache_ref, cache_dir=tmp_path)
+
+
+def test_cached_clt_rejects_decoder_chunk_size_fingerprint_mismatch(tmp_path: Path) -> None:
+    cache_ref = "stale-cache"
+    cache_path = tmp_path / cache_ref
+    cache_path.mkdir()
+    fingerprint = {
+        "schema_version": 1,
+        "architecture": "clt",
+        "checkpoint_format": "standard",
+        "checkpoint_identity": cache_ref,
+        "supports_exact_chunked_provider": True,
+        "decoder_chunk_size": 2,
+    }
+    config = {
+        "model_kind": "cross_layer_transcoder",
+        "feature_input_hook": "hook_resid_mid",
+        "feature_output_hook": "hook_mlp_out",
+        "scan": cache_ref,
+        "decoder_chunk_size": 4,
+        "transcoder_provider_fingerprint": fingerprint,
+    }
+    with open(cache_path / "config.yaml", "w") as f:
+        yaml.safe_dump(config, f)
+
+    with pytest.raises(ValueError, match="decoder_chunk_size"):
+        load_transcoders_from_cache(cache_ref, cache_dir=tmp_path)
 
 
 class GuardrailDecoderProvider:
@@ -297,6 +510,80 @@ def _assert_chunked_attr_helper(context_cls) -> None:
 
 def test_nnsight_chunked_attr_reuses_decoder_block_loads() -> None:
     _assert_chunked_attr_helper(NNSightAttributionContext)
+
+
+def test_nnsight_chunked_attr_uses_provider_same_layer_topology() -> None:
+    class SameLayerProvider:
+        decoder_chunk_size = 2
+        capabilities = TranscoderCapabilities(
+            architecture="plt",
+            checkpoint_format="synthetic",
+            supports_exact_chunked_provider=True,
+            supports_compact_row_store=True,
+            supports_decoder_chunk_cache=True,
+            decoder_output_topology="same_layer",
+            default_decoder_chunk_size=2,
+        )
+
+        def __init__(self) -> None:
+            self.blocks = {
+                0: torch.tensor([[[1.0, 0.0]], [[0.0, 0.0]]]),
+                1: torch.tensor([[[0.0, 0.0]], [[0.0, 1.0]]]),
+            }
+
+        def create_decoder_block_cache(self, *, fingerprint=None):
+            return None
+
+        def clear_decoder_block_cache(self, cache) -> None:
+            return None
+
+        def get_decoder_chunk(self, layer_id: int, chunk_id: int, decoder_cache=None):
+            assert chunk_id == 0
+            return self.blocks[layer_id]
+
+        def decoder_output_layers_for_source(self, source_layer: int, active_output_layers=None):
+            if active_output_layers is None or source_layer in active_output_layers:
+                return [source_layer]
+            return []
+
+        def decoder_output_slot(self, source_layer: int, output_layer: int) -> int:
+            if output_layer != source_layer:
+                raise ValueError("same-layer provider only decodes to its source layer")
+            return 0
+
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 1], [0, 0], [0, 1]]),
+        values=torch.tensor([1.0, 1.0]),
+        size=(2, 1, 2),
+        check_invariants=True,
+    ).coalesce()
+    ctx = NNSightAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 1, 2),
+        token_vectors=torch.zeros(1, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1),
+        decoder_provider=SameLayerProvider(),
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+    ctx._batch_buffer = torch.zeros(ctx._row_size, 1)
+
+    ctx._compute_chunked_feature_attributions_from_grads(
+        [
+            torch.tensor([[[3.0, 5.0]]]),
+            torch.tensor([[[7.0, 11.0]]]),
+        ]
+    )
+
+    assert torch.allclose(ctx._batch_buffer[:2], torch.tensor([[3.0], [11.0]]))
 
 
 def test_nnsight_chunked_attr_requires_sorted_source_layers() -> None:
@@ -655,6 +942,44 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
     assert torch.equal(batch, encoder_vecs[torch.tensor([2, 0])])
 
 
+def test_transformerlens_context_materializes_lazy_same_layer_provider_rows() -> None:
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0, 1, 1], [0, 0, 1], [1, 0, 1]]),
+        values=torch.tensor([1.0, 2.0, 3.0]),
+        size=(2, 2, 4),
+        check_invariants=True,
+    ).coalesce()
+    provider = FakeDecoderProvider(
+        {0: torch.zeros(4, 1, 2), 1: torch.zeros(4, 1, 2)},
+        chunk_size=2,
+        decoder_output_topology="same_layer",
+    )
+    ctx = TransformerLensAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, 2, 2),
+        token_vectors=torch.zeros(2, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.empty((0, 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1, 2, 5),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+
+    assert provider.decoder_output_layers_for_source(1, [0, 1]) == [1]
+    assert provider.decoder_output_slot(1, 1) == 0
+    batch = ctx.materialize_encoder_vectors(torch.tensor([2, 0]))
+    assert torch.equal(batch, torch.tensor([[1.0, 1.0], [0.0, 1.0]]))
+    before, after = ctx.apply_diagnostic_feature_cap(2)
+    assert (before, after) == (3, 2)
+
+
 def test_exact_chunked_active_cpu_encoder_residency_stages_materialized_table() -> None:
     activation_matrix = torch.sparse_coo_tensor(
         indices=torch.tensor([[0, 0, 1], [0, 1, 1], [0, 1, 0]]),
@@ -941,7 +1266,7 @@ def test_phase4_refresh_optimization_metadata_tracks_requested_and_effective_mod
     config = _resolve_phase4_refresh_optimization_config(
         "v1",
         compact_output=True,
-        exact_chunked_decoder=True,
+        exact_chunked_provider_enabled=True,
     )
     metadata = _build_phase4_refresh_optimization_metadata(config)
 
@@ -957,7 +1282,7 @@ def test_phase4_refresh_optimization_falls_back_off_when_compact_refresh_unavail
     config = _resolve_phase4_refresh_optimization_config(
         "v1",
         compact_output=False,
-        exact_chunked_decoder=False,
+        exact_chunked_provider_enabled=False,
     )
     metadata = _build_phase4_refresh_optimization_metadata(config)
 
@@ -1125,7 +1450,7 @@ def test_phase4_refresh_policy_config_validates_and_activates_deferred_when_appl
         phase4_refresh_policy="deferred_v1",
         phase4_refresh_interval_multiplier=3,
         compact_output=True,
-        exact_chunked_decoder=True,
+        exact_chunked_provider_enabled=True,
     )
     metadata = _build_phase4_refresh_policy_metadata(config)
     assert metadata["refresh_policy_requested"] == "deferred_v1"
@@ -1146,7 +1471,7 @@ def test_phase4_refresh_policy_config_falls_back_when_deferred_path_unavailable(
         phase4_refresh_policy="deferred_v1",
         phase4_refresh_interval_multiplier=3,
         compact_output=False,
-        exact_chunked_decoder=False,
+        exact_chunked_provider_enabled=False,
     )
     metadata = _build_phase4_refresh_policy_metadata(config)
 
@@ -1164,7 +1489,7 @@ def test_phase4_refresh_policy_config_falls_back_when_deferred_path_unavailable(
         phase4_refresh_policy="standard",
         phase4_refresh_interval_multiplier=3,
         compact_output=True,
-        exact_chunked_decoder=True,
+        exact_chunked_provider_enabled=True,
     )
     standard_nondefault_metadata = _build_phase4_refresh_policy_metadata(standard_nondefault)
     assert standard_nondefault_metadata["refresh_policy_effective"] == "standard"
@@ -1273,7 +1598,7 @@ def test_row_store_cache_control_config_validates_and_tracks_effective_mode() ->
     config = _resolve_row_store_cache_control_config(
         "fadvise_dontneed_after_append_v1",
         compact_output=True,
-        exact_chunked_decoder=True,
+        supports_compact_row_store=True,
     )
     metadata = _build_row_store_cache_control_metadata(config)
     assert metadata["row_store_cache_control_requested"] == "fadvise_dontneed_after_append_v1"
@@ -1286,7 +1611,7 @@ def test_row_store_cache_control_config_validates_and_tracks_effective_mode() ->
     read_config = _resolve_row_store_cache_control_config(
         "fadvise_dontneed_after_append_and_read_v1",
         compact_output=True,
-        exact_chunked_decoder=True,
+        supports_compact_row_store=True,
     )
     read_metadata = _build_row_store_cache_control_metadata(read_config)
     assert (
@@ -1297,7 +1622,7 @@ def test_row_store_cache_control_config_validates_and_tracks_effective_mode() ->
     fallback_config = _resolve_row_store_cache_control_config(
         "fadvise_dontneed_after_append_v1",
         compact_output=False,
-        exact_chunked_decoder=False,
+        supports_compact_row_store=False,
     )
     fallback_metadata = _build_row_store_cache_control_metadata(fallback_config)
     assert fallback_metadata["row_store_cache_control_effective"] == "off"
@@ -1315,7 +1640,7 @@ def test_exact_encoder_residency_config_validates_tracks_effective_mode_and_fall
 
     config = _resolve_exact_encoder_residency_config(
         "active_pinned_cpu",
-        exact_chunked_decoder=True,
+        supports_exact_encoder_residency=True,
     )
     metadata = _build_exact_encoder_residency_metadata(config)
     assert metadata["exact_encoder_residency_requested"] == "active_pinned_cpu"
@@ -1333,7 +1658,7 @@ def test_exact_encoder_residency_config_validates_tracks_effective_mode_and_fall
 
     fallback_config = _resolve_exact_encoder_residency_config(
         "active_pinned_cpu",
-        exact_chunked_decoder=False,
+        supports_exact_encoder_residency=False,
     )
     fallback_metadata = _build_exact_encoder_residency_metadata(fallback_config)
     assert fallback_metadata["exact_encoder_residency_effective"] == "lazy"
@@ -1357,7 +1682,7 @@ def test_phase4_row_executor_metadata_tracks_requested_and_effective_modes() -> 
     config = _resolve_phase4_row_executor_config(
         "streaming_v1",
         compact_output=True,
-        exact_chunked_decoder=True,
+        exact_chunked_provider_enabled=True,
     )
     metadata = _build_phase4_row_executor_metadata(config)
 
@@ -1373,7 +1698,7 @@ def test_phase4_row_executor_falls_back_to_batched_when_streaming_path_unavailab
     config = _resolve_phase4_row_executor_config(
         "streaming_v1",
         compact_output=False,
-        exact_chunked_decoder=False,
+        exact_chunked_provider_enabled=False,
     )
     metadata = _build_phase4_row_executor_metadata(config)
 
@@ -1395,7 +1720,7 @@ def test_phase4_row_reduction_off_metadata_and_gpu_v1_rejection() -> None:
         _resolve_phase4_row_reduction_config(
             "off",
             compact_output=True,
-            exact_chunked_decoder=True,
+            exact_chunked_provider_enabled=True,
         )
     )
     assert metadata["row_reduction_requested"] == "off"
@@ -1407,7 +1732,7 @@ def test_phase4_row_reduction_off_metadata_and_gpu_v1_rejection() -> None:
         _resolve_phase4_row_reduction_config(
             "gpu_v1",
             compact_output=True,
-            exact_chunked_decoder=True,
+            exact_chunked_provider_enabled=True,
         )
     )
     assert gpu_metadata["row_reduction_requested"] == "gpu_v1"
@@ -1419,7 +1744,7 @@ def test_phase4_row_reduction_off_metadata_and_gpu_v1_rejection() -> None:
         _resolve_phase4_row_reduction_config(
             "gpu_v1",
             compact_output=False,
-            exact_chunked_decoder=True,
+            exact_chunked_provider_enabled=True,
         )
     )
     assert fallback_metadata["row_reduction_requested"] == "gpu_v1"

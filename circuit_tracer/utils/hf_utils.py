@@ -17,6 +17,73 @@ from tqdm.contrib.concurrent import thread_map
 logger = logging.getLogger(__name__)
 
 
+def _record_transcoder_provider_metadata(config: dict, transcoder: object) -> None:
+    from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
+
+    capabilities = get_transcoder_capabilities(transcoder)
+    config["transcoder_architecture"] = capabilities.architecture
+    config["transcoder_capabilities"] = dict(capabilities.__dict__)
+    if (
+        capabilities.supports_exact_chunked_provider
+        and "transcoder_provider_fingerprint" not in config
+    ):
+        config["transcoder_provider_fingerprint"] = provider_fingerprint(
+            transcoder,
+            checkpoint_identity=config.get("scan") or config.get("repo_id"),
+        )
+
+
+def _validate_configured_provider_fingerprint(config: dict, transcoder: object) -> None:
+    expected = config.get("transcoder_provider_fingerprint")
+    if expected is None:
+        return
+    if not isinstance(expected, dict):
+        raise ValueError("Configured transcoder_provider_fingerprint is malformed")
+    from circuit_tracer.transcoder.provider import provider_fingerprint
+
+    current = provider_fingerprint(
+        transcoder,
+        checkpoint_format=str(expected.get("checkpoint_format", "standard")),
+        checkpoint_identity=expected.get("checkpoint_identity"),
+        dtype=expected.get("dtype"),
+    )
+    if expected != current:
+        raise ValueError("Configured transcoder_provider_fingerprint mismatch")
+
+
+def _resolve_exact_chunked_provider_requested(
+    config: dict, *, legacy_repo_scan: bool = True
+) -> bool:
+    explicit_value = config.get(
+        "supports_exact_chunked_provider",
+        config.get("exact_chunked_provider", config.get("exact_chunked_decoder")),
+    )
+    if explicit_value is not None:
+        config["transcoder_capability_source"] = "config"
+        return bool(explicit_value)
+
+    capabilities = config.get("transcoder_capabilities")
+    if isinstance(capabilities, dict) and "supports_exact_chunked_provider" in capabilities:
+        config["transcoder_capability_source"] = "provider_metadata"
+        return bool(capabilities["supports_exact_chunked_provider"])
+
+    provider_fp = config.get("transcoder_provider_fingerprint")
+    if isinstance(provider_fp, dict) and "supports_exact_chunked_provider" in provider_fp:
+        config["transcoder_capability_source"] = "provider_fingerprint"
+        return bool(provider_fp["supports_exact_chunked_provider"])
+
+    if not legacy_repo_scan:
+        config["transcoder_capability_source"] = "default"
+        return False
+
+    # Compatibility fallback for older CLT configs that predate explicit provider metadata.
+    config["transcoder_capability_source"] = "legacy_repo_scan"
+    return bool(
+        "gemma-scope-2" in str(config.get("repo_id", ""))
+        or "gemma-scope-2" in str(config.get("scan", ""))
+    )
+
+
 class HfUri(NamedTuple):
     """Structured representation of a HuggingFace URI."""
 
@@ -145,7 +212,12 @@ def load_transcoders(
         else:
             special_load_fn = None
 
-        return load_transcoder_set(
+        exact_chunked_provider = _resolve_exact_chunked_provider_requested(
+            config, legacy_repo_scan=False
+        )
+        effective_lazy_encoder = True if exact_chunked_provider else lazy_encoder
+        effective_lazy_decoder = True if exact_chunked_provider else lazy_decoder
+        transcoder = load_transcoder_set(
             transcoder_paths,
             scan=config["scan"],
             feature_input_hook=config["feature_input_hook"],
@@ -153,9 +225,15 @@ def load_transcoders(
             special_load_fn=special_load_fn,
             dtype=dtype,
             device=device,
-            lazy_encoder=lazy_encoder,
-            lazy_decoder=lazy_decoder,
+            lazy_encoder=effective_lazy_encoder,
+            lazy_decoder=effective_lazy_decoder,
+            exact_chunked_provider=exact_chunked_provider,
+            decoder_chunk_size=int(config.get("decoder_chunk_size") or 1024),
+            cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
+        _validate_configured_provider_fingerprint(config, transcoder)
+        _record_transcoder_provider_metadata(config, transcoder)
+        return transcoder
     elif model_kind == "cross_layer_transcoder":
         from circuit_tracer.transcoder.cross_layer_transcoder import (
             load_clt,
@@ -165,7 +243,7 @@ def load_transcoders(
         if "gemma-scope-2" in config["repo_id"] and "transcoders" in config:
             transcoder_paths = resolve_transcoder_paths(config)
             local_path = transcoder_paths
-            return load_gemma_scope_2_clt(
+            transcoder = load_gemma_scope_2_clt(
                 local_path,  # type:ignore
                 scan=config["scan"],
                 feature_input_hook=config["feature_input_hook"],
@@ -175,7 +253,11 @@ def load_transcoders(
                 dtype=dtype,
                 device=device,
                 cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
+                decoder_chunk_size=int(config.get("decoder_chunk_size") or 1024),
             )
+            _validate_configured_provider_fingerprint(config, transcoder)
+            _record_transcoder_provider_metadata(config, transcoder)
+            return transcoder
 
         subfolder = config.get("subfolder")
         if subfolder:
@@ -192,12 +274,9 @@ def load_transcoders(
         if subfolder:
             local_path = os.path.join(local_path, subfolder)
 
-        exact_chunked_decoder = bool(
-            "gemma-scope-2" in str(config.get("repo_id", ""))
-            or "gemma-scope-2" in str(config.get("scan", ""))
-        )
+        exact_chunked_decoder = _resolve_exact_chunked_provider_requested(config)
 
-        return load_clt(
+        transcoder = load_clt(
             local_path,
             scan=config["scan"],
             feature_input_hook=config["feature_input_hook"],
@@ -207,8 +286,12 @@ def load_transcoders(
             dtype=dtype,
             device=device,
             exact_chunked_decoder=exact_chunked_decoder,
+            decoder_chunk_size=int(config.get("decoder_chunk_size") or 1024),
             cross_batch_decoder_cache_bytes=config.get("cross_batch_decoder_cache_bytes"),
         )
+        _validate_configured_provider_fingerprint(config, transcoder)
+        _record_transcoder_provider_metadata(config, transcoder)
+        return transcoder
     else:
         raise ValueError(f"Unknown model kind: {model_kind}")
 

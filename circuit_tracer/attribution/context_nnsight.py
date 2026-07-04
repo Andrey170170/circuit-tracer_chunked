@@ -2,6 +2,7 @@
 Attribution context for managing hooks during attribution computation.
 """
 
+import inspect
 import time
 import weakref
 from typing import TYPE_CHECKING, Literal, cast
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 from einops import einsum
 
+from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
 from circuit_tracer.utils.telemetry import (
     TelemetryRecorder,
     build_memory_before_after_attrs,
@@ -231,6 +233,10 @@ class AttributionContext:
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
         self._refresh_chunked_layer_spans()
         self._owns_decoder_chunk_cache = decoder_chunk_cache is None
+        if decoder_cache_fingerprint is None and decoder_provider is not None:
+            caps = get_transcoder_capabilities(decoder_provider)
+            if bool(caps.supports_exact_chunked_provider):
+                decoder_cache_fingerprint = provider_fingerprint(decoder_provider)
         self.decoder_cache_fingerprint = decoder_cache_fingerprint
         if decoder_chunk_cache is not None:
             expected = decoder_cache_fingerprint
@@ -633,6 +639,8 @@ class AttributionContext:
         init_decoder_cache = getattr(self.decoder_provider, "create_decoder_block_cache", None)
         if self.chunked_decoder_state is None or not callable(init_decoder_cache):
             return None
+        if "fingerprint" in inspect.signature(init_decoder_cache).parameters:
+            return init_decoder_cache(fingerprint=self.decoder_cache_fingerprint)
         return init_decoder_cache()
 
     def _effective_row_subchunk_size(self) -> int:
@@ -982,9 +990,25 @@ class AttributionContext:
             if span is None:
                 continue
 
-            relevant_output_layers = [
-                layer for layer in active_output_layers if layer >= source_layer
-            ]
+            requires_provider_topology = bool(
+                getattr(
+                    getattr(self.decoder_provider, "capabilities", None),
+                    "supports_exact_chunked_provider",
+                    False,
+                )
+            )
+            if hasattr(self.decoder_provider, "decoder_output_layers_for_source"):
+                relevant_output_layers = self.decoder_provider.decoder_output_layers_for_source(
+                    source_layer, active_output_layers
+                )
+            elif requires_provider_topology:
+                raise TypeError(
+                    "exact chunked provider is missing decoder_output_layers_for_source"
+                )
+            else:
+                relevant_output_layers = [
+                    layer for layer in active_output_layers if layer >= source_layer
+                ]
             if not relevant_output_layers:
                 continue
 
@@ -1053,7 +1077,15 @@ class AttributionContext:
                         )
                         grad_cache[output_layer] = typed_grads
 
-                    decoder_vectors = decoder_chunk[:, output_layer - source_layer].to(
+                    if hasattr(self.decoder_provider, "decoder_output_slot"):
+                        decoder_slot = self.decoder_provider.decoder_output_slot(
+                            source_layer, output_layer
+                        )
+                    elif requires_provider_topology:
+                        raise TypeError("exact chunked provider is missing decoder_output_slot")
+                    else:
+                        decoder_slot = output_layer - source_layer
+                    decoder_vectors = decoder_chunk[:, decoder_slot].to(
                         dtype=self._batch_buffer.dtype
                     )
                     for row_subchunk_idx, row_start in enumerate(

@@ -1,8 +1,7 @@
 import os
-import warnings
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import numpy as np
 import torch
@@ -18,7 +17,58 @@ from circuit_tracer.attribution.sparsification import (
     select_candidate_feature_indices,
 )
 from circuit_tracer.transcoder.activation_functions import JumpReLU
+from circuit_tracer.transcoder.provider import TranscoderCapabilities
 from circuit_tracer.utils import get_default_device
+
+
+DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES = 0
+
+
+def _validate_decoder_chunk_size(decoder_chunk_size: int) -> int:
+    decoder_chunk_size = int(decoder_chunk_size)
+    if decoder_chunk_size <= 0:
+        raise ValueError(f"decoder_chunk_size must be positive, got {decoder_chunk_size}")
+    return decoder_chunk_size
+
+
+def _slice_rows(safe_slice, row_ids, *, device: torch.device) -> torch.Tensor:
+    if isinstance(row_ids, torch.Tensor):
+        row_ids = row_ids.detach().cpu().reshape(-1).tolist()
+    rows = [safe_slice[int(row_id) : int(row_id) + 1] for row_id in row_ids]
+    if not rows:
+        shape = safe_slice.get_shape()
+        return torch.empty((0, shape[1]), device=device)
+    return torch.cat(rows, dim=0)
+
+
+def _slice_columns_transposed(safe_slice, column_ids, *, device: torch.device) -> torch.Tensor:
+    if isinstance(column_ids, torch.Tensor):
+        column_ids = column_ids.detach().cpu().reshape(-1).tolist()
+    rows = [safe_slice[:, int(column_id) : int(column_id) + 1].T for column_id in column_ids]
+    if not rows:
+        shape = safe_slice.get_shape()
+        return torch.empty((0, shape[0]), device=device)
+    return torch.cat(rows, dim=0).contiguous()
+
+
+def safetensors_has_gemmascope2_plt_keys(path: str) -> bool:
+    if Path(path).suffix != ".safetensors":
+        return False
+    with safe_open(path, framework="pt", device="cpu") as f:
+        keys = set(f.keys())
+    return {"w_enc", "w_dec", "threshold"}.issubset(keys)
+
+
+def select_single_layer_transcoder_load_fn(
+    path: str,
+    special_load_fn: Literal["gemma-scope", "gemma-scope-2", None] = None,
+):
+    npz_format = Path(path).suffix == ".npz"
+    if special_load_fn == "gemma-scope" and npz_format:
+        return load_gemma_scope_transcoder
+    if special_load_fn == "gemma-scope-2" or safetensors_has_gemmascope2_plt_keys(path):
+        return load_gemma_scope_2_transcoder
+    return load_relu_transcoder
 
 
 class SingleLayerTranscoder(nn.Module):
@@ -54,6 +104,7 @@ class SingleLayerTranscoder(nn.Module):
         lazy_decoder: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        weight_format: Literal["standard", "gemmascope2"] = "standard",
     ):
         super().__init__()
 
@@ -66,6 +117,7 @@ class SingleLayerTranscoder(nn.Module):
         self.transcoder_path = transcoder_path
         self.lazy_encoder = lazy_encoder
         self.lazy_decoder = lazy_decoder
+        self.weight_format = weight_format
 
         if lazy_encoder or lazy_decoder:
             assert self.transcoder_path is not None, "Transcoder path must be set for lazy loading"
@@ -105,10 +157,13 @@ class SingleLayerTranscoder(nn.Module):
 
         if name == "W_enc" and self.lazy_encoder and self.transcoder_path is not None:
             with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
+                if self.weight_format == "gemmascope2":
+                    return f.get_tensor("w_enc").T.contiguous().to(self.dtype)
                 return f.get_tensor("W_enc").to(self.dtype)
         elif name == "W_dec" and self.lazy_decoder and self.transcoder_path is not None:
             with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
-                return f.get_tensor("W_dec").to(self.dtype)
+                key = "w_dec" if self.weight_format == "gemmascope2" else "W_dec"
+                return f.get_tensor(key).to(self.dtype)
 
         return super().__getattr__(name)
 
@@ -120,7 +175,41 @@ class SingleLayerTranscoder(nn.Module):
         if isinstance(to_read, torch.Tensor):
             to_read = to_read.cpu()
         with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
-            return f.get_slice("W_dec")[to_read].to(self.dtype)
+            key = "w_dec" if self.weight_format == "gemmascope2" else "W_dec"
+            if isinstance(to_read, slice):
+                return f.get_slice(key)[to_read].to(self.dtype)
+            return _slice_rows(f.get_slice(key), to_read, device=self.device).to(self.dtype)
+
+    def materialize_encoder_rows(self, feature_ids) -> torch.Tensor:
+        if isinstance(feature_ids, torch.Tensor):
+            feature_ids_read = feature_ids.detach().cpu()
+        else:
+            feature_ids_read = feature_ids
+        if not self.lazy_encoder:
+            return self.W_enc[feature_ids].to(dtype=self.dtype)
+        assert self.transcoder_path is not None
+        with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
+            if self.weight_format == "gemmascope2":
+                return _slice_columns_transposed(
+                    f.get_slice("w_enc"), feature_ids_read, device=self.device
+                ).to(self.dtype)
+            return _slice_rows(f.get_slice("W_enc"), feature_ids_read, device=self.device).to(
+                self.dtype
+            )
+
+    def get_decoder_chunk(self, chunk_id: int, decoder_chunk_size: int) -> torch.Tensor:
+        start = chunk_id * decoder_chunk_size
+        stop = min(start + decoder_chunk_size, self.d_transcoder)
+        if start >= self.d_transcoder or stop <= start:
+            raise IndexError(f"Decoder chunk {chunk_id} out of range for layer {self.layer_idx}")
+        if not self.lazy_decoder:
+            block = self.W_dec[start:stop]
+        else:
+            assert self.transcoder_path is not None
+            with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
+                key = "w_dec" if self.weight_format == "gemmascope2" else "W_dec"
+                block = f.get_slice(key)[start:stop]
+        return block.to(dtype=self.dtype).unsqueeze(1)
 
     def encode(self, input_acts, apply_activation_function: bool = True):
         W_enc = self.W_enc
@@ -153,7 +242,13 @@ class SingleLayerTranscoder(nn.Module):
 
         return decoded
 
-    def encode_sparse(self, input_acts, zero_positions: slice = slice(0, 1)):
+    def encode_sparse(
+        self,
+        input_acts,
+        zero_positions: slice = slice(0, 1),
+        *,
+        return_encoder_vectors: bool = True,
+    ):
         """Encode and return sparse activations with active encoder vectors.
 
         Args:
@@ -172,7 +267,7 @@ class SingleLayerTranscoder(nn.Module):
 
         sparse_acts = acts.to_sparse()
         _, feat_idx = sparse_acts.indices()
-        active_encoders = W_enc[feat_idx]
+        active_encoders = W_enc[feat_idx] if return_encoder_vectors else None
 
         return sparse_acts, active_encoders
 
@@ -253,8 +348,13 @@ class TranscoderSet(nn.Module):
         feature_input_hook: str,
         feature_output_hook: str,
         scan: str | list[str] | None = None,
+        exact_chunked_provider: bool = False,
+        decoder_chunk_size: int = 1024,
+        cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
     ):
         super().__init__()
+        if exact_chunked_provider:
+            decoder_chunk_size = _validate_decoder_chunk_size(decoder_chunk_size)
         # Validate that we have continuous layers from 0 to max
         assert set(transcoders.keys()) == set(range(max(transcoders.keys()) + 1)), (
             f"Each layer should have a transcoder, but got transcoders for layers "
@@ -277,6 +377,172 @@ class TranscoderSet(nn.Module):
         self.feature_output_hook = feature_output_hook
         self.scan = scan
         self.skip_connection = self.transcoders[0].W_skip is not None
+        self.exact_chunked_provider = exact_chunked_provider
+        self.decoder_chunk_size = int(decoder_chunk_size)
+        self.cross_batch_decoder_cache_bytes = (
+            DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES
+            if cross_batch_decoder_cache_bytes is None
+            else int(cross_batch_decoder_cache_bytes)
+        )
+
+    @property
+    def architecture(self):
+        return "plt"
+
+    @property
+    def d_model(self):
+        return self.transcoders[0].d_model
+
+    @property
+    def dtype(self):
+        return self.transcoders[0].dtype
+
+    @property
+    def capabilities(self) -> TranscoderCapabilities:
+        exact = bool(self.exact_chunked_provider)
+        return TranscoderCapabilities(
+            architecture="plt",
+            checkpoint_format=str(getattr(self.transcoders[0], "weight_format", "standard")),
+            supports_exact_chunked_provider=exact,
+            supports_compact_row_store=exact,
+            supports_decoder_chunk_cache=exact,
+            supports_exact_encoder_residency=exact,
+            supports_encoder_row_materialization=exact,
+            supports_lazy_decoder=any(t.lazy_decoder for t in self.transcoders),
+            supports_lazy_encoder=any(t.lazy_encoder for t in self.transcoders),
+            supports_lazy_decoder_chunks=exact,
+            supports_lazy_encoder_rows=exact,
+            decoder_output_topology="same_layer",
+            default_decoder_chunk_size=int(self.decoder_chunk_size),
+            default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),
+            legacy_exact_chunked_decoder=False,
+        )
+
+    def decoder_output_layers_for_source(
+        self, source_layer: int, active_output_layers=None
+    ) -> list[int]:
+        if source_layer < 0 or source_layer >= self.n_layers:
+            raise ValueError(f"source_layer out of range: {source_layer}")
+        if active_output_layers is not None and source_layer not in [
+            int(x) for x in active_output_layers
+        ]:
+            return []
+        return [source_layer]
+
+    def decoder_output_slot(self, source_layer: int, output_layer: int) -> int:
+        if source_layer < 0 or source_layer >= self.n_layers:
+            raise ValueError(f"source_layer out of range: {source_layer}")
+        if output_layer != source_layer:
+            raise ValueError(
+                f"PLT decoder for source_layer {source_layer} only writes to same layer"
+            )
+        return 0
+
+    def materialize_encoder_rows(self, source_layers, feature_ids):
+        source_layers = torch.as_tensor(source_layers, dtype=torch.long).reshape(-1).cpu()
+        feature_ids = torch.as_tensor(feature_ids, dtype=torch.long).reshape(-1).cpu()
+        if source_layers.numel() != feature_ids.numel():
+            raise ValueError("source_layers and feature_ids must have matching lengths")
+
+        first = cast(SingleLayerTranscoder, self.transcoders[0])
+        if source_layers.numel() == 0:
+            return torch.empty((0, self.d_model), device=first.device, dtype=first.dtype)
+
+        active_encoders = torch.empty(
+            (source_layers.numel(), self.d_model),
+            device=first.device,
+            dtype=first.dtype,
+        )
+        for layer_id in torch.unique(source_layers, sorted=True).tolist():
+            layer_mask = source_layers == int(layer_id)
+            layer_rows = torch.nonzero(layer_mask, as_tuple=False).squeeze(-1)
+            transcoder = cast(SingleLayerTranscoder, self.transcoders[int(layer_id)])
+            active_encoders[layer_rows.to(device=active_encoders.device)] = (
+                transcoder.materialize_encoder_rows(feature_ids[layer_rows]).to(
+                    device=active_encoders.device, dtype=active_encoders.dtype
+                )
+            )
+        return active_encoders
+
+    def get_decoder_chunk(
+        self, source_layer: int, chunk_id: int, decoder_cache=None
+    ) -> torch.Tensor:
+        cache_key = (int(source_layer), int(chunk_id))
+        if decoder_cache is not None:
+            cached = decoder_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        transcoder = cast(SingleLayerTranscoder, self.transcoders[int(source_layer)])
+        result = transcoder.get_decoder_chunk(chunk_id, self.decoder_chunk_size)
+        if decoder_cache is not None:
+            if hasattr(decoder_cache, "put"):
+                decoder_cache.put(cache_key, result)
+            else:
+                decoder_cache[cache_key] = result
+        return result
+
+    def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None):
+        from circuit_tracer.transcoder.cross_layer_transcoder import DecoderChunkCache
+
+        cache_bytes = self.cross_batch_decoder_cache_bytes if max_bytes is None else int(max_bytes)
+        if cache_bytes <= 0:
+            return None
+        return DecoderChunkCache(cache_bytes, fingerprint=fingerprint)
+
+    def clear_decoder_block_cache(self, cache) -> None:
+        if cache is not None:
+            cache.clear()
+
+    def get_diagnostic_snapshot(self) -> dict[str, object]:
+        return {
+            "architecture": self.architecture,
+            "capabilities": self.capabilities,
+            "n_layers": self.n_layers,
+            "d_model": self.d_model,
+            "d_transcoder": self.d_transcoder,
+        }
+
+    def _decode_sparse_with_decoder_chunks(
+        self,
+        layer: int,
+        sparse_acts: torch.Tensor,
+        input_acts: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        sparse_acts = sparse_acts.coalesce()
+        pos_idx, feat_idx = sparse_acts.indices()
+        values = sparse_acts.values()
+        reconstruction = torch.zeros(
+            sparse_acts.shape[0],
+            self.d_model,
+            device=sparse_acts.device,
+            dtype=sparse_acts.dtype,
+        )
+
+        if feat_idx.numel() > 0:
+            chunk_ids = torch.div(feat_idx, self.decoder_chunk_size, rounding_mode="floor")
+            for chunk_id_tensor in torch.unique(chunk_ids, sorted=True):
+                chunk_id = int(chunk_id_tensor.item())
+                chunk_mask = chunk_ids == chunk_id_tensor
+                local_feat_idx = (feat_idx[chunk_mask] - chunk_id * self.decoder_chunk_size).long()
+                decoder_chunk = self.get_decoder_chunk(layer, chunk_id)
+                decoder_vectors = decoder_chunk[:, 0].to(
+                    device=sparse_acts.device,
+                    dtype=sparse_acts.dtype,
+                    non_blocking=decoder_chunk.device.type == "cuda",
+                )
+                scaled_decoders = decoder_vectors[local_feat_idx] * values[chunk_mask, None]
+                reconstruction.index_add_(0, pos_idx[chunk_mask], scaled_decoders)
+
+        transcoder = cast(SingleLayerTranscoder, self.transcoders[layer])
+        if transcoder.W_skip is not None:
+            assert input_acts is not None, (
+                "Transcoder has skip connection but no input_acts were provided"
+            )
+            reconstruction = reconstruction + transcoder.compute_skip(input_acts)
+        reconstruction = reconstruction + transcoder.b_dec.to(
+            device=reconstruction.device, dtype=reconstruction.dtype
+        )
+        return reconstruction
 
     def __len__(self):
         return self.n_layers
@@ -345,6 +611,8 @@ class TranscoderSet(nn.Module):
         mlp_inputs: torch.Tensor,
         zero_positions: slice = slice(0, 1),
         sparsification: SparsificationConfig | None = None,
+        *,
+        materialize_encoder_vecs: bool = True,
     ) -> dict[str, object]:
         """Extract active features and their encoder/decoder vectors for attribution.
 
@@ -366,7 +634,7 @@ class TranscoderSet(nn.Module):
 
         for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
             sparse_acts, _ = transcoder.encode_sparse(
-                mlp_inputs[layer], zero_positions=zero_positions
+                mlp_inputs[layer], zero_positions=zero_positions, return_encoder_vectors=False
             )
             sparse_acts_list.append(sparse_acts)
 
@@ -382,6 +650,49 @@ class TranscoderSet(nn.Module):
         encoder_vectors = []
         decoder_vectors = []
         layer_ids, pos_ids, feat_ids = activation_matrix.indices()
+
+        if self.exact_chunked_provider:
+            for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
+                layer_mask = layer_ids == layer
+                layer_sparse = torch.sparse_coo_tensor(
+                    torch.stack((pos_ids[layer_mask], feat_ids[layer_mask])),
+                    activation_matrix.values()[layer_mask],
+                    size=(mlp_inputs.shape[1], transcoder.d_transcoder),
+                    device=device,
+                    dtype=activation_matrix.dtype,
+                ).coalesce()
+                reconstruction[layer] = self._decode_sparse_with_decoder_chunks(
+                    layer,
+                    layer_sparse,
+                    mlp_inputs[layer],
+                )
+
+            encoder_vecs = (
+                self.materialize_encoder_rows(layer_ids.tolist(), feat_ids.tolist())
+                if materialize_encoder_vecs
+                else torch.empty((0, self.d_model), device=device, dtype=self.dtype)
+            )
+            empty_decoder_vecs = torch.empty(
+                (0, self.d_model), device=device, dtype=activation_matrix.dtype
+            )
+            empty_locations = torch.empty((2, 0), device=device, dtype=torch.long)
+            attribution_data = {
+                "activation_matrix": activation_matrix,
+                "reconstruction": reconstruction,
+                "encoder_vecs": encoder_vecs,
+                "decoder_vecs": empty_decoder_vecs,
+                "encoder_to_decoder_map": torch.empty((0,), device=device, dtype=torch.long),
+                "decoder_locations": empty_locations,
+                "chunked_decoder_state": {
+                    "source_layers": layer_ids,
+                    "positions": pos_ids,
+                    "feature_ids": feat_ids,
+                    "activation_values": activation_matrix.values(),
+                },
+            }
+            if sparsification_stats is not None:
+                attribution_data["sparsification_stats"] = sparsification_stats
+            return attribution_data
 
         for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
             layer_mask = layer_ids == layer
@@ -404,8 +715,12 @@ class TranscoderSet(nn.Module):
         attribution_data = {
             "activation_matrix": activation_matrix,
             "reconstruction": reconstruction,
-            "encoder_vecs": torch.cat(encoder_vectors, dim=0),
-            "decoder_vecs": torch.cat(decoder_vectors, dim=0),
+            "encoder_vecs": torch.cat(encoder_vectors, dim=0)
+            if encoder_vectors
+            else torch.empty((0, self.d_model), device=device, dtype=self.dtype),
+            "decoder_vecs": torch.cat(decoder_vectors, dim=0)
+            if decoder_vectors
+            else torch.empty((0, self.d_model), device=device, dtype=activation_matrix.dtype),
             "encoder_to_decoder_map": encoder_to_decoder_map,
             "decoder_locations": activation_matrix.indices()[:2],
         }
@@ -531,8 +846,8 @@ def load_gemma_scope_2_transcoder(
         layer: Layer index for the transcoder
         device: Device to load to
         dtype: Data type to use
-        lazy_encoder: Whether to use lazy loading for encoder weights (not supported for GemmaScope2 format)
-        lazy_decoder: Whether to use lazy loading for decoder weights (not supported for GemmaScope2 format)
+        lazy_encoder: Whether to use lazy loading for encoder weights
+        lazy_decoder: Whether to use lazy loading for decoder weights
 
     Returns:
         SingleLayerTranscoder: The loaded transcoder
@@ -540,31 +855,26 @@ def load_gemma_scope_2_transcoder(
     if device is None:
         device = get_default_device()
 
-    if lazy_encoder or lazy_decoder:
-        warnings.warn(
-            "Lazy loading is not supported for GemmaScope2 format due to different key naming conventions. "
-            "Setting lazy_encoder=False and lazy_decoder=False. If you wish to use lazy loading, please "
-            "cache the relevant transcoders via circuit_tracer.utils.caching.save_transcoders_to_cache",
-            UserWarning,
-        )
-        lazy_encoder = False
-        lazy_decoder = False
-
     with safe_open(path, framework="pt", device=device.type) as f:
-        state_dict = {k: f.get_tensor(k) for k in f.keys()}
-
-    param_dict = {
-        "W_enc": state_dict["w_enc"].T.contiguous().to(device=device, dtype=dtype),
-        "W_dec": state_dict["w_dec"].to(device=device, dtype=dtype),
-        "b_enc": state_dict["b_enc"].to(device=device, dtype=dtype),
-        "b_dec": state_dict["b_dec"].to(device=device, dtype=dtype),
-        "activation_function.threshold": state_dict["threshold"].to(device=device, dtype=dtype),
-    }
-
-    if "affine_skip_connection" in state_dict:
-        param_dict["W_skip"] = (
-            state_dict["affine_skip_connection"].T.contiguous().to(device=device, dtype=dtype)
-        )
+        b_enc = f.get_tensor("b_enc").to(device=device, dtype=dtype)
+        b_dec = f.get_tensor("b_dec").to(device=device, dtype=dtype)
+        param_dict = {
+            "b_enc": b_enc,
+            "b_dec": b_dec,
+            "activation_function.threshold": f.get_tensor("threshold").to(
+                device=device, dtype=dtype
+            ),
+        }
+        if not lazy_encoder:
+            param_dict["W_enc"] = (
+                f.get_tensor("w_enc").T.contiguous().to(device=device, dtype=dtype)
+            )
+        if not lazy_decoder:
+            param_dict["W_dec"] = f.get_tensor("w_dec").to(device=device, dtype=dtype)
+        if "affine_skip_connection" in f.keys():
+            param_dict["W_skip"] = (
+                f.get_tensor("affine_skip_connection").T.contiguous().to(device=device, dtype=dtype)
+            )
 
     d_transcoder = param_dict["b_enc"].shape[0]
     d_model = param_dict["b_dec"].shape[0]
@@ -578,6 +888,10 @@ def load_gemma_scope_2_transcoder(
             activation_function,
             layer,
             skip_connection="W_skip" in param_dict,
+            transcoder_path=path,
+            lazy_encoder=lazy_encoder,
+            lazy_decoder=lazy_decoder,
+            weight_format="gemmascope2",
         )
 
     transcoder.load_state_dict(param_dict, assign=True)
@@ -594,6 +908,9 @@ def load_transcoder_set(
     special_load_fn: Literal["gemma-scope", "gemma-scope-2", None] = None,
     lazy_encoder: bool = True,
     lazy_decoder: bool = True,
+    exact_chunked_provider: bool = False,
+    decoder_chunk_size: int = 1024,
+    cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
 ) -> TranscoderSet:
     if device is None:
         device = get_default_device()
@@ -613,17 +930,12 @@ def load_transcoder_set(
     Returns:
         TranscoderSet: The loaded transcoder set with all configuration
     """
+    if exact_chunked_provider:
+        decoder_chunk_size = _validate_decoder_chunk_size(decoder_chunk_size)
 
     transcoders = {}
     for layer in range(len(transcoder_paths)):
-        npz_format = Path(transcoder_paths[layer]).suffix == ".npz"
-
-        if special_load_fn == "gemma-scope" and npz_format:
-            load_fn = load_gemma_scope_transcoder
-        elif special_load_fn == "gemma-scope-2":
-            load_fn = load_gemma_scope_2_transcoder
-        else:
-            load_fn = load_relu_transcoder
+        load_fn = select_single_layer_transcoder_load_fn(transcoder_paths[layer], special_load_fn)
 
         transcoders[layer] = load_fn(
             transcoder_paths[layer],
@@ -644,4 +956,7 @@ def load_transcoder_set(
         feature_input_hook=feature_input_hook,
         feature_output_hook=feature_output_hook,
         scan=scan,
+        exact_chunked_provider=exact_chunked_provider,
+        decoder_chunk_size=decoder_chunk_size,
+        cross_batch_decoder_cache_bytes=cross_batch_decoder_cache_bytes,
     )

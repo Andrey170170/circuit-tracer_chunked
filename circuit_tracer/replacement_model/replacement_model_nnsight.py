@@ -17,6 +17,10 @@ from circuit_tracer.attribution.context_nnsight import AttributionContext
 from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
+from circuit_tracer.transcoder.provider import (
+    get_transcoder_capabilities,
+    require_exact_chunked_provider,
+)
 from circuit_tracer.utils import get_default_device
 from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
 from circuit_tracer.utils.telemetry import get_memory_snapshot
@@ -713,7 +717,8 @@ class NNSightReplacementModel(LanguageModel):
         component_start = time.perf_counter()
         if callable(trace_event):
             trace_event("phase0.setup.components_start", backend="nnsight")
-        exact_chunked_decoder = getattr(transcoders, "exact_chunked_decoder", False)
+        transcoder_capabilities = get_transcoder_capabilities(transcoders)
+        exact_chunked_decoder = require_exact_chunked_provider(transcoders)
         exact_encoder_residency_requested = str(exact_encoder_residency).strip().lower()
         allowed_residency_modes = {"lazy", "active_cpu", "active_pinned_cpu"}
         if exact_encoder_residency_requested not in allowed_residency_modes:
@@ -728,10 +733,13 @@ class NNSightReplacementModel(LanguageModel):
             exact_encoder_residency_requested,
         )
         exact_encoder_residency_fallback_reason: str | None = None
-        if exact_encoder_residency_effective != "lazy" and not exact_chunked_decoder:
+        exact_encoder_residency_supported = bool(
+            exact_chunked_decoder and transcoder_capabilities.supports_exact_encoder_residency
+        )
+        if exact_encoder_residency_effective != "lazy" and not exact_encoder_residency_supported:
             exact_encoder_residency_effective = "lazy"
             exact_encoder_residency_fallback_reason = (
-                "active encoder residency requires exact_chunked_decoder=True; "
+                "active encoder residency requires exact encoder-residency provider support; "
                 "falling back to lazy execution"
             )
 
@@ -832,7 +840,7 @@ class NNSightReplacementModel(LanguageModel):
             row_subchunk_size=row_subchunk_size,
             exact_encoder_residency=cast(
                 Literal["lazy", "active_cpu", "active_pinned_cpu"],
-                exact_encoder_residency_requested,
+                exact_encoder_residency_effective,
             ),
             materialized_encoder_vecs_during_phase0=materialize_encoder_vecs_phase0,
             internal_precision_requested=internal_precision_requested,

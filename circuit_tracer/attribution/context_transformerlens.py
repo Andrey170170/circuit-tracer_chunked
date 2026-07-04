@@ -169,6 +169,41 @@ class AttributionContext:
         self.clear_decoder_cache()
         self.decoder_chunk_cache = self._create_decoder_cache()
 
+
+    def materialize_encoder_vectors(
+        self,
+        indices: torch.Tensor | slice,
+        *,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        if self.encoder_vecs.numel() > 0:
+            if isinstance(indices, slice):
+                result = self.encoder_vecs[indices]
+            else:
+                result = self.encoder_vecs[indices.to(device=self.encoder_vecs.device, dtype=torch.long)]
+            return result if device is None else result.to(device=device)
+
+        if self.chunked_decoder_state is None:
+            raise RuntimeError("encoder vectors are unavailable and no chunked state was provided")
+        materialize_rows = getattr(self.decoder_provider, "materialize_encoder_rows", None)
+        if not callable(materialize_rows):
+            raise RuntimeError("decoder_provider does not support materialize_encoder_rows")
+        total_active_feats = self.activation_matrix._nnz()
+        if isinstance(indices, slice):
+            row_indices = torch.arange(
+                total_active_feats,
+                device=self.chunked_decoder_state["source_layers"].device,
+                dtype=torch.long,
+            )[indices]
+        else:
+            row_indices = indices.to(
+                device=self.chunked_decoder_state["source_layers"].device, dtype=torch.long
+            )
+        source_layers = self.chunked_decoder_state["source_layers"][row_indices]
+        feature_ids = self.chunked_decoder_state["feature_ids"][row_indices]
+        result = materialize_rows(source_layers=source_layers, feature_ids=feature_ids)
+        return result if device is None else result.to(device=device)
+
     def apply_diagnostic_feature_cap(self, max_features: int) -> tuple[int, int]:
         total_active_feats = self.activation_matrix._nnz()
         if max_features >= total_active_feats:
@@ -187,7 +222,8 @@ class AttributionContext:
             device=self.activation_matrix.device,
             dtype=self.activation_matrix.dtype,
         ).coalesce()
-        self.encoder_vecs = self.encoder_vecs[selected]
+        if self.encoder_vecs.numel() > 0:
+            self.encoder_vecs = self.encoder_vecs[selected.to(device=self.encoder_vecs.device)]
 
         if self.chunked_decoder_state is not None:
             for key in self.chunked_decoder_state:
@@ -252,9 +288,13 @@ class AttributionContext:
             if span is None:
                 continue
 
-            relevant_output_layers = [
-                layer for layer in active_output_layers if layer >= source_layer
-            ]
+            layer_selector = getattr(self.decoder_provider, "decoder_output_layers_for_source", None)
+            if callable(layer_selector):
+                relevant_output_layers = layer_selector(source_layer, active_output_layers)
+            else:
+                relevant_output_layers = [
+                    layer for layer in active_output_layers if layer >= source_layer
+                ]
             if not relevant_output_layers:
                 continue
 
@@ -299,7 +339,12 @@ class AttributionContext:
                         )
                         grad_cache[output_layer] = typed_grads
 
-                    decoder_vectors = decoder_chunk[:, output_layer - source_layer]
+                    slot_selector = getattr(self.decoder_provider, "decoder_output_slot", None)
+                    if callable(slot_selector):
+                        decoder_slot = slot_selector(source_layer, output_layer)
+                    else:
+                        decoder_slot = output_layer - source_layer
+                    decoder_vectors = decoder_chunk[:, decoder_slot]
                     for row_subchunk_idx, row_start in enumerate(
                         range(0, len(chunk_rows), row_subchunk_size),
                         start=1,

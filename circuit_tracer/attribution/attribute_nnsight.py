@@ -52,6 +52,10 @@ from circuit_tracer.graph import (
     compute_partial_influences,
 )
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
+from circuit_tracer.transcoder.provider import (
+    get_transcoder_capabilities,
+    require_exact_chunked_provider,
+)
 from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.utils.telemetry import (
     TelemetryRecorder,
@@ -1931,10 +1935,10 @@ def _resolve_phase4_refresh_optimization_config(
     phase4_refresh_optimization: str,
     *,
     compact_output: bool,
-    exact_chunked_decoder: bool,
+    exact_chunked_provider_enabled: bool,
 ) -> _Phase4RefreshOptimizationConfig:
     requested_mode = _resolve_phase4_refresh_optimization_mode(phase4_refresh_optimization)
-    refresh_optimization_applicable = bool(compact_output and exact_chunked_decoder)
+    refresh_optimization_applicable = bool(compact_output and exact_chunked_provider_enabled)
     effective_mode = cast(
         Literal["off", "v1"],
         requested_mode if requested_mode == "off" or refresh_optimization_applicable else "off",
@@ -1989,10 +1993,10 @@ def _resolve_phase4_row_executor_config(
     phase4_row_executor: str,
     *,
     compact_output: bool,
-    exact_chunked_decoder: bool,
+    exact_chunked_provider_enabled: bool,
 ) -> _Phase4RowExecutorConfig:
     requested_mode = _resolve_phase4_row_executor_mode(phase4_row_executor)
-    streaming_executor_applicable = bool(compact_output and exact_chunked_decoder)
+    streaming_executor_applicable = bool(compact_output and exact_chunked_provider_enabled)
     effective_mode = cast(
         Literal["batched", "streaming_v1"],
         (
@@ -2056,10 +2060,10 @@ def _resolve_phase4_row_reduction_config(
     phase4_row_reduction: str,
     *,
     compact_output: bool,
-    exact_chunked_decoder: bool,
+    exact_chunked_provider_enabled: bool,
 ) -> _Phase4RowReductionConfig:
     requested_mode = _resolve_phase4_row_reduction_mode(phase4_row_reduction)
-    gpu_v1_applicable = bool(compact_output and exact_chunked_decoder)
+    gpu_v1_applicable = bool(compact_output and exact_chunked_provider_enabled)
     effective_mode = cast(
         Literal["off", "gpu_v1"],
         requested_mode if requested_mode == "off" or gpu_v1_applicable else "off",
@@ -2332,13 +2336,13 @@ def _resolve_phase4_refresh_policy_config(
     phase4_refresh_policy: str,
     phase4_refresh_interval_multiplier: int,
     compact_output: bool,
-    exact_chunked_decoder: bool,
+    exact_chunked_provider_enabled: bool,
 ) -> _Phase4RefreshPolicyConfig:
     requested_policy = _resolve_phase4_refresh_policy(phase4_refresh_policy)
     requested_interval_multiplier = _resolve_phase4_refresh_interval_multiplier(
         phase4_refresh_interval_multiplier
     )
-    policy_applicable = bool(compact_output and exact_chunked_decoder)
+    policy_applicable = bool(compact_output and exact_chunked_provider_enabled)
 
     fallback_reason: str | None = None
     if requested_policy == "deferred_v1" and not policy_applicable:
@@ -2348,7 +2352,7 @@ def _resolve_phase4_refresh_policy_config(
             "standard_reference_execution"
         )
         fallback_reason = (
-            "deferred_v1 requires compact_output=True and exact_chunked_decoder=True; "
+            "deferred_v1 requires compact_output=True and exact chunked provider support; "
             "falling back to standard execution"
         )
     elif requested_policy == "standard":
@@ -2643,16 +2647,16 @@ def _resolve_row_store_cache_control_config(
     row_store_cache_control: str,
     *,
     compact_output: bool,
-    exact_chunked_decoder: bool,
+    supports_compact_row_store: bool,
 ) -> _RowStoreCacheControlConfig:
     requested_mode = _resolve_row_store_cache_control(row_store_cache_control)
-    mode_applicable = bool(compact_output and exact_chunked_decoder)
+    mode_applicable = bool(compact_output and supports_compact_row_store)
     fallback_reason: str | None = None
     if requested_mode != "off" and not mode_applicable:
         effective_mode = cast(_RowStoreCacheControlMode, "off")
         fallback_reason = (
             f"{requested_mode} requires compact_output=True and "
-            "exact_chunked_decoder=True; falling back to off execution"
+            "compact row-store provider support; falling back to off execution"
         )
     else:
         effective_mode = cast(
@@ -2779,15 +2783,15 @@ def _resolve_exact_encoder_residency(
 def _resolve_exact_encoder_residency_config(
     exact_encoder_residency: str,
     *,
-    exact_chunked_decoder: bool,
+    supports_exact_encoder_residency: bool,
 ) -> _ExactEncoderResidencyConfig:
     requested_mode = _resolve_exact_encoder_residency(exact_encoder_residency)
-    mode_applicable = bool(exact_chunked_decoder)
+    mode_applicable = bool(supports_exact_encoder_residency)
     fallback_reason: str | None = None
     if requested_mode != "lazy" and not mode_applicable:
         effective_mode = cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], "lazy")
         fallback_reason = (
-            "active encoder residency requires exact_chunked_decoder=True; "
+            "active encoder residency requires exact encoder-residency provider support; "
             "falling back to lazy execution"
         )
     else:
@@ -6961,7 +6965,7 @@ def _plan_phase4_feature_batch_size_preflight(
             model.configure_skip_connection(tracer, barrier=detach_barrier)
             ctx.cache_residual(model, tracer, barrier=detach_barrier)
 
-        exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
+        exact_chunked_decoder = require_exact_chunked_provider(model.transcoders)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
 
         # Build probe candidates using the same Phase-3 attribution targets and
@@ -7823,8 +7827,20 @@ def _run_attribution(
         internal_precision_requested=internal_precision_requested,
         phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,
     )
-    exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
-    use_compact_feature_row_store = compact_output and exact_chunked_decoder
+    transcoder_capabilities = get_transcoder_capabilities(model.transcoders)
+    exact_chunked_provider_enabled = require_exact_chunked_provider(model.transcoders)
+    supports_compact_row_store = bool(
+        exact_chunked_provider_enabled and transcoder_capabilities.supports_compact_row_store
+    )
+    supports_decoder_chunk_cache = bool(
+        exact_chunked_provider_enabled and transcoder_capabilities.supports_decoder_chunk_cache
+    )
+    supports_exact_encoder_residency = bool(
+        exact_chunked_provider_enabled and transcoder_capabilities.supports_exact_encoder_residency
+    )
+    # Compatibility/debug breadcrumb for historical metadata and helper plumbing.
+    exact_chunked_decoder = exact_chunked_provider_enabled
+    use_compact_feature_row_store = compact_output and supports_compact_row_store
     feature_row_storage_dtype = _dtype_from_name(resolved_dtype_map["feature_row_storage_dtype"])
     row_abs_sum_dtype = _dtype_from_name(resolved_dtype_map["row_abs_sum_dtype"])
     influence_compute_dtype = _dtype_from_name(resolved_dtype_map["influence_compute_dtype"])
@@ -7851,7 +7867,7 @@ def _run_attribution(
     phase4_refresh_optimization_config = _resolve_phase4_refresh_optimization_config(
         phase4_refresh_optimization,
         compact_output=compact_output,
-        exact_chunked_decoder=exact_chunked_decoder,
+        exact_chunked_provider_enabled=supports_compact_row_store,
     )
     phase4_refresh_optimization_metadata = _build_phase4_refresh_optimization_metadata(
         phase4_refresh_optimization_config
@@ -7860,7 +7876,9 @@ def _run_attribution(
         use_compact_feature_row_store and phase4_refresh_optimization_config.effective_mode == "v1"
     )
     phase4_refresh_prepared_chunk_cache_bytes_effective = (
-        int(phase4_refresh_prepared_chunk_cache_bytes) if phase4_refresh_aux_applicable else 0
+        int(phase4_refresh_prepared_chunk_cache_bytes)
+        if phase4_refresh_aux_applicable and supports_decoder_chunk_cache
+        else 0
     )
     phase4_refresh_active_row_accumulation_effective = (
         phase4_refresh_active_row_accumulation if phase4_refresh_aux_applicable else "zero_fill"
@@ -7888,13 +7906,13 @@ def _run_attribution(
     phase4_row_executor_config = _resolve_phase4_row_executor_config(
         phase4_row_executor,
         compact_output=compact_output,
-        exact_chunked_decoder=exact_chunked_decoder,
+        exact_chunked_provider_enabled=supports_compact_row_store,
     )
     phase4_row_executor_metadata = _build_phase4_row_executor_metadata(phase4_row_executor_config)
     phase4_row_reduction_config = _resolve_phase4_row_reduction_config(
         phase4_row_reduction,
         compact_output=compact_output,
-        exact_chunked_decoder=exact_chunked_decoder,
+        exact_chunked_provider_enabled=supports_compact_row_store,
     )
     phase4_row_reduction_metadata = _build_phase4_row_reduction_metadata(
         phase4_row_reduction_config
@@ -7924,7 +7942,7 @@ def _run_attribution(
         phase4_refresh_policy=phase4_refresh_policy,
         phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
         compact_output=compact_output,
-        exact_chunked_decoder=exact_chunked_decoder,
+        exact_chunked_provider_enabled=supports_compact_row_store,
     )
     phase4_refresh_policy_metadata = _build_phase4_refresh_policy_metadata(
         phase4_refresh_policy_config
@@ -7934,14 +7952,14 @@ def _run_attribution(
     row_store_cache_control_config = _resolve_row_store_cache_control_config(
         row_store_cache_control,
         compact_output=compact_output,
-        exact_chunked_decoder=exact_chunked_decoder,
+        supports_compact_row_store=supports_compact_row_store,
     )
     row_store_cache_control_metadata = _build_row_store_cache_control_metadata(
         row_store_cache_control_config
     )
     exact_encoder_residency_config = _resolve_exact_encoder_residency_config(
         exact_encoder_residency,
-        exact_chunked_decoder=exact_chunked_decoder,
+        supports_exact_encoder_residency=supports_exact_encoder_residency,
     )
     exact_encoder_residency_metadata = _build_exact_encoder_residency_metadata(
         exact_encoder_residency_config
@@ -7974,6 +7992,13 @@ def _run_attribution(
         attrs={
             "profile": profile,
             "compact_output": compact_output,
+            "transcoder_architecture": transcoder_capabilities.architecture,
+            "transcoder_checkpoint_format": transcoder_capabilities.checkpoint_format,
+            "exact_chunked_provider_enabled": exact_chunked_provider_enabled,
+            "supports_compact_row_store": supports_compact_row_store,
+            "supports_decoder_chunk_cache": supports_decoder_chunk_cache,
+            "supports_exact_encoder_residency": supports_exact_encoder_residency,
+            "decoder_output_topology": transcoder_capabilities.decoder_output_topology,
             "batch_size": batch_size,
             "feature_batch_size": feature_batch_size,
             "logit_batch_size": logit_batch_size,
@@ -8030,7 +8055,6 @@ def _run_attribution(
     if (not planner_enabled) and max_phase4_feature_batch_size < effective_feature_batch_size:
         raise ValueError("feature_batch_size_max must be >= the effective feature batch size")
 
-    exact_chunked_decoder = bool(getattr(model.transcoders, "exact_chunked_decoder", False))
     planner_status, planner_skip_reason = _resolve_phase4_feature_batch_planner_status(
         planner_enabled=planner_enabled,
         effective_feature_batch_size=effective_feature_batch_size,
@@ -8042,52 +8066,52 @@ def _run_attribution(
     cross_cluster_debug_batches: list[dict[str, object]] | None = None
     if phase4_anomaly_debug_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
-            "Phase-4 anomaly debug requires compact_output=True and exact_chunked_decoder=True"
+            "Phase-4 anomaly debug requires compact_output=True and exact chunked provider support"
         )
     if cross_cluster_debug_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
-            "cross_cluster_debug requires compact_output=True and exact_chunked_decoder=True"
+            "cross_cluster_debug requires compact_output=True and exact chunked provider support"
         )
     if capture_phase0_donor_bundle_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "capture_phase0_donor_bundle requires compact_output=True and "
-            "exact_chunked_decoder=True"
+            "exact chunked provider support"
         )
     if capture_phase3_seed_bundle_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
-            "capture_phase3_seed_bundle requires compact_output=True and exact_chunked_decoder=True"
+            "capture_phase3_seed_bundle requires compact_output=True and exact chunked provider support"
         )
     if capture_phase3_gradient_bundle_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
             "capture_phase3_gradient_bundle requires compact_output=True and "
-            "exact_chunked_decoder=True"
+            "exact chunked provider support"
         )
     if capture_phase3_row_bundle_enabled and not (compact_output and exact_chunked_decoder):
         raise ValueError(
-            "capture_phase3_row_bundle requires compact_output=True and exact_chunked_decoder=True"
+            "capture_phase3_row_bundle requires compact_output=True and exact chunked provider support"
         )
     if capture_feature_semantic_descriptors_enabled and not (
         compact_output and exact_chunked_decoder
     ):
         raise ValueError(
             "capture_feature_semantic_descriptors requires compact_output=True and "
-            "exact_chunked_decoder=True"
+            "exact chunked provider support"
         )
     if phase0_replay_mode_resolved != "disabled" and not (compact_output and exact_chunked_decoder):
         raise ValueError(
-            "phase0 donor replay requires compact_output=True and exact_chunked_decoder=True"
+            "phase0 donor replay requires compact_output=True and exact chunked provider support"
         )
     if phase3_gradient_replay_mode_resolved != "disabled" and not (
         compact_output and exact_chunked_decoder
     ):
         raise ValueError(
-            "Phase-3 gradient replay requires compact_output=True and exact_chunked_decoder=True"
+            "Phase-3 gradient replay requires compact_output=True and exact chunked provider support"
         )
     if phase3_row_replay_mode_resolved != "disabled" and not (
         compact_output and exact_chunked_decoder
     ):
         raise ValueError(
-            "Phase-3 row replay requires compact_output=True and exact_chunked_decoder=True"
+            "Phase-3 row replay requires compact_output=True and exact chunked provider support"
         )
     if phase4_anomaly_debug_enabled:
         anomaly_debug_result = {
@@ -8140,9 +8164,9 @@ def _run_attribution(
         }
         cross_cluster_debug_checkpoints = []
         cross_cluster_debug_batches = []
-    if planner_enabled and not (compact_output and exact_chunked_decoder):
+    if planner_enabled and not (compact_output and supports_compact_row_store):
         raise ValueError(
-            "Phase-4 feature batch planner requires compact_output=True and exact_chunked_decoder=True"
+            "Phase-4 feature batch planner requires compact_output=True and compact row-store provider support"
         )
     if planner_enabled:
         if planner_status == "skipped_no_headroom":
@@ -8187,7 +8211,7 @@ def _run_attribution(
                 stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
                 stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
                 row_subchunk_size=row_subchunk_size,
-                exact_encoder_residency=exact_encoder_residency_config.requested_mode,
+                exact_encoder_residency=exact_encoder_residency_config.effective_mode,
                 diagnostic_feature_cap=diagnostic_feature_cap,
                 feature_batch_target_reserved_fraction=feature_batch_target_reserved_fraction,
                 feature_batch_min_free_fraction=feature_batch_min_free_fraction,
@@ -8290,7 +8314,8 @@ def _run_attribution(
             "Profiling enabled | "
             f"lazy_encoder={getattr(model.transcoders, 'lazy_encoder', 'n/a')} | "
             f"lazy_decoder={getattr(model.transcoders, 'lazy_decoder', 'n/a')} | "
-            f"exact_chunked_decoder={getattr(model.transcoders, 'exact_chunked_decoder', False)} | "
+            f"exact_chunked_provider_enabled={exact_chunked_provider_enabled} | "
+            f"exact_chunked_decoder={exact_chunked_decoder} | "
             f"decoder_chunk_size={getattr(model.transcoders, 'decoder_chunk_size', 'n/a')} | "
             f"decoder_cache_bytes={getattr(model.transcoders, 'cross_batch_decoder_cache_bytes', 0)} | "
             f"chunked_feature_replay_window={chunked_feature_replay_window} | "
@@ -8335,7 +8360,7 @@ def _run_attribution(
             stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
             stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
             row_subchunk_size=row_subchunk_size,
-            exact_encoder_residency=exact_encoder_residency_config.requested_mode,
+            exact_encoder_residency=exact_encoder_residency_config.effective_mode,
             internal_precision_requested=internal_precision_requested,
             resolved_dtype_map=resolved_dtype_map,
             prefix_view_length=prefix_view_length,
@@ -8631,11 +8656,7 @@ def _run_attribution(
                 stream_payload=phase0_stream_checkpoint,
             )
 
-        if (
-            offload
-            and not model.skip_transcoder
-            and not getattr(model.transcoders, "exact_chunked_decoder", False)
-        ):
+        if offload and not model.skip_transcoder and not exact_chunked_decoder:
             offload_handles += offload_modules(model.transcoders, offload)
 
         # Phase 1: forward pass
@@ -8688,9 +8709,7 @@ def _run_attribution(
             offload_handles += offload_modules(
                 [layer.mlp for layer in getattr(model.pre_logit_location, "layers")], offload
             )
-            if model.skip_transcoder and not getattr(
-                model.transcoders, "exact_chunked_decoder", False
-            ):
+            if model.skip_transcoder and not exact_chunked_decoder:
                 offload_handles += offload_modules(model.transcoders, offload)
 
         # Phase 2: build input vector list

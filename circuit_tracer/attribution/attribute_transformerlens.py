@@ -38,6 +38,7 @@ from circuit_tracer.graph import Graph, compute_partial_influences
 from circuit_tracer.replacement_model.replacement_model_transformerlens import (
     TransformerLensReplacementModel,
 )
+from circuit_tracer.transcoder.provider import exact_chunked_provider_usable, get_transcoder_capabilities
 from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.utils.telemetry import (
     diff_numeric_metrics,
@@ -223,7 +224,8 @@ def _run_attribution(
             "Profiling enabled | "
             f"lazy_encoder={getattr(model.transcoders, 'lazy_encoder', 'n/a')} | "
             f"lazy_decoder={getattr(model.transcoders, 'lazy_decoder', 'n/a')} | "
-            f"exact_chunked_decoder={getattr(model.transcoders, 'exact_chunked_decoder', False)} | "
+            f"exact_provider={exact_chunked_provider_usable(model.transcoders)} | "
+            f"decoder_topology={get_transcoder_capabilities(model.transcoders).decoder_output_topology} | "
             f"decoder_chunk_size={getattr(model.transcoders, 'decoder_chunk_size', 'n/a')} | "
             f"decoder_cache_bytes={getattr(model.transcoders, 'cross_batch_decoder_cache_bytes', 0)} | "
             f"prompt_tokens={input_ids.shape[-1]} | attribution_batch_size={batch_size}"
@@ -265,7 +267,7 @@ def _run_attribution(
                 )
         logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
 
-        if offload and not getattr(model.transcoders, "exact_chunked_decoder", False):
+        if offload and not exact_chunked_provider_usable(model.transcoders):
             offload_handles += offload_modules(model.transcoders, offload)
 
         # Phase 1: forward pass
@@ -394,7 +396,7 @@ def _run_attribution(
                 rows = ctx.compute_batch(
                     layers=feat_layers[idx_batch],
                     positions=feat_pos[idx_batch],
-                    inject_values=ctx.encoder_vecs[idx_batch],
+                    inject_values=ctx.materialize_encoder_vectors(idx_batch),
                     retain_graph=n_visited < max_feature_nodes,
                     phase_label="phase4_features",
                 )
