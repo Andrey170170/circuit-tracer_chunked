@@ -67,6 +67,9 @@ from circuit_tracer.utils.telemetry import (
 )
 
 
+_PHASE4_RANK_SELECTION_NEAR_CUTOFF_EPSILON = 1e-6
+
+
 def _log_phase_metrics(logger, label: str, phase_start: float, device, **extra):
     logger.info(
         f"{label} completed in {time.perf_counter() - phase_start:.2f}s | "
@@ -725,6 +728,10 @@ class _Phase4FrontierRankSelection:
     selected_order_hash: str | None
     selected_membership_hash: str | None
     cutoff_score: float | None
+    cutoff_gap: float | None
+    relative_cutoff_gap: float | None
+    near_cutoff_epsilon: float | None
+    near_cutoff_count: int
     tie_count_at_cutoff: int
     tie_at_cutoff: bool
     tie_behavior: str
@@ -2494,9 +2501,9 @@ def _compute_phase4_rank_selection_cutoff_metadata(
     selected_scores: torch.Tensor,
     selected_count: int,
     candidate_count: int,
-) -> tuple[float | None, int, bool]:
+) -> tuple[float | None, float | None, float | None, float | None, int, int, bool]:
     if selected_count <= 0 or candidate_count <= 0 or unvisited_scores.numel() <= 0:
-        return None, 0, False
+        return None, None, None, None, 0, 0, False
 
     scores_cpu = unvisited_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
     selected_scores_cpu = selected_scores.detach().to(device="cpu", dtype=torch.float64).flatten()
@@ -2507,17 +2514,65 @@ def _compute_phase4_rank_selection_cutoff_metadata(
         selected_count = int(selected_scores_cpu.numel())
 
     if selected_count <= 0:
-        return None, 0, False
+        return None, None, None, None, 0, 0, False
 
+    scores_cpu = scores_cpu[:candidate_count]
+    selected_scores_cpu = selected_scores_cpu[:selected_count]
     cutoff_score = float(selected_scores_cpu[selected_count - 1].item())
-    tie_count_at_cutoff = int((scores_cpu[:candidate_count] == cutoff_score).sum().item())
-    strictly_greater_count = int((scores_cpu[:candidate_count] > cutoff_score).sum().item())
+    selection_bound = bool(selected_count < candidate_count)
+    cutoff_gap: float | None = None
+    relative_cutoff_gap: float | None = None
+    near_cutoff_epsilon: float | None = None
+    near_cutoff_count = 0
+    tie_count_at_cutoff = int((scores_cpu == cutoff_score).sum().item())
+    strictly_greater_count = int((scores_cpu > cutoff_score).sum().item())
+    if selection_bound:
+        selected_at_cutoff = selected_count - strictly_greater_count
+        unselected_ties = tie_count_at_cutoff - max(selected_at_cutoff, 0)
+        if unselected_ties > 0:
+            cutoff_gap = 0.0
+        else:
+            below_cutoff_scores = scores_cpu[scores_cpu < cutoff_score]
+            if below_cutoff_scores.numel() > 0:
+                next_score = float(below_cutoff_scores.max().item())
+                cutoff_gap = float(cutoff_score - next_score)
+        if cutoff_score > 0:
+            relative_cutoff_gap = (
+                float(cutoff_gap / cutoff_score) if cutoff_gap is not None else None
+            )
+            near_cutoff_epsilon = float(_PHASE4_RANK_SELECTION_NEAR_CUTOFF_EPSILON)
+            near_boundary = cutoff_score * (1.0 - near_cutoff_epsilon)
+            near_cutoff_count = unselected_ties + int(
+                ((scores_cpu < cutoff_score) & (scores_cpu >= near_boundary)).sum().item()
+            )
     tie_at_cutoff = bool(
         selected_count < candidate_count
         and tie_count_at_cutoff > 1
         and strictly_greater_count < selected_count
     )
-    return cutoff_score, tie_count_at_cutoff, tie_at_cutoff
+    return (
+        cutoff_score,
+        cutoff_gap,
+        relative_cutoff_gap,
+        near_cutoff_epsilon,
+        near_cutoff_count,
+        tie_count_at_cutoff,
+        tie_at_cutoff,
+    )
+
+
+def _compute_phase4_rank_selection_max_feature_nodes_cap_bound(
+    *,
+    candidate_count: int,
+    actual_max_feature_nodes: int,
+    n_visited: int,
+    max_frontier_size: int,
+) -> bool:
+    remaining_feature_budget = max(0, int(actual_max_feature_nodes - n_visited))
+    return bool(
+        int(candidate_count) > remaining_feature_budget
+        and int(max_frontier_size) >= remaining_feature_budget
+    )
 
 
 def _select_phase4_frontier_rank_selection(
@@ -2548,6 +2603,10 @@ def _select_phase4_frontier_rank_selection(
             selected_order_hash=None,
             selected_membership_hash=None,
             cutoff_score=None,
+            cutoff_gap=None,
+            relative_cutoff_gap=None,
+            near_cutoff_epsilon=None,
+            near_cutoff_count=0,
             tie_count_at_cutoff=0,
             tie_at_cutoff=False,
             tie_behavior=_PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE[ranker_mode],
@@ -2599,13 +2658,19 @@ def _select_phase4_frontier_rank_selection(
         )
         unvisited_scores = unvisited_scores_device.detach().to(device="cpu", dtype=torch.float64)
 
-    cutoff_score, tie_count_at_cutoff, tie_at_cutoff = (
-        _compute_phase4_rank_selection_cutoff_metadata(
-            unvisited_scores=unvisited_scores,
-            selected_scores=selected_scores,
-            selected_count=selected_count,
-            candidate_count=candidate_count,
-        )
+    (
+        cutoff_score,
+        cutoff_gap,
+        relative_cutoff_gap,
+        near_cutoff_epsilon,
+        near_cutoff_count,
+        tie_count_at_cutoff,
+        tie_at_cutoff,
+    ) = _compute_phase4_rank_selection_cutoff_metadata(
+        unvisited_scores=unvisited_scores,
+        selected_scores=selected_scores,
+        selected_count=selected_count,
+        candidate_count=candidate_count,
     )
 
     selected_membership_hash = (
@@ -2624,6 +2689,10 @@ def _select_phase4_frontier_rank_selection(
         selected_order_hash=selected_order_hash,
         selected_membership_hash=selected_membership_hash,
         cutoff_score=cutoff_score,
+        cutoff_gap=cutoff_gap,
+        relative_cutoff_gap=relative_cutoff_gap,
+        near_cutoff_epsilon=near_cutoff_epsilon,
+        near_cutoff_count=near_cutoff_count,
         tie_count_at_cutoff=tie_count_at_cutoff,
         tie_at_cutoff=tie_at_cutoff,
         tie_behavior=_PHASE4_RANKER_TIE_BEHAVIOR_BY_MODE[ranker_mode],
@@ -10457,6 +10526,15 @@ def _run_attribution(
                         visited,
                     )
 
+                max_feature_nodes_cap_bound = (
+                    _compute_phase4_rank_selection_max_feature_nodes_cap_bound(
+                        candidate_count=int(rank_selection.candidate_count),
+                        actual_max_feature_nodes=int(actual_max_feature_nodes),
+                        n_visited=int(n_visited),
+                        max_frontier_size=int(max_frontier_size),
+                    )
+                )
+
                 ranker_refresh_telemetry = {
                     "ranker_frontier_candidate_count": int(rank_selection.candidate_count),
                     "ranker_frontier_selected_count": int(rank_selection.selected_count),
@@ -10466,6 +10544,13 @@ def _run_attribution(
                         rank_selection.selected_membership_hash
                     ),
                     "ranker_frontier_cutoff_score": rank_selection.cutoff_score,
+                    "ranker_frontier_cutoff_gap": rank_selection.cutoff_gap,
+                    "ranker_frontier_relative_cutoff_gap": rank_selection.relative_cutoff_gap,
+                    "ranker_frontier_near_cutoff_epsilon": rank_selection.near_cutoff_epsilon,
+                    "ranker_frontier_near_cutoff_count": int(rank_selection.near_cutoff_count),
+                    "ranker_frontier_max_feature_nodes_cap_bound": bool(
+                        max_feature_nodes_cap_bound
+                    ),
                     "ranker_frontier_tie_count_at_cutoff": int(rank_selection.tie_count_at_cutoff),
                     "ranker_frontier_tie_at_cutoff": bool(rank_selection.tie_at_cutoff),
                     "ranker_frontier_tie_behavior": rank_selection.tie_behavior,
@@ -10497,21 +10582,8 @@ def _run_attribution(
                         )
                         for eps in (0.001, 0.01, 0.05)
                     }
-                    next_score = (
-                        float(
-                            unvisited_scores_for_cutoff[int(rank_selection.selected_count)].item()
-                        )
-                        if int(rank_selection.selected_count) < unvisited_scores_for_cutoff.numel()
-                        else None
-                    )
-                    cutoff_gap = (
-                        None if next_score is None else float(cutoff_score_for_profile - next_score)
-                    )
                     ranker_refresh_telemetry["ranker_frontier_near_cutoff_counts"] = (
                         near_cutoff_counts
-                    )
-                    ranker_refresh_telemetry["ranker_frontier_relative_cutoff_gap"] = (
-                        None if cutoff_gap is None else float(cutoff_gap / cutoff_score_for_profile)
                     )
                 candidate_scores: torch.Tensor | None = None
                 rank_signal_stats: dict[str, object] | None = None

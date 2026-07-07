@@ -1,7 +1,10 @@
+import pytest
 import torch
 
 from circuit_tracer.attribution.attribute_nnsight import (
     _build_phase4_frontier_buffer_decision,
+    _compute_phase4_rank_selection_max_feature_nodes_cap_bound,
+    _select_phase4_frontier_rank_selection,
 )
 
 
@@ -66,3 +69,104 @@ def test_phase4_frontier_buffer_capacity_exhausted_fallback():
 
     assert decision["effective"] is False
     assert decision["event"]["fallback_reason"] == "capacity_or_budget_exhausted"
+
+
+def test_phase4_rank_selection_reports_binding_cutoff_margin():
+    selection = _select_phase4_frontier_rank_selection(
+        feature_influences=torch.tensor([10.0, 9.0, 8.0, 7.999996, 1.0], dtype=torch.float64),
+        visited=torch.zeros(5, dtype=torch.bool),
+        frontier_size=3,
+        ranker_mode="argsort",
+    )
+
+    assert selection.cutoff_score == 8.0
+    assert selection.cutoff_gap == pytest.approx(4e-6)
+    assert selection.relative_cutoff_gap == pytest.approx(
+        selection.cutoff_gap / selection.cutoff_score
+    )
+    assert selection.near_cutoff_epsilon == 1e-6
+    assert selection.near_cutoff_count == 1
+
+
+def test_phase4_rank_selection_topk_v1_reports_unselected_ties_and_near_cutoff_gap():
+    selection = _select_phase4_frontier_rank_selection(
+        feature_influences=torch.tensor([7.0, 0.5, 8.0, 1.0, 7.9999992, 8.0], dtype=torch.float64),
+        visited=torch.zeros(6, dtype=torch.bool),
+        frontier_size=1,
+        ranker_mode="topk_v1",
+    )
+
+    assert selection.cutoff_score == 8.0
+    assert selection.cutoff_gap == 0.0
+    assert selection.relative_cutoff_gap == 0.0
+    assert selection.near_cutoff_epsilon == 1e-6
+    assert selection.near_cutoff_count == 2
+    assert selection.tie_count_at_cutoff == 2
+    assert selection.tie_at_cutoff is True
+
+
+def test_phase4_rank_selection_nonbinding_has_no_cutoff_gap():
+    selection = _select_phase4_frontier_rank_selection(
+        feature_influences=torch.tensor([3.0, 2.0]),
+        visited=torch.zeros(2, dtype=torch.bool),
+        frontier_size=5,
+        ranker_mode="argsort",
+    )
+
+    assert selection.cutoff_score == 2.0
+    assert selection.cutoff_gap is None
+    assert selection.relative_cutoff_gap is None
+    assert selection.near_cutoff_epsilon is None
+    assert selection.near_cutoff_count == 0
+
+
+def test_phase4_rank_selection_empty_has_null_margin_telemetry():
+    selection = _select_phase4_frontier_rank_selection(
+        feature_influences=torch.tensor([3.0, 2.0]),
+        visited=torch.ones(2, dtype=torch.bool),
+        frontier_size=5,
+        ranker_mode="argsort",
+    )
+
+    assert selection.cutoff_score is None
+    assert selection.cutoff_gap is None
+    assert selection.relative_cutoff_gap is None
+    assert selection.near_cutoff_count == 0
+
+
+def test_phase4_rank_selection_nonpositive_cutoff_has_no_relative_gap():
+    selection = _select_phase4_frontier_rank_selection(
+        feature_influences=torch.tensor([1.0, 0.0, -0.5]),
+        visited=torch.zeros(3, dtype=torch.bool),
+        frontier_size=2,
+        ranker_mode="argsort",
+    )
+
+    assert selection.cutoff_score == 0.0
+    assert selection.cutoff_gap == 0.5
+    assert selection.relative_cutoff_gap is None
+    assert selection.near_cutoff_count == 0
+
+
+def test_phase4_rank_selection_max_feature_nodes_cap_bound_requires_budget_and_frontier_room():
+    assert (
+        _compute_phase4_rank_selection_max_feature_nodes_cap_bound(
+            candidate_count=5,
+            actual_max_feature_nodes=3,
+            n_visited=0,
+            max_frontier_size=3,
+        )
+        is True
+    )
+
+
+def test_phase4_rank_selection_max_feature_nodes_cap_bound_ignores_queue_window_only_clipping():
+    assert (
+        _compute_phase4_rank_selection_max_feature_nodes_cap_bound(
+            candidate_count=5,
+            actual_max_feature_nodes=10,
+            n_visited=0,
+            max_frontier_size=3,
+        )
+        is False
+    )
