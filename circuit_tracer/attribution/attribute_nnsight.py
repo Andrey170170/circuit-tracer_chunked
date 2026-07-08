@@ -68,6 +68,38 @@ from circuit_tracer.utils.telemetry import (
 
 
 _PHASE4_RANK_SELECTION_NEAR_CUTOFF_EPSILON = 1e-6
+_TELEMETRY_EXCEPTION_SUMMARY_ATTR = "circuit_tracer_telemetry_summary"
+_TELEMETRY_EXCEPTION_EVENTS_ATTR = "circuit_tracer_telemetry_events"
+
+
+def _attach_telemetry_export_to_exception(
+    exc: BaseException | None,
+    telemetry_export: Mapping[str, object],
+) -> None:
+    """Attach telemetry export to an exception for callers that persist failures.
+
+    ``attribute`` normally returns telemetry through the compact result. If an
+    exception interrupts the run before a compact result exists, the caller still
+    needs the recorded telemetry events to diagnose the failure. Best-effort
+    exception attributes avoid changing the public return type and survive common
+    wrappers such as NNsight exceptions.
+    """
+
+    if exc is None:
+        return
+    try:
+        setattr(
+            exc,
+            _TELEMETRY_EXCEPTION_SUMMARY_ATTR,
+            telemetry_export.get("summary"),
+        )
+        setattr(
+            exc,
+            _TELEMETRY_EXCEPTION_EVENTS_ATTR,
+            telemetry_export.get("events", []),
+        )
+    except Exception:  # pragma: no cover - defensive for unusual exception types
+        return
 
 
 def _log_phase_metrics(logger, label: str, phase_start: float, device, **extra):
@@ -12594,8 +12626,8 @@ def _run_attribution(
                 elapsed_ms=run_elapsed_ms,
             )
 
+        telemetry_export = telemetry_recorder.export(include_events=True)
         if compact_output_result is not None:
-            telemetry_export = telemetry_recorder.export(include_events=True)
             compact_output_result["telemetry_summary"] = telemetry_export["summary"]
             compact_output_result["telemetry_events"] = telemetry_export.get("events", [])
             if prefix_view_metadata is not None:
@@ -12619,11 +12651,14 @@ def _run_attribution(
                 and "cross_cluster_debug_batches" not in compact_output_result
             ):
                 compact_output_result["cross_cluster_debug_batches"] = cross_cluster_debug_batches
-        elif profile:
-            telemetry_summary = telemetry_recorder.build_summary()
-            logger.info(
-                "Telemetry summary | "
-                f"event_count={telemetry_summary.get('event_count')} | "
-                f"stored_event_count={telemetry_summary.get('stored_event_count')} | "
-                f"dropped_event_count={telemetry_summary.get('dropped_event_count')}"
-            )
+        else:
+            if exc is not None:
+                _attach_telemetry_export_to_exception(exc, telemetry_export)
+            if profile:
+                telemetry_summary = telemetry_export["summary"]
+                logger.info(
+                    "Telemetry summary | "
+                    f"event_count={telemetry_summary.get('event_count')} | "
+                    f"stored_event_count={telemetry_summary.get('stored_event_count')} | "
+                    f"dropped_event_count={telemetry_summary.get('dropped_event_count')}"
+                )

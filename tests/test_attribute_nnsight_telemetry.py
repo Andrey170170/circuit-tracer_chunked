@@ -11,6 +11,7 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _compute_row_abs_sums,
     _compute_row_denominator_scaled_l1,
     _FileBackedFeatureRowStore,
+    _attach_telemetry_export_to_exception,
     _build_row_transfer_telemetry,
     _resolve_phase3_effective_row_state,
     _row_abs_sums_to_scaled_l1,
@@ -69,6 +70,34 @@ def test_file_backed_feature_row_store_emits_structured_events() -> None:
     assert "feature_row_store.append_rows" in names
     assert "feature_row_store.read_rows" in names
     assert "feature_row_store.materialize_dense_slice" in names
+
+
+def test_telemetry_export_attaches_to_exception() -> None:
+    recorder = TelemetryRecorder(enabled=True)
+    recorder.record_event(
+        scope="phase",
+        name="phase1.forward",
+        phase="phase1",
+        elapsed_ms=12.5,
+        attrs={"active_features": 3},
+    )
+    exc = RuntimeError("synthetic failure")
+
+    _attach_telemetry_export_to_exception(exc, recorder.export(include_events=True))
+
+    summary = getattr(exc, "circuit_tracer_telemetry_summary")
+    events = getattr(exc, "circuit_tracer_telemetry_events")
+    assert summary["event_count"] == 1
+    assert events == [
+        {
+            "t_rel_ms": events[0]["t_rel_ms"],
+            "scope": "phase",
+            "name": "phase1.forward",
+            "phase": "phase1",
+            "elapsed_ms": 12.5,
+            "attrs": {"active_features": 3},
+        }
+    ]
 
 
 def test_file_backed_feature_row_store_prepared_cache_hits_invalidates_and_skips() -> None:
