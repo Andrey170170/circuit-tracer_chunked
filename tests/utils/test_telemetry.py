@@ -3,6 +3,7 @@ from pathlib import Path
 
 import torch
 
+from circuit_tracer.observability import resources
 import circuit_tracer.utils.telemetry as telemetry
 from circuit_tracer.utils.telemetry import (
     TelemetryRecorder,
@@ -179,6 +180,15 @@ def test_get_memory_snapshot_soft_fails_when_cgroup_is_unavailable(monkeypatch) 
     assert snapshot["cgroup_memory_peak_gib"] is None
     assert snapshot["cgroup_memory_anon_gib"] is None
     assert snapshot["cgroup_memory_file_gib"] is None
+
+
+def test_facade_respects_direct_resource_resolver_monkeypatch(monkeypatch) -> None:
+    monkeypatch.setattr(resources, "_resolve_cgroup_memory_dir", lambda: None)
+
+    snapshot = get_memory_snapshot(torch.device("cpu"))
+
+    assert snapshot["cgroup_memory_current_gib"] is None
+    assert snapshot["cgroup_memory_peak_gib"] is None
 
 
 def test_build_memory_before_after_attrs_emits_prefixed_values_and_deltas() -> None:
