@@ -7282,6 +7282,8 @@ def attribute(
     semantic_descriptor_top_k: int = 2048,
     semantic_descriptor_dim: int = 64,
     telemetry_max_events: int | None = None,
+    telemetry_jsonl_path: str | os.PathLike[str] | None = None,
+    telemetry_context: Mapping[str, object] | None = None,
     compact_output: bool = False,
     phase0_donor_bundle: str | os.PathLike[str] | None = None,
     phase0_replay_mode: Literal["disabled", "donor_phase0"] = "disabled",
@@ -7546,6 +7548,8 @@ def attribute(
             semantic_descriptor_top_k=semantic_descriptor_top_k,
             semantic_descriptor_dim=semantic_descriptor_dim,
             telemetry_max_events=telemetry_max_events,
+            telemetry_jsonl_path=telemetry_jsonl_path,
+            telemetry_context=telemetry_context,
             compact_output=compact_output,
             phase0_donor_bundle=phase0_donor_bundle,
             phase0_replay_mode=phase0_replay_mode,
@@ -7777,6 +7781,8 @@ def _run_attribution(
     semantic_descriptor_top_k: int = 2048,
     semantic_descriptor_dim: int = 64,
     telemetry_max_events: int | None = None,
+    telemetry_jsonl_path: str | os.PathLike[str] | None = None,
+    telemetry_context: Mapping[str, object] | None = None,
     compact_output: bool = False,
     phase0_donor_bundle: str | os.PathLike[str] | None = None,
     phase0_replay_mode: Literal["disabled", "donor_phase0"] = "disabled",
@@ -8086,6 +8092,8 @@ def _run_attribution(
     telemetry_recorder = TelemetryRecorder(
         enabled=(profile or compact_output or phase4_anomaly_debug_enabled),
         max_events=telemetry_max_events_resolved,
+        jsonl_path=telemetry_jsonl_path,
+        static_context=telemetry_context,
     )
     telemetry_recorder.record_event(
         scope="run",
@@ -12626,6 +12634,7 @@ def _run_attribution(
                 elapsed_ms=run_elapsed_ms,
             )
 
+        telemetry_recorder.close()
         telemetry_export = telemetry_recorder.export(include_events=True)
         if compact_output_result is not None:
             compact_output_result["telemetry_summary"] = telemetry_export["summary"]
