@@ -12,36 +12,57 @@ from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightRe
 
 
 class FakeStore:
-    def __init__(self) -> None:
+    def __init__(self, error: BaseException | None = None) -> None:
         self.cleanup_calls = 0
+        self.error = error
 
     def cleanup(self) -> None:
         self.cleanup_calls += 1
+        if self.error is not None:
+            raise self.error
 
 
 class FakeContext:
-    def __init__(self) -> None:
+    def __init__(self, error: BaseException | None = None) -> None:
         self.cleanup_calls = 0
+        self.error = error
 
     def cleanup(self) -> None:
         self.cleanup_calls += 1
+        if self.error is not None:
+            raise self.error
 
 
 class FakeLifecycleObserver:
-    def __init__(self) -> None:
+    def __init__(self, failures: set[str] | None = None) -> None:
         self.recorder = object()
         self.phase_events: list[dict[str, object]] = []
+        self.calls: list[str] = []
+        self.failures = failures or set()
 
-    def run(self, **_: object) -> None:
-        pass
+    def run(self, **payload: object) -> None:
+        name = str(payload["name"])
+        self.calls.append(name)
+        if name in self.failures:
+            raise RuntimeError(f"{name} failed")
 
     def phase(self, **payload: object) -> None:
+        name = str(payload["name"])
+        self.calls.append(name)
         self.phase_events.append(payload)
+        if name in self.failures:
+            raise RuntimeError(f"{name} failed")
 
     def close_export(self, **_: object) -> dict[str, object]:
+        self.calls.append("close_export")
+        if "close_export" in self.failures:
+            raise RuntimeError("close_export failed")
         return {"summary": {}, "events": []}
 
     def attach_exception(self, error: BaseException, _: object) -> None:
+        self.calls.append("attach_exception")
+        if "attach_exception" in self.failures:
+            raise RuntimeError("attach_exception failed")
         setattr(error, "telemetry_export", {})
 
     def render_human_summary(self, **_: object) -> None:
@@ -203,3 +224,104 @@ def test_phase2_returned_stores_cleanup_once_after_ownership_transfer(
 
 def test_phase2_resource_owner_starts_empty() -> None:
     assert Phase2ResourceOwner() == Phase2ResourceOwner()
+
+
+def test_lifecycle_cleanup_failures_do_not_replace_primary_and_all_actions_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = RuntimeError("primary tracing failure")
+    ctx = FakeContext(RuntimeError("context cleanup failed"))
+    feature_store = FakeStore(RuntimeError("feature cleanup failed"))
+    nonfeature_store = FakeStore(RuntimeError("nonfeature cleanup failed"))
+    observer = FakeLifecycleObserver(
+        {"teardown.cleanup", "attribute.failed", "close_export", "attach_exception"}
+    )
+
+    def fail_after_both_stores(*, inputs: Phase2Inputs, **_: object) -> None:
+        inputs.resource_owner.feature_row_store = cast(
+            _FileBackedFeatureRowStore, feature_store
+        )
+        inputs.resource_owner.nonfeature_row_store = cast(
+            _FileBackedFeatureRowStore, nonfeature_store
+        )
+        raise primary
+
+    _configure_runtime(
+        monkeypatch, ctx=ctx, observer=observer, run_phase2=fail_after_both_stores
+    )
+
+    with pytest.raises(RuntimeError, match="primary tracing failure") as raised:
+        _run_attribution(ctx)
+
+    assert raised.value is primary
+    assert feature_store.cleanup_calls == 1
+    assert nonfeature_store.cleanup_calls == 1
+    assert ctx.cleanup_calls == 1
+    assert observer.calls[-4:] == [
+        "teardown.cleanup",
+        "attribute.failed",
+        "close_export",
+        "attach_exception",
+    ]
+    notes = getattr(primary, "__notes__", [])
+    assert len(notes) == 7
+
+
+def test_cancellation_is_preserved_through_lifecycle_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancellation = KeyboardInterrupt("cancelled")
+    ctx = FakeContext()
+    observer = FakeLifecycleObserver()
+
+    def cancel(*, inputs: Phase2Inputs, **_: object) -> None:
+        raise cancellation
+
+    _configure_runtime(monkeypatch, ctx=ctx, observer=observer, run_phase2=cancel)
+
+    with pytest.raises(KeyboardInterrupt, match="cancelled") as raised:
+        _run_attribution(ctx)
+
+    assert raised.value is cancellation
+    assert ctx.cleanup_calls == 1
+    assert "attribute.failed" in observer.calls
+    assert "attach_exception" in observer.calls
+
+
+def test_preflight_rejection_does_not_create_observer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        attribute_nnsight.TelemetryObserver,
+        "create",
+        lambda **_: pytest.fail("observer created before preflight completed"),
+    )
+    model = SimpleNamespace(device=torch.device("cpu"), transcoders=object())
+
+    with pytest.raises(ValueError, match="feature_batch_size_max"):
+        attribute_nnsight._run_attribution(
+            model=cast(NNSightReplacementModel, model),
+            prompt=[1, 2],
+            attribution_targets=None,
+            max_n_logits=1,
+            desired_logit_prob=0.0,
+            batch_size=2,
+            feature_batch_size=2,
+            logit_batch_size=None,
+            max_feature_nodes=None,
+            offload=None,
+            verbose=False,
+            offload_handles=[],
+            logger=SimpleNamespace(info=lambda *_, **__: None),
+            feature_batch_size_max=1,
+        )
+
+
+def test_cleanup_only_failures_raise_exception_group() -> None:
+    first = RuntimeError("feature cleanup failed")
+    second = OSError("sink close failed")
+
+    with pytest.raises(
+        attribute_nnsight.ExceptionGroup, match="lifecycle cleanup failed"
+    ) as raised:
+        attribute_nnsight._raise_cleanup_failures([first, second])
+
+    assert raised.value.exceptions == (first, second)

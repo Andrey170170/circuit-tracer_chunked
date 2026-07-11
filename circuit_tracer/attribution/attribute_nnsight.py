@@ -29,6 +29,11 @@ from typing import Any, Literal, Mapping
 
 import torch
 
+if sys.version_info >= (3, 11):
+    from builtins import BaseExceptionGroup, ExceptionGroup
+else:
+    from exceptiongroup import BaseExceptionGroup, ExceptionGroup
+
 from circuit_tracer.attribution.targets import (
     TargetSpec,
 )
@@ -311,6 +316,17 @@ _PHASE0_ACTIVATION_THRESHOLD_COMPARE_MODE_BY_NAME: dict[str, str] = {
     "float64": "fp64",
     "torch.float64": "fp64",
 }
+
+
+def _raise_cleanup_failures(cleanup_failures: Sequence[BaseException]) -> None:
+    if not cleanup_failures:
+        return
+    if all(isinstance(error, Exception) for error in cleanup_failures):
+        raise ExceptionGroup(
+            "Attribution lifecycle cleanup failed",
+            [error for error in cleanup_failures if isinstance(error, Exception)],
+        )
+    raise BaseExceptionGroup("Attribution lifecycle cleanup failed", list(cleanup_failures))
 
 
 def _resolve_phase0_activation_threshold_compare_mode(value: str) -> str:
@@ -1149,6 +1165,12 @@ def _run_attribution(
     max_phase4_feature_batch_size = (
         phase1_trace_batch_sizing.effective_phase4_max_feature_batch_size
     )
+    planner_enabled = _resolve_phase4_feature_batch_planner_enabled(
+        plan_feature_batch_size=plan_feature_batch_size,
+        auto_scale_feature_batch_size=auto_scale_feature_batch_size,
+    )
+    if (not planner_enabled) and max_phase4_feature_batch_size < effective_feature_batch_size:
+        raise ValueError("feature_batch_size_max must be >= the effective feature batch size")
     phase4_refresh_policy_config = _resolve_phase4_refresh_policy_config(
         phase4_refresh_policy=phase4_refresh_policy,
         phase4_refresh_interval_multiplier=phase4_refresh_interval_multiplier,
@@ -1186,6 +1208,40 @@ def _run_attribution(
         **exact_encoder_residency_metadata,
     }
     phase4_debug_summary_enabled = phase4_anomaly_debug_enabled or cross_cluster_debug_enabled
+    compact_exact_provider = compact_output and exact_chunked_decoder
+    compact_row_store_provider = compact_output and supports_compact_row_store
+    preflight_requirements = (
+        (phase4_anomaly_debug_enabled, compact_exact_provider, "Phase-4 anomaly debug"),
+        (cross_cluster_debug_enabled, compact_exact_provider, "cross_cluster_debug"),
+        (capture_phase0_donor_bundle_enabled, compact_exact_provider, "capture_phase0_donor_bundle"),
+        (capture_phase3_seed_bundle_enabled, compact_exact_provider, "capture_phase3_seed_bundle"),
+        (
+            capture_phase3_gradient_bundle_enabled,
+            compact_exact_provider,
+            "capture_phase3_gradient_bundle",
+        ),
+        (capture_phase3_row_bundle_enabled, compact_exact_provider, "capture_phase3_row_bundle"),
+        (
+            capture_feature_semantic_descriptors_enabled,
+            compact_exact_provider,
+            "capture_feature_semantic_descriptors",
+        ),
+        (phase0_replay_mode_resolved != "disabled", compact_exact_provider, "phase0 donor replay"),
+        (
+            phase3_gradient_replay_mode_resolved != "disabled",
+            compact_exact_provider,
+            "Phase-3 gradient replay",
+        ),
+        (
+            phase3_row_replay_mode_resolved != "disabled",
+            compact_exact_provider,
+            "Phase-3 row replay",
+        ),
+        (planner_enabled, compact_row_store_provider, "Phase-4 feature batch planner"),
+    )
+    for requested, supported, label in preflight_requirements:
+        if requested and not supported:
+            raise ValueError(f"{label} requires compact_output=True and exact provider support")
     telemetry_max_events_resolved = _resolve_telemetry_max_events(
         telemetry_max_events=telemetry_max_events,
         compact_output=compact_output,
@@ -1255,19 +1311,12 @@ def _run_attribution(
         },
     )
 
-    planner_enabled = _resolve_phase4_feature_batch_planner_enabled(
-        plan_feature_batch_size=plan_feature_batch_size,
-        auto_scale_feature_batch_size=auto_scale_feature_batch_size,
-    )
     if auto_scale_feature_batch_size and not plan_feature_batch_size:
         logger.info(
             "Phase-4 feature batch planning | "
             "legacy auto_scale_feature_batch_size flag detected; "
             "using fixed preflight planner semantics"
         )
-    if (not planner_enabled) and max_phase4_feature_batch_size < effective_feature_batch_size:
-        raise ValueError("feature_batch_size_max must be >= the effective feature batch size")
-
     planner_status, planner_skip_reason = _resolve_phase4_feature_batch_planner_status(
         planner_enabled=planner_enabled,
         effective_feature_batch_size=effective_feature_batch_size,
@@ -1538,9 +1587,12 @@ def _run_attribution(
                 diagnostic_feature_cap=diagnostic_feature_cap,
             ),
         )
-    except Phase0ExecutionError as exc:
-        ctx = exc.ctx
-        phase0_failure = exc.cause
+    except BaseException as exc:
+        if isinstance(exc, Phase0ExecutionError):
+            ctx = exc.ctx
+            phase0_failure = exc.cause
+        else:
+            phase0_failure = exc
     else:
         ctx = phase0_result.ctx
         input_ids = phase0_result.input_ids
@@ -1925,6 +1977,23 @@ def _run_attribution(
         edge_matrix = phase5_result.edge_matrix
         return phase5_result.output
     finally:
+        _, primary_error, _ = sys.exc_info()
+        cleanup_failures: list[BaseException] = []
+
+        def attempt_cleanup(action: str, callback) -> object | None:
+            try:
+                return callback()
+            except BaseException as cleanup_error:
+                cleanup_failures.append(cleanup_error)
+                note = f"Phase D0 lifecycle action {action!r} failed: {cleanup_error!r}"
+                if primary_error is not None:
+                    try:
+                        primary_error.add_note(note)
+                    except BaseException:
+                        pass
+                logging.getLogger(__name__).error(note, exc_info=cleanup_error)
+                return None
+
         teardown_start = time.perf_counter()
         feature_row_store_for_cleanup = (
             feature_row_store
@@ -1937,56 +2006,78 @@ def _run_attribution(
             else phase2_resource_owner.nonfeature_row_store
         )
         if feature_row_store_for_cleanup is not None:
-            feature_row_store_for_cleanup.cleanup()
+            attempt_cleanup("feature row-store cleanup", feature_row_store_for_cleanup.cleanup)
         if nonfeature_row_store_for_cleanup is not None:
-            nonfeature_row_store_for_cleanup.cleanup()
+            attempt_cleanup(
+                "nonfeature row-store cleanup", nonfeature_row_store_for_cleanup.cleanup
+            )
         if ctx is not None:
-            _log_memory_boundary(logger, "Teardown start", model.device)
-            cleanup = getattr(ctx, "cleanup", None)
-            if callable(cleanup):
-                cleanup()
-            else:
-                clear_decoder_cache = getattr(ctx, "clear_decoder_cache", None)
-                if callable(clear_decoder_cache):
-                    clear_decoder_cache()
-            _log_memory_boundary(logger, "Teardown done", model.device)
+            def cleanup_context() -> None:
+                _log_memory_boundary(logger, "Teardown start", model.device)
+                cleanup = getattr(ctx, "cleanup", None)
+                if callable(cleanup):
+                    cleanup()
+                else:
+                    clear_decoder_cache = getattr(ctx, "clear_decoder_cache", None)
+                    if callable(clear_decoder_cache):
+                        clear_decoder_cache()
+                _log_memory_boundary(logger, "Teardown done", model.device)
+
+            attempt_cleanup("context cleanup", cleanup_context)
         teardown_elapsed_ms = (time.perf_counter() - teardown_start) * 1000.0
-        telemetry_observer.phase(
-            name="teardown.cleanup",
-            phase="teardown",
-            elapsed_ms=teardown_elapsed_ms,
-            attrs={
-                "ctx_present": ctx is not None,
-                "feature_row_store": feature_row_store_for_cleanup is not None,
-            },
-            wall_clock=True,
+        attempt_cleanup(
+            "teardown terminal-event emission",
+            lambda: telemetry_observer.phase(
+                name="teardown.cleanup",
+                phase="teardown",
+                elapsed_ms=teardown_elapsed_ms,
+                attrs={
+                    "ctx_present": ctx is not None,
+                    "feature_row_store": feature_row_store_for_cleanup is not None,
+                },
+                wall_clock=True,
+            ),
         )
 
-        exc_type, exc, _ = sys.exc_info()
-        if exc_type is None:
+        if primary_error is None:
             run_elapsed_ms = (time.perf_counter() - run_start) * 1000.0
-            telemetry_observer.run(
-                name="attribute.done",
-                elapsed_ms=run_elapsed_ms,
-                attrs={"compact_output": compact_output},
-                wall_clock=True,
+            attempt_cleanup(
+                "run terminal-event emission",
+                lambda: telemetry_observer.run(
+                    name="attribute.done",
+                    elapsed_ms=run_elapsed_ms,
+                    attrs={"compact_output": compact_output},
+                    wall_clock=True,
+                ),
             )
         else:
             run_elapsed_ms = (time.perf_counter() - run_start) * 1000.0
-            telemetry_observer.run(
-                name="attribute.failed",
-                elapsed_ms=run_elapsed_ms,
-                attrs={
-                    "compact_output": compact_output,
-                    "error_type": exc_type.__name__,
-                    "error_message": str(exc) if exc is not None else None,
-                },
-                wall_clock=True,
+            attempt_cleanup(
+                "run terminal-event emission",
+                lambda: telemetry_observer.run(
+                    name="attribute.failed",
+                    elapsed_ms=run_elapsed_ms,
+                    attrs={
+                        "compact_output": compact_output,
+                        "error_type": type(primary_error).__name__,
+                        "error_message": str(primary_error),
+                    },
+                    wall_clock=True,
+                ),
             )
 
-        telemetry_export = telemetry_observer.close_export(include_events=True)
+        telemetry_export = attempt_cleanup(
+            "sink close/export", lambda: telemetry_observer.close_export(include_events=True)
+        )
+        if not isinstance(telemetry_export, dict):
+            telemetry_export = {"summary": {}, "events": []}
         if compact_output_result is not None:
-            telemetry_observer.attach_compact_result(compact_output_result, telemetry_export)
+            attempt_cleanup(
+                "result attachment",
+                lambda: telemetry_observer.attach_compact_result(
+                    compact_output_result, telemetry_export
+                ),
+            )
             if prefix_view_metadata is not None:
                 compact_output_result["prefix_view_metadata"] = dict(prefix_view_metadata)
             if anomaly_debug_result is not None:
@@ -2009,7 +2100,16 @@ def _run_attribution(
             ):
                 compact_output_result["cross_cluster_debug_batches"] = cross_cluster_debug_batches
         else:
-            if exc is not None:
-                telemetry_observer.attach_exception(exc, telemetry_export)
+            if primary_error is not None:
+                attempt_cleanup(
+                    "exception attachment",
+                    lambda: telemetry_observer.attach_exception(primary_error, telemetry_export),
+                )
             if profile:
-                telemetry_observer.render_human_summary(logger, telemetry_export)
+                attempt_cleanup(
+                    "human telemetry rendering",
+                    lambda: telemetry_observer.render_human_summary(logger, telemetry_export),
+                )
+
+        if primary_error is None and cleanup_failures:
+            _raise_cleanup_failures(cleanup_failures)
