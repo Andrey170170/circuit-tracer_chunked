@@ -1,10 +1,14 @@
 from types import SimpleNamespace
+from collections.abc import Callable
+from typing import cast
 
 import pytest
 import torch
 
 import circuit_tracer.attribution.attribute_nnsight as attribute_nnsight
-from circuit_tracer.attribution.nnsight.phases.phase2 import Phase2ResourceOwner
+from circuit_tracer.attribution.nnsight.phases.phase2 import Phase2Inputs, Phase2ResourceOwner
+from circuit_tracer.attribution.nnsight.row_store import _FileBackedFeatureRowStore
+from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 
 
 class FakeStore:
@@ -49,7 +53,7 @@ def _configure_runtime(
     *,
     ctx: FakeContext,
     observer: FakeLifecycleObserver,
-    run_phase2: object,
+    run_phase2: Callable[..., object],
 ) -> None:
     capabilities = SimpleNamespace(
         architecture="fake",
@@ -81,7 +85,7 @@ def _configure_runtime(
 def _run_attribution(ctx: FakeContext) -> None:
     model = SimpleNamespace(device=torch.device("cpu"), transcoders=object())
     attribute_nnsight._run_attribution(
-        model=model,
+        model=cast(NNSightReplacementModel, model),
         prompt=[1, 2],
         attribution_targets=None,
         max_n_logits=1,
@@ -104,9 +108,9 @@ def test_phase2_second_store_failure_uses_owner_fallback_once(monkeypatch: pytes
     feature_store = FakeStore()
     original_error = OSError("second row-store construction failed")
 
-    def fail_after_feature_store(*, inputs: object, **_: object) -> None:
-        owner = inputs.resource_owner  # type: ignore[attr-defined]
-        owner.feature_row_store = feature_store
+    def fail_after_feature_store(*, inputs: Phase2Inputs, **_: object) -> None:
+        owner = inputs.resource_owner
+        owner.feature_row_store = cast(_FileBackedFeatureRowStore, feature_store)
         raise original_error
 
     _configure_runtime(monkeypatch, ctx=ctx, observer=observer, run_phase2=fail_after_feature_store)
@@ -130,10 +134,10 @@ def test_phase2_failure_after_both_stores_uses_owner_fallback_once(
     nonfeature_store = FakeStore()
     original_error = RuntimeError("post-store Phase 2 failure")
 
-    def fail_after_both_stores(*, inputs: object, **_: object) -> None:
-        owner = inputs.resource_owner  # type: ignore[attr-defined]
-        owner.feature_row_store = feature_store
-        owner.nonfeature_row_store = nonfeature_store
+    def fail_after_both_stores(*, inputs: Phase2Inputs, **_: object) -> None:
+        owner = inputs.resource_owner
+        owner.feature_row_store = cast(_FileBackedFeatureRowStore, feature_store)
+        owner.nonfeature_row_store = cast(_FileBackedFeatureRowStore, nonfeature_store)
         raise original_error
 
     _configure_runtime(monkeypatch, ctx=ctx, observer=observer, run_phase2=fail_after_both_stores)
@@ -180,10 +184,10 @@ def test_phase2_returned_stores_cleanup_once_after_ownership_transfer(
         def edge_matrix(self) -> object:
             raise original_error
 
-    def return_stores(*, inputs: object, **_: object) -> ResultAfterOwnershipTransfer:
-        owner = inputs.resource_owner  # type: ignore[attr-defined]
-        owner.feature_row_store = feature_store
-        owner.nonfeature_row_store = nonfeature_store
+    def return_stores(*, inputs: Phase2Inputs, **_: object) -> ResultAfterOwnershipTransfer:
+        owner = inputs.resource_owner
+        owner.feature_row_store = cast(_FileBackedFeatureRowStore, feature_store)
+        owner.nonfeature_row_store = cast(_FileBackedFeatureRowStore, nonfeature_store)
         return ResultAfterOwnershipTransfer()
 
     _configure_runtime(monkeypatch, ctx=ctx, observer=observer, run_phase2=return_stores)
