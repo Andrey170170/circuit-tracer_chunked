@@ -45,6 +45,7 @@ from circuit_tracer.attribution.nnsight.telemetry import (
     _record_cross_cluster_checkpoint,
     _safe_float,
 )
+from circuit_tracer.attribution.nnsight.session_controls import ordered_physical_ranges
 from circuit_tracer.attribution.targets import AttributionTargets
 from circuit_tracer.graph import (
     compute_partial_feature_influences_streaming,
@@ -89,6 +90,7 @@ class Phase3Inputs:
 @dataclass(frozen=True)
 class Phase3Config:
     effective_logit_batch_size: int
+    compute_microbatch_max_rows: int
     effective_feature_batch_size: int
     output_position: int | None
     n_layers: int
@@ -220,8 +222,17 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
     phase3_gpu_to_cpu_bytes_total = 0
     phase3_cpu_to_gpu_bytes_total = 0
     phase3_copy_count = 0
-    for i in range(0, len(targets), effective_logit_batch_size):
-        batch = targets.logit_vectors[i : i + effective_logit_batch_size]
+    physical_batch_count = 0
+    physical_batch_peak_rows = 0
+    physical_ranges = ordered_physical_ranges(
+        total_rows=len(targets),
+        logical_batch_rows=effective_logit_batch_size,
+        physical_batch_rows=config.compute_microbatch_max_rows,
+    )
+    for logical_batch_index, i, physical_end in physical_ranges:
+        batch = targets.logit_vectors[i:physical_end]
+        physical_batch_count += 1
+        physical_batch_peak_rows = max(physical_batch_peak_rows, int(batch.shape[0]))
         ctx_before = _snapshot_diagnostics(ctx) if profile else None
         transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
         batch_start = time.perf_counter()
@@ -414,6 +425,8 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             attrs={
                 "batch_rows": int(batch.shape[0]),
                 "batch_start_index": int(i),
+                "logical_batch_index": int(logical_batch_index + 1),
+                "physical_batch_index": int(physical_batch_count),
                 "total_logit_batches": int(total_logit_batches),
                 "compute_batch_elapsed_ms": float(phase3_compute_batch_elapsed_ms),
                 "cpu_staging_elapsed_ms": float(phase3_cpu_staging_elapsed_ms),
@@ -488,6 +501,9 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
         attrs={
             "logit_count": int(len(targets)),
             "batches": int(total_logit_batches),
+            "logical_batch_count": int(total_logit_batches),
+            "physical_batch_count": int(physical_batch_count),
+            "physical_batch_peak_rows": int(physical_batch_peak_rows),
             "phase3_compute_batch_elapsed_ms_total": float(
                 phase3_compute_batch_elapsed_ms_total
             ),

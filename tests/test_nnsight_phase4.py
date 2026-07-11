@@ -76,6 +76,7 @@ def _config() -> Phase4Config:
         n_logits=1,
         logit_offset=1,
         effective_feature_batch_size=2,
+        compute_microbatch_max_rows=2,
         max_phase4_feature_batch_size=4,
         update_interval=1,
         row_store_capacity_feature_nodes=0,

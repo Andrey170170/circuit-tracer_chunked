@@ -174,6 +174,9 @@ from circuit_tracer.attribution.nnsight.phase1_policy import (
     _resolve_phase1_trace_batch_size_max as _resolve_phase1_trace_batch_size_max,
     _resolve_phase1_trace_batch_sizing as _resolve_phase1_trace_batch_sizing,
 )
+from circuit_tracer.attribution.nnsight.session_controls import (
+    resolve_nnsight_session_controls,
+)
 from circuit_tracer.attribution.nnsight.phases.phase0 import (
     Phase0CleanupOwner,
     Phase0Config,
@@ -372,6 +375,9 @@ def attribute(
     batch_size: int = 512,
     feature_batch_size: int | None = None,
     logit_batch_size: int | None = None,
+    nnsight_session_capacity: int | None = None,
+    phase3_compute_microbatch_max_rows: int | None = None,
+    phase4_compute_microbatch_max_rows: int | None = None,
     max_feature_nodes: int | None = None,
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
@@ -637,6 +643,9 @@ def attribute(
             batch_size=batch_size,
             feature_batch_size=feature_batch_size,
             logit_batch_size=logit_batch_size,
+            nnsight_session_capacity=nnsight_session_capacity,
+            phase3_compute_microbatch_max_rows=phase3_compute_microbatch_max_rows,
+            phase4_compute_microbatch_max_rows=phase4_compute_microbatch_max_rows,
             max_feature_nodes=max_feature_nodes,
             offload=offload,
             verbose=verbose,
@@ -874,6 +883,9 @@ def _run_attribution(
     verbose: bool,
     offload_handles,
     logger,
+    nnsight_session_capacity: int | None = None,
+    phase3_compute_microbatch_max_rows: int | None = None,
+    phase4_compute_microbatch_max_rows: int | None = None,
     update_interval: int = 4,
     profile: bool = False,
     profile_log_interval: int = 1,
@@ -1165,6 +1177,19 @@ def _run_attribution(
     max_phase4_feature_batch_size = (
         phase1_trace_batch_sizing.effective_phase4_max_feature_batch_size
     )
+    legacy_session_capacity = max(
+        effective_source_batch_size,
+        effective_feature_batch_size,
+        effective_logit_batch_size,
+    )
+    session_controls = resolve_nnsight_session_controls(
+        nnsight_session_capacity=nnsight_session_capacity,
+        phase3_compute_microbatch_max_rows=phase3_compute_microbatch_max_rows,
+        phase4_compute_microbatch_max_rows=phase4_compute_microbatch_max_rows,
+        legacy_session_capacity=legacy_session_capacity,
+        legacy_phase3_batch_rows=effective_logit_batch_size,
+        legacy_phase4_batch_rows=effective_feature_batch_size,
+    )
     planner_enabled = _resolve_phase4_feature_batch_planner_enabled(
         plan_feature_batch_size=plan_feature_batch_size,
         auto_scale_feature_batch_size=auto_scale_feature_batch_size,
@@ -1256,6 +1281,11 @@ def _run_attribution(
         static_context=telemetry_context,
     )
     telemetry_recorder = telemetry_observer.recorder
+    if session_controls.metadata["legacy_derived_fields"]:
+        telemetry_observer.run(
+            name="compatibility.nnsight_session_controls",
+            attrs=session_controls.metadata,
+        )
     telemetry_observer.run(
         name="attribute.start",
         attrs={
@@ -1271,6 +1301,7 @@ def _run_attribution(
             "batch_size": batch_size,
             "feature_batch_size": feature_batch_size,
             "logit_batch_size": logit_batch_size,
+            **session_controls.metadata,
             "telemetry_max_events": telemetry_max_events_resolved,
             "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
             "phase0_activation_threshold_compare_mode": (
@@ -1488,11 +1519,7 @@ def _run_attribution(
             )
             planner_status = "executed"
 
-    trace_batch_size = max(
-        effective_source_batch_size,
-        effective_feature_batch_size,
-        effective_logit_batch_size,
-    )
+    trace_batch_size = session_controls.session_capacity
     phase1_trace_batch_metadata.update(
         trace_batch_size_legacy=int(phase1_trace_batch_sizing.trace_batch_size_legacy),
         trace_batch_size_effective=int(trace_batch_size),
@@ -1734,6 +1761,7 @@ def _run_attribution(
             ),
             config=Phase3Config(
                 effective_logit_batch_size=effective_logit_batch_size,
+                compute_microbatch_max_rows=session_controls.phase3_microbatch_max_rows,
                 effective_feature_batch_size=effective_feature_batch_size,
                 output_position=output_position,
                 n_layers=n_layers,
@@ -1804,6 +1832,7 @@ def _run_attribution(
                 n_logits=n_logits,
                 logit_offset=logit_offset,
                 effective_feature_batch_size=effective_feature_batch_size,
+                compute_microbatch_max_rows=session_controls.phase4_microbatch_max_rows,
                 max_phase4_feature_batch_size=max_phase4_feature_batch_size,
                 update_interval=update_interval,
                 row_store_capacity_feature_nodes=row_store_capacity_feature_nodes,

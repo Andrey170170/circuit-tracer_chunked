@@ -51,6 +51,7 @@ class FakeObserver:
 def _config(**overrides: object) -> Phase3Config:
     values: dict[str, object] = {
         "effective_logit_batch_size": 1,
+        "compute_microbatch_max_rows": 1,
         "effective_feature_batch_size": 1,
         "output_position": 0,
         "n_layers": 1,

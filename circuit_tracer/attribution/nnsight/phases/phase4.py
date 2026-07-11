@@ -26,7 +26,6 @@ from circuit_tracer.attribution.nnsight.phase4_policy import (
     _plan_phase4_frontier_membership_preserving_v1,
     _rank_phase4_unvisited_features_argsort,
     _reorder_pending_for_phase4_locality,
-    _resolve_phase4_streaming_v1_microbatch_size,
     _select_phase4_frontier_rank_selection,
 )
 from circuit_tracer.attribution.nnsight.phase_support import (
@@ -88,6 +87,7 @@ class Phase4Config:
     n_logits: int
     logit_offset: int
     effective_feature_batch_size: int
+    compute_microbatch_max_rows: int
     max_phase4_feature_batch_size: int
     update_interval: int
     row_store_capacity_feature_nodes: int
@@ -241,11 +241,9 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     )
     phase4_row_executor_effective_mode = phase4_row_executor_config.effective_mode
     phase4_executor_reference_batch_size = int(phase4_feature_batch_size)
-    phase4_executor_microbatch_size = phase4_executor_reference_batch_size
-    if phase4_row_executor_effective_mode == "streaming_v1":
-        phase4_executor_microbatch_size = _resolve_phase4_streaming_v1_microbatch_size(
-            phase4_executor_reference_batch_size
-        )
+    phase4_executor_microbatch_size = min(
+        phase4_executor_reference_batch_size, config.compute_microbatch_max_rows
+    )
     phase4_execution_metadata.update(
         {
             "executor_configured_reference_batch_size": int(
@@ -1269,7 +1267,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             scheduler_reference_batch_index = int(phase4_scheduler_reference_batch_count)
             phase4_scheduler_reference_batch_count += 1
     
-            if phase4_row_executor_effective_mode == "streaming_v1":
+            if phase4_executor_microbatch_size < int(reference_idx_batch.numel()):
                 executor_batches: list[torch.Tensor] = []
                 streaming_pending_offset = 0
                 while streaming_pending_offset < int(reference_idx_batch.numel()):

@@ -1323,7 +1323,13 @@ class AttributionContext:
             torch.Tensor: ``(batch, row_size)`` matrix - one row per node.
         """
 
-        batch_size = self._resid_activations[0].shape[0]
+        session_capacity = self._resid_activations[0].shape[0]
+        batch_size = int(len(layers))
+        if batch_size <= 0 or batch_size > session_capacity:
+            raise ValueError(
+                "compute_batch active lanes must be in [1, session capacity] "
+                f"(active={batch_size}, capacity={session_capacity})"
+            )
         batch_start = time.perf_counter()
         self._compute_batch_call_index += 1
         batch_call_index = self._compute_batch_call_index
@@ -1420,13 +1426,16 @@ class AttributionContext:
 
         last_layer = max(layers_in_batch)
         try:
-            with self._resid_activations[last_layer].backward(
-                gradient=torch.zeros_like(self._resid_activations[last_layer]),
+            active_residual = self._resid_activations[last_layer][:batch_size]
+            with active_residual.backward(
+                gradient=torch.zeros_like(active_residual),
                 retain_graph=retain_graph,
             ):
                 for layer in reversed(range(last_layer + 1)):
                     if layer != last_layer:
-                        grad = self._feature_output_activations[layer + 1].grad.detach()  # type:ignore
+                        grad = self._feature_output_activations[layer + 1].grad.detach()[
+                            :batch_size
+                        ]  # type:ignore
                         if replay_phase3_gradients:
                             assert replay_gradients is not None
                             replay_grad = _slice_phase3_gradient_replay_batch(
@@ -1503,7 +1512,7 @@ class AttributionContext:
                         )
 
                 token_start = time.perf_counter()
-                token_grad = self._feature_output_activations[0].grad
+                token_grad = self._feature_output_activations[0].grad[:batch_size]
                 self.compute_token_attributions(token_grad)
                 if self.diagnostic_mode:
                     self._add_stat("token_attr_seconds", time.perf_counter() - token_start)
