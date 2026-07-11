@@ -1204,6 +1204,24 @@ class AttributionContext:
 
                 self._feature_output_activations.append(feature_output_loc_.output)  # type: ignore
 
+    def run_forward_pass(
+        self,
+        model: "NNSightReplacementModel",
+        trace_input_ids: torch.Tensor,
+        *,
+        trace_batch_size: int,
+    ) -> None:
+        """Run and cache the Phase-1 forward pass."""
+        with model.trace() as tracer:
+            with tracer.invoke(trace_input_ids.expand(trace_batch_size, -1)):
+                pass
+
+            detach_barrier = tracer.barrier(2)
+
+            model.configure_gradient_flow(tracer)
+            model.configure_skip_connection(tracer, barrier=detach_barrier)
+            self.cache_residual(model, tracer, barrier=detach_barrier)
+
     def compute_score(
         self,
         grads: torch.Tensor,

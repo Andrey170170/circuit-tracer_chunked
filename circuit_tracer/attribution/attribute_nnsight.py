@@ -187,6 +187,9 @@ from circuit_tracer.attribution.nnsight.phase1_policy import (
     _resolve_phase1_trace_batch_size_max as _resolve_phase1_trace_batch_size_max,
     _resolve_phase1_trace_batch_sizing as _resolve_phase1_trace_batch_sizing,
 )
+from circuit_tracer.attribution.nnsight.phases.phase1 import (
+    _run_phase1_forward_pass as _run_phase1_forward_pass,
+)
 from circuit_tracer.attribution.nnsight.prefix_view import (
     PrefixViewMetadata as PrefixViewMetadata,
     _apply_prefix_view_activation_mask as _apply_prefix_view_activation_mask,
@@ -1854,43 +1857,18 @@ def _run_attribution(
             offload_handles += offload_modules(model.transcoders, offload)
 
         # Phase 1: forward pass
-        logger.info("Phase 1: Running forward pass")
-        logger.info(
-            "Phase 1 trace-batch policy | "
-            f"requested_policy={phase1_trace_batch_config.requested_policy} | "
-            f"effective_policy={phase1_trace_batch_config.effective_policy} | "
-            f"requested_size_max={phase1_trace_batch_config.requested_batch_size_max} | "
-            f"effective_size_max={phase1_trace_batch_config.effective_batch_size_max} | "
-            f"effective_behavior={phase1_trace_batch_config.effective_behavior} | "
-            f"source_batch_size={effective_source_batch_size} | "
-            f"feature_batch_size={effective_feature_batch_size} | "
-            f"logit_batch_size={effective_logit_batch_size} | "
-            f"cap_reason={phase1_trace_batch_metadata.get('trace_batch_cap_reason')} | "
-            f"trace_batch_size={trace_batch_size}"
-        )
-        phase_start = time.perf_counter()
-        _log_memory_boundary(logger, "Phase 1 start", model.device)
-        with model.trace() as tracer:
-            with tracer.invoke(trace_input_ids.expand(trace_batch_size, -1)):
-                pass
-
-            detach_barrier = tracer.barrier(2)
-
-            model.configure_gradient_flow(tracer)
-            model.configure_skip_connection(tracer, barrier=detach_barrier)
-            ctx.cache_residual(model, tracer, barrier=detach_barrier)
-
-        _log_phase_metrics(logger, "Forward pass", phase_start, model.device)
-        phase1_elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
-        telemetry_observer.phase(
-            name="phase1.forward_pass",
-            phase="phase1",
-            elapsed_ms=phase1_elapsed_ms,
-            attrs={
-                "trace_batch_size": int(trace_batch_size),
-                **phase1_trace_batch_metadata,
-            },
-            wall_clock=True,
+        _run_phase1_forward_pass(
+            logger=logger,
+            model=model,
+            ctx=ctx,
+            trace_input_ids=trace_input_ids,
+            trace_batch_size=trace_batch_size,
+            trace_batch_config=phase1_trace_batch_config,
+            trace_batch_metadata=phase1_trace_batch_metadata,
+            effective_source_batch_size=effective_source_batch_size,
+            effective_feature_batch_size=effective_feature_batch_size,
+            effective_logit_batch_size=effective_logit_batch_size,
+            telemetry_observer=telemetry_observer,
         )
 
         if offload:
