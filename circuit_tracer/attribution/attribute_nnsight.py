@@ -24,6 +24,7 @@ import logging
 import os
 import sys
 import time
+import functools
 from collections.abc import Sequence
 from typing import Any, Literal, Mapping
 
@@ -367,7 +368,7 @@ def _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug: bool) -> bool:
     return bool(phase4_anomaly_debug)
 
 
-def attribute(
+def _attribute_impl(
     prompt: str | torch.Tensor | list[int],
     model: NNSightReplacementModel,
     *,
@@ -742,6 +743,14 @@ def attribute(
 
         if handler:
             logger.removeHandler(handler)
+
+
+@functools.wraps(_attribute_impl)
+def attribute(prompt, model, **kwargs):
+    """Compatibility facade over :func:`circuit_tracer.trace_one`."""
+    from circuit_tracer.runtime import request_from_legacy, trace_one
+
+    return trace_one(request_from_legacy(prompt, model, **kwargs)).output
 
 
 class FullSequenceWindowAttributionSession:

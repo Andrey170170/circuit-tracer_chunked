@@ -43,6 +43,15 @@ if TYPE_CHECKING:
     from circuit_tracer.governor import resolve_trace_plan
     from circuit_tracer.governor import semantic_fingerprint
     from circuit_tracer.graph import Graph
+    from circuit_tracer.runtime import TraceLogicalSemantics
+    from circuit_tracer.runtime import TracePhysicalControls
+    from circuit_tracer.runtime import TraceRequest
+    from circuit_tracer.runtime import TraceResult
+    from circuit_tracer.runtime import TraceSession
+    from circuit_tracer.runtime import TraceStatus
+    from circuit_tracer.runtime import open_session
+    from circuit_tracer.runtime import trace_batch
+    from circuit_tracer.runtime import trace_one
     from circuit_tracer.replacement_model import ReplacementModel
 
 
@@ -89,6 +98,15 @@ __all__ = [
     "fingerprint",
     "resolve_trace_plan",
     "semantic_fingerprint",
+    "TraceLogicalSemantics",
+    "TracePhysicalControls",
+    "TraceRequest",
+    "TraceResult",
+    "TraceSession",
+    "TraceStatus",
+    "trace_one",
+    "trace_batch",
+    "open_session",
 ]
 
 
@@ -114,6 +132,15 @@ def __getattr__(name):
         ),
         "Graph": ("circuit_tracer.graph", "Graph"),
         "ReplacementModel": ("circuit_tracer.replacement_model", "ReplacementModel"),
+        "TraceLogicalSemantics": ("circuit_tracer.runtime", "TraceLogicalSemantics"),
+        "TracePhysicalControls": ("circuit_tracer.runtime", "TracePhysicalControls"),
+        "TraceRequest": ("circuit_tracer.runtime", "TraceRequest"),
+        "TraceResult": ("circuit_tracer.runtime", "TraceResult"),
+        "TraceSession": ("circuit_tracer.runtime", "TraceSession"),
+        "TraceStatus": ("circuit_tracer.runtime", "TraceStatus"),
+        "trace_one": ("circuit_tracer.runtime", "trace_one"),
+        "trace_batch": ("circuit_tracer.runtime", "trace_batch"),
+        "open_session": ("circuit_tracer.runtime", "open_session"),
     }
     if name in _GOVERNOR_EXPORTS:
         lazy_imports[name] = ("circuit_tracer.governor", name)

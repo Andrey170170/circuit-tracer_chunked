@@ -173,6 +173,10 @@ def attribute(
     row_store_preallocate: bool = True,
     feature_row_retention: Literal["full_file", "none_recompute"] = "full_file",
     replay_tile_cache_bytes: int | None = None,
+    full_retention_backend: Literal["full_file", "column_tiled_v1"] = "full_file",
+    feature_row_column_tile_size: int = 2048,
+    influence_row_tile_size: int = 4096,
+    influence_column_tile_size: int = 2048,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
@@ -283,6 +287,10 @@ def attribute(
         or not bool(row_store_preallocate)
         or feature_row_retention != "full_file"
         or replay_tile_cache_bytes is not None
+        or full_retention_backend != "full_file"
+        or feature_row_column_tile_size != 2048
+        or influence_row_tile_size != 4096
+        or influence_column_tile_size != 2048
         or exact_encoder_residency != "lazy"
     )
 
@@ -339,6 +347,10 @@ def attribute(
             row_store_preallocate=row_store_preallocate,
             feature_row_retention=feature_row_retention,
             replay_tile_cache_bytes=replay_tile_cache_bytes,
+            full_retention_backend=full_retention_backend,
+            feature_row_column_tile_size=feature_row_column_tile_size,
+            influence_row_tile_size=influence_row_tile_size,
+            influence_column_tile_size=influence_column_tile_size,
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
         )
