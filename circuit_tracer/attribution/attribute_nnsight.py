@@ -45,6 +45,7 @@ from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightRe
 from circuit_tracer.transcoder.provider import (
     get_transcoder_capabilities,
     require_exact_chunked_provider,
+    require_exact_row_replay_provider,
 )
 from circuit_tracer.utils.disk_offload import offload_modules
 
@@ -437,6 +438,8 @@ def attribute(
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
     row_store_preallocate: bool = True,
+    feature_row_retention: Literal["full_file", "none_recompute"] = "full_file",
+    replay_tile_cache_bytes: int | None = None,
     full_retention_backend: Literal["full_file", "column_tiled_v1"] = "full_file",
     feature_row_column_tile_size: int = 2048,
     influence_row_tile_size: int = 4096,
@@ -710,6 +713,8 @@ def attribute(
             row_store_temp_root_policy=row_store_temp_root_policy,
             row_store_temp_root=row_store_temp_root,
             row_store_preallocate=row_store_preallocate,
+            feature_row_retention=feature_row_retention,
+            replay_tile_cache_bytes=replay_tile_cache_bytes,
             full_retention_backend=full_retention_backend,
             feature_row_column_tile_size=feature_row_column_tile_size,
             influence_row_tile_size=influence_row_tile_size,
@@ -950,6 +955,8 @@ def _run_attribution(
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
     row_store_preallocate: bool = True,
+    feature_row_retention: Literal["full_file", "none_recompute"] = "full_file",
+    replay_tile_cache_bytes: int | None = None,
     full_retention_backend: Literal["full_file", "column_tiled_v1"] = "full_file",
     feature_row_column_tile_size: int = 2048,
     influence_row_tile_size: int = 4096,
@@ -1073,6 +1080,34 @@ def _run_attribution(
         )
     if phase3_row_replay_mode_resolved != "disabled" and not phase3_row_donor_bundle_path:
         raise ValueError("phase3_row_replay_mode requires a phase3_row_donor_bundle path")
+
+    if feature_row_retention not in ("full_file", "none_recompute"):
+        raise ValueError("feature_row_retention must be 'full_file' or 'none_recompute'")
+    if replay_tile_cache_bytes is not None and replay_tile_cache_bytes < 0:
+        raise ValueError("replay_tile_cache_bytes must be >= 0 when provided")
+    if feature_row_retention == "none_recompute":
+        if not compact_output:
+            raise ValueError("none_recompute requires compact_output=True")
+        require_exact_row_replay_provider(model.transcoders)
+    tiled_or_recompute = bool(
+        full_retention_backend == "column_tiled_v1"
+        or feature_row_retention == "none_recompute"
+    )
+    if tiled_or_recompute and (
+        phase3_gradient_replay_mode_resolved != "disabled"
+        or phase3_row_replay_mode_resolved != "disabled"
+        or capture_phase3_gradient_bundle
+        or capture_phase3_row_bundle
+    ):
+        raise ValueError(
+            "column-tiled and none_recompute row production do not yet support "
+            "Phase-3 donor replay or gradient/row capture"
+        )
+    if full_retention_backend == "column_tiled_v1" and row_store_preallocate:
+        raise ValueError(
+            "column_tiled_v1 does not support row_store_preallocate=True; "
+            "pass row_store_preallocate=False"
+        )
 
     phase4_anomaly_debug_enabled = _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug)
     if internal_precision is not None:
@@ -1737,6 +1772,8 @@ def _run_attribution(
                 row_store_preallocate=row_store_preallocate,
                 full_retention_backend=full_retention_backend,
                 feature_row_column_tile_size=feature_row_column_tile_size,
+                feature_row_retention=feature_row_retention,
+                replay_tile_cache_bytes=int(replay_tile_cache_bytes or 0),
                 feature_row_storage_dtype=feature_row_storage_dtype,
                 row_abs_sum_dtype=row_abs_sum_dtype,
                 effective_feature_batch_size=effective_feature_batch_size,
@@ -1838,6 +1875,7 @@ def _run_attribution(
                 influence_row_tile_size=influence_row_tile_size,
                 influence_column_tile_size=influence_column_tile_size,
                 feature_row_column_tile_size=feature_row_column_tile_size,
+                feature_row_retention=feature_row_retention,
             ),
         )
         row_to_node_index = phase3_result.row_to_node_index
@@ -1907,6 +1945,7 @@ def _run_attribution(
                 influence_row_tile_size=influence_row_tile_size,
                 influence_column_tile_size=influence_column_tile_size,
                 feature_row_column_tile_size=feature_row_column_tile_size,
+                feature_row_retention=feature_row_retention,
                 exact_encoder_residency_config=exact_encoder_residency_config,
                 profile=profile,
                 profile_log_interval=profile_log_interval,

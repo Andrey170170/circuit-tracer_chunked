@@ -46,7 +46,11 @@ from circuit_tracer.attribution.nnsight.telemetry import (
     _safe_float,
 )
 from circuit_tracer.attribution.nnsight.session_controls import ordered_physical_ranges
-from circuit_tracer.attribution.nnsight.tiled_rows import produce_and_store_tiled_rows
+from circuit_tracer.attribution.nnsight.row_replay import RowRecipe, RowRecipeLedger
+from circuit_tracer.attribution.nnsight.tiled_rows import (
+    produce_and_store_tiled_rows,
+    produce_tiled_rows_no_retention,
+)
 from circuit_tracer.attribution.targets import AttributionTargets
 from circuit_tracer.graph import (
     compute_partial_feature_influences_tiled,
@@ -126,6 +130,7 @@ class Phase3Config:
     influence_row_tile_size: int = 4096
     influence_column_tile_size: int = 2048
     feature_row_column_tile_size: int = 2048
+    feature_row_retention: str = "full_file"
 
 
 @dataclass(frozen=True)
@@ -258,8 +263,23 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 phase3_inject_transfer_telemetry["inject_values_transfer_bytes"]
             )
         compute_batch_start = time.perf_counter()
-        tiled_production = config.full_retention_backend == "column_tiled_v1"
-        if tiled_production:
+        no_retention = config.feature_row_retention == "none_recompute"
+        tiled_production = config.full_retention_backend == "column_tiled_v1" or no_retention
+        if no_retention:
+            assert feature_row_store is not None and nonfeature_row_store is not None
+            rows, tiled_denominator = produce_tiled_rows_no_retention(
+                ctx=ctx,
+                layers=torch.full((batch.shape[0],), n_layers),
+                positions=torch.full(
+                    (batch.shape[0],),
+                    output_position if output_position is not None else n_pos - 1,
+                ),
+                inject_values=batch,
+                feature_column_tile_size=config.feature_row_column_tile_size,
+                dtype=exact_trace_internal_dtype_resolved,
+                phase_label="phase3_logits",
+            )
+        elif tiled_production:
             assert feature_row_store is not None and nonfeature_row_store is not None
             rows, tiled_denominator = produce_and_store_tiled_rows(
                 ctx=ctx,
@@ -422,7 +442,30 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     ),
                 }
             )
-        if use_compact_feature_row_store and not tiled_production:
+        if no_retention:
+            assert isinstance(feature_row_store, RowRecipeLedger)
+            assert isinstance(nonfeature_row_store, RowRecipeLedger)
+            for local_index in range(batch.shape[0]):
+                ordinal = i + local_index
+                recipe = RowRecipe(
+                    ordinal=ordinal,
+                    source_kind="logit",
+                    layer=n_layers,
+                    position=output_position if output_position is not None else n_pos - 1,
+                    injection=batch[local_index],
+                )
+                denominator = (
+                    row_abs_max_cpu[local_index : local_index + 1],
+                    row_l1_scaled_cpu[local_index : local_index + 1],
+                )
+                node_index = logit_offset + ordinal
+                feature_row_store.append_recipe(
+                    recipe, node_index=node_index, denominator=denominator
+                )
+                nonfeature_row_store.append_recipe(
+                    recipe, node_index=node_index, denominator=denominator
+                )
+        elif use_compact_feature_row_store and not tiled_production:
             assert feature_row_store is not None
             assert nonfeature_row_store is not None
             end = i + batch.shape[0]

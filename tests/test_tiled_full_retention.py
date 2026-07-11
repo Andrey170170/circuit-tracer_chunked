@@ -177,3 +177,43 @@ def test_true_tiled_production_streams_tiles_and_matches_full_row_denominator() 
     finally:
         feature.cleanup()
         nonfeature.cleanup()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_tiled_denominator_uses_canonical_global_max_chunk_order(dtype: torch.dtype) -> None:
+    feature_rows = torch.full((2, 5003), 1e-7, dtype=dtype)
+    feature_rows[0, 4097] = 1e10
+    feature_rows[1, 3] = -1e8
+    nonfeature_rows = torch.tensor([[3e-4, -2e5], [7e7, -9e-6]], dtype=dtype)
+
+    class Context:
+        def produce_row_tiles(self, *args, feature_column_tile_size, consume_feature_tile, **kwargs):
+            del args, kwargs
+            for start in range(0, feature_rows.shape[1], feature_column_tile_size):
+                end = min(start + feature_column_tile_size, feature_rows.shape[1])
+                consume_feature_tile(start, end, feature_rows[:, start:end])
+            return nonfeature_rows
+
+    feature = _ColumnTiledFeatureRowStore(
+        n_rows=2, n_feature_columns=5003, column_tile_size=257, dtype=dtype
+    )
+    nonfeature = _ColumnTiledFeatureRowStore(
+        n_rows=2, n_feature_columns=2, column_tile_size=2, dtype=dtype
+    )
+    try:
+        _, actual = produce_and_store_tiled_rows(
+            ctx=Context(), layers=torch.tensor([0, 0]), positions=torch.tensor([0, 0]),
+            inject_values=torch.ones((2, 1)), row_start=0, feature_row_store=feature,
+            nonfeature_row_store=nonfeature, feature_column_tile_size=257, dtype=dtype,
+            phase_label="phase3_logits",
+        )
+        maximum = torch.maximum(feature_rows.abs().amax(dim=1), nonfeature_rows.abs().amax(dim=1))
+        scaled = torch.zeros_like(maximum)
+        for start in range(0, feature_rows.shape[1], 4096):
+            scaled += (feature_rows[:, start : start + 4096].abs() / maximum[:, None]).sum(dim=1)
+        scaled += (nonfeature_rows.abs() / maximum[:, None]).sum(dim=1)
+        assert torch.equal(actual[0], maximum)
+        assert torch.equal(actual[1], scaled)
+    finally:
+        feature.cleanup()
+        nonfeature.cleanup()

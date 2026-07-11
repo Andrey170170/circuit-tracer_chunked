@@ -171,6 +171,8 @@ def attribute(
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
     row_store_preallocate: bool = True,
+    feature_row_retention: Literal["full_file", "none_recompute"] = "full_file",
+    replay_tile_cache_bytes: int | None = None,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
 ) -> Graph:
@@ -279,6 +281,8 @@ def attribute(
         or row_store_temp_root_policy != "default"
         or row_store_temp_root is not None
         or not bool(row_store_preallocate)
+        or feature_row_retention != "full_file"
+        or replay_tile_cache_bytes is not None
         or exact_encoder_residency != "lazy"
     )
 
@@ -333,6 +337,8 @@ def attribute(
             row_store_temp_root_policy=row_store_temp_root_policy,
             row_store_temp_root=row_store_temp_root,
             row_store_preallocate=row_store_preallocate,
+            feature_row_retention=feature_row_retention,
+            replay_tile_cache_bytes=replay_tile_cache_bytes,
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
         )

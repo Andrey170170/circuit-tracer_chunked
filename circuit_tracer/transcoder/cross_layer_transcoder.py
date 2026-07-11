@@ -182,6 +182,7 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
             supports_lazy_encoder=bool(self.lazy_encoder),
             supports_lazy_decoder_chunks=exact_provider,
             supports_lazy_encoder_rows=exact_provider,
+            supports_exact_row_replay=exact_provider,
             decoder_output_topology="cross_layer",
             default_decoder_chunk_size=int(self.decoder_chunk_size),
             default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),

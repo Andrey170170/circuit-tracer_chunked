@@ -217,6 +217,9 @@ class AttributionContext:
         self.phase3_gradient_replay_status = "disabled"
         self.phase3_gradient_replay_column_offset = 0
         self._compute_batch_call_index = 0
+        self._replay_model = None
+        self._replay_trace_input_ids: torch.Tensor | None = None
+        self._replay_trace_batch_size: int | None = None
         self._diagnostic_stats: dict[str, object] = {
             "compute_batch_calls": 0.0,
             "compute_batch_seconds": 0.0,
@@ -1224,6 +1227,9 @@ class AttributionContext:
         trace_batch_size: int,
     ) -> None:
         """Run and cache the Phase-1 forward pass."""
+        self._replay_model = model
+        self._replay_trace_input_ids = trace_input_ids.detach()
+        self._replay_trace_batch_size = int(trace_batch_size)
         with model.trace() as tracer:
             with tracer.invoke(trace_input_ids.expand(trace_batch_size, -1)):
                 pass
@@ -1233,6 +1239,33 @@ class AttributionContext:
             model.configure_gradient_flow(tracer)
             model.configure_skip_connection(tracer, barrier=detach_barrier)
             self.cache_residual(model, tracer, barrier=detach_barrier)
+
+    def reset_saved_graph_handles(self) -> None:
+        """Clear only Phase-1 graph handles while preserving immutable Phase-0 state."""
+        self._clear_saved_grads()
+        self._resid_activations.clear()
+        self._feature_output_activations.clear()
+        self._batch_buffer = None
+        self._produced_feature_range = None
+        self._produce_nonfeature = True
+
+    def rebuild_saved_graph_handles(self) -> None:
+        """Re-run the identical Phase-1 input and capacity captured by the context."""
+        if (
+            self._replay_model is None
+            or self._replay_trace_input_ids is None
+            or self._replay_trace_batch_size is None
+        ):
+            raise RuntimeError("Phase-1 replay state has not been configured")
+        self.run_forward_pass(
+            self._replay_model,
+            self._replay_trace_input_ids,
+            trace_batch_size=self._replay_trace_batch_size,
+        )
+
+    def release_saved_graph_handles(self) -> None:
+        """Deterministically release a replay graph without clearing Phase-0 state."""
+        self.reset_saved_graph_handles()
 
     def compute_score(
         self,

@@ -71,10 +71,70 @@ def produce_and_store_tiled_rows(
         .detach()
         .to(device="cpu", dtype=dtype)
     )
-    denominator = _merge_scaled_l1(denominator, nonfeature, dtype=dtype)
+    # Re-read persisted feature tiles so full-retention tiled execution follows
+    # the canonical global-max then 4096-column scaled-sum reduction order.
+    # The streaming merge above remains useful for no-retention execution, but
+    # its floating-point association is not the full-file reference contract.
+    row_count = int(nonfeature.shape[0])
+    global_max = nonfeature.abs().amax(dim=1).to(dtype=dtype)
+    for start in range(0, int(feature_row_store.n_feature_columns), 4096):
+        end = min(start + 4096, int(feature_row_store.n_feature_columns))
+        tile = feature_row_store.read_tile(row_start, row_start + row_count, start, end)
+        global_max = torch.maximum(global_max, tile.abs().amax(dim=1).to(dtype=dtype))
+    scaled_sum = torch.zeros_like(global_max)
+    finite = (global_max > 0) & torch.isfinite(global_max)
+    for start in range(0, int(feature_row_store.n_feature_columns), 4096):
+        end = min(start + 4096, int(feature_row_store.n_feature_columns))
+        tile = feature_row_store.read_tile(row_start, row_start + row_count, start, end)
+        if bool(finite.any()):
+            scaled_sum[finite] += (
+                tile[finite].abs().to(dtype=dtype) / global_max[finite, None]
+            ).sum(dim=1)
+    for start in range(0, int(nonfeature.shape[1]), 4096):
+        end = min(start + 4096, int(nonfeature.shape[1]))
+        if bool(finite.any()):
+            scaled_sum[finite] += (
+                nonfeature[finite, start:end].abs().to(dtype=dtype)
+                / global_max[finite, None]
+            ).sum(dim=1)
+    scaled_sum[torch.isinf(global_max)] = 1
+    denominator = (global_max, scaled_sum)
     feature_row_store.set_row_denominator(row_start=row_start, value=denominator)
     nonfeature_row_store.append_tile(
         row_start=row_start, column_start=0, values=nonfeature, nonfeature=True, phase=phase_label
     )
     nonfeature_row_store.set_row_denominator(row_start=row_start, value=denominator)
+    return nonfeature, denominator
+
+
+def produce_tiled_rows_no_retention(
+    *,
+    ctx: Any,
+    layers: torch.Tensor,
+    positions: torch.Tensor,
+    inject_values: torch.Tensor,
+    feature_column_tile_size: int,
+    dtype: torch.dtype,
+    phase_label: str,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Produce each tile once, retain only stable denominator state and nonfeatures."""
+    denominator: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def consume(_start: int, _end: int, tile: torch.Tensor) -> None:
+        nonlocal denominator
+        denominator = _merge_scaled_l1(
+            denominator, tile.detach().to(device="cpu", dtype=dtype), dtype=dtype
+        )
+
+    nonfeature = ctx.produce_row_tiles(
+        layers,
+        positions,
+        inject_values,
+        feature_column_tile_size=feature_column_tile_size,
+        consume_feature_tile=consume,
+        phase_label=phase_label,
+        retain_graph=True,
+    ).detach().to(device="cpu", dtype=dtype)
+    denominator = _merge_scaled_l1(denominator, nonfeature, dtype=dtype)
+    assert denominator is not None
     return nonfeature, denominator

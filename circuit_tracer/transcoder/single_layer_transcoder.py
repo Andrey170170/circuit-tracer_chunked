@@ -412,6 +412,7 @@ class TranscoderSet(nn.Module):
             supports_lazy_encoder=any(t.lazy_encoder for t in self.transcoders),
             supports_lazy_decoder_chunks=exact,
             supports_lazy_encoder_rows=exact,
+            supports_exact_row_replay=exact,
             decoder_output_topology="same_layer",
             default_decoder_chunk_size=int(self.decoder_chunk_size),
             default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),

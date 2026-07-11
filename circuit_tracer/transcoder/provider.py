@@ -21,6 +21,7 @@ class TranscoderCapabilities:
     supports_lazy_encoder: bool = False
     supports_lazy_decoder_chunks: bool = False
     supports_lazy_encoder_rows: bool = False
+    supports_exact_row_replay: bool = False
     decoder_output_topology: DecoderOutputTopology = "cross_layer"
     default_decoder_chunk_size: int | None = None
     default_cross_batch_decoder_cache_bytes: int | None = None
@@ -75,6 +76,7 @@ def get_transcoder_capabilities(obj: object) -> TranscoderCapabilities:
         supports_lazy_encoder=bool(getattr(obj, "lazy_encoder", False)),
         supports_lazy_decoder_chunks=legacy_exact,
         supports_lazy_encoder_rows=legacy_exact,
+        supports_exact_row_replay=legacy_exact,
         decoder_output_topology="cross_layer",
         default_decoder_chunk_size=getattr(obj, "decoder_chunk_size", None),
         default_cross_batch_decoder_cache_bytes=getattr(
@@ -125,6 +127,19 @@ def require_exact_chunked_provider(obj: object | None) -> bool:
     return False
 
 
+def require_exact_row_replay_provider(obj: object | None) -> None:
+    """Reject explicit no-retention replay unless the provider guarantees it."""
+
+    if not exact_chunked_provider_usable(obj):
+        missing = ", ".join(provider_contract_missing_methods(obj))
+        suffix = f"; missing methods: {missing}" if missing else ""
+        raise ValueError(f"none_recompute requires an exact chunked CLT/PLT provider{suffix}")
+    if not get_transcoder_capabilities(obj).supports_exact_row_replay:
+        raise ValueError(
+            "none_recompute requires explicit provider capability supports_exact_row_replay=True"
+        )
+
+
 def provider_fingerprint(
     obj: object,
     *,
@@ -154,6 +169,7 @@ def provider_fingerprint(
         "supports_encoder_row_materialization": caps.supports_encoder_row_materialization,
         "supports_lazy_decoder_chunks": caps.supports_lazy_decoder_chunks,
         "supports_lazy_encoder_rows": caps.supports_lazy_encoder_rows,
+        "supports_exact_row_replay": caps.supports_exact_row_replay,
         "decoder_chunk_size": caps.default_decoder_chunk_size,
         "cross_batch_decoder_cache_bytes": caps.default_cross_batch_decoder_cache_bytes,
         "legacy_exact_chunked_decoder": caps.legacy_exact_chunked_decoder,

@@ -55,7 +55,11 @@ from circuit_tracer.attribution.nnsight.telemetry import (
     _safe_int,
     _tensor_nbytes_estimate,
 )
-from circuit_tracer.attribution.nnsight.tiled_rows import produce_and_store_tiled_rows
+from circuit_tracer.attribution.nnsight.row_replay import RowRecipe, RowRecipeLedger
+from circuit_tracer.attribution.nnsight.tiled_rows import (
+    produce_and_store_tiled_rows,
+    produce_tiled_rows_no_retention,
+)
 from circuit_tracer.graph import (
     compute_partial_feature_influences_streaming,
     compute_partial_feature_influences_tiled,
@@ -138,6 +142,7 @@ class Phase4Config:
     influence_row_tile_size: int = 4096
     influence_column_tile_size: int = 2048
     feature_row_column_tile_size: int = 2048
+    feature_row_retention: str = "full_file"
 
 
 @dataclass(frozen=True)
@@ -495,7 +500,10 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                             phase="phase4",
                         )
 
-                if config.full_retention_backend == "column_tiled_v1":
+                if (
+                    config.full_retention_backend == "column_tiled_v1"
+                    or config.feature_row_retention == "none_recompute"
+                ):
                     feature_influences = compute_partial_feature_influences_tiled(
                         feature_row_store.read_tile,
                         row_denominator_prefix,
@@ -1348,8 +1356,21 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 if encoder_vectors_source_device == "cpu" and encoder_vectors.device.type == "cuda":
                     phase4_cpu_to_gpu_bytes_total += int(encoder_vectors_transfer_bytes)
                 compute_batch_start = time.perf_counter()
-                tiled_production = config.full_retention_backend == "column_tiled_v1"
-                if tiled_production:
+                no_retention = config.feature_row_retention == "none_recompute"
+                tiled_production = config.full_retention_backend == "column_tiled_v1" or no_retention
+                if no_retention:
+                    ctx.reset_saved_graph_handles()
+                    ctx.rebuild_saved_graph_handles()
+                    rows, tiled_denominator = produce_tiled_rows_no_retention(
+                        ctx=ctx,
+                        layers=feat_layers[idx_batch],
+                        positions=feat_pos[idx_batch],
+                        inject_values=encoder_vectors,
+                        feature_column_tile_size=config.feature_row_column_tile_size,
+                        dtype=exact_trace_internal_dtype_resolved,
+                        phase_label="phase4_features",
+                    )
+                elif tiled_production:
                     assert feature_row_store is not None and nonfeature_row_store is not None
                     rows, tiled_denominator = produce_and_store_tiled_rows(
                         ctx=ctx,
@@ -1492,7 +1513,32 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                             ),
                         }
                     )
-                if use_compact_feature_row_store and not tiled_production:
+                if no_retention:
+                    assert isinstance(feature_row_store, RowRecipeLedger)
+                    assert isinstance(nonfeature_row_store, RowRecipeLedger)
+                    for local_index in range(row_count):
+                        ordinal = st + local_index
+                        recipe = RowRecipe(
+                            ordinal=ordinal,
+                            source_kind="feature",
+                            layer=int(feat_layers[idx_batch[local_index]]),
+                            position=int(feat_pos[idx_batch[local_index]]),
+                            injection=encoder_vectors[local_index],
+                        )
+                        denominator = (
+                            row_denominator_scaled_l1[0][local_index : local_index + 1],
+                            row_denominator_scaled_l1[1][local_index : local_index + 1],
+                        )
+                        node_index = int(idx_batch[local_index])
+                        feature_row_store.append_recipe(
+                            recipe, node_index=node_index, denominator=denominator
+                        )
+                        nonfeature_row_store.append_recipe(
+                            recipe, node_index=node_index, denominator=denominator
+                        )
+                    executor_row_store_write_elapsed_ms = 0.0
+                    row_store_append_telemetry = {}
+                elif use_compact_feature_row_store and not tiled_production:
                     assert feature_row_store is not None
                     assert nonfeature_row_store is not None
                     row_store_write_start = time.perf_counter()

@@ -38,6 +38,12 @@ from circuit_tracer.attribution.nnsight.row_store import (
     _ColumnTiledFeatureRowStore,
     _FileBackedFeatureRowStore,
 )
+from circuit_tracer.attribution.nnsight.row_replay import (
+    NonfeatureProjectionLedger,
+    ReplayGraphLifecycle,
+    RowRecipeLedger,
+)
+from circuit_tracer.transcoder.provider import provider_fingerprint
 from circuit_tracer.attribution.nnsight.telemetry import (
     _build_cross_cluster_runtime_snapshot,
     _record_cross_cluster_checkpoint,
@@ -113,6 +119,8 @@ class Phase2Config:
     trace_batch_size: int
     phase3_row_replay_mode_resolved: str
     phase3_row_donor_bundle_path: str | os.PathLike[str] | None
+    feature_row_retention: Literal["full_file", "none_recompute"] = "full_file"
+    replay_tile_cache_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -551,17 +559,73 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
         assert compact_output
         assert exact_chunked_decoder
         n_nonfeature_columns = int(logit_offset - total_active_feats)
-        store_class = (
+        if config.feature_row_retention == "none_recompute":
+            def make_lifecycle() -> ReplayGraphLifecycle:
+                return ReplayGraphLifecycle(
+                    reset=ctx.reset_saved_graph_handles,
+                    rebuild_forward=ctx.rebuild_saved_graph_handles,
+                    release=ctx.release_saved_graph_handles,
+                )
+
+            def feature_producer(recipe, start: int, end: int) -> torch.Tensor:
+                assert recipe.injection is not None
+                return ctx.compute_batch(
+                    layers=torch.tensor([recipe.layer]),
+                    positions=torch.tensor([recipe.position]),
+                    inject_values=recipe.injection.unsqueeze(0),
+                    feature_column_range=(start, end),
+                    include_nonfeature=False,
+                    phase_label="row_replay_feature",
+                ).detach().to(device="cpu", dtype=exact_trace_internal_dtype_resolved)
+
+            def nonfeature_producer(recipe, start: int, end: int) -> torch.Tensor:
+                assert recipe.injection is not None
+                values = ctx.compute_batch(
+                    layers=torch.tensor([recipe.layer]),
+                    positions=torch.tensor([recipe.position]),
+                    inject_values=recipe.injection.unsqueeze(0),
+                    feature_column_range=(0, 0),
+                    include_nonfeature=True,
+                    phase_label="row_replay_nonfeature",
+                )
+                return values[:, start:end].detach().to(
+                    device="cpu", dtype=exact_trace_internal_dtype_resolved
+                )
+
+            common = {
+                "n_rows": row_store_capacity_feature_nodes + n_logits,
+                "dtype": exact_trace_internal_dtype_resolved,
+                "semantic_fingerprint": {"active_features": int(total_active_feats)},
+                "execution_fingerprint": {"trace_batch_size": int(trace_batch_size)},
+                "provider_fingerprint": provider_fingerprint(model.transcoders),
+                "tile_cache_bytes": int(config.replay_tile_cache_bytes),
+            }
+            feature_row_store = RowRecipeLedger(
+                n_feature_columns=total_active_feats,
+                producer=feature_producer,
+                lifecycle=make_lifecycle(),
+                **common,
+            )
+            inputs.resource_owner.feature_row_store = feature_row_store
+            nonfeature_row_store = NonfeatureProjectionLedger(
+                n_feature_columns=n_nonfeature_columns,
+                producer=nonfeature_producer,
+                lifecycle=make_lifecycle(),
+                **common,
+            )
+            inputs.resource_owner.nonfeature_row_store = nonfeature_row_store
+        else:
+            store_class = (
             _ColumnTiledFeatureRowStore
             if config.full_retention_backend == "column_tiled_v1"
             else _FileBackedFeatureRowStore
-        )
-        tiled_kwargs = (
+            )
+            tiled_kwargs = (
             {"column_tile_size": config.feature_row_column_tile_size}
             if config.full_retention_backend == "column_tiled_v1"
             else {}
-        )
-        feature_row_store = store_class(
+            )
+            feature_row_store = store_class(
             n_rows=row_store_capacity_feature_nodes + n_logits,
             n_feature_columns=total_active_feats,
             dtype=exact_trace_internal_dtype_resolved,
@@ -574,9 +638,9 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
             preallocate=row_store_preallocate,
             telemetry_recorder=telemetry_recorder,
             **tiled_kwargs,
-        )
-        inputs.resource_owner.feature_row_store = feature_row_store
-        nonfeature_row_store = store_class(
+            )
+            inputs.resource_owner.feature_row_store = feature_row_store
+            nonfeature_row_store = store_class(
             n_rows=row_store_capacity_feature_nodes + n_logits,
             n_feature_columns=n_nonfeature_columns,
             dtype=exact_trace_internal_dtype_resolved,
@@ -589,8 +653,8 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
             preallocate=row_store_preallocate,
             telemetry_recorder=telemetry_recorder,
             **tiled_kwargs,
-        )
-        inputs.resource_owner.nonfeature_row_store = nonfeature_row_store
+            )
+            inputs.resource_owner.nonfeature_row_store = nonfeature_row_store
     else:
         edge_matrix = torch.zeros(row_store_capacity_feature_nodes + n_logits, total_nodes)
 
@@ -600,7 +664,12 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
 
     phase2_extra: dict[str, object] = {
         "row_store_mode": (
-            "compact_feature_file_backed_dense" if use_compact_feature_row_store else "dense_full"
+            "compact_none_recompute"
+            if use_compact_feature_row_store
+            and config.feature_row_retention == "none_recompute"
+            else "compact_feature_file_backed_dense"
+            if use_compact_feature_row_store
+            else "dense_full"
         ),
         "phase0_replay_mode": phase0_replay_metadata.get("mode"),
         "phase0_replay_status": phase0_replay_metadata.get("status"),
@@ -612,9 +681,9 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
         assert feature_row_store is not None
         assert nonfeature_row_store is not None
         phase2_extra.update(
-            feature_row_store="dense_memmap",
-            feature_row_store_path=feature_row_store.path,
-            nonfeature_row_store_path=nonfeature_row_store.path,
+            feature_row_store=type(feature_row_store).__name__,
+            feature_row_store_path=getattr(feature_row_store, "path", None),
+            nonfeature_row_store_path=getattr(nonfeature_row_store, "path", None),
             row_abs_sums_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
             row_abs_max_shape=f"{tuple(feature_row_store.row_abs_max.shape)}",
             row_l1_scaled_shape=f"{tuple(feature_row_store.row_l1_scaled.shape)}",
@@ -663,7 +732,7 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
         )
         row_denominator_component_count = 2 if use_compact_feature_row_store else 1
         row_count = int(actual_max_feature_nodes + n_logits)
-        row_store_expected_bytes = (
+        row_store_expected_bytes = 0 if config.feature_row_retention == "none_recompute" else (
             row_count
             * int(total_active_feats)
             * torch.empty((), dtype=row_store_dtype_for_metrics).element_size()
