@@ -193,6 +193,22 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
     nonfeature_row_store: _FileBackedFeatureRowStore | None = None
     edge_matrix: torch.Tensor | None = None
     phase0_donor_bundle_payload: dict[str, object] | None = None
+    phase3_gradient_replay_metadata: dict[str, object] = _build_phase3_replay_metadata(
+        replay_kind="phase3_gradient_replay_v1",
+        mode=phase3_gradient_replay_mode_resolved,
+        status="disabled" if phase3_gradient_replay_mode_resolved == "disabled" else "pending",
+        donor_bundle_path=phase3_gradient_donor_bundle_path,
+        validation_policy=phase3_replay_validation_policy_resolved,
+        source="host_computed" if phase3_gradient_replay_mode_resolved == "disabled" else None,
+    )
+    phase3_row_replay_metadata: dict[str, object] = _build_phase3_replay_metadata(
+        replay_kind="phase3_row_replay_v1",
+        mode=phase3_row_replay_mode_resolved,
+        status="disabled" if phase3_row_replay_mode_resolved == "disabled" else "pending",
+        donor_bundle_path=phase3_row_donor_bundle_path,
+        validation_policy=phase3_replay_validation_policy_resolved,
+        source="host_computed" if phase3_row_replay_mode_resolved == "disabled" else None,
+    )
     loaded_phase3_row_donor_bundle: dict[str, object] | None = None
 
     # Phase 2: build input vector list
