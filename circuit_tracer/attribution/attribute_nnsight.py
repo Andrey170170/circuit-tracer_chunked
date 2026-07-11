@@ -1247,9 +1247,18 @@ def _run_attribution(
     compact_exact_provider = compact_output and exact_chunked_decoder
     compact_row_store_provider = compact_output and supports_compact_row_store
     preflight_requirements = (
+        (
+            full_retention_backend == "column_tiled_v1",
+            compact_row_store_provider and transcoder_capabilities.architecture in ("clt", "plt"),
+            "column_tiled_v1 true row production",
+        ),
         (phase4_anomaly_debug_enabled, compact_exact_provider, "Phase-4 anomaly debug"),
         (cross_cluster_debug_enabled, compact_exact_provider, "cross_cluster_debug"),
-        (capture_phase0_donor_bundle_enabled, compact_exact_provider, "capture_phase0_donor_bundle"),
+        (
+            capture_phase0_donor_bundle_enabled,
+            compact_exact_provider,
+            "capture_phase0_donor_bundle",
+        ),
         (capture_phase3_seed_bundle_enabled, compact_exact_provider, "capture_phase3_seed_bundle"),
         (
             capture_phase3_gradient_bundle_enabled,
@@ -1293,56 +1302,56 @@ def _run_attribution(
     )
     telemetry_recorder = telemetry_observer.recorder
     attribute_start_attrs = {
-            "profile": profile,
-            "compact_output": compact_output,
-            "transcoder_architecture": transcoder_capabilities.architecture,
-            "transcoder_checkpoint_format": transcoder_capabilities.checkpoint_format,
-            "exact_chunked_provider_enabled": exact_chunked_provider_enabled,
-            "supports_compact_row_store": supports_compact_row_store,
-            "supports_decoder_chunk_cache": supports_decoder_chunk_cache,
-            "supports_exact_encoder_residency": supports_exact_encoder_residency,
-            "decoder_output_topology": transcoder_capabilities.decoder_output_topology,
-            "batch_size": batch_size,
-            "feature_batch_size": feature_batch_size,
-            "logit_batch_size": logit_batch_size,
-            "telemetry_max_events": telemetry_max_events_resolved,
-            "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
-            "phase0_activation_threshold_compare_mode": (
-                phase0_activation_threshold_compare_mode_resolved
-            ),
-            "phase0_replay_mode": phase0_replay_mode_resolved,
-            "phase0_donor_bundle_supplied": bool(phase0_donor_bundle_path is not None),
-            "phase0_donor_context_policy": phase0_donor_context_policy_resolved,
-            "phase3_gradient_replay_mode": phase3_gradient_replay_mode_resolved,
-            "phase3_gradient_donor_bundle_supplied": bool(
-                phase3_gradient_donor_bundle_path is not None
-            ),
-            "phase3_row_replay_mode": phase3_row_replay_mode_resolved,
-            "phase3_row_donor_bundle_supplied": bool(phase3_row_donor_bundle_path is not None),
-            "phase3_replay_validation_policy": phase3_replay_validation_policy_resolved,
-            "internal_precision_requested": internal_precision_requested,
-            "resolved_dtype_map": resolved_dtype_map,
-            "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
-            "capture_phase0_donor_bundle_enabled": capture_phase0_donor_bundle_enabled,
-            "capture_phase3_seed_bundle_enabled": capture_phase3_seed_bundle_enabled,
-            "capture_phase3_gradient_bundle_enabled": capture_phase3_gradient_bundle_enabled,
-            "capture_phase3_row_bundle_enabled": capture_phase3_row_bundle_enabled,
-            "capture_feature_semantic_descriptors_enabled": (
-                capture_feature_semantic_descriptors_enabled
-            ),
-            "phase0_donor_bundle_schema_version": 1,
-            "phase0_donor_bundle_replay_kind": "phase0_active_features_v1",
-            "semantic_descriptor_top_k": semantic_descriptor_top_k,
-            "semantic_descriptor_dim": semantic_descriptor_dim,
-            "prefix_view_validation_applied": prefix_view_metadata is not None,
-            "prefix_view_metadata": dict(prefix_view_metadata) if prefix_view_metadata else None,
-            "phase0_window_state_reuse_requested": phase0_context_override is not None,
-            "phase0_window_state_reuse_effective": phase0_context_override is not None,
-            "target_logit_source": target_logit_source
-            or ("override" if target_logits_override is not None else "context"),
-            **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
-            **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
-        }
+        "profile": profile,
+        "compact_output": compact_output,
+        "transcoder_architecture": transcoder_capabilities.architecture,
+        "transcoder_checkpoint_format": transcoder_capabilities.checkpoint_format,
+        "exact_chunked_provider_enabled": exact_chunked_provider_enabled,
+        "supports_compact_row_store": supports_compact_row_store,
+        "supports_decoder_chunk_cache": supports_decoder_chunk_cache,
+        "supports_exact_encoder_residency": supports_exact_encoder_residency,
+        "decoder_output_topology": transcoder_capabilities.decoder_output_topology,
+        "batch_size": batch_size,
+        "feature_batch_size": feature_batch_size,
+        "logit_batch_size": logit_batch_size,
+        "telemetry_max_events": telemetry_max_events_resolved,
+        "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
+        "phase0_activation_threshold_compare_mode": (
+            phase0_activation_threshold_compare_mode_resolved
+        ),
+        "phase0_replay_mode": phase0_replay_mode_resolved,
+        "phase0_donor_bundle_supplied": bool(phase0_donor_bundle_path is not None),
+        "phase0_donor_context_policy": phase0_donor_context_policy_resolved,
+        "phase3_gradient_replay_mode": phase3_gradient_replay_mode_resolved,
+        "phase3_gradient_donor_bundle_supplied": bool(
+            phase3_gradient_donor_bundle_path is not None
+        ),
+        "phase3_row_replay_mode": phase3_row_replay_mode_resolved,
+        "phase3_row_donor_bundle_supplied": bool(phase3_row_donor_bundle_path is not None),
+        "phase3_replay_validation_policy": phase3_replay_validation_policy_resolved,
+        "internal_precision_requested": internal_precision_requested,
+        "resolved_dtype_map": resolved_dtype_map,
+        "cross_cluster_debug_enabled": cross_cluster_debug_enabled,
+        "capture_phase0_donor_bundle_enabled": capture_phase0_donor_bundle_enabled,
+        "capture_phase3_seed_bundle_enabled": capture_phase3_seed_bundle_enabled,
+        "capture_phase3_gradient_bundle_enabled": capture_phase3_gradient_bundle_enabled,
+        "capture_phase3_row_bundle_enabled": capture_phase3_row_bundle_enabled,
+        "capture_feature_semantic_descriptors_enabled": (
+            capture_feature_semantic_descriptors_enabled
+        ),
+        "phase0_donor_bundle_schema_version": 1,
+        "phase0_donor_bundle_replay_kind": "phase0_active_features_v1",
+        "semantic_descriptor_top_k": semantic_descriptor_top_k,
+        "semantic_descriptor_dim": semantic_descriptor_dim,
+        "prefix_view_validation_applied": prefix_view_metadata is not None,
+        "prefix_view_metadata": dict(prefix_view_metadata) if prefix_view_metadata else None,
+        "phase0_window_state_reuse_requested": phase0_context_override is not None,
+        "phase0_window_state_reuse_effective": phase0_context_override is not None,
+        "target_logit_source": target_logit_source
+        or ("override" if target_logits_override is not None else "context"),
+        **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
+        **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
+    }
 
     if auto_scale_feature_batch_size and not plan_feature_batch_size:
         logger.info(
@@ -1828,6 +1837,7 @@ def _run_attribution(
                 full_retention_backend=full_retention_backend,
                 influence_row_tile_size=influence_row_tile_size,
                 influence_column_tile_size=influence_column_tile_size,
+                feature_row_column_tile_size=feature_row_column_tile_size,
             ),
         )
         row_to_node_index = phase3_result.row_to_node_index
@@ -1896,6 +1906,7 @@ def _run_attribution(
                 full_retention_backend=full_retention_backend,
                 influence_row_tile_size=influence_row_tile_size,
                 influence_column_tile_size=influence_column_tile_size,
+                feature_row_column_tile_size=feature_row_column_tile_size,
                 exact_encoder_residency_config=exact_encoder_residency_config,
                 profile=profile,
                 profile_log_interval=profile_log_interval,
@@ -2079,6 +2090,7 @@ def _run_attribution(
                 "nonfeature row-store cleanup", nonfeature_row_store_for_cleanup.cleanup
             )
         if ctx is not None:
+
             def cleanup_context() -> None:
                 _log_memory_boundary(logger, "Teardown start", model.device)
                 cleanup = getattr(ctx, "cleanup", None)

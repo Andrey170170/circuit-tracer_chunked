@@ -39,7 +39,10 @@ from circuit_tracer.attribution.nnsight.phase_support import (
     _copy_rows_to_cpu_staging,
     _record_phase4_refresh_debug,
 )
-from circuit_tracer.attribution.nnsight.replay import _compute_row_denominator_scaled_l1, _hash_index_tensor
+from circuit_tracer.attribution.nnsight.replay import (
+    _compute_row_denominator_scaled_l1,
+    _hash_index_tensor,
+)
 from circuit_tracer.attribution.nnsight.telemetry import (
     _build_phase4_executor_batch_telemetry,
     _build_phase4_executor_substage_telemetry,
@@ -52,13 +55,23 @@ from circuit_tracer.attribution.nnsight.telemetry import (
     _safe_int,
     _tensor_nbytes_estimate,
 )
+from circuit_tracer.attribution.nnsight.tiled_rows import produce_and_store_tiled_rows
 from circuit_tracer.graph import (
     compute_partial_feature_influences_streaming,
     compute_partial_feature_influences_tiled,
     compute_partial_influences,
 )
-from circuit_tracer.observability.human_logs import _log_batch_profile, _log_memory_boundary, _log_phase_metrics, _snapshot_diagnostics
-from circuit_tracer.utils.telemetry import build_memory_before_after_attrs, diff_numeric_metrics, get_memory_snapshot
+from circuit_tracer.observability.human_logs import (
+    _log_batch_profile,
+    _log_memory_boundary,
+    _log_phase_metrics,
+    _snapshot_diagnostics,
+)
+from circuit_tracer.utils.telemetry import (
+    build_memory_before_after_attrs,
+    diff_numeric_metrics,
+    get_memory_snapshot,
+)
 
 
 @dataclass(frozen=True)
@@ -124,6 +137,7 @@ class Phase4Config:
     full_retention_backend: str = "full_file"
     influence_row_tile_size: int = 4096
     influence_column_tile_size: int = 2048
+    feature_row_column_tile_size: int = 2048
 
 
 @dataclass(frozen=True)
@@ -197,10 +211,16 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     phase4_debug_summary_enabled = config.phase4_debug_summary_enabled
     cross_cluster_debug_enabled = config.cross_cluster_debug_enabled
     phase4_frontier_buffer_relative_epsilon = config.phase4_frontier_buffer_relative_epsilon
-    phase4_frontier_buffer_max_extra_per_refresh = config.phase4_frontier_buffer_max_extra_per_refresh
+    phase4_frontier_buffer_max_extra_per_refresh = (
+        config.phase4_frontier_buffer_max_extra_per_refresh
+    )
     phase4_frontier_buffer_max_extra_total = config.phase4_frontier_buffer_max_extra_total
-    phase4_refresh_prepared_chunk_cache_bytes_effective = config.phase4_refresh_prepared_chunk_cache_bytes_effective
-    phase4_refresh_active_row_accumulation_effective = config.phase4_refresh_active_row_accumulation_effective
+    phase4_refresh_prepared_chunk_cache_bytes_effective = (
+        config.phase4_refresh_prepared_chunk_cache_bytes_effective
+    )
+    phase4_refresh_active_row_accumulation_effective = (
+        config.phase4_refresh_active_row_accumulation_effective
+    )
     phase4_scheduler_config = config.phase4_scheduler_config
     phase4_refresh_optimization_config = config.phase4_refresh_optimization_config
     phase4_refresh_policy_config = config.phase4_refresh_policy_config
@@ -215,9 +235,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     # Phase 4: feature attribution
     logger.info("Phase 4: Computing feature attributions")
     phase4_start = time.perf_counter()
-    phase4_frontier_buffer_metadata["initial_target_feature_nodes"] = int(
-        actual_max_feature_nodes
-    )
+    phase4_frontier_buffer_metadata["initial_target_feature_nodes"] = int(actual_max_feature_nodes)
     phase4_frontier_buffer_metadata["final_actual_max_feature_nodes"] = int(
         actual_max_feature_nodes
     )
@@ -225,9 +243,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     _log_memory_boundary(logger, "Phase 4 start", model.device)
     decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)
     phase4_feature_batch_size = effective_feature_batch_size
-    phase4_refresh_queue_multiplier = int(
-        phase4_refresh_policy_config.effective_queue_multiplier
-    )
+    phase4_refresh_queue_multiplier = int(phase4_refresh_policy_config.effective_queue_multiplier)
     phase4_refresh_cycle_batches = _compute_phase4_refresh_cycle_batches(
         update_interval=update_interval,
         queue_multiplier=phase4_refresh_queue_multiplier,
@@ -256,9 +272,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     )
     phase4_execution_metadata.update(
         {
-            "executor_configured_reference_batch_size": int(
-                phase4_executor_reference_batch_size
-            ),
+            "executor_configured_reference_batch_size": int(phase4_executor_reference_batch_size),
             "executor_reference_batch_size": int(phase4_executor_reference_batch_size),
             "executor_microbatch_size": int(phase4_executor_microbatch_size),
             "executor_physically_split": bool(executor_physically_split),
@@ -389,13 +403,13 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             top_k=8,
         )
         anomaly_debug_result["logit_probability_stats"] = phase4_logit_probability_stats
-    
+
     pbar = tqdm(
         total=actual_max_feature_nodes,
         desc="Feature influence computation",
         disable=not verbose,
     )
-    
+
     while n_visited < actual_max_feature_nodes:
         phase4_frontier_plan: _Phase4FrontierPlan | None = None
         pending_refresh_index: int | None = None
@@ -463,7 +477,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     phase4_refresh_prepared_chunk_cache_bytes_effective > 0
                 )
                 if refresh_prepared_row_reader:
-    
+
                     def refresh_row_reader(row_start: int, row_end: int) -> torch.Tensor:
                         return feature_row_store.read_prepared_feature_rows(
                             row_start,
@@ -473,14 +487,14 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                             phase="phase4",
                         )
                 else:
-    
+
                     def refresh_row_reader(row_start: int, row_end: int) -> torch.Tensor:
                         return feature_row_store.read_feature_rows(
                             row_start,
                             row_end,
                             phase="phase4",
                         )
-    
+
                 if config.full_retention_backend == "column_tiled_v1":
                     feature_influences = compute_partial_feature_influences_tiled(
                         feature_row_store.read_tile,
@@ -497,17 +511,17 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     )
                 else:
                     feature_influences = compute_partial_feature_influences_streaming(
-                    refresh_row_reader,
-                    row_denominator_prefix,
-                    phase4_logit_probabilities,
-                    row_to_node_index[:st],
-                    n_feature_nodes=total_active_feats,
-                    n_logits=n_logits,
-                    device=feature_row_store.row_abs_max.device,
-                    chunk_reuse_stats=streaming_chunk_reuse_stats,
-                    compute_dtype=influence_compute_dtype,
-                    active_row_only_chunks=refresh_active_row_only_chunks,
-                    row_reader_returns_prepared=refresh_prepared_row_reader,
+                        refresh_row_reader,
+                        row_denominator_prefix,
+                        phase4_logit_probabilities,
+                        row_to_node_index[:st],
+                        n_feature_nodes=total_active_feats,
+                        n_logits=n_logits,
+                        device=feature_row_store.row_abs_max.device,
+                        chunk_reuse_stats=streaming_chunk_reuse_stats,
+                        compute_dtype=influence_compute_dtype,
+                        active_row_only_chunks=refresh_active_row_only_chunks,
+                        row_reader_returns_prepared=refresh_prepared_row_reader,
                         active_row_accumulation=phase4_refresh_active_row_accumulation_effective,
                     )
                 refresh_row_store_read_elapsed_ms = _safe_float(
@@ -561,7 +575,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     device=edge_matrix.device,
                 )
                 feature_influences = influences[:total_active_feats]
-    
+
             refresh_partial_influence_elapsed_ms = (
                 time.perf_counter() - partial_influence_start
             ) * 1000.0
@@ -569,9 +583,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 refresh_partial_influence_elapsed_ms
             )
             if refresh_row_store_read_elapsed_ms is not None:
-                phase4_refresh_row_store_read_elapsed_ms_total += (
-                    refresh_row_store_read_elapsed_ms
-                )
+                phase4_refresh_row_store_read_elapsed_ms_total += refresh_row_store_read_elapsed_ms
             if refresh_influence_normalization_elapsed_ms is not None:
                 phase4_refresh_influence_normalization_elapsed_ms_total += (
                     refresh_influence_normalization_elapsed_ms
@@ -580,7 +592,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 phase4_refresh_influence_matmul_elapsed_ms_total += (
                     refresh_influence_matmul_elapsed_ms
                 )
-    
+
             max_frontier_size = min(
                 _compute_phase4_refresh_queue_window_size(
                     update_interval=update_interval,
@@ -589,7 +601,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 ),
                 int(actual_max_feature_nodes - n_visited),
             )
-    
+
             phase4_frontier_buffer_event: dict[str, object] | None = None
             if bool(phase4_frontier_buffer_metadata["enabled"]):
                 unvisited_scores_for_buffer = feature_influences[
@@ -634,7 +646,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     phase4_frontier_buffer_metadata["fallback_count"] = (
                         int(phase4_frontier_buffer_metadata["fallback_count"]) + 1
                     )
-    
+
             rank_topk_start = time.perf_counter()
             rank_selection = _select_phase4_frontier_rank_selection(
                 feature_influences=feature_influences,
@@ -652,7 +664,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     feature_influences,
                     visited,
                 )
-    
+
             max_feature_nodes_cap_bound = (
                 _compute_phase4_rank_selection_max_feature_nodes_cap_bound(
                     candidate_count=int(rank_selection.candidate_count),
@@ -661,7 +673,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     max_frontier_size=int(max_frontier_size),
                 )
             )
-    
+
             ranker_refresh_telemetry = {
                 "ranker_frontier_candidate_count": int(rank_selection.candidate_count),
                 "ranker_frontier_selected_count": int(rank_selection.selected_count),
@@ -675,18 +687,13 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 "ranker_frontier_relative_cutoff_gap": rank_selection.relative_cutoff_gap,
                 "ranker_frontier_near_cutoff_epsilon": rank_selection.near_cutoff_epsilon,
                 "ranker_frontier_near_cutoff_count": int(rank_selection.near_cutoff_count),
-                "ranker_frontier_max_feature_nodes_cap_bound": bool(
-                    max_feature_nodes_cap_bound
-                ),
+                "ranker_frontier_max_feature_nodes_cap_bound": bool(max_feature_nodes_cap_bound),
                 "ranker_frontier_tie_count_at_cutoff": int(rank_selection.tie_count_at_cutoff),
                 "ranker_frontier_tie_at_cutoff": bool(rank_selection.tie_at_cutoff),
                 "ranker_frontier_tie_behavior": rank_selection.tie_behavior,
             }
             if (
-                (
-                    cross_cluster_debug_enabled
-                    or phase4_scheduler_config.telemetry_detail == "debug"
-                )
+                (cross_cluster_debug_enabled or phase4_scheduler_config.telemetry_detail == "debug")
                 and rank_selection.cutoff_score is not None
                 and rank_selection.cutoff_score > 0
             ):
@@ -709,9 +716,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     )
                     for eps in (0.001, 0.01, 0.05)
                 }
-                ranker_refresh_telemetry["ranker_frontier_near_cutoff_counts"] = (
-                    near_cutoff_counts
-                )
+                ranker_refresh_telemetry["ranker_frontier_near_cutoff_counts"] = near_cutoff_counts
             candidate_scores: torch.Tensor | None = None
             rank_signal_stats: dict[str, object] | None = None
             normalization_input_stats: dict[str, object] | None = None
@@ -752,7 +757,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             )
             refresh_rank_topk_elapsed_ms = (time.perf_counter() - rank_topk_start) * 1000.0
             phase4_refresh_rank_topk_elapsed_ms_total += refresh_rank_topk_elapsed_ms
-    
+
             frontier_plan_start = time.perf_counter()
             if scheduler_uses_reference_planner:
                 phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
@@ -796,7 +801,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     decoder_chunk_size=decoder_chunk_size,
                 )
                 pending = pending[:queue_size]
-    
+
             planner_v2_candidate_window = torch.empty(0, dtype=torch.long)
             planner_v2_refresh_telemetry = _build_phase4_planner_v2_refresh_telemetry_disabled()
             if (
@@ -837,9 +842,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 phase4_frontier_plan=phase4_frontier_plan,
                 telemetry_detail=phase4_scheduler_config.telemetry_detail,
             )
-            refresh_frontier_plan_elapsed_ms = (
-                time.perf_counter() - frontier_plan_start
-            ) * 1000.0
+            refresh_frontier_plan_elapsed_ms = (time.perf_counter() - frontier_plan_start) * 1000.0
             phase4_refresh_frontier_plan_elapsed_ms_total += refresh_frontier_plan_elapsed_ms
             refresh_substage_telemetry = _build_phase4_refresh_substage_telemetry(
                 telemetry_detail=phase4_scheduler_config.telemetry_detail,
@@ -885,9 +888,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     ),
                     "phase4_frontier_buffer_expanded_frontier_size": int(max_frontier_size),
                     "pending_count": int(pending.numel()),
-                    "pending_hash": _hash_index_tensor(pending)
-                    if pending.numel() > 0
-                    else None,
+                    "pending_hash": _hash_index_tensor(pending) if pending.numel() > 0 else None,
                     **phase4_execution_metadata,
                     **ranker_refresh_telemetry,
                     **planner_v2_refresh_telemetry,
@@ -941,9 +942,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     ),
                     "feature_row_store_read_bytes": (
                         int(
-                            float(
-                                (feature_row_store_read_stats or {}).get("read_row_count") or 0
-                            )
+                            float((feature_row_store_read_stats or {}).get("read_row_count") or 0)
                             * int(total_active_feats)
                             * torch.empty(
                                 (), dtype=exact_trace_internal_dtype_resolved
@@ -959,9 +958,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                         (feature_row_store_read_stats or {}).get("read_cache_miss_count")
                     ),
                     "feature_row_store_read_cache_store_success": _safe_float(
-                        (feature_row_store_read_stats or {}).get(
-                            "read_cache_store_success_count"
-                        )
+                        (feature_row_store_read_stats or {}).get("read_cache_store_success_count")
                     ),
                     "feature_row_store_read_cache_store_skip_disabled": _safe_float(
                         (feature_row_store_read_stats or {}).get(
@@ -997,8 +994,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     "streaming_row_reader_estimated_bytes": (
                         int(
                             float(
-                                (streaming_chunk_reuse_stats or {}).get("row_reader_row_count")
-                                or 0
+                                (streaming_chunk_reuse_stats or {}).get("row_reader_row_count") or 0
                             )
                             * int(total_active_feats)
                             * torch.empty(
@@ -1009,9 +1005,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                         else None
                     ),
                     "streaming_chunk_cache_store_success": _safe_float(
-                        (streaming_chunk_reuse_stats or {}).get(
-                            "chunk_cache_store_success_count"
-                        )
+                        (streaming_chunk_reuse_stats or {}).get("chunk_cache_store_success_count")
                     ),
                     "streaming_chunk_cache_store_skip_disabled": _safe_float(
                         (streaming_chunk_reuse_stats or {}).get(
@@ -1147,28 +1141,24 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     if use_compact_feature_row_store:
                         assert feature_row_store is not None
                         shadow_row_denominator = (
-                            feature_row_store.row_abs_max[:st].to(
-                                dtype=shadow_debug_compute_dtype
-                            ),
+                            feature_row_store.row_abs_max[:st].to(dtype=shadow_debug_compute_dtype),
                             feature_row_store.row_l1_scaled[:st].to(
                                 dtype=shadow_debug_compute_dtype
                             ),
                         )
-                        float64_feature_influences = (
-                            compute_partial_feature_influences_streaming(
-                                lambda row_start, row_end: feature_row_store.read_feature_rows(
-                                    row_start,
-                                    row_end,
-                                    phase="phase4_anomaly_debug",
-                                ),
-                                shadow_row_denominator,
-                                phase4_logit_probabilities.to(dtype=shadow_debug_compute_dtype),
-                                row_to_node_index[:st],
-                                n_feature_nodes=total_active_feats,
-                                n_logits=n_logits,
-                                device=torch.device("cpu"),
-                                compute_dtype=shadow_debug_compute_dtype,
-                            )
+                        float64_feature_influences = compute_partial_feature_influences_streaming(
+                            lambda row_start, row_end: feature_row_store.read_feature_rows(
+                                row_start,
+                                row_end,
+                                phase="phase4_anomaly_debug",
+                            ),
+                            shadow_row_denominator,
+                            phase4_logit_probabilities.to(dtype=shadow_debug_compute_dtype),
+                            row_to_node_index[:st],
+                            n_feature_nodes=total_active_feats,
+                            n_logits=n_logits,
+                            device=torch.device("cpu"),
+                            compute_dtype=shadow_debug_compute_dtype,
                         )
                     else:
                         float64_influences = compute_partial_influences(
@@ -1186,20 +1176,18 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                             feature_row_store.row_abs_max[:st].to(dtype=torch.float32),
                             feature_row_store.row_l1_scaled[:st].to(dtype=torch.float32),
                         )
-                        float32_feature_influences = (
-                            compute_partial_feature_influences_streaming(
-                                lambda row_start, row_end: feature_row_store.read_feature_rows(
-                                    row_start,
-                                    row_end,
-                                    phase="phase4_anomaly_debug",
-                                ),
-                                float32_row_denominator,
-                                phase4_logit_probabilities.to(dtype=torch.float32),
-                                row_to_node_index[:st],
-                                n_feature_nodes=total_active_feats,
-                                n_logits=n_logits,
-                                device=torch.device("cpu"),
-                            )
+                        float32_feature_influences = compute_partial_feature_influences_streaming(
+                            lambda row_start, row_end: feature_row_store.read_feature_rows(
+                                row_start,
+                                row_end,
+                                phase="phase4_anomaly_debug",
+                            ),
+                            float32_row_denominator,
+                            phase4_logit_probabilities.to(dtype=torch.float32),
+                            row_to_node_index[:st],
+                            n_feature_nodes=total_active_feats,
+                            n_logits=n_logits,
+                            device=torch.device("cpu"),
                         )
                     else:
                         float32_influences = compute_partial_influences(
@@ -1255,7 +1243,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     first_phase4_pending = current_pending_cpu.clone()
                 previous_phase4_pending = current_pending_cpu
             phase4_refresh_count += 1
-    
+
         pending_offset = 0
         planned_boundaries = (
             phase4_frontier_plan.batch_boundaries
@@ -1297,7 +1285,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             pending_offset = batch_end
             scheduler_reference_batch_index = int(phase4_scheduler_reference_batch_count)
             phase4_scheduler_reference_batch_count += 1
-    
+
             if phase4_executor_microbatch_size < int(reference_idx_batch.numel()):
                 executor_batches: list[torch.Tensor] = []
                 streaming_pending_offset = 0
@@ -1312,7 +1300,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     streaming_pending_offset = streaming_end
             else:
                 executor_batches = [reference_idx_batch]
-    
+
             streaming_chunk_count = int(len(executor_batches))
             chunk_pending_start = reference_pending_start
             for streaming_chunk_index, idx_batch in enumerate(executor_batches, start=1):
@@ -1320,19 +1308,14 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 n_visited += len(idx_batch)
                 phase4_executor_microbatch_count += 1
                 executor_microbatch_index = int(phase4_executor_microbatch_count)
-    
+
                 ctx_before = _snapshot_diagnostics(ctx) if profile else None
-                transcoder_before = (
-                    _snapshot_diagnostics(model.transcoders) if profile else None
-                )
+                transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
                 batch_start = time.perf_counter()
                 batch_memory_before = get_memory_snapshot(model.device)
                 encoder_vectors_source_device = None
                 encoder_vectors_source_dtype = None
-                if (
-                    getattr(ctx, "encoder_vecs", None) is not None
-                    and ctx.encoder_vecs.numel() > 0
-                ):
+                if getattr(ctx, "encoder_vecs", None) is not None and ctx.encoder_vecs.numel() > 0:
                     encoder_vectors_source_device = str(ctx.encoder_vecs.device.type)
                     encoder_vectors_source_dtype = ctx.encoder_vecs.dtype
                 encoder_materialize_start = time.perf_counter()
@@ -1362,37 +1345,65 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                         executor_encoder_materialize_elapsed_ms
                     ),
                 }
-                if (
-                    encoder_vectors_source_device == "cpu"
-                    and encoder_vectors.device.type == "cuda"
-                ):
+                if encoder_vectors_source_device == "cpu" and encoder_vectors.device.type == "cuda":
                     phase4_cpu_to_gpu_bytes_total += int(encoder_vectors_transfer_bytes)
                 compute_batch_start = time.perf_counter()
-                rows = ctx.compute_batch(
-                    layers=feat_layers[idx_batch],
-                    positions=feat_pos[idx_batch],
-                    inject_values=encoder_vectors,
-                    retain_graph=n_visited < actual_max_feature_nodes,
-                    phase_label="phase4_features",
-                )
+                tiled_production = config.full_retention_backend == "column_tiled_v1"
+                if tiled_production:
+                    assert feature_row_store is not None and nonfeature_row_store is not None
+                    rows, tiled_denominator = produce_and_store_tiled_rows(
+                        ctx=ctx,
+                        layers=feat_layers[idx_batch],
+                        positions=feat_pos[idx_batch],
+                        inject_values=encoder_vectors,
+                        row_start=st,
+                        feature_row_store=feature_row_store,
+                        nonfeature_row_store=nonfeature_row_store,
+                        feature_column_tile_size=config.feature_row_column_tile_size,
+                        dtype=exact_trace_internal_dtype_resolved,
+                        phase_label="phase4_features",
+                        retain_graph=n_visited < actual_max_feature_nodes,
+                    )
+                else:
+                    rows = ctx.compute_batch(
+                        layers=feat_layers[idx_batch],
+                        positions=feat_pos[idx_batch],
+                        inject_values=encoder_vectors,
+                        retain_graph=n_visited < actual_max_feature_nodes,
+                        phase_label="phase4_features",
+                    )
                 executor_compute_batch_elapsed_ms = (
                     time.perf_counter() - compute_batch_start
                 ) * 1000.0
-    
+
                 row_count = rows.shape[0]
                 end = st + row_count
-                if phase4_row_reduction_config.effective_mode == "gpu_v1":
+                if tiled_production:
+                    cpu_staging_start = time.perf_counter()
+                    rows_cpu = rows
+                    row_input_slice = rows_cpu
+                    feature_row_slice = torch.empty((row_count, 0), dtype=rows_cpu.dtype)
+                    nonfeature_row_slice = rows_cpu
+                    executor_cpu_staging_elapsed_ms = 0.0
+                    denominator_start = time.perf_counter()
+                    row_denominator_scaled_l1 = tiled_denominator
+                    executor_denominator_elapsed_ms = 0.0
+                    executor_row_transfer_telemetry = _build_row_transfer_telemetry(
+                        rows=rows,
+                        rows_cpu=rows_cpu,
+                        row_input_slice=row_input_slice,
+                        feature_row_slice=feature_row_slice,
+                    )
+                elif phase4_row_reduction_config.effective_mode == "gpu_v1":
                     if not use_compact_feature_row_store:
                         raise RuntimeError(
                             "phase4_row_reduction='gpu_v1' requires compact Phase-4 row store"
                         )
                     cpu_staging_start = time.perf_counter()
-                    feature_row_slice, feature_rows_cpu_staging = (
-                        _copy_feature_rows_to_cpu_staging(
-                            rows,
-                            total_active_feats=total_active_feats,
-                            staging_buffer=feature_rows_cpu_staging,
-                        )
+                    feature_row_slice, feature_rows_cpu_staging = _copy_feature_rows_to_cpu_staging(
+                        rows,
+                        total_active_feats=total_active_feats,
+                        staging_buffer=feature_rows_cpu_staging,
                     )
                     executor_cpu_staging_elapsed_ms = (
                         time.perf_counter() - cpu_staging_start
@@ -1481,7 +1492,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                             ),
                         }
                     )
-                if use_compact_feature_row_store:
+                if use_compact_feature_row_store and not tiled_production:
                     assert feature_row_store is not None
                     assert nonfeature_row_store is not None
                     row_store_write_start = time.perf_counter()
@@ -1500,7 +1511,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     executor_row_store_write_elapsed_ms = (
                         time.perf_counter() - row_store_write_start
                     ) * 1000.0
-                else:
+                elif not use_compact_feature_row_store:
                     assert phase4_row_reduction_config.effective_mode == "off"
                     row_store_write_start = time.perf_counter()
                     edge_matrix[st:end, :logit_offset] = rows_cpu
@@ -1508,11 +1519,14 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                         time.perf_counter() - row_store_write_start
                     ) * 1000.0
                     row_store_append_telemetry = None
+                else:
+                    executor_row_store_write_elapsed_ms = 0.0
+                    row_store_append_telemetry = {}
                 row_to_node_index[st:end] = idx_batch
                 visited[idx_batch] = True
                 st = end
                 pbar.update(len(idx_batch))
-    
+
                 if profile:
                     batch_number = executor_microbatch_index
                     if batch_number % profile_log_interval == 0:
@@ -1535,9 +1549,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 phase4_executor_encoder_materialize_elapsed_ms_total += (
                     executor_encoder_materialize_elapsed_ms
                 )
-                phase4_executor_compute_batch_elapsed_ms_total += (
-                    executor_compute_batch_elapsed_ms
-                )
+                phase4_executor_compute_batch_elapsed_ms_total += executor_compute_batch_elapsed_ms
                 phase4_executor_cpu_staging_elapsed_ms_total += executor_cpu_staging_elapsed_ms
                 phase4_executor_denominator_elapsed_ms_total += executor_denominator_elapsed_ms
                 phase4_executor_row_store_write_elapsed_ms_total += (
@@ -1571,9 +1583,11 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     "executor_reference_batch_size": int(reference_idx_batch.numel()),
                     "executor_microbatch_size": int(phase4_executor_microbatch_size),
                     "executor_streaming_chunk_index": int(streaming_chunk_index)
-                    if executor_physically_split else None,
+                    if executor_physically_split
+                    else None,
                     "executor_streaming_chunk_count": int(streaming_chunk_count)
-                    if executor_physically_split else None,
+                    if executor_physically_split
+                    else None,
                     "executor_physically_split": bool(executor_physically_split),
                     "scheduler_pending_start_index": int(chunk_pending_start),
                     "scheduler_pending_end_index": int(chunk_pending_end),
@@ -1637,12 +1651,8 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                             **executor_streaming_telemetry,
                             **batch_locality_summary,
                             **executor_substage_telemetry,
-                            "idx_batch_hash": batch_locality_summary.get(
-                                "scheduler_batch_hash"
-                            ),
-                            "row_input_nonfinite_count": int(
-                                row_input_stats["nonfinite_count"]
-                            ),
+                            "idx_batch_hash": batch_locality_summary.get("scheduler_batch_hash"),
+                            "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
                             "row_input_finite_max_abs": _safe_float(
                                 row_input_stats.get("finite_max_abs")
                             ),
@@ -1657,14 +1667,12 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                         },
                     )
                 chunk_pending_start = chunk_pending_end
-        if planned_boundaries is not None and planned_boundary_offset != len(
-            planned_boundaries
-        ):
+        if planned_boundaries is not None and planned_boundary_offset != len(planned_boundaries):
             raise RuntimeError(
                 "Planner v1 produced unused planned boundaries "
                 f"(used={planned_boundary_offset}, planned={len(planned_boundaries)})"
             )
-    
+
     pbar.close()
     _log_phase_metrics(
         logger,
@@ -1688,9 +1696,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             "phase4_executor_microbatch_count": int(phase4_executor_microbatch_count),
             "phase4_refreshes": int(phase4_refresh_count),
             "phase4_refresh_elapsed_ms_total": float(phase4_refresh_elapsed_ms_total),
-            "phase4_feature_batch_elapsed_ms_total": float(
-                phase4_feature_batch_elapsed_ms_total
-            ),
+            "phase4_feature_batch_elapsed_ms_total": float(phase4_feature_batch_elapsed_ms_total),
             "phase4_refresh_partial_influence_elapsed_ms_total": float(
                 phase4_refresh_partial_influence_elapsed_ms_total
             ),
@@ -1848,27 +1854,19 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             is not None
         ]
         feature_row_store_cache_skip_disabled = [
-            float(
-                record["feature_row_store_read_stats"]["read_cache_store_skip_disabled_count"]
-            )
+            float(record["feature_row_store_read_stats"]["read_cache_store_skip_disabled_count"])
             for record in records
             if isinstance(record, dict)
             and isinstance(record.get("feature_row_store_read_stats"), dict)
-            and record["feature_row_store_read_stats"].get(
-                "read_cache_store_skip_disabled_count"
-            )
+            and record["feature_row_store_read_stats"].get("read_cache_store_skip_disabled_count")
             is not None
         ]
         feature_row_store_cache_skip_too_large = [
-            float(
-                record["feature_row_store_read_stats"]["read_cache_store_skip_too_large_count"]
-            )
+            float(record["feature_row_store_read_stats"]["read_cache_store_skip_too_large_count"])
             for record in records
             if isinstance(record, dict)
             and isinstance(record.get("feature_row_store_read_stats"), dict)
-            and record["feature_row_store_read_stats"].get(
-                "read_cache_store_skip_too_large_count"
-            )
+            and record["feature_row_store_read_stats"].get("read_cache_store_skip_too_large_count")
             is not None
         ]
         streaming_chunk_cache_hits = [
@@ -1894,27 +1892,19 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             is not None
         ]
         streaming_chunk_cache_skip_disabled = [
-            float(
-                record["streaming_chunk_reuse_stats"]["chunk_cache_store_skip_disabled_count"]
-            )
+            float(record["streaming_chunk_reuse_stats"]["chunk_cache_store_skip_disabled_count"])
             for record in records
             if isinstance(record, dict)
             and isinstance(record.get("streaming_chunk_reuse_stats"), dict)
-            and record["streaming_chunk_reuse_stats"].get(
-                "chunk_cache_store_skip_disabled_count"
-            )
+            and record["streaming_chunk_reuse_stats"].get("chunk_cache_store_skip_disabled_count")
             is not None
         ]
         streaming_chunk_cache_skip_too_large = [
-            float(
-                record["streaming_chunk_reuse_stats"]["chunk_cache_store_skip_too_large_count"]
-            )
+            float(record["streaming_chunk_reuse_stats"]["chunk_cache_store_skip_too_large_count"])
             for record in records
             if isinstance(record, dict)
             and isinstance(record.get("streaming_chunk_reuse_stats"), dict)
-            and record["streaming_chunk_reuse_stats"].get(
-                "chunk_cache_store_skip_too_large_count"
-            )
+            and record["streaming_chunk_reuse_stats"].get("chunk_cache_store_skip_too_large_count")
             is not None
         ]
         first_float_precision = None
@@ -1934,9 +1924,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
         anomaly_debug_result["summary"] = {
             "refresh_count": int(len(records)),
             "pending_size_first": (
-                int(records[0]["pending_size"])
-                if records and isinstance(records[0], dict)
-                else 0
+                int(records[0]["pending_size"]) if records and isinstance(records[0], dict) else 0
             ),
             "cutoff_margin_min": min(cutoff_margins) if cutoff_margins else None,
             "cutoff_margin_mean": (
@@ -1965,9 +1953,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 else None
             ),
             "rank_signal_all_zero_refresh_count": int(rank_all_zero_count),
-            "rank_signal_effectively_all_zero_refresh_count": int(
-                rank_effectively_all_zero_count
-            ),
+            "rank_signal_effectively_all_zero_refresh_count": int(rank_effectively_all_zero_count),
             "rank_signal_nonzero_count_min": (
                 min(rank_nonzero_counts) if rank_nonzero_counts else None
             ),
@@ -2065,9 +2051,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 else None
             ),
             "phase3_logit_row_batch_count": int(
-                len(phase3_logit_row_batches)
-                if isinstance(phase3_logit_row_batches, list)
-                else 0
+                len(phase3_logit_row_batches) if isinstance(phase3_logit_row_batches, list) else 0
             ),
             "phase4_feature_row_batch_count": int(
                 len(phase4_feature_row_batches)
@@ -2105,9 +2089,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 else None
             ),
             "phase3_logit_row_batch_0_row_l1_effectively_all_zero": (
-                first_phase3_logit_batch.get("row_abs_sum_stats", {}).get(
-                    "effectively_all_zero"
-                )
+                first_phase3_logit_batch.get("row_abs_sum_stats", {}).get("effectively_all_zero")
                 if isinstance(first_phase3_logit_batch, dict)
                 else None
             ),
@@ -2117,34 +2099,33 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 else None
             ),
         }
-    
-    
+
     return Phase4Result(
-    visited=visited,
-    actual_max_feature_nodes=actual_max_feature_nodes,
-    edge_matrix=edge_matrix,
-    feature_row_store=feature_row_store,
-    nonfeature_row_store=nonfeature_row_store,
-    row_to_node_index=row_to_node_index,
-    rows_cpu_staging=rows_cpu_staging,
-    st=st,
-    phase4_frontier_buffer_metadata=phase4_frontier_buffer_metadata,
-    phase4_execution_metadata=phase4_execution_metadata,
-    cross_cluster_debug_summary=cross_cluster_debug_summary,
-    cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
-    cross_cluster_debug_batches=cross_cluster_debug_batches,
-    anomaly_debug_result=anomaly_debug_result,
-    phase4_elapsed_ms=phase4_elapsed_ms,
-    phase4_feature_batch_size=phase4_feature_batch_size,
-    phase4_executor_reference_batch_size=phase4_executor_reference_batch_size,
-    phase4_executor_microbatch_size=phase4_executor_microbatch_size,
-    phase4_refresh_count=phase4_refresh_count,
-    phase4_scheduler_reference_batch_count=phase4_scheduler_reference_batch_count,
-    phase4_executor_microbatch_count=phase4_executor_microbatch_count,
-    phase4_refresh_elapsed_ms_total=phase4_refresh_elapsed_ms_total,
-    phase4_feature_batch_elapsed_ms_total=phase4_feature_batch_elapsed_ms_total,
-    phase4_refresh_partial_influence_elapsed_ms_total=phase4_refresh_partial_influence_elapsed_ms_total,
-    phase4_refresh_rank_topk_elapsed_ms_total=phase4_refresh_rank_topk_elapsed_ms_total,
-    phase4_refresh_frontier_plan_elapsed_ms_total=phase4_refresh_frontier_plan_elapsed_ms_total,
-    phase4_refresh_row_store_read_elapsed_ms_total=phase4_refresh_row_store_read_elapsed_ms_total,
-)
+        visited=visited,
+        actual_max_feature_nodes=actual_max_feature_nodes,
+        edge_matrix=edge_matrix,
+        feature_row_store=feature_row_store,
+        nonfeature_row_store=nonfeature_row_store,
+        row_to_node_index=row_to_node_index,
+        rows_cpu_staging=rows_cpu_staging,
+        st=st,
+        phase4_frontier_buffer_metadata=phase4_frontier_buffer_metadata,
+        phase4_execution_metadata=phase4_execution_metadata,
+        cross_cluster_debug_summary=cross_cluster_debug_summary,
+        cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
+        cross_cluster_debug_batches=cross_cluster_debug_batches,
+        anomaly_debug_result=anomaly_debug_result,
+        phase4_elapsed_ms=phase4_elapsed_ms,
+        phase4_feature_batch_size=phase4_feature_batch_size,
+        phase4_executor_reference_batch_size=phase4_executor_reference_batch_size,
+        phase4_executor_microbatch_size=phase4_executor_microbatch_size,
+        phase4_refresh_count=phase4_refresh_count,
+        phase4_scheduler_reference_batch_count=phase4_scheduler_reference_batch_count,
+        phase4_executor_microbatch_count=phase4_executor_microbatch_count,
+        phase4_refresh_elapsed_ms_total=phase4_refresh_elapsed_ms_total,
+        phase4_feature_batch_elapsed_ms_total=phase4_feature_batch_elapsed_ms_total,
+        phase4_refresh_partial_influence_elapsed_ms_total=phase4_refresh_partial_influence_elapsed_ms_total,
+        phase4_refresh_rank_topk_elapsed_ms_total=phase4_refresh_rank_topk_elapsed_ms_total,
+        phase4_refresh_frontier_plan_elapsed_ms_total=phase4_refresh_frontier_plan_elapsed_ms_total,
+        phase4_refresh_row_store_read_elapsed_ms_total=phase4_refresh_row_store_read_elapsed_ms_total,
+    )

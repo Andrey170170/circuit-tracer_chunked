@@ -7,6 +7,8 @@ from circuit_tracer.attribution.nnsight.row_store import (
     _ColumnTiledFeatureRowStore,
     _FileBackedFeatureRowStore,
 )
+from circuit_tracer.attribution.nnsight.tiled_rows import produce_and_store_tiled_rows
+from circuit_tracer.attribution.nnsight.replay import _compute_row_denominator_scaled_l1
 from circuit_tracer.graph import (
     compute_partial_feature_influences_streaming,
     compute_partial_feature_influences_tiled,
@@ -16,9 +18,7 @@ from circuit_tracer.graph import (
 def _append(store, rows: torch.Tensor) -> None:
     abs_rows = rows.abs()
     row_abs_max = abs_rows.amax(dim=1)
-    row_l1_scaled = torch.where(
-        row_abs_max > 0, (abs_rows / row_abs_max[:, None]).sum(dim=1), 0
-    )
+    row_l1_scaled = torch.where(row_abs_max > 0, (abs_rows / row_abs_max[:, None]).sum(dim=1), 0)
     store.append_rows(
         row_start=0,
         feature_rows=rows,
@@ -121,3 +121,59 @@ def test_tiled_solver_enforces_requested_tile_bound() -> None:
     )
     assert result.shape == (1_000,)
     assert maximum_shape <= (7, 11)
+
+
+def test_true_tiled_production_streams_tiles_and_matches_full_row_denominator() -> None:
+    full_rows = torch.tensor([[1.0, -2.0, 3.0, -4.0, 5.0, 0.25, -0.5]], dtype=torch.float64)
+
+    class AllocationSpyContext:
+        def __init__(self) -> None:
+            self.maximum_feature_width = 0
+
+        def produce_row_tiles(
+            self, *args, feature_column_tile_size, consume_feature_tile, **kwargs
+        ):
+            del args, kwargs
+            for start in range(0, 5, feature_column_tile_size):
+                end = min(start + feature_column_tile_size, 5)
+                tile = full_rows[:, start:end].clone()
+                self.maximum_feature_width = max(self.maximum_feature_width, tile.shape[1])
+                consume_feature_tile(start, end, tile)
+            return full_rows[:, 5:].clone()
+
+    ctx = AllocationSpyContext()
+    feature = _ColumnTiledFeatureRowStore(
+        n_rows=1, n_feature_columns=5, column_tile_size=2, dtype=torch.float64
+    )
+    nonfeature = _ColumnTiledFeatureRowStore(
+        n_rows=1, n_feature_columns=2, column_tile_size=2, dtype=torch.float64
+    )
+    try:
+        produced_nonfeature, denominator = produce_and_store_tiled_rows(
+            ctx=ctx,
+            layers=torch.tensor([0]),
+            positions=torch.tensor([0]),
+            inject_values=torch.ones((1, 1)),
+            row_start=0,
+            feature_row_store=feature,
+            nonfeature_row_store=nonfeature,
+            feature_column_tile_size=2,
+            dtype=torch.float64,
+            phase_label="phase4_features",
+        )
+        expected_denominator = _compute_row_denominator_scaled_l1(full_rows, dtype=torch.float64)
+        torch.testing.assert_close(feature.read_feature_rows(0, 1), full_rows[:, :5])
+        torch.testing.assert_close(produced_nonfeature, full_rows[:, 5:])
+        torch.testing.assert_close(nonfeature.read_feature_rows(0, 1), full_rows[:, 5:])
+        torch.testing.assert_close(denominator[0], expected_denominator[0])
+        torch.testing.assert_close(denominator[1], expected_denominator[1])
+        assert ctx.maximum_feature_width == 2
+        snapshot = feature.get_diagnostic_snapshot()
+        assert snapshot["full_width_production"] is False
+        assert snapshot["max_produced_tile_columns"] == 2
+        assert snapshot["feature_tile_count"] == 3
+        assert snapshot["max_produced_tile_bytes"] <= 2 * 8
+        assert nonfeature.get_diagnostic_snapshot()["nonfeature_tile_count"] == 1
+    finally:
+        feature.cleanup()
+        nonfeature.cleanup()

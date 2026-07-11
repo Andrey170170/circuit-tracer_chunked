@@ -5,6 +5,7 @@ Attribution context for managing hooks during attribution computation.
 import inspect
 import time
 import weakref
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
@@ -113,6 +114,8 @@ class AttributionContext:
         self._resid_activations: list[torch.Tensor] = []
         self._feature_output_activations: list[torch.Tensor] = []
         self._batch_buffer: torch.Tensor | None = None
+        self._produced_feature_range: tuple[int, int] | None = None
+        self._produce_nonfeature = True
         self.n_layers: int = n_layers
 
         exact_chunked_mode = chunked_decoder_state is not None
@@ -1013,6 +1016,12 @@ class AttributionContext:
                 continue
 
             layer_start, layer_end = span
+            if self._produced_feature_range is not None:
+                requested_start, requested_end = self._produced_feature_range
+                layer_start = max(layer_start, requested_start)
+                layer_end = min(layer_end, requested_end)
+                if layer_start >= layer_end:
+                    continue
             layer_rows = torch.arange(layer_start, layer_end, device=feature_ids.device)
             layer_feature_ids = feature_ids[layer_start:layer_end]
             layer_chunk_ids = torch.div(layer_feature_ids, chunk_size, rounding_mode="floor")
@@ -1102,7 +1111,10 @@ class AttributionContext:
                             decoder_vectors[row_chunk_local_feat_ids] * row_chunk_activations
                         )
                         selected_grads = typed_grads[:, row_chunk_positions]
-                        self._batch_buffer[row_chunk_rows] += einsum(
+                        write_rows = row_chunk_rows
+                        if self._produced_feature_range is not None:
+                            write_rows = write_rows - self._produced_feature_range[0]
+                        self._batch_buffer[write_rows] += einsum(
                             selected_grads,
                             scaled_decoders,
                             "batch position d_model, position d_model -> position batch",
@@ -1272,11 +1284,18 @@ class AttributionContext:
             )
 
     def compute_error_attributions(self, layer, grads):
+        if not self._produce_nonfeature:
+            return
         _, n_pos, _ = self.activation_matrix.shape
 
         # Error nodes
         def error_offset(layer: int) -> int:  # starting row for this layer
-            return self.activation_matrix._nnz() + layer * n_pos
+            feature_width = (
+                self._produced_feature_range[1] - self._produced_feature_range[0]
+                if self._produced_feature_range is not None
+                else self.activation_matrix._nnz()
+            )
+            return feature_width + layer * n_pos
 
         self.compute_score(
             grads,
@@ -1286,11 +1305,18 @@ class AttributionContext:
         )
 
     def compute_token_attributions(self, grads):
+        if not self._produce_nonfeature:
+            return
         n_layers, n_pos, _ = self.activation_matrix.shape
 
         # Token-embedding nodes
         def error_offset(layer: int) -> int:  # starting row for this layer
-            return self.activation_matrix._nnz() + layer * n_pos
+            feature_width = (
+                self._produced_feature_range[1] - self._produced_feature_range[0]
+                if self._produced_feature_range is not None
+                else self.activation_matrix._nnz()
+            )
+            return feature_width + layer * n_pos
 
         tok_start = error_offset(n_layers)
         self.compute_score(
@@ -1307,6 +1333,8 @@ class AttributionContext:
         inject_values: torch.Tensor,
         retain_graph: bool = True,
         phase_label: str = "unknown",
+        feature_column_range: tuple[int, int] | None = None,
+        include_nonfeature: bool = True,
     ) -> torch.Tensor:
         """Return attribution rows for a batch of (layer, pos) nodes.
 
@@ -1338,8 +1366,15 @@ class AttributionContext:
         execution_device = self._resid_activations[0].device
         memory_before = get_memory_snapshot(execution_device)
         inject_values_input_nbytes = int(inject_values.numel() * inject_values.element_size())
+        feature_width = (
+            feature_column_range[1] - feature_column_range[0]
+            if feature_column_range is not None
+            else int(self.activation_matrix._nnz())
+        )
+        nonfeature_width = self._row_size - int(self.activation_matrix._nnz())
+        produced_row_size = feature_width + (nonfeature_width if include_nonfeature else 0)
         planned_batch_buffer_nbytes = int(
-            self._row_size * batch_size * torch.tensor([], dtype=torch.float32).element_size()
+            produced_row_size * batch_size * torch.tensor([], dtype=torch.float32).element_size()
         )
         self._emit_trace(
             "compute_batch.start",
@@ -1373,8 +1408,10 @@ class AttributionContext:
             dtype=inject_values.dtype,
         )
         inject_values_nbytes = int(inject_values.numel() * inject_values.element_size())
+        self._produced_feature_range = feature_column_range
+        self._produce_nonfeature = include_nonfeature
         self._batch_buffer = torch.zeros(
-            self._row_size,
+            produced_row_size,
             batch_size,
             dtype=torch.float32,
             device=inject_values.device,
@@ -1547,6 +1584,8 @@ class AttributionContext:
                 )
 
         buf, self._batch_buffer = self._batch_buffer, None
+        self._produced_feature_range = None
+        self._produce_nonfeature = True
         elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
         memory_after = get_memory_snapshot(execution_device)
         if self.diagnostic_mode:
@@ -1602,3 +1641,42 @@ class AttributionContext:
             ),
         )
         return buf.T[: len(layers)]
+
+    def produce_row_tiles(
+        self,
+        layers: torch.Tensor,
+        positions: torch.Tensor,
+        inject_values: torch.Tensor,
+        *,
+        feature_column_tile_size: int,
+        consume_feature_tile: Callable[[int, int, torch.Tensor], None],
+        phase_label: str = "unknown",
+        retain_graph: bool = True,
+    ) -> torch.Tensor:
+        """Produce canonical active-feature tiles and return only nonfeature columns."""
+        if self.chunked_decoder_state is None:
+            raise ValueError("column-tiled row production requires an exact chunked provider")
+        if feature_column_tile_size <= 0:
+            raise ValueError("feature_column_tile_size must be > 0")
+        n_features = int(self.activation_matrix._nnz())
+        for start in range(0, n_features, feature_column_tile_size):
+            end = min(start + feature_column_tile_size, n_features)
+            tile = self.compute_batch(
+                layers,
+                positions,
+                inject_values,
+                retain_graph=True,
+                phase_label=phase_label,
+                feature_column_range=(start, end),
+                include_nonfeature=False,
+            )
+            consume_feature_tile(start, end, tile)
+        return self.compute_batch(
+            layers,
+            positions,
+            inject_values,
+            retain_graph=retain_graph,
+            phase_label=phase_label,
+            feature_column_range=(n_features, n_features),
+            include_nonfeature=True,
+        )

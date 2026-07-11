@@ -26,6 +26,8 @@ class FeatureRowStore(Protocol):
     row_l1_scaled: torch.Tensor
 
     def append_rows(self, *, row_start: int, feature_rows: torch.Tensor, **kwargs): ...
+    def append_tile(self, *, row_start: int, column_start: int, values: torch.Tensor, **kwargs): ...
+    def set_row_denominator(self, *, row_start: int, value: tuple[torch.Tensor, torch.Tensor]): ...
     def read_feature_rows(self, row_start: int, row_end: int, **kwargs) -> torch.Tensor: ...
     def read_tile(
         self, row_start: int, row_end: int, column_start: int, column_end: int, **kwargs
@@ -33,6 +35,7 @@ class FeatureRowStore(Protocol):
     def materialize_dense_feature_slice(self, **kwargs) -> torch.Tensor: ...
     def get_diagnostic_snapshot(self) -> dict[str, object]: ...
     def cleanup(self) -> None: ...
+
 
 _ROW_STORE_TEMP_ROOT_POLICY_DEFAULT: Literal["default"] = "default"
 _ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL: Literal["env_node_local"] = "env_node_local"
@@ -59,6 +62,7 @@ _ROW_STORE_CACHE_CONTROL_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "fadvise_dontneed_after_append_and_read_v1": ("fadvise_dontneed_after_append_and_read_v1"),
 }
 
+
 @dataclass(frozen=True)
 class _RowStoreCacheControlConfig:
     requested_mode: _RowStoreCacheControlMode
@@ -76,7 +80,6 @@ class _RowStoreTempRootSelection:
     selected_root: str | None
     selected_path: str
     fallback_reason: str | None
-
 
 
 class _FileBackedFeatureRowStore:
@@ -888,8 +891,7 @@ class _FileBackedFeatureRowStore:
 class _ColumnTiledFeatureRowStore:
     """Exact rows stored as independently auditable column-tile files.
 
-    This Phase-D oracle still accepts full-width rows from ``compute_batch``.  Only
-    storage and downstream influence reads are column bounded.
+    Production and storage are both bounded by ``column_tile_size``.
     """
 
     def __init__(
@@ -922,9 +924,16 @@ class _ColumnTiledFeatureRowStore:
         self._paths: list[str] = []
         self._closed = False
         self._max_materialized_tile_bytes = 0
+        self._max_produced_tile_rows = 0
+        self._max_produced_tile_columns = 0
+        self._max_produced_tile_bytes = 0
+        self._feature_tile_count = 0
+        self._nonfeature_tile_count = 0
         for column_start in range(0, n_feature_columns, column_tile_size):
             width = min(column_tile_size, n_feature_columns - column_start)
-            path = os.path.join(self._tmpdir.name, f"columns_{column_start:012d}_{column_start + width:012d}.memmap")
+            path = os.path.join(
+                self._tmpdir.name, f"columns_{column_start:012d}_{column_start + width:012d}.memmap"
+            )
             with open(path, "wb") as handle:
                 handle.truncate(n_rows * width * np.dtype(self._np_dtype).itemsize)
             self._paths.append(path)
@@ -961,7 +970,9 @@ class _ColumnTiledFeatureRowStore:
     ) -> dict[str, float]:
         self._require_open()
         if feature_rows.shape != (feature_rows.shape[0], self.n_feature_columns):
-            raise ValueError("feature_rows second dimension must equal configured n_feature_columns")
+            raise ValueError(
+                "feature_rows second dimension must equal configured n_feature_columns"
+            )
         row_end = row_start + feature_rows.shape[0]
         if row_start < 0 or row_end > self.n_rows:
             raise ValueError("row range is out of bounds for column-tiled store")
@@ -984,6 +995,60 @@ class _ColumnTiledFeatureRowStore:
         self.row_abs_max[row_start:row_end] = row_denominator_scaled_l1[0].to("cpu")
         self.row_l1_scaled[row_start:row_end] = row_denominator_scaled_l1[1].to("cpu")
         return {}
+
+    def append_tile(
+        self,
+        *,
+        row_start: int,
+        column_start: int,
+        values: torch.Tensor,
+        nonfeature: bool = False,
+        **_: object,
+    ) -> dict[str, float]:
+        self._require_open()
+        rows, columns = values.shape
+        row_end = row_start + rows
+        column_end = column_start + columns
+        if row_start < 0 or row_end > self.n_rows:
+            raise ValueError("row range is out of bounds for column-tiled store")
+        if column_start < 0 or column_end > self.n_feature_columns:
+            raise ValueError("column range is out of bounds for column-tiled store")
+        first = column_start // self.column_tile_size
+        last = (column_end - 1) // self.column_tile_size if columns else first
+        cpu = values.detach().to(device="cpu", dtype=self._dtype)
+        for tile_index in range(first, last + 1):
+            tile_start = tile_index * self.column_tile_size
+            source_start = max(column_start, tile_start) - column_start
+            source_end = (
+                min(column_end, tile_start + self._tiles[tile_index].shape[1]) - column_start
+            )
+            local_start = max(column_start, tile_start) - tile_start
+            local_end = local_start + source_end - source_start
+            self._tiles[tile_index][row_start:row_end, local_start:local_end] = cpu[
+                :, source_start:source_end
+            ].numpy()
+        produced_bytes = int(cpu.numel() * cpu.element_size())
+        self._max_materialized_tile_bytes = max(self._max_materialized_tile_bytes, produced_bytes)
+        self._max_produced_tile_bytes = max(self._max_produced_tile_bytes, produced_bytes)
+        self._max_produced_tile_rows = max(self._max_produced_tile_rows, rows)
+        self._max_produced_tile_columns = max(self._max_produced_tile_columns, columns)
+        if nonfeature:
+            self._nonfeature_tile_count += 1
+        else:
+            self._feature_tile_count += 1
+        return {}
+
+    def set_row_denominator(
+        self, *, row_start: int, value: tuple[torch.Tensor, torch.Tensor]
+    ) -> None:
+        row_abs_max, row_l1_scaled = value
+        row_end = row_start + int(row_abs_max.numel())
+        if row_start < 0 or row_end > self.n_rows or row_l1_scaled.numel() != row_abs_max.numel():
+            raise ValueError("row denominator range is out of bounds for column-tiled store")
+        self.row_abs_max[row_start:row_end] = row_abs_max.to("cpu", dtype=self.row_abs_max.dtype)
+        self.row_l1_scaled[row_start:row_end] = row_l1_scaled.to(
+            "cpu", dtype=self.row_l1_scaled.dtype
+        )
 
     def read_tile(
         self, row_start: int, row_end: int, column_start: int, column_end: int, **_: object
@@ -1023,7 +1088,9 @@ class _ColumnTiledFeatureRowStore:
         result = torch.empty((row_end - row_start, selected.numel()), dtype=self._dtype)
         for output_column, source_column in enumerate(selected.tolist()):
             if source_column < 0 or source_column >= self.n_feature_columns:
-                raise ValueError("selected feature column indices must be in [0, n_feature_columns)")
+                raise ValueError(
+                    "selected feature column indices must be in [0, n_feature_columns)"
+                )
             result[:, output_column : output_column + 1] = self.read_tile(
                 row_start, row_end, source_column, source_column + 1
             )
@@ -1032,12 +1099,17 @@ class _ColumnTiledFeatureRowStore:
     def get_diagnostic_snapshot(self) -> dict[str, object]:
         return {
             "backend": "column_tiled_full_retention_v1",
-            "full_width_production": True,
+            "full_width_production": False,
             "column_tile_size": self.column_tile_size,
             "tile_file_count": len(self._paths),
             "apparent_file_bytes": self.nbytes,
             "allocated_file_bytes": self.allocated_file_bytes,
             "maximum_materialized_tile_bytes": self._max_materialized_tile_bytes,
+            "max_produced_tile_rows": self._max_produced_tile_rows,
+            "max_produced_tile_columns": self._max_produced_tile_columns,
+            "max_produced_tile_bytes": self._max_produced_tile_bytes,
+            "feature_tile_count": self._feature_tile_count,
+            "nonfeature_tile_count": self._nonfeature_tile_count,
         }
 
     def cleanup(self) -> None:
@@ -1054,7 +1126,6 @@ class _ColumnTiledFeatureRowStore:
             self.cleanup()
         except Exception:
             pass
-
 
 
 def _resolve_row_store_cache_control(

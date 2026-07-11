@@ -46,6 +46,7 @@ from circuit_tracer.attribution.nnsight.telemetry import (
     _safe_float,
 )
 from circuit_tracer.attribution.nnsight.session_controls import ordered_physical_ranges
+from circuit_tracer.attribution.nnsight.tiled_rows import produce_and_store_tiled_rows
 from circuit_tracer.attribution.targets import AttributionTargets
 from circuit_tracer.graph import (
     compute_partial_feature_influences_tiled,
@@ -124,6 +125,7 @@ class Phase3Config:
     full_retention_backend: str = "full_file"
     influence_row_tile_size: int = 4096
     influence_column_tile_size: int = 2048
+    feature_row_column_tile_size: int = 2048
 
 
 @dataclass(frozen=True)
@@ -256,22 +258,43 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 phase3_inject_transfer_telemetry["inject_values_transfer_bytes"]
             )
         compute_batch_start = time.perf_counter()
-        rows = ctx.compute_batch(
-            layers=torch.full((batch.shape[0],), n_layers),
-            positions=torch.full(
-                (batch.shape[0],),
-                output_position if output_position is not None else n_pos - 1,
-            ),
-            inject_values=batch,
-            phase_label="phase3_logits",
-        )
+        tiled_production = config.full_retention_backend == "column_tiled_v1"
+        if tiled_production:
+            assert feature_row_store is not None and nonfeature_row_store is not None
+            rows, tiled_denominator = produce_and_store_tiled_rows(
+                ctx=ctx,
+                layers=torch.full((batch.shape[0],), n_layers),
+                positions=torch.full(
+                    (batch.shape[0],),
+                    output_position if output_position is not None else n_pos - 1,
+                ),
+                inject_values=batch,
+                row_start=i,
+                feature_row_store=feature_row_store,
+                nonfeature_row_store=nonfeature_row_store,
+                feature_column_tile_size=config.feature_row_column_tile_size,
+                dtype=exact_trace_internal_dtype_resolved,
+                phase_label="phase3_logits",
+            )
+        else:
+            rows = ctx.compute_batch(
+                layers=torch.full((batch.shape[0],), n_layers),
+                positions=torch.full(
+                    (batch.shape[0],),
+                    output_position if output_position is not None else n_pos - 1,
+                ),
+                inject_values=batch,
+                phase_label="phase3_logits",
+            )
         phase3_compute_batch_elapsed_ms = (time.perf_counter() - compute_batch_start) * 1000.0
         phase3_compute_batch_elapsed_ms_total += phase3_compute_batch_elapsed_ms
         cpu_staging_start = time.perf_counter()
-        rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
-            rows,
-            staging_buffer=rows_cpu_staging,
-        )
+        if tiled_production:
+            rows_cpu = rows
+        else:
+            rows_cpu, rows_cpu_staging = _copy_rows_to_cpu_staging(
+                rows, staging_buffer=rows_cpu_staging
+            )
         phase3_cpu_staging_elapsed_ms = (time.perf_counter() - cpu_staging_start) * 1000.0
         phase3_cpu_staging_elapsed_ms_total += phase3_cpu_staging_elapsed_ms
         donor_feature_rows: torch.Tensor | None = None
@@ -302,20 +325,26 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 loaded_phase3_row_donor_bundle["token_abs_sums"],
             )[i:end]
         denominator_start = time.perf_counter()
-        (
-            rows_cpu,
-            row_input_slice,
-            feature_row_slice,
-            (row_abs_max_cpu, row_l1_scaled_cpu),
-            row_abs_sums_cpu,
-        ) = _resolve_phase3_effective_row_state(
-            rows_cpu=rows_cpu,
-            row_input_column_count=int(logit_offset),
-            total_active_features=int(total_active_feats),
-            dtype=exact_trace_internal_dtype_resolved,
-            donor_feature_rows=donor_feature_rows,
-            donor_row_abs_sums=donor_row_abs_sums,
-        )
+        if tiled_production:
+            row_input_slice = rows_cpu
+            feature_row_slice = torch.empty((rows_cpu.shape[0], 0), dtype=rows_cpu.dtype)
+            row_abs_max_cpu, row_l1_scaled_cpu = tiled_denominator
+            row_abs_sums_cpu = row_abs_max_cpu * row_l1_scaled_cpu
+        else:
+            (
+                rows_cpu,
+                row_input_slice,
+                feature_row_slice,
+                (row_abs_max_cpu, row_l1_scaled_cpu),
+                row_abs_sums_cpu,
+            ) = _resolve_phase3_effective_row_state(
+                rows_cpu=rows_cpu,
+                row_input_column_count=int(logit_offset),
+                total_active_features=int(total_active_feats),
+                dtype=exact_trace_internal_dtype_resolved,
+                donor_feature_rows=donor_feature_rows,
+                donor_row_abs_sums=donor_row_abs_sums,
+            )
         phase3_denominator_elapsed_ms = (time.perf_counter() - denominator_start) * 1000.0
         phase3_denominator_elapsed_ms_total += phase3_denominator_elapsed_ms
         phase3_row_transfer_telemetry = _build_row_transfer_telemetry(
@@ -393,7 +422,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     ),
                 }
             )
-        if use_compact_feature_row_store:
+        if use_compact_feature_row_store and not tiled_production:
             assert feature_row_store is not None
             assert nonfeature_row_store is not None
             end = i + batch.shape[0]
@@ -476,15 +505,11 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     "total_logical_batches": int(total_logit_batches),
                     "total_physical_batches": int(len(physical_ranges)),
                     "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
-                    "row_input_finite_max_abs": _safe_float(
-                        row_input_stats.get("finite_max_abs")
-                    ),
+                    "row_input_finite_max_abs": _safe_float(row_input_stats.get("finite_max_abs")),
                     "row_l1_abs_sum": _safe_float(row_abs_sum_stats.get("abs_sum")),
                     "row_l1_max": _safe_float(row_abs_sum_stats.get("max")),
                     "row_l1_nonfinite_count": int(row_abs_sum_stats["nonfinite_count"]),
-                    "row_l1_effectively_all_zero": bool(
-                        row_abs_sum_stats["effectively_all_zero"]
-                    ),
+                    "row_l1_effectively_all_zero": bool(row_abs_sum_stats["effectively_all_zero"]),
                     **get_memory_snapshot(model.device),
                 },
             )
@@ -518,9 +543,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             "logical_batch_count": int(total_logit_batches),
             "physical_batch_count": int(physical_batch_count),
             "physical_batch_peak_rows": int(physical_batch_peak_rows),
-            "phase3_compute_batch_elapsed_ms_total": float(
-                phase3_compute_batch_elapsed_ms_total
-            ),
+            "phase3_compute_batch_elapsed_ms_total": float(phase3_compute_batch_elapsed_ms_total),
             "phase3_cpu_staging_elapsed_ms_total": float(phase3_cpu_staging_elapsed_ms_total),
             "phase3_denominator_elapsed_ms_total": float(phase3_denominator_elapsed_ms_total),
             "phase3_row_store_write_elapsed_ms_total": float(
@@ -543,9 +566,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
     if capture_phase3_gradient_bundle_enabled:
         gradient_captures = getattr(ctx, "phase3_gradient_captures", [])
         phase3_gradient_bundle_payload = _build_phase3_gradient_bundle_payload(
-            gradient_captures=(
-                gradient_captures if isinstance(gradient_captures, list) else []
-            ),
+            gradient_captures=(gradient_captures if isinstance(gradient_captures, list) else []),
             active_features=activation_matrix.indices().T,
             activation_values=activation_matrix.values(),
             target_token_ids=phase3_target_token_ids,
@@ -589,12 +610,10 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
         phase3_runtime_summary: dict[str, object] = {}
         phase3_runtime_stream: dict[str, object] = {}
         if cross_cluster_debug_summary is not None:
-            phase3_runtime_summary, phase3_runtime_stream = (
-                _build_cross_cluster_runtime_snapshot(
-                    device=model.device,
-                    ctx=ctx,
-                    transcoder=model.transcoders,
-                )
+            phase3_runtime_summary, phase3_runtime_stream = _build_cross_cluster_runtime_snapshot(
+                device=model.device,
+                ctx=ctx,
+                transcoder=model.transcoders,
             )
         pre_phase4_st = int(n_logits)
         phase3_seed_summary: dict[str, object] = {
@@ -631,17 +650,17 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     )
                 else:
                     seed_feature_influences = compute_partial_feature_influences_streaming(
-                    lambda row_start, row_end: feature_row_store.read_feature_rows(
-                        row_start,
-                        row_end,
-                        phase="phase3_seed_ranking",
-                    ),
-                    row_denominator_prefix,
-                    targets.logit_probabilities,
-                    row_to_node_index[:pre_phase4_st],
-                    n_feature_nodes=total_active_feats,
-                    n_logits=n_logits,
-                    device=feature_row_store.row_abs_max.device,
+                        lambda row_start, row_end: feature_row_store.read_feature_rows(
+                            row_start,
+                            row_end,
+                            phase="phase3_seed_ranking",
+                        ),
+                        row_denominator_prefix,
+                        targets.logit_probabilities,
+                        row_to_node_index[:pre_phase4_st],
+                        n_feature_nodes=total_active_feats,
+                        n_logits=n_logits,
+                        device=feature_row_store.row_abs_max.device,
                         compute_dtype=planner_compute_dtype,
                     )
                 if cross_cluster_debug_summary is not None:
@@ -662,11 +681,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 seed_feature_influences = planner_influences[:total_active_feats]
                 if cross_cluster_debug_summary is not None:
                     normalization_input_stats = _build_phase4_normalization_stats(
-                        edge_matrix[:pre_phase4_st, :logit_offset]
-                        .abs()
-                        .sum(dim=1)
-                        .detach()
-                        .cpu(),
+                        edge_matrix[:pre_phase4_st, :logit_offset].abs().sum(dim=1).detach().cpu(),
                     )
 
             unvisited_feature_rank = torch.argsort(
@@ -684,9 +699,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             actual_max_feature_nodes = int(
                 phase3_frontier_buffer_metadata["actual_max_feature_nodes"]
             )
-            phase3_seed_summary["phase3_frontier_buffer_metadata"] = (
-                phase3_frontier_buffer_metadata
-            )
+            phase3_seed_summary["phase3_frontier_buffer_metadata"] = phase3_frontier_buffer_metadata
             queue_size = min(
                 _compute_phase4_refresh_queue_window_size(
                     update_interval=update_interval,
@@ -726,18 +739,16 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     influence_compute_dtype=influence_compute_dtype,
                 )
             if capture_feature_semantic_descriptors_enabled:
-                feature_semantic_descriptors_payload = (
-                    _build_feature_semantic_descriptors_payload(
-                        active_features=activation_matrix.indices().T,
-                        activation_values=activation_matrix.values(),
-                        seed_feature_influences=seed_feature_influences,
-                        frontier_pre_locality=pre_locality_pending,
-                        frontier_post_locality=post_locality_pending,
-                        total_active_features=int(total_active_feats),
-                        status="captured",
-                        semantic_descriptor_top_k=semantic_descriptor_top_k,
-                        semantic_descriptor_dim=semantic_descriptor_dim,
-                    )
+                feature_semantic_descriptors_payload = _build_feature_semantic_descriptors_payload(
+                    active_features=activation_matrix.indices().T,
+                    activation_values=activation_matrix.values(),
+                    seed_feature_influences=seed_feature_influences,
+                    frontier_pre_locality=pre_locality_pending,
+                    frontier_post_locality=post_locality_pending,
+                    total_active_features=int(total_active_feats),
+                    status="captured",
+                    semantic_descriptor_top_k=semantic_descriptor_top_k,
+                    semantic_descriptor_dim=semantic_descriptor_dim,
                 )
 
             if cross_cluster_debug_summary is not None:
@@ -776,9 +787,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                             dtype=torch.float64,
                         ),
                         "frontier_pre_locality_hash": _hash_index_tensor(pre_locality_pending),
-                        "frontier_post_locality_hash": _hash_index_tensor(
-                            post_locality_pending
-                        ),
+                        "frontier_post_locality_hash": _hash_index_tensor(post_locality_pending),
                         "frontier_pre_locality_sample": [
                             int(v) for v in pre_locality_pending[:16].tolist()
                         ],
@@ -800,24 +809,22 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 if shadow_debug_compute_dtype != planner_compute_dtype:
                     if use_compact_feature_row_store:
                         assert feature_row_store is not None
-                        shadow_feature_influences = (
-                            compute_partial_feature_influences_streaming(
-                                lambda row_start, row_end: feature_row_store.read_feature_rows(
-                                    row_start,
-                                    row_end,
-                                    phase="phase3_seed_ranking_shadow",
-                                ),
-                                (
-                                    feature_row_store.row_abs_max[:pre_phase4_st],
-                                    feature_row_store.row_l1_scaled[:pre_phase4_st],
-                                ),
-                                targets.logit_probabilities,
-                                row_to_node_index[:pre_phase4_st],
-                                n_feature_nodes=total_active_feats,
-                                n_logits=n_logits,
-                                device=torch.device("cpu"),
-                                compute_dtype=shadow_debug_compute_dtype,
-                            )
+                        shadow_feature_influences = compute_partial_feature_influences_streaming(
+                            lambda row_start, row_end: feature_row_store.read_feature_rows(
+                                row_start,
+                                row_end,
+                                phase="phase3_seed_ranking_shadow",
+                            ),
+                            (
+                                feature_row_store.row_abs_max[:pre_phase4_st],
+                                feature_row_store.row_l1_scaled[:pre_phase4_st],
+                            ),
+                            targets.logit_probabilities,
+                            row_to_node_index[:pre_phase4_st],
+                            n_feature_nodes=total_active_feats,
+                            n_logits=n_logits,
+                            device=torch.device("cpu"),
+                            compute_dtype=shadow_debug_compute_dtype,
                         )
                     else:
                         shadow_influences = compute_partial_influences(
@@ -837,9 +844,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                         feat_positions=feat_pos,
                         feat_ids=feat_ids,
                         exact_chunked_decoder=exact_chunked_decoder,
-                        decoder_chunk_size=getattr(
-                            model.transcoders, "decoder_chunk_size", None
-                        ),
+                        decoder_chunk_size=getattr(model.transcoders, "decoder_chunk_size", None),
                     )
                     phase3_seed_summary["shadow_debug"] = _compare_phase4_frontiers(
                         post_locality_pending,
@@ -872,18 +877,16 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     influence_compute_dtype=influence_compute_dtype,
                 )
             if capture_feature_semantic_descriptors_enabled:
-                feature_semantic_descriptors_payload = (
-                    _build_feature_semantic_descriptors_payload(
-                        active_features=activation_matrix.indices().T,
-                        activation_values=activation_matrix.values(),
-                        seed_feature_influences=torch.empty(0, dtype=planner_compute_dtype),
-                        frontier_pre_locality=torch.empty(0, dtype=torch.long),
-                        frontier_post_locality=torch.empty(0, dtype=torch.long),
-                        total_active_features=int(total_active_feats),
-                        status="skipped_all_features_included",
-                        semantic_descriptor_top_k=semantic_descriptor_top_k,
-                        semantic_descriptor_dim=semantic_descriptor_dim,
-                    )
+                feature_semantic_descriptors_payload = _build_feature_semantic_descriptors_payload(
+                    active_features=activation_matrix.indices().T,
+                    activation_values=activation_matrix.values(),
+                    seed_feature_influences=torch.empty(0, dtype=planner_compute_dtype),
+                    frontier_pre_locality=torch.empty(0, dtype=torch.long),
+                    frontier_post_locality=torch.empty(0, dtype=torch.long),
+                    total_active_features=int(total_active_feats),
+                    status="skipped_all_features_included",
+                    semantic_descriptor_top_k=semantic_descriptor_top_k,
+                    semantic_descriptor_dim=semantic_descriptor_dim,
                 )
         if cross_cluster_debug_summary is not None:
             deterministic_shadow = phase3_seed_summary.get("deterministic_shadow")
@@ -899,9 +902,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 "feature_batch_size": int(effective_feature_batch_size),
                 "queue_size": phase3_seed_summary.get("queue_size"),
                 "feature_influence_hash": phase3_seed_summary.get("feature_influence_hash"),
-                "frontier_pre_locality_hash": phase3_seed_summary.get(
-                    "frontier_pre_locality_hash"
-                ),
+                "frontier_pre_locality_hash": phase3_seed_summary.get("frontier_pre_locality_hash"),
                 "frontier_post_locality_hash": phase3_seed_summary.get(
                     "frontier_post_locality_hash"
                 ),
@@ -971,7 +972,6 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 summary_payload=phase3_seed_summary,
                 stream_payload=phase3_stream_checkpoint,
             )
-
 
     return Phase3Result(
         stored_row_count=int(n_logits),
