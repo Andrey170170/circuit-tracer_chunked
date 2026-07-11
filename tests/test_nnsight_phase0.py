@@ -253,9 +253,7 @@ def test_phase0_override_prefix_mask_and_event_checkpoint_order(monkeypatch) -> 
         "masked_feature_count": 1,
     }
     assert calls.index("ctx.prefix:3") < calls.index("event:phase0.precompute")
-    assert calls.index("event:phase0.precompute") < calls.index(
-        "checkpoint:phase0_sparse_setup"
-    )
+    assert calls.index("event:phase0.precompute") < calls.index("checkpoint:phase0_sparse_setup")
 
 
 def test_phase0_metrics_failure_exposes_context_and_original_cause(monkeypatch) -> None:
@@ -287,6 +285,32 @@ def test_phase0_metrics_failure_exposes_context_and_original_cause(monkeypatch) 
     assert calls.count("ctx.cleanup") == 0
 
 
+def test_phase0_base_exception_exposes_context_and_original_cause(monkeypatch) -> None:
+    calls: list[str] = []
+    ctx = FakeContext(calls)
+    model = FakeModel(calls, ctx)
+    original_error = KeyboardInterrupt("injected interrupt")
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.phases.phase0._log_memory_boundary",
+        lambda *args, **kwargs: None,
+    )
+
+    def fail_metrics(*args: object, **kwargs: object) -> None:
+        raise original_error
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.phases.phase0._log_phase_metrics",
+        fail_metrics,
+    )
+
+    with pytest.raises(Phase0ExecutionError) as raised:
+        run_phase0(inputs=_inputs(calls, model), config=_config())
+
+    assert raised.value.ctx is ctx
+    assert raised.value.cause is original_error
+    assert calls.count("ctx.cleanup") == 0
+
+
 def test_phase0_failure_uses_attribution_lifecycle_finalizer(monkeypatch) -> None:
     calls: list[str] = []
     ctx = FakeContext(calls)
@@ -311,9 +335,7 @@ def test_phase0_failure_uses_attribution_lifecycle_finalizer(monkeypatch) -> Non
             calls.append("attach_exception")
             setattr(error, "telemetry_export", telemetry_export)
 
-        def render_human_summary(
-            self, logger: object, telemetry_export: dict[str, object]
-        ) -> None:
+        def render_human_summary(self, logger: object, telemetry_export: dict[str, object]) -> None:
             calls.append("render_human_summary")
 
     observer = FakeLifecycleObserver()

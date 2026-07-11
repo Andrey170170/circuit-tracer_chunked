@@ -68,23 +68,17 @@ def _value_stats_int_entry(value_stats: dict[str, object], key: str) -> int:
     return int(cast(int, value_stats[key]))
 
 
-def _value_stats_safe_float_entry(
-    value_stats: dict[str, object], key: str
-) -> float | None:
+def _value_stats_safe_float_entry(value_stats: dict[str, object], key: str) -> float | None:
     """Read a numeric vector-stat entry without changing its runtime coercion."""
     return _safe_float(cast(torch.Tensor | float | int | None, value_stats.get(key)))
 
 
-def _diagnostic_int_entry(
-    diagnostics: Mapping[str, object], key: str, default: int = 0
-) -> int:
+def _diagnostic_int_entry(diagnostics: Mapping[str, object], key: str, default: int = 0) -> int:
     """Read an integer diagnostic entry without changing its runtime coercion."""
     return int(cast(int, diagnostics.get(key, default)))
 
 
-def _diagnostic_mapping_entry(
-    diagnostics: Mapping[str, object], key: str
-) -> dict[str, object]:
+def _diagnostic_mapping_entry(diagnostics: Mapping[str, object], key: str) -> dict[str, object]:
     """Narrow a nested diagnostic mapping while preserving invalid-payload errors."""
     return cast(dict[str, object], diagnostics.get(key, {}))
 
@@ -102,7 +96,7 @@ def _with_phase0_cleanup_ownership(
     def wrapped(*, inputs: Phase0Inputs, config: "Phase0Config") -> "Phase0Result":
         try:
             return function(inputs=inputs, config=config)
-        except Exception as exc:
+        except BaseException as exc:
             if inputs.cleanup_owner.ctx is None:
                 raise
             raise Phase0ExecutionError(inputs.cleanup_owner.ctx, exc) from exc
@@ -257,7 +251,9 @@ def run_phase0(*, inputs: Phase0Inputs, config: Phase0Config) -> Phase0Result:
         )
     inputs.cleanup_owner.ctx = ctx
     runtime_metadata = {
-        "exact_encoder_staging_destination": getattr(ctx, "exact_encoder_staging_destination", "none"),
+        "exact_encoder_staging_destination": getattr(
+            ctx, "exact_encoder_staging_destination", "none"
+        ),
         "exact_encoder_materialized_during_phase0": bool(
             getattr(ctx, "exact_encoder_materialized_during_phase0", False)
         ),
@@ -414,7 +410,9 @@ def run_phase0(*, inputs: Phase0Inputs, config: Phase0Config) -> Phase0Result:
             "phase0_threshold_membership": threshold_membership,
             "phase0_boundary_fingerprints": boundary_fingerprints,
             "phase0_pre_clt_input_fingerprints": pre_clt,
-            "phase0_pre_clt_input_global_hash": pre_clt.get("global_hash") if isinstance(pre_clt, dict) else None,
+            "phase0_pre_clt_input_global_hash": pre_clt.get("global_hash")
+            if isinstance(pre_clt, dict)
+            else None,
             "logit_retention": getattr(ctx, "logit_retention", None),
             "staging_flags": {
                 "stage_encoder_vecs_on_cpu": bool(config.stage_encoder_vecs_on_cpu),
@@ -439,26 +437,52 @@ def run_phase0(*, inputs: Phase0Inputs, config: Phase0Config) -> Phase0Result:
             "activation_value_effectively_all_zero": bool(value_stats["effectively_all_zero"]),
             "phase0_threshold_membership_layer_count": len(
                 _diagnostic_sized_entry(threshold_membership, "per_layer")
-            ) if isinstance(threshold_membership, dict) else None,
+            )
+            if isinstance(threshold_membership, dict)
+            else None,
             "phase0_threshold_membership_borderline_sample_count": _diagnostic_int_entry(
                 threshold_membership, "borderline_sample_count"
-            ) if isinstance(threshold_membership, dict) else None,
+            )
+            if isinstance(threshold_membership, dict)
+            else None,
             "phase0_threshold_membership_near_count_abs_lte_1e_04": _diagnostic_int_entry(
                 _diagnostic_mapping_entry(threshold_membership, "near_counts_by_epsilon"),
                 "abs_lte_1e-04",
-            ) if isinstance(threshold_membership, dict) else None,
+            )
+            if isinstance(threshold_membership, dict)
+            else None,
             "phase0_pre_clt_input_global_hash": summary.get("phase0_pre_clt_input_global_hash"),
-            "phase0_pre_clt_input_layer_count": int(pre_clt.get("layer_count", 0)) if isinstance(pre_clt, dict) else None,
+            "phase0_pre_clt_input_layer_count": int(pre_clt.get("layer_count", 0))
+            if isinstance(pre_clt, dict)
+            else None,
             "phase0_boundary_layer_count": len(
                 _diagnostic_sized_entry(boundary_fingerprints, "per_layer")
-            ) if isinstance(boundary_fingerprints, dict) else None,
+            )
+            if isinstance(boundary_fingerprints, dict)
+            else None,
             "phase0_boundary_transcoder_constants_global_hash": _diagnostic_mapping_entry(
                 boundary_fingerprints, "transcoder_constant_fingerprints"
-            ).get("global_hash") if isinstance(boundary_fingerprints, dict) else None,
-            "phase0_boundary_preactivation_hash_global": global_hashes.get("pre_activation_hash_global") if isinstance(global_hashes, dict) else None,
-            "phase0_boundary_margin_hash_global": global_hashes.get("compare_margin_hash_global") if isinstance(global_hashes, dict) else None,
-            "phase0_boundary_mask_membership_hash_global": global_hashes.get("mask_membership_hash_global") if isinstance(global_hashes, dict) else None,
-            "phase0_boundary_post_activation_hash_global": global_hashes.get("post_activation_hash_global") if isinstance(global_hashes, dict) else None,
+            ).get("global_hash")
+            if isinstance(boundary_fingerprints, dict)
+            else None,
+            "phase0_boundary_preactivation_hash_global": global_hashes.get(
+                "pre_activation_hash_global"
+            )
+            if isinstance(global_hashes, dict)
+            else None,
+            "phase0_boundary_margin_hash_global": global_hashes.get("compare_margin_hash_global")
+            if isinstance(global_hashes, dict)
+            else None,
+            "phase0_boundary_mask_membership_hash_global": global_hashes.get(
+                "mask_membership_hash_global"
+            )
+            if isinstance(global_hashes, dict)
+            else None,
+            "phase0_boundary_post_activation_hash_global": global_hashes.get(
+                "post_activation_hash_global"
+            )
+            if isinstance(global_hashes, dict)
+            else None,
             "logit_retention": getattr(ctx, "logit_retention", None),
             "stage_encoder_vecs_on_cpu": bool(config.stage_encoder_vecs_on_cpu),
             "stage_error_vectors_on_cpu": bool(config.stage_error_vectors_on_cpu),
