@@ -18,6 +18,13 @@ def request(value=1, **kwargs):
     return runtime.TraceRequest(prompt=[value], model=FakeModel(), **kwargs)
 
 
+def test_every_top_level_export_is_reachable():
+    import circuit_tracer
+
+    for name in circuit_tracer.__all__:
+        assert getattr(circuit_tracer, name) is not None, name
+
+
 def test_attribute_facade_and_trace_one_share_implementation(monkeypatch):
     calls = []
 
@@ -150,6 +157,55 @@ def test_fingerprints_are_stable_and_split_logical_from_physical():
     assert first.execution_fingerprint == logical.execution_fingerprint
 
 
+@pytest.mark.parametrize(
+    ("name", "first", "second"),
+    [
+        ("max_n_logits", 2, 3),
+        ("desired_logit_prob", 0.8, 0.9),
+        ("attribution_targets", ["a"], ["b"]),
+        ("max_feature_nodes", 10, 11),
+        ("diagnostic_feature_cap", 4, 5),
+        ("sparsification", {"threshold": 0.1}, {"threshold": 0.2}),
+        ("phase3_frontier_buffer_max_extra", 1, 2),
+        ("phase4_frontier_buffer_max_extra_total", 1, 2),
+    ],
+)
+def test_graph_controls_cannot_collide_in_semantic_fingerprint(name, first, second):
+    if name == "attribution_targets":
+        left = request(attribution_targets=first)
+        right = request(attribution_targets=second)
+    elif name in {"max_feature_nodes", "diagnostic_feature_cap"}:
+        left = request(logical=runtime.TraceLogicalSemantics(**{name: first}))
+        right = request(logical=runtime.TraceLogicalSemantics(**{name: second}))
+    else:
+        left = request(legacy_kwargs={name: first})
+        right = request(legacy_kwargs={name: second})
+    assert left.semantic_fingerprint != right.semantic_fingerprint
+
+
+def test_unknown_legacy_kwarg_is_rejected_preflight():
+    with pytest.raises(TypeError, match="unknown legacy attribution kwargs: obsolete_knob"):
+        request(legacy_kwargs={"obsolete_knob": True}).semantic_fingerprint
+
+
+def test_direct_feature_controls_map_or_reject_before_execution(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.attribute_nnsight._attribute_impl",
+        lambda prompt, model, **kwargs: captured.update(kwargs) or {},
+    )
+    runtime.trace_one(request(logical=runtime.TraceLogicalSemantics(
+        feature_group_size=7, phase4_reference_frontier_batch=7,
+    )))
+    assert captured["feature_batch_size"] == 7
+    with pytest.raises(ValueError, match="must be equal"):
+        runtime.trace_one(request(logical=runtime.TraceLogicalSemantics(
+            feature_group_size=7, phase4_reference_frontier_batch=8,
+        )))
+    with pytest.raises(ValueError, match="hooks are not representable"):
+        runtime.trace_one(request(logical=runtime.TraceLogicalSemantics(hooks=("x",))))
+
+
 def test_conflict_is_rejected_before_implementation(monkeypatch):
     monkeypatch.setattr(
         "circuit_tracer.attribution.attribute_nnsight._attribute_impl",
@@ -242,3 +298,39 @@ def test_session_reuse_reset_close_and_failure_recovery(monkeypatch):
     session.close()
     with pytest.raises(RuntimeError, match="closed"):
         session.trace()
+
+
+def test_session_window_applies_base_and_call_effective_config(monkeypatch):
+    calls = []
+
+    class Delegate:
+        def __init__(self, **kwargs):
+            pass
+
+        def attribute_target_position(self, position, **kwargs):
+            calls.append((position, kwargs))
+            return "graph"
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.attribute_nnsight.FullSequenceWindowAttributionSession",
+        Delegate,
+    )
+    base = request(
+        [1, 2, 3],
+        attribution_targets=["base"],
+        logical=runtime.TraceLogicalSemantics(source_group_size=6),
+        physical=runtime.TracePhysicalControls(influence_row_tile=2),
+    )
+    session = runtime.open_session(base)
+    first = session.trace_window(2, reuse=True, max_n_logits=3)
+    second = session.trace_window(3, reuse=True, max_n_logits=3)
+    assert calls[0][1]["attribution_targets"] == ["base"]
+    assert calls[0][1]["batch_size"] == 6
+    assert calls[0][1]["influence_row_tile_size"] == 2
+    assert calls[0][1]["max_n_logits"] == 3
+    assert first.semantic_fingerprint != second.semantic_fingerprint
+    assert first.compatibility_metadata["target_position"] == 2
+    assert first.compatibility_metadata["semantic_effective_config"]["output_position"] == 1

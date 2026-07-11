@@ -117,6 +117,11 @@ def test_replay_reader_enforces_configured_request_bounds() -> None:
         ledger.read_tile(0, 2, 0, 1)
     with pytest.raises(ValueError, match="column bound"):
         ledger.read_tile(0, 1, 0, 3)
+    selected = torch.tensor([3, 1, 3])
+    actual = ledger.materialize_dense_feature_slice(
+        row_start=0, row_end=2, selected_feature_columns=selected
+    )
+    torch.testing.assert_close(actual, rows[:, selected])
 
 
 @pytest.mark.parametrize("architecture", ["clt", "plt"])

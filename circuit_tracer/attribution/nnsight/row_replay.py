@@ -227,8 +227,18 @@ class RowRecipeLedger:
         columns = selected_feature_columns.detach().to(device="cpu", dtype=torch.long)
         if columns.numel() == 0:
             return torch.empty((row_end - row_start, 0), dtype=self.dtype)
-        pieces = [self.read_tile(row_start, row_end, int(column), int(column) + 1) for column in columns]
-        return torch.cat(pieces, dim=1)
+        result = torch.empty((row_end - row_start, columns.numel()), dtype=self.dtype)
+        row_step = self._max_request_rows or max(row_end - row_start, 1)
+        for chunk_start in range(row_start, row_end, row_step):
+            chunk_end = min(chunk_start + row_step, row_end)
+            output_start = chunk_start - row_start
+            output_end = chunk_end - row_start
+            pieces = [
+                self.read_tile(chunk_start, chunk_end, int(column), int(column) + 1)
+                for column in columns
+            ]
+            result[output_start:output_end] = torch.cat(pieces, dim=1)
+        return result
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:
         retained_recipe_bytes = sum(

@@ -1094,14 +1094,18 @@ class _ColumnTiledFeatureRowStore:
     ) -> torch.Tensor:
         selected = selected_feature_columns.to(device="cpu", dtype=torch.long)
         result = torch.empty((row_end - row_start, selected.numel()), dtype=self._dtype)
-        for output_column, source_column in enumerate(selected.tolist()):
+        row_step = self._max_request_rows or max(row_end - row_start, 1)
+        for source_column in selected.tolist():
             if source_column < 0 or source_column >= self.n_feature_columns:
-                raise ValueError(
-                    "selected feature column indices must be in [0, n_feature_columns)"
+                raise ValueError("selected feature column indices must be in [0, n_feature_columns)")
+        for chunk_start in range(row_start, row_end, row_step):
+            chunk_end = min(chunk_start + row_step, row_end)
+            output_start = chunk_start - row_start
+            output_end = chunk_end - row_start
+            for output_column, source_column in enumerate(selected.tolist()):
+                result[output_start:output_end, output_column : output_column + 1] = self.read_tile(
+                    chunk_start, chunk_end, source_column, source_column + 1
                 )
-            result[:, output_column : output_column + 1] = self.read_tile(
-                row_start, row_end, source_column, source_column + 1
-            )
         return result
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:

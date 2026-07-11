@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
+import inspect
 from typing import Any, Mapping, Sequence
 
 from circuit_tracer.governor.contracts import canonical_json, fingerprint
 
 
-RUNTIME_SCHEMA_VERSION = 1
-LEGACY_TRANSLATOR_VERSION = "attribute_kwargs_v1"
+RUNTIME_SCHEMA_VERSION = 2
+LEGACY_TRANSLATOR_VERSION = "attribute_kwargs_v2"
 
 
 @dataclass(frozen=True)
@@ -70,19 +71,11 @@ class TraceRequest:
 
     @property
     def semantic_fingerprint(self) -> str:
-        return fingerprint(
-            {
-                "schema_version": RUNTIME_SCHEMA_VERSION,
-                "logical": self.logical,
-                "prompt": _stable_value(self.prompt),
-                "targets": _stable_value(self.attribution_targets),
-                "provider": _provider_identity(self.model),
-            }
-        )
+        return _translate(self)[1]["semantic_fingerprint"]
 
     @property
     def execution_fingerprint(self) -> str:
-        return fingerprint({"schema_version": RUNTIME_SCHEMA_VERSION, "physical": self.physical})
+        return _translate(self)[1]["execution_fingerprint"]
 
 
 class TraceStatus(str, Enum):
@@ -112,6 +105,11 @@ def _stable_value(value: Any) -> Any:
         return {str(key): _stable_value(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
     if isinstance(value, (list, tuple)):
         return [_stable_value(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field_info.name: _stable_value(getattr(value, field_info.name))
+            for field_info in fields(value)
+        }
     tolist = getattr(value, "tolist", None)
     if callable(tolist):
         return tolist()
@@ -171,6 +169,57 @@ _PHYSICAL_LEGACY = {
     "stage_error_vectors_on_cpu": "stage_error_vectors_on_cpu",
 }
 
+# Every public attribution argument belongs to exactly one fingerprint category.
+# Semantic is completed from the implementation signature below so newly added
+# graph controls fail classification tests instead of silently colliding.
+_IGNORED_FOR_FINGERPRINT = {
+    "verbose", "profile", "profile_log_interval", "phase4_anomaly_debug",
+    "cross_cluster_debug", "capture_phase0_donor_bundle", "capture_phase3_seed_bundle",
+    "capture_phase3_gradient_bundle", "capture_phase3_row_bundle",
+    "capture_feature_semantic_descriptors", "semantic_descriptor_top_k",
+    "semantic_descriptor_dim", "telemetry_max_events", "telemetry_jsonl_path",
+    "telemetry_context", "phase4_scheduler_debug", "phase4_scheduler_telemetry_detail",
+    "row_store_temp_root_policy", "row_store_temp_root", "prefix_view_metadata",
+}
+_INTERNAL_EFFECTIVE_ARGUMENTS = {
+    "_phase0_context_override", "_target_logits_override", "_target_logit_source"
+}
+
+
+def _attribute_parameters() -> Mapping[str, inspect.Parameter]:
+    from circuit_tracer.attribution.attribute_nnsight import attribute
+
+    return inspect.signature(attribute).parameters
+
+
+def _classified_effective_config(kwargs: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    parameters = _attribute_parameters()
+    accepted = set(parameters) - {"prompt", "model"}
+    unknown = set(kwargs) - accepted
+    if unknown:
+        raise TypeError(f"unknown legacy attribution kwargs: {', '.join(sorted(unknown))}")
+    physical = set(_PHYSICAL_LEGACY) | {
+        "offload", "plan_feature_batch_size", "auto_scale_feature_batch_size",
+        "feature_batch_size_max", "feature_batch_target_reserved_fraction",
+        "feature_batch_min_free_fraction", "feature_batch_probe_batches",
+        "phase4_refresh_prepared_chunk_cache_bytes", "phase1_trace_batch_policy",
+        "phase1_trace_batch_size_max",
+    }
+    semantic = accepted - physical - _IGNORED_FOR_FINGERPRINT - _INTERNAL_EFFECTIVE_ARGUMENTS
+    classified = semantic | physical | _IGNORED_FOR_FINGERPRINT | _INTERNAL_EFFECTIVE_ARGUMENTS
+    if classified != accepted:
+        raise RuntimeError(f"unclassified attribution arguments: {sorted(accepted - classified)}")
+    defaults = {
+        name: parameter.default
+        for name, parameter in parameters.items()
+        if name not in {"prompt", "model"} and parameter.default is not inspect.Parameter.empty
+    }
+    effective = {**defaults, **kwargs}
+    return (
+        {name: _stable_value(effective[name]) for name in sorted(semantic)},
+        {name: _stable_value(effective[name]) for name in sorted(physical)},
+    )
+
 
 def _different(explicit: Any, legacy: Any) -> bool:
     return explicit is not None and canonical_json(explicit) != canonical_json(legacy)
@@ -204,6 +253,12 @@ def _translate(request: TraceRequest) -> tuple[dict[str, Any], dict[str, Any]]:
         "order": "canonical",
         "source": "transcoder_provider.decoder_chunk_size",
     }
+    if request.logical.hooks:
+        raise ValueError("typed hooks are not representable by the attribution runtime")
+    if request.logical.provider_semantics or request.logical.sequence_semantics:
+        raise ValueError("typed provider/sequence semantics are not representable by the attribution runtime")
+    if request.logical.phase4_refresh_checkpoints:
+        raise ValueError("explicit phase4 refresh checkpoints are not supported")
     for legacy, field_name in _LOGICAL_LEGACY.items():
         explicit = getattr(request.logical, field_name)
         default = getattr(logical_defaults, field_name)
@@ -245,6 +300,20 @@ def _translate(request: TraceRequest) -> tuple[dict[str, Any], dict[str, Any]]:
             "phase4_microbatch_max_rows": legacy_feature_batch,
             "derivation": "legacy_matching_default",
         }
+    else:
+        feature_group = request.logical.feature_group_size
+        reference_group = request.logical.phase4_reference_frontier_batch
+        if feature_group is not None or reference_group is not None:
+            if feature_group is None or reference_group is None or feature_group != reference_group:
+                raise ValueError(
+                    "feature_group_size and phase4_reference_frontier_batch must be equal; "
+                    "the runtime exposes one feature_batch_size control"
+                )
+            kwargs["feature_batch_size"] = feature_group
+            translated["logical"]["feature_batch_size"] = {
+                "feature_group_size": feature_group,
+                "phase4_reference_frontier_batch": reference_group,
+            }
     for legacy, field_name in _PHYSICAL_LEGACY.items():
         explicit = getattr(request.physical, field_name)
         default = getattr(physical_defaults, field_name)
@@ -255,12 +324,26 @@ def _translate(request: TraceRequest) -> tuple[dict[str, Any], dict[str, Any]]:
             kwargs[legacy] = value
         translated["physical"][legacy] = value
     kwargs["attribution_targets"] = request.attribution_targets
+    semantic_config, physical_config = _classified_effective_config(kwargs)
+    semantic_hash = fingerprint({
+        "schema_version": RUNTIME_SCHEMA_VERSION,
+        "semantic_effective_config": semantic_config,
+        "prompt": _stable_value(request.prompt),
+        "provider": _provider_identity(request.model),
+    })
+    execution_hash = fingerprint({
+        "schema_version": RUNTIME_SCHEMA_VERSION,
+        "physical_effective_config": physical_config,
+    })
     compatibility = {
         "schema_version": RUNTIME_SCHEMA_VERSION,
         "translator": LEGACY_TRANSLATOR_VERSION,
         "translated": translated,
-        "semantic_fingerprint": request.semantic_fingerprint,
-        "execution_fingerprint": request.execution_fingerprint,
+        "semantic_effective_config": semantic_config,
+        "physical_effective_config": physical_config,
+        "ignored_for_fingerprint": sorted(_IGNORED_FOR_FINGERPRINT),
+        "semantic_fingerprint": semantic_hash,
+        "execution_fingerprint": execution_hash,
     }
     context = dict(kwargs.get("telemetry_context") or {})
     context["runtime_compatibility"] = compatibility
@@ -279,8 +362,8 @@ def trace_one(request: TraceRequest) -> TraceResult:
         summary = getattr(output, "telemetry_summary", {})
     return TraceResult(
         output=output,
-        semantic_fingerprint=request.semantic_fingerprint,
-        execution_fingerprint=request.execution_fingerprint,
+        semantic_fingerprint=compatibility["semantic_fingerprint"],
+        execution_fingerprint=compatibility["execution_fingerprint"],
         status=TraceStatus.SUCCEEDED,
         telemetry_summary=summary,
         compatibility_metadata=compatibility,
@@ -337,6 +420,19 @@ class TraceSession:
 
     def trace_window(self, target_position: int, *, reuse: bool, **kwargs: Any) -> TraceResult:
         self._ensure_open()
+        base_kwargs, _ = _translate(self.request)
+        base_kwargs.pop("telemetry_context", None)
+        effective_kwargs = {**base_kwargs, **kwargs, "output_position": target_position - 1}
+        window_request = TraceRequest(
+            prompt=self.request.prompt,
+            model=self.request.model,
+            attribution_targets=effective_kwargs.pop("attribution_targets", None),
+            legacy_kwargs=effective_kwargs,
+            metadata={**self.request.metadata, "target_position": target_position},
+        )
+        call_kwargs, compatibility = _translate(window_request)
+        call_kwargs.pop("output_position", None)
+        call_kwargs.pop("telemetry_context", None)
         if self._delegate is None:
             from circuit_tracer.attribution.attribute_nnsight import FullSequenceWindowAttributionSession
 
@@ -350,8 +446,15 @@ class TraceSession:
             self._reuse = bool(reuse)
         elif self._reuse != bool(reuse):
             raise ValueError("reuse cannot change without reset()")
-        graph = self._delegate.attribute_target_position(target_position, **kwargs)
-        return TraceResult(graph, self.request.semantic_fingerprint, self.request.execution_fingerprint, TraceStatus.SUCCEEDED)
+        graph = self._delegate.attribute_target_position(target_position, **call_kwargs)
+        compatibility = {**compatibility, "target_position": target_position}
+        return TraceResult(
+            graph,
+            compatibility["semantic_fingerprint"],
+            compatibility["execution_fingerprint"],
+            TraceStatus.SUCCEEDED,
+            compatibility_metadata=compatibility,
+        )
 
     def reset(self) -> None:
         self._ensure_open()

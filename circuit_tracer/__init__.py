@@ -116,6 +116,15 @@ _GOVERNOR_EXPORTS = set(__all__) - {
     "attribute",
     "attribute_phase0_stats",
     "SparsificationConfig",
+    "TraceLogicalSemantics",
+    "TracePhysicalControls",
+    "TraceRequest",
+    "TraceResult",
+    "TraceSession",
+    "TraceStatus",
+    "trace_one",
+    "trace_batch",
+    "open_session",
 }
 
 

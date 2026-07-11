@@ -183,16 +183,23 @@ def produce_tiled_rows_no_retention(
         copy_start = time.perf_counter()
         first_pass_tiles.append((_start, _end))
         feature_columns = max(feature_columns, _end)
-        tile_max = tile.detach().abs().amax(dim=1).to(device="cpu", dtype=dtype)
+        tile_max_device = tile.detach().abs().amax(dim=1)
+        tile_max = tile_max_device.to(device="cpu", dtype=dtype)
         if telemetry is not None:
-            telemetry["feature_transfer_bytes"] = int(telemetry.get("feature_transfer_bytes", 0)) + (
-                int(tile.numel() * tile.element_size()) if tile.device.type != "cpu" else 0
+            transferred = (
+                int(tile_max_device.numel() * tile_max_device.element_size())
+                if tile_max_device.device.type != "cpu"
+                else 0
             )
-            telemetry["feature_copy_count"] = int(telemetry.get("feature_copy_count", 0)) + int(
-                tile.device.type != "cpu" or tile.dtype != dtype
-            )
-            telemetry["feature_cpu_copy_elapsed_ms"] = float(
-                telemetry.get("feature_cpu_copy_elapsed_ms", 0.0)
+            telemetry["feature_transfer_bytes"] = int(telemetry.get("feature_transfer_bytes", 0)) + transferred
+            telemetry["feature_reduction_transfer_bytes"] = int(
+                telemetry.get("feature_reduction_transfer_bytes", 0)
+            ) + transferred
+            telemetry["feature_reduction_copy_count"] = int(
+                telemetry.get("feature_reduction_copy_count", 0)
+            ) + int(tile_max_device.device.type != "cpu" or tile_max_device.dtype != dtype)
+            telemetry["feature_reduction_copy_elapsed_ms"] = float(
+                telemetry.get("feature_reduction_copy_elapsed_ms", 0.0)
             ) + (time.perf_counter() - copy_start) * 1000.0
         global_max = tile_max if global_max is None else torch.maximum(global_max, tile_max)
 

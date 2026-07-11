@@ -83,6 +83,23 @@ def test_column_tiled_selected_projection_preserves_order_and_duplicates() -> No
         store.cleanup()
 
 
+def test_column_tiled_selected_projection_chunks_rows_to_request_bound() -> None:
+    rows = torch.arange(30, dtype=torch.float32).reshape(5, 6)
+    store = _ColumnTiledFeatureRowStore(
+        n_rows=5, n_feature_columns=6, column_tile_size=2, dtype=torch.float32,
+        max_request_rows=2, max_request_columns=2,
+    )
+    try:
+        _append(store, rows)
+        selected = torch.tensor([5, 1, 5])
+        actual = store.materialize_dense_feature_slice(
+            row_start=0, row_end=5, selected_feature_columns=selected
+        )
+        torch.testing.assert_close(actual, rows[:, selected])
+    finally:
+        store.cleanup()
+
+
 def test_huge_shape_construction_is_sparse_and_never_materializes_full_matrix(tmp_path) -> None:
     store = _ColumnTiledFeatureRowStore(
         n_rows=1_000_000,
@@ -180,6 +197,27 @@ def test_true_tiled_production_streams_tiles_and_matches_full_row_denominator() 
     finally:
         feature.cleanup()
         nonfeature.cleanup()
+
+
+def test_none_recompute_labels_first_pass_reduction_copy_separately() -> None:
+    rows = torch.tensor([[1.0, -2.0, 3.0]], dtype=torch.float32)
+
+    class Context:
+        def produce_row_tiles(self, *args, consume_feature_tile, **kwargs):
+            del args, kwargs
+            consume_feature_tile(0, 2, rows[:, :2])
+            return rows[:, 2:]
+
+    telemetry = {}
+    produce_tiled_rows_no_retention(
+        ctx=Context(), layers=torch.tensor([0]), positions=torch.tensor([0]),
+        inject_values=torch.ones((1, 1)), feature_column_tile_size=2,
+        dtype=torch.float64, phase_label="test", telemetry=telemetry,
+    )
+    assert telemetry["feature_reduction_copy_count"] == 1
+    assert telemetry["feature_copy_count"] == 1
+    assert telemetry["feature_reduction_transfer_bytes"] == 0
+    assert telemetry["feature_transfer_bytes"] == 0
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
