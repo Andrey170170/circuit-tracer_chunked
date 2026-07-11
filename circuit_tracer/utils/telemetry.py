@@ -1,6 +1,6 @@
 """Compatibility facade for the observability subsystem.
 
-New code should import from :mod:\`circuit_tracer.observability\` directly.
+New code should import from :mod:`circuit_tracer.observability` directly.
 """
 
 from __future__ import annotations

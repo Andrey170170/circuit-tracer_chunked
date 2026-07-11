@@ -6,6 +6,7 @@ from circuit_tracer.observability.recorder import (
     sanitize_attrs,
     sanitize_scalar_attr,
 )
+from circuit_tracer.observability.lifecycle import TelemetryObserver
 from circuit_tracer.observability.resources import (
     build_memory_before_after_attrs,
     build_memory_snapshot_attrs,
@@ -18,6 +19,7 @@ from circuit_tracer.observability.resources import (
 
 __all__ = [
     "TelemetryRecorder",
+    "TelemetryObserver",
     "TelemetryScalar",
     "build_memory_before_after_attrs",
     "build_memory_snapshot_attrs",

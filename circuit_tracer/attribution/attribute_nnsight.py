@@ -69,7 +69,7 @@ from circuit_tracer.utils.telemetry import (
 from circuit_tracer.observability.exception_export import (
     _TELEMETRY_EXCEPTION_EVENTS_ATTR as _TELEMETRY_EXCEPTION_EVENTS_ATTR,
     _TELEMETRY_EXCEPTION_SUMMARY_ATTR as _TELEMETRY_EXCEPTION_SUMMARY_ATTR,
-    _attach_telemetry_export_to_exception,
+    _attach_telemetry_export_to_exception as _attach_telemetry_export_to_exception,
 )
 from circuit_tracer.observability.human_logs import (
     _log_batch_profile,
@@ -77,6 +77,10 @@ from circuit_tracer.observability.human_logs import (
     _log_phase_metrics,
     _log_sparsification_profile,
     _snapshot_diagnostics,
+)
+from circuit_tracer.observability.lifecycle import (
+    TelemetryObserver,
+    _TelemetryObserver as _TelemetryObserver,
 )
 from circuit_tracer.attribution.nnsight.telemetry import (
     _RowTransferTelemetry as _RowTransferTelemetry,
@@ -7664,14 +7668,14 @@ def _run_attribution(
         profile=profile,
         phase4_anomaly_debug_enabled=phase4_anomaly_debug_enabled,
     )
-    telemetry_recorder = TelemetryRecorder(
+    telemetry_observer = TelemetryObserver.create(
         enabled=(profile or compact_output or phase4_anomaly_debug_enabled),
         max_events=telemetry_max_events_resolved,
         jsonl_path=telemetry_jsonl_path,
         static_context=telemetry_context,
     )
-    telemetry_recorder.record_event(
-        scope="run",
+    telemetry_recorder = telemetry_observer.recorder
+    telemetry_observer.run(
         name="attribute.start",
         attrs={
             "profile": profile,
@@ -8128,8 +8132,7 @@ def _run_attribution(
             logit_retention=getattr(ctx, "logit_retention", "full"),
         )
         phase0_elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
-        telemetry_recorder.record_event(
-            scope="phase",
+        telemetry_observer.phase(
             name="phase0.precompute",
             phase="phase0",
             elapsed_ms=phase0_elapsed_ms,
@@ -8137,12 +8140,7 @@ def _run_attribution(
                 "active_features": int(ctx.activation_matrix._nnz()),
                 "logit_retention": getattr(ctx, "logit_retention", "full"),
             },
-        )
-        telemetry_recorder.record_wall_clock_duration(
-            scope="phase",
-            name="phase0.precompute",
-            phase="phase0",
-            elapsed_ms=phase0_elapsed_ms,
+            wall_clock=True,
         )
         if profile:
             if getattr(ctx, "setup_diagnostic_stats", None):
@@ -8372,8 +8370,7 @@ def _run_attribution(
 
         _log_phase_metrics(logger, "Forward pass", phase_start, model.device)
         phase1_elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
-        telemetry_recorder.record_event(
-            scope="phase",
+        telemetry_observer.phase(
             name="phase1.forward_pass",
             phase="phase1",
             elapsed_ms=phase1_elapsed_ms,
@@ -8381,12 +8378,7 @@ def _run_attribution(
                 "trace_batch_size": int(trace_batch_size),
                 **phase1_trace_batch_metadata,
             },
-        )
-        telemetry_recorder.record_wall_clock_duration(
-            scope="phase",
-            name="phase1.forward_pass",
-            phase="phase1",
-            elapsed_ms=phase1_elapsed_ms,
+            wall_clock=True,
         )
 
         if offload:
@@ -8803,18 +8795,12 @@ def _run_attribution(
             **phase2_extra,
         )
         phase2_elapsed_ms = (time.perf_counter() - phase2_start) * 1000.0
-        telemetry_recorder.record_event(
-            scope="phase",
+        telemetry_observer.phase(
             name="phase2.input_vector_build",
             phase="phase2",
             elapsed_ms=phase2_elapsed_ms,
             attrs=phase2_extra,
-        )
-        telemetry_recorder.record_wall_clock_duration(
-            scope="phase",
-            name="phase2.input_vector_build",
-            phase="phase2",
-            elapsed_ms=phase2_elapsed_ms,
+            wall_clock=True,
         )
         if cross_cluster_debug_summary is not None:
             phase2_runtime_summary, phase2_runtime_stream = _build_cross_cluster_runtime_snapshot(
@@ -9189,8 +9175,7 @@ def _run_attribution(
             )
             batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
             batch_memory_after = get_memory_snapshot(model.device)
-            telemetry_recorder.record_event(
-                scope="batch",
+            telemetry_observer.batch(
                 name="phase3.logit_batch",
                 phase="phase3",
                 batch_index=(i // effective_logit_batch_size) + 1,
@@ -9211,11 +9196,7 @@ def _run_attribution(
                         keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
                     ),
                 },
-            )
-            telemetry_recorder.record_wall_clock_duration(
-                scope="batch",
-                name="phase3.logit_batch",
-                elapsed_ms=batch_elapsed_ms,
+                wall_clock=True,
             )
             if cross_cluster_debug_batches is not None:
                 row_input_stats = _build_matrix_abs_stats(
@@ -9269,8 +9250,7 @@ def _run_attribution(
             model.device,
         )
         phase3_elapsed_ms = (time.perf_counter() - phase3_start) * 1000.0
-        telemetry_recorder.record_event(
-            scope="phase",
+        telemetry_observer.phase(
             name="phase3.logit_attribution",
             phase="phase3",
             elapsed_ms=phase3_elapsed_ms,
@@ -9289,12 +9269,7 @@ def _run_attribution(
                 "phase3_cpu_to_gpu_bytes_total": int(phase3_cpu_to_gpu_bytes_total),
                 "phase3_copy_count": int(phase3_copy_count),
             },
-        )
-        telemetry_recorder.record_wall_clock_duration(
-            scope="phase",
-            name="phase3.logit_attribution",
-            phase="phase3",
-            elapsed_ms=phase3_elapsed_ms,
+            wall_clock=True,
         )
         reset_decoder_cache = getattr(ctx, "reset_decoder_cache", None)
         if callable(reset_decoder_cache):
@@ -10352,8 +10327,7 @@ def _run_attribution(
                 refresh_memory_after = get_memory_snapshot(model.device)
                 refresh_elapsed_ms = (time.perf_counter() - refresh_start) * 1000.0
                 phase4_refresh_elapsed_ms_total += refresh_elapsed_ms
-                telemetry_recorder.record_event(
-                    scope="batch",
+                telemetry_observer.batch(
                     name="phase4.refresh",
                     phase="phase4",
                     batch_index=phase4_refresh_count + 1,
@@ -10527,11 +10501,7 @@ def _run_attribution(
                             keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
                         ),
                     },
-                )
-                telemetry_recorder.record_wall_clock_duration(
-                    scope="batch",
-                    name="phase4.refresh",
-                    elapsed_ms=refresh_elapsed_ms,
+                    wall_clock=True,
                 )
                 if cross_cluster_debug_batches is not None:
                     assert rank_signal_stats is not None
@@ -11085,8 +11055,7 @@ def _run_attribution(
                         exact_chunked_decoder=exact_chunked_decoder,
                         decoder_chunk_size=decoder_chunk_size,
                     )
-                    telemetry_recorder.record_event(
-                        scope="batch",
+                    telemetry_observer.batch(
                         name="phase4.feature_batch",
                         phase="phase4",
                         batch_index=batch_number,
@@ -11109,11 +11078,7 @@ def _run_attribution(
                                 keys=_PHASE4_REFRESH_MEMORY_ATTR_KEYS,
                             ),
                         },
-                    )
-                    telemetry_recorder.record_wall_clock_duration(
-                        scope="batch",
-                        name="phase4.feature_batch",
-                        elapsed_ms=batch_elapsed_ms,
+                        wall_clock=True,
                     )
                     if cross_cluster_debug_batches is not None:
                         row_input_stats = _build_matrix_abs_stats(
@@ -11180,8 +11145,7 @@ def _run_attribution(
             phase4_executor_microbatch_count=phase4_executor_microbatch_count,
         )
         phase4_elapsed_ms = (time.perf_counter() - phase4_start) * 1000.0
-        telemetry_recorder.record_event(
-            scope="phase",
+        telemetry_observer.phase(
             name="phase4.feature_attribution",
             phase="phase4",
             elapsed_ms=phase4_elapsed_ms,
@@ -11237,12 +11201,7 @@ def _run_attribution(
                 **phase4_execution_metadata,
                 **(phase4_no_refresh_plan_telemetry or {}),
             },
-        )
-        telemetry_recorder.record_wall_clock_duration(
-            scope="phase",
-            name="phase4.feature_attribution",
-            phase="phase4",
-            elapsed_ms=phase4_elapsed_ms,
+            wall_clock=True,
         )
         if anomaly_debug_result is not None:
             records = anomaly_debug_result.get("records", [])
@@ -12053,8 +12012,7 @@ def _run_attribution(
                 )
             )
             phase5_elapsed_ms = (time.perf_counter() - phase5_start) * 1000.0
-            telemetry_recorder.record_event(
-                scope="phase",
+            telemetry_observer.phase(
                 name="phase5.packaging",
                 phase="phase5",
                 elapsed_ms=phase5_elapsed_ms,
@@ -12068,12 +12026,7 @@ def _run_attribution(
                         compact_output_result["feature_feature_edges"].shape[1]
                     ),
                 },
-            )
-            telemetry_recorder.record_wall_clock_duration(
-                scope="phase",
-                name="phase5.packaging",
-                phase="phase5",
-                elapsed_ms=phase5_elapsed_ms,
+                wall_clock=True,
             )
             if prefix_view_metadata is not None:
                 compact_output_result["prefix_view_metadata"] = dict(prefix_view_metadata)
@@ -12124,8 +12077,7 @@ def _run_attribution(
             f"{format_memory_snapshot(device=model.device, extra={'adjacency_shape': tuple(full_edge_matrix.shape)})}"
         )
         phase5_elapsed_ms = (time.perf_counter() - phase5_start) * 1000.0
-        telemetry_recorder.record_event(
-            scope="phase",
+        telemetry_observer.phase(
             name="phase5.packaging",
             phase="phase5",
             elapsed_ms=phase5_elapsed_ms,
@@ -12134,12 +12086,7 @@ def _run_attribution(
                 "adjacency_rows": int(full_edge_matrix.shape[0]),
                 "adjacency_cols": int(full_edge_matrix.shape[1]),
             },
-        )
-        telemetry_recorder.record_wall_clock_duration(
-            scope="phase",
-            name="phase5.packaging",
-            phase="phase5",
-            elapsed_ms=phase5_elapsed_ms,
+            wall_clock=True,
         )
 
         return graph
@@ -12160,8 +12107,7 @@ def _run_attribution(
                     clear_decoder_cache()
             _log_memory_boundary(logger, "Teardown done", model.device)
         teardown_elapsed_ms = (time.perf_counter() - teardown_start) * 1000.0
-        telemetry_recorder.record_event(
-            scope="phase",
+        telemetry_observer.phase(
             name="teardown.cleanup",
             phase="teardown",
             elapsed_ms=teardown_elapsed_ms,
@@ -12169,32 +12115,21 @@ def _run_attribution(
                 "ctx_present": ctx is not None,
                 "feature_row_store": feature_row_store is not None,
             },
-        )
-        telemetry_recorder.record_wall_clock_duration(
-            scope="phase",
-            name="teardown.cleanup",
-            phase="teardown",
-            elapsed_ms=teardown_elapsed_ms,
+            wall_clock=True,
         )
 
         exc_type, exc, _ = sys.exc_info()
         if exc_type is None:
             run_elapsed_ms = (time.perf_counter() - run_start) * 1000.0
-            telemetry_recorder.record_event(
-                scope="run",
+            telemetry_observer.run(
                 name="attribute.done",
                 elapsed_ms=run_elapsed_ms,
                 attrs={"compact_output": compact_output},
-            )
-            telemetry_recorder.record_wall_clock_duration(
-                scope="run",
-                name="attribute.done",
-                elapsed_ms=run_elapsed_ms,
+                wall_clock=True,
             )
         else:
             run_elapsed_ms = (time.perf_counter() - run_start) * 1000.0
-            telemetry_recorder.record_event(
-                scope="run",
+            telemetry_observer.run(
                 name="attribute.failed",
                 elapsed_ms=run_elapsed_ms,
                 attrs={
@@ -12202,18 +12137,12 @@ def _run_attribution(
                     "error_type": exc_type.__name__,
                     "error_message": str(exc) if exc is not None else None,
                 },
-            )
-            telemetry_recorder.record_wall_clock_duration(
-                scope="run",
-                name="attribute.failed",
-                elapsed_ms=run_elapsed_ms,
+                wall_clock=True,
             )
 
-        telemetry_recorder.close()
-        telemetry_export = telemetry_recorder.export(include_events=True)
+        telemetry_export = telemetry_observer.close_export(include_events=True)
         if compact_output_result is not None:
-            compact_output_result["telemetry_summary"] = telemetry_export["summary"]
-            compact_output_result["telemetry_events"] = telemetry_export.get("events", [])
+            telemetry_observer.attach_compact_result(compact_output_result, telemetry_export)
             if prefix_view_metadata is not None:
                 compact_output_result["prefix_view_metadata"] = dict(prefix_view_metadata)
             if anomaly_debug_result is not None:
@@ -12237,12 +12166,6 @@ def _run_attribution(
                 compact_output_result["cross_cluster_debug_batches"] = cross_cluster_debug_batches
         else:
             if exc is not None:
-                _attach_telemetry_export_to_exception(exc, telemetry_export)
+                telemetry_observer.attach_exception(exc, telemetry_export)
             if profile:
-                telemetry_summary = telemetry_export["summary"]
-                logger.info(
-                    "Telemetry summary | "
-                    f"event_count={telemetry_summary.get('event_count')} | "
-                    f"stored_event_count={telemetry_summary.get('stored_event_count')} | "
-                    f"dropped_event_count={telemetry_summary.get('dropped_event_count')}"
-                )
+                telemetry_observer.render_human_summary(logger, telemetry_export)
