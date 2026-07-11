@@ -17,6 +17,24 @@ The repo-facing API is intentionally kept close to upstream:
 - `attribute_phase0_stats(...)` now exposes a compact Phase-0-only count/timing API.
 - Existing graph consumers should continue to work with the produced `Graph` objects.
 
+## Runtime module ownership
+
+The NNSight attribution runtime is decomposed by responsibility while retaining
+`circuit_tracer.attribution.attribute_nnsight` as the compatibility entry point:
+
+- `attribution/nnsight/phases/phase0.py` through `phase5.py` own typed phase
+  inputs, configuration, execution, and returned state;
+- `attribution/nnsight/phase1_policy.py` and `phase4_policy.py` own execution
+  policy resolution, while replay, row-store, prefix-view, numerics, and shared
+  phase support live beside them;
+- `observability/` owns lifecycle events, bounded recording, incremental JSONL,
+  resource sampling, exception export, and human rendering;
+- `transcoder/` keeps loading, decoder caching, diagnostics, and fingerprints
+  separate from transcoder math objects.
+
+The memory governor resolver remains advisory. This decomposition does not
+apply a plan or change attribution defaults.
+
 ## Recommended usage for GemmaScope-2 CLTs
 
 Use:
