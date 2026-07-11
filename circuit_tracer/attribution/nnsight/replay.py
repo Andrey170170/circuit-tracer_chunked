@@ -271,7 +271,7 @@ def _build_phase0_donor_bundle_payload(
     )
 
     payload: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 1,
         "replay_kind": "phase0_active_features_v1",
         "status": str(status),
         "active_features": active_features,
@@ -760,7 +760,7 @@ def _build_phase0_replay_metadata(
         warning_count = int(max(validation_failure_count, 0))
 
     return {
-        "schema_version": 2,
+        "schema_version": 1,
         "status": str(status),
         "mode": str(mode),
         "context_policy": str(context_policy),
