@@ -393,6 +393,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     phase4_row_reduction_gpu_to_cpu_bytes_saved_total = 0
     phase4_cpu_to_gpu_bytes_total = 0
     phase4_copy_count = 0
+    phase4_feature_backward_count_total = 0
     phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
     previous_phase4_pending: torch.Tensor | None = None
     first_phase4_pending: torch.Tensor | None = None
@@ -1358,6 +1359,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 compute_batch_start = time.perf_counter()
                 no_retention = config.feature_row_retention == "none_recompute"
                 tiled_production = config.full_retention_backend == "column_tiled_v1" or no_retention
+                tiled_feature_telemetry: dict[str, int | float] = {}
                 if no_retention:
                     ctx.reset_saved_graph_handles()
                     ctx.rebuild_saved_graph_handles()
@@ -1369,6 +1371,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                         feature_column_tile_size=config.feature_row_column_tile_size,
                         dtype=exact_trace_internal_dtype_resolved,
                         phase_label="phase4_features",
+                        telemetry=tiled_feature_telemetry,
                     )
                 elif tiled_production:
                     assert feature_row_store is not None and nonfeature_row_store is not None
@@ -1384,6 +1387,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                         dtype=exact_trace_internal_dtype_resolved,
                         phase_label="phase4_features",
                         retain_graph=n_visited < actual_max_feature_nodes,
+                        telemetry=tiled_feature_telemetry,
                     )
                 else:
                     rows = ctx.compute_batch(
@@ -1396,6 +1400,25 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 executor_compute_batch_elapsed_ms = (
                     time.perf_counter() - compute_batch_start
                 ) * 1000.0
+                if tiled_production:
+                    phase4_gpu_to_cpu_bytes_total += int(
+                        tiled_feature_telemetry.get("feature_transfer_bytes", 0)
+                    )
+                    phase4_copy_count += int(
+                        tiled_feature_telemetry.get("feature_copy_count", 0)
+                    )
+                    phase4_feature_backward_count_total += int(
+                        tiled_feature_telemetry.get("feature_backward_count", 0)
+                    )
+                    phase4_executor_cpu_staging_elapsed_ms_total += float(
+                        tiled_feature_telemetry.get("feature_cpu_copy_elapsed_ms", 0.0)
+                    )
+                    phase4_executor_denominator_elapsed_ms_total += float(
+                        tiled_feature_telemetry.get("feature_denominator_elapsed_ms", 0.0)
+                    )
+                    phase4_executor_row_store_write_elapsed_ms_total += float(
+                        tiled_feature_telemetry.get("feature_store_write_elapsed_ms", 0.0)
+                    )
 
                 row_count = rows.shape[0]
                 end = st + row_count
@@ -1782,6 +1805,7 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             ),
             "phase4_cpu_to_gpu_bytes_total": int(phase4_cpu_to_gpu_bytes_total),
             "phase4_copy_count": int(phase4_copy_count),
+            "phase4_feature_backward_count_total": int(phase4_feature_backward_count_total),
             **phase4_execution_metadata,
             **(phase4_no_refresh_plan_telemetry or {}),
         },

@@ -32,7 +32,7 @@ class RowRecipe:
         if (self.injection is None) == (self.stable_reference is None):
             raise ValueError("row recipe requires exactly one injection or stable reference")
         if self.injection is not None:
-            injection = self.injection.detach().to(device="cpu").contiguous()
+            injection = self.injection.detach().to(device="cpu").contiguous().clone()
             object.__setattr__(self, "injection", injection)
 
     @property
@@ -63,11 +63,15 @@ class ReplayGraphLifecycle:
     def begin_request(self) -> None:
         if self._retained:
             self.release()
-        self._reset()
-        self._rebuild_forward()
+        self._retained = True
+        try:
+            self._reset()
+            self._rebuild_forward()
+        except BaseException:
+            self.release()
+            raise
         self.graph_rebuild_count += 1
         self.forward_count += 1
-        self._retained = True
 
     def record_backward(self) -> None:
         if not self._retained:
@@ -106,11 +110,17 @@ class RowRecipeLedger:
         execution_fingerprint: Mapping[str, object],
         provider_fingerprint: Mapping[str, object],
         tile_cache_bytes: int = 0,
+        max_request_rows: int | None = None,
+        max_request_columns: int | None = None,
     ) -> None:
         if n_rows < 0 or n_feature_columns < 0:
             raise ValueError("ledger dimensions must be nonnegative")
         if tile_cache_bytes < 0:
             raise ValueError("tile_cache_bytes must be >= 0")
+        if max_request_rows is not None and max_request_rows <= 0:
+            raise ValueError("max_request_rows must be > 0")
+        if max_request_columns is not None and max_request_columns <= 0:
+            raise ValueError("max_request_columns must be > 0")
         self.n_rows = int(n_rows)
         self.n_feature_columns = int(n_feature_columns)
         self.dtype = dtype
@@ -124,6 +134,8 @@ class RowRecipeLedger:
         self._lifecycle = lifecycle
         self._recipes: list[RowRecipe | None] = [None] * n_rows
         self._cache_limit = int(tile_cache_bytes)
+        self._max_request_rows = max_request_rows
+        self._max_request_columns = max_request_columns
         self._cache: OrderedDict[tuple[int, int, int, int], torch.Tensor] = OrderedDict()
         self._cache_bytes = 0
         self._closed = False
@@ -224,8 +236,13 @@ class RowRecipeLedger:
         )
         return {
             "feature_row_retention": "none_recompute",
-            "no_kxn_tensor": True,
+            "no_retained_full_feature_matrix": True,
             "no_kxn_file": True,
+            "request_bounds_enforced": bool(
+                self._max_request_rows is not None and self._max_request_columns is not None
+            ),
+            "configured_max_request_rows": self._max_request_rows,
+            "configured_max_request_columns": self._max_request_columns,
             "retained_recipe_bytes": retained_recipe_bytes,
             **self._stats,
             "graph_rebuild_count": self._lifecycle.graph_rebuild_count,
@@ -261,6 +278,10 @@ class RowRecipeLedger:
             raise IndexError("replay row range is out of bounds")
         if not (0 <= cs <= ce <= self.n_feature_columns):
             raise IndexError("replay column range is out of bounds")
+        if self._max_request_rows is not None and re - rs > self._max_request_rows:
+            raise ValueError("replay request exceeds configured row bound")
+        if self._max_request_columns is not None and ce - cs > self._max_request_columns:
+            raise ValueError("replay request exceeds configured column bound")
 
     def _ensure_open(self) -> None:
         if self._closed:

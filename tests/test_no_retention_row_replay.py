@@ -42,7 +42,8 @@ def test_replay_tiles_and_selected_projection_are_bitwise_equal() -> None:
     )
     assert events.count("reset") == events.count("forward") == events.count("release")
     snapshot = ledger.get_diagnostic_snapshot()
-    assert snapshot["no_kxn_tensor"] is snapshot["no_kxn_file"] is True
+    assert snapshot["no_retained_full_feature_matrix"] is snapshot["no_kxn_file"] is True
+    assert snapshot["request_bounds_enforced"] is False
     assert snapshot["apparent_file_bytes"] == snapshot["allocated_file_bytes"] == 0
 
 
@@ -76,6 +77,46 @@ def test_release_runs_after_replay_failure_and_cleanup_is_idempotent() -> None:
     assert events == ["reset", "forward", "release"]
     ledger.cleanup()
     ledger.cleanup()
+
+
+def test_rebuild_failure_releases_and_resets_lifecycle() -> None:
+    events: list[str] = []
+    lifecycle = ReplayGraphLifecycle(
+        reset=lambda: events.append("reset"),
+        rebuild_forward=lambda: (_ for _ in ()).throw(RuntimeError("rebuild failed")),
+        release=lambda: events.append("release"),
+    )
+    with pytest.raises(RuntimeError, match="rebuild failed"):
+        lifecycle.begin_request()
+    assert events == ["reset", "release"]
+    lifecycle.cleanup()
+    assert events == ["reset", "release"]
+
+
+def test_row_recipe_clones_cpu_injection_immutably() -> None:
+    source = torch.tensor([1.0, 2.0])
+    recipe = RowRecipe(0, "feature", 0, 0, injection=source)
+    source.add_(10)
+    assert torch.equal(recipe.injection, torch.tensor([1.0, 2.0]))
+
+
+def test_replay_reader_enforces_configured_request_bounds() -> None:
+    rows = torch.zeros((2, 4))
+    lifecycle = ReplayGraphLifecycle(reset=lambda: None, rebuild_forward=lambda: None, release=lambda: None)
+    ledger = RowRecipeLedger(
+        n_rows=2, n_feature_columns=4, dtype=torch.float32,
+        producer=lambda recipe, start, end: rows[recipe.ordinal : recipe.ordinal + 1, start:end],
+        lifecycle=lifecycle, semantic_fingerprint={}, execution_fingerprint={},
+        provider_fingerprint={}, max_request_rows=1, max_request_columns=2,
+    )
+    for ordinal in range(2):
+        ledger.append_recipe(RowRecipe(ordinal, "feature", 0, 0, injection=torch.ones(1)),
+                             node_index=ordinal, denominator=(torch.ones(1), torch.ones(1)))
+    assert ledger.get_diagnostic_snapshot()["request_bounds_enforced"] is True
+    with pytest.raises(ValueError, match="row bound"):
+        ledger.read_tile(0, 2, 0, 1)
+    with pytest.raises(ValueError, match="column bound"):
+        ledger.read_tile(0, 1, 0, 3)
 
 
 @pytest.mark.parametrize("architecture", ["clt", "plt"])

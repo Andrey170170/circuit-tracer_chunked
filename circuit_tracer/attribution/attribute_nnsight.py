@@ -1360,6 +1360,16 @@ def _run_attribution(
         "logit_batch_size": logit_batch_size,
         "telemetry_max_events": telemetry_max_events_resolved,
         "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
+        "full_retention_backend_requested": full_retention_backend,
+        "full_retention_backend_effective": full_retention_backend,
+        "feature_row_retention_requested": feature_row_retention,
+        "feature_row_retention_effective": feature_row_retention,
+        "replay_tile_cache_bytes_requested": int(replay_tile_cache_bytes or 0),
+        "replay_tile_cache_bytes_effective": int(replay_tile_cache_bytes or 0),
+        "row_store_preallocate_requested": bool(row_store_preallocate),
+        "row_store_preallocate_effective": bool(
+            row_store_preallocate and feature_row_retention == "full_file"
+        ),
         "phase0_activation_threshold_compare_mode": (
             phase0_activation_threshold_compare_mode_resolved
         ),
@@ -1781,6 +1791,8 @@ def _run_attribution(
                 row_store_preallocate=row_store_preallocate,
                 full_retention_backend=full_retention_backend,
                 feature_row_column_tile_size=feature_row_column_tile_size,
+                influence_row_tile_size=influence_row_tile_size,
+                influence_column_tile_size=influence_column_tile_size,
                 feature_row_retention=feature_row_retention,
                 replay_tile_cache_bytes=int(replay_tile_cache_bytes or 0),
                 feature_row_storage_dtype=feature_row_storage_dtype,

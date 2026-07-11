@@ -7,7 +7,10 @@ from circuit_tracer.attribution.nnsight.row_store import (
     _ColumnTiledFeatureRowStore,
     _FileBackedFeatureRowStore,
 )
-from circuit_tracer.attribution.nnsight.tiled_rows import produce_and_store_tiled_rows
+from circuit_tracer.attribution.nnsight.tiled_rows import (
+    produce_and_store_tiled_rows,
+    produce_tiled_rows_no_retention,
+)
 from circuit_tracer.attribution.nnsight.replay import _compute_row_denominator_scaled_l1
 from circuit_tracer.graph import (
     compute_partial_feature_influences_streaming,
@@ -180,7 +183,10 @@ def test_true_tiled_production_streams_tiles_and_matches_full_row_denominator() 
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_tiled_denominator_uses_canonical_global_max_chunk_order(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("production_tile_size", [257, 4096, 8192])
+def test_tiled_denominator_uses_canonical_global_max_chunk_order(
+    dtype: torch.dtype, production_tile_size: int
+) -> None:
     feature_rows = torch.full((2, 5003), 1e-7, dtype=dtype)
     feature_rows[0, 4097] = 1e10
     feature_rows[1, 3] = -1e8
@@ -204,16 +210,53 @@ def test_tiled_denominator_uses_canonical_global_max_chunk_order(dtype: torch.dt
         _, actual = produce_and_store_tiled_rows(
             ctx=Context(), layers=torch.tensor([0, 0]), positions=torch.tensor([0, 0]),
             inject_values=torch.ones((2, 1)), row_start=0, feature_row_store=feature,
-            nonfeature_row_store=nonfeature, feature_column_tile_size=257, dtype=dtype,
+            nonfeature_row_store=nonfeature, feature_column_tile_size=production_tile_size, dtype=dtype,
             phase_label="phase3_logits",
         )
-        maximum = torch.maximum(feature_rows.abs().amax(dim=1), nonfeature_rows.abs().amax(dim=1))
+        full = torch.cat((feature_rows, nonfeature_rows), dim=1)
+        maximum = full.abs().amax(dim=1)
         scaled = torch.zeros_like(maximum)
-        for start in range(0, feature_rows.shape[1], 4096):
-            scaled += (feature_rows[:, start : start + 4096].abs() / maximum[:, None]).sum(dim=1)
-        scaled += (nonfeature_rows.abs() / maximum[:, None]).sum(dim=1)
+        for start in range(0, full.shape[1], 4096):
+            scaled += (full[:, start : start + 4096].abs() / maximum[:, None]).sum(dim=1)
         assert torch.equal(actual[0], maximum)
         assert torch.equal(actual[1], scaled)
     finally:
         feature.cleanup()
         nonfeature.cleanup()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("production_tile_size", [257, 4096, 8192])
+def test_none_recompute_denominator_replays_and_matches_concatenated_reference(
+    dtype: torch.dtype, production_tile_size: int
+) -> None:
+    feature = torch.full((2, 5003), 1e-7, dtype=dtype)
+    feature[0, 4095] = 1e10
+    feature[1, 4097] = -1e8
+    nonfeature = torch.tensor([[3e-4, -2e5, 9e-9], [7e7, -9e-6, 2e3]], dtype=dtype)
+
+    class Context:
+        calls = 0
+
+        def produce_row_tiles(self, *args, feature_column_tile_size, consume_feature_tile, **kwargs):
+            del args, kwargs
+            self.calls += 1
+            for start in range(0, feature.shape[1], feature_column_tile_size):
+                end = min(start + feature_column_tile_size, feature.shape[1])
+                consume_feature_tile(start, end, feature[:, start:end].clone())
+            return nonfeature.clone()
+
+    ctx = Context()
+    _, actual = produce_tiled_rows_no_retention(
+        ctx=ctx, layers=torch.tensor([0, 0]), positions=torch.tensor([0, 0]),
+        inject_values=torch.ones((2, 1)), feature_column_tile_size=production_tile_size,
+        dtype=dtype, phase_label="test",
+    )
+    full = torch.cat((feature, nonfeature), dim=1)
+    maximum = full.abs().amax(dim=1)
+    scaled = torch.zeros_like(maximum)
+    for start in range(0, full.shape[1], 4096):
+        scaled += (full[:, start : start + 4096].abs() / maximum[:, None]).sum(dim=1)
+    assert ctx.calls == 2
+    assert torch.equal(actual[0], maximum)
+    assert torch.equal(actual[1], scaled)

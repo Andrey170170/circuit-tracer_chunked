@@ -110,6 +110,8 @@ class Phase2Config:
     row_store_preallocate: bool
     full_retention_backend: Literal["full_file", "column_tiled_v1"]
     feature_row_column_tile_size: int
+    influence_row_tile_size: int
+    influence_column_tile_size: int
     feature_row_storage_dtype: torch.dtype
     row_abs_sum_dtype: torch.dtype
     effective_feature_batch_size: int
@@ -599,6 +601,8 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
                 "execution_fingerprint": {"trace_batch_size": int(trace_batch_size)},
                 "provider_fingerprint": provider_fingerprint(model.transcoders),
                 "tile_cache_bytes": int(config.replay_tile_cache_bytes),
+                "max_request_rows": int(config.influence_row_tile_size),
+                "max_request_columns": int(config.influence_column_tile_size),
             }
             feature_row_store = RowRecipeLedger(
                 n_feature_columns=total_active_feats,
@@ -625,6 +629,15 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
             if config.full_retention_backend == "column_tiled_v1"
             else {}
             )
+            if tiled_kwargs:
+                tiled_kwargs.update(
+                    max_request_rows=max(
+                        config.influence_row_tile_size, config.effective_feature_batch_size
+                    ),
+                    max_request_columns=max(
+                        4096, config.influence_column_tile_size, config.feature_row_column_tile_size
+                    ),
+                )
             feature_row_store = store_class(
             n_rows=row_store_capacity_feature_nodes + n_logits,
             n_feature_columns=total_active_feats,
@@ -663,6 +676,16 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
     row_to_node_index = torch.zeros(row_store_capacity_feature_nodes + n_logits, dtype=torch.int32)
 
     phase2_extra: dict[str, object] = {
+        "full_retention_backend_requested": config.full_retention_backend,
+        "full_retention_backend_effective": config.full_retention_backend,
+        "feature_row_retention_requested": config.feature_row_retention,
+        "feature_row_retention_effective": config.feature_row_retention,
+        "replay_tile_cache_bytes_requested": int(config.replay_tile_cache_bytes),
+        "replay_tile_cache_bytes_effective": int(config.replay_tile_cache_bytes),
+        "row_store_preallocate_requested": bool(config.row_store_preallocate),
+        "row_store_preallocate_effective": bool(
+            config.row_store_preallocate and config.feature_row_retention == "full_file"
+        ),
         "row_store_mode": (
             "compact_none_recompute"
             if use_compact_feature_row_store

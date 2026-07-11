@@ -59,11 +59,9 @@ def get_transcoder_capabilities(obj: object) -> TranscoderCapabilities:
     if isinstance(capabilities, TranscoderCapabilities):
         return capabilities
     legacy_exact = bool(getattr(obj, "exact_chunked_decoder", False))
-    architecture = getattr(obj, "architecture", "clt")
-    if architecture not in ("clt", "plt"):
-        architecture = "clt"
+    architecture = getattr(obj, "architecture", "unknown")
     return TranscoderCapabilities(
-        architecture=architecture,
+        architecture=architecture,  # type: ignore[arg-type]
         checkpoint_format=str(getattr(obj, "weight_format", "unknown")),
         supports_exact_chunked_provider=legacy_exact,
         supports_compact_row_store=legacy_exact,
@@ -76,7 +74,7 @@ def get_transcoder_capabilities(obj: object) -> TranscoderCapabilities:
         supports_lazy_encoder=bool(getattr(obj, "lazy_encoder", False)),
         supports_lazy_decoder_chunks=legacy_exact,
         supports_lazy_encoder_rows=legacy_exact,
-        supports_exact_row_replay=legacy_exact,
+        supports_exact_row_replay=False,
         decoder_output_topology="cross_layer",
         default_decoder_chunk_size=getattr(obj, "decoder_chunk_size", None),
         default_cross_batch_decoder_cache_bytes=getattr(
@@ -130,11 +128,18 @@ def require_exact_chunked_provider(obj: object | None) -> bool:
 def require_exact_row_replay_provider(obj: object | None) -> None:
     """Reject explicit no-retention replay unless the provider guarantees it."""
 
+    explicit = getattr(obj, "capabilities", None)
+    if not isinstance(explicit, TranscoderCapabilities):
+        raise ValueError(
+            "none_recompute requires explicit TranscoderCapabilities with row replay support"
+        )
+    if explicit.architecture not in ("clt", "plt"):
+        raise ValueError("none_recompute requires explicit provider architecture clt or plt")
     if not exact_chunked_provider_usable(obj):
         missing = ", ".join(provider_contract_missing_methods(obj))
         suffix = f"; missing methods: {missing}" if missing else ""
         raise ValueError(f"none_recompute requires an exact chunked CLT/PLT provider{suffix}")
-    if not get_transcoder_capabilities(obj).supports_exact_row_replay:
+    if not explicit.supports_exact_row_replay:
         raise ValueError(
             "none_recompute requires explicit provider capability supports_exact_row_replay=True"
         )

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from circuit_tracer.attribution.nnsight.phases.phase3 import (
     Phase3Inputs,
     run_phase3,
 )
+from circuit_tracer.attribution.nnsight.row_replay import ReplayGraphLifecycle, RowRecipeLedger
 
 
 class FakeTargets:
@@ -176,6 +178,66 @@ def test_phase3_propagates_compute_batch_exception_without_finalizing(monkeypatc
     assert ctx.calls == ["compute_batch"]
     assert observer.batches == []
     assert observer.phases == []
+
+
+def test_none_recompute_seed_selection_uses_tiled_reader_when_feature_cap_is_smaller(
+    monkeypatch,
+) -> None:
+    observer = FakeObserver()
+    ctx = FakeContext(torch.empty(0))
+    lifecycle = ReplayGraphLifecycle(reset=lambda: None, rebuild_forward=lambda: None, release=lambda: None)
+    common = dict(
+        n_rows=2, dtype=torch.float32, lifecycle=lifecycle,
+        semantic_fingerprint={}, execution_fingerprint={}, provider_fingerprint={},
+    )
+    feature_store = RowRecipeLedger(
+        n_feature_columns=2, producer=lambda *_: torch.zeros((1, 1)), **common
+    )
+    nonfeature_store = RowRecipeLedger(
+        n_feature_columns=2, producer=lambda *_: torch.zeros((1, 1)),
+        **{**common, "lifecycle": ReplayGraphLifecycle(
+            reset=lambda: None, rebuild_forward=lambda: None, release=lambda: None
+        )},
+    )
+    inputs = _inputs(ctx, observer)
+    activation_matrix = torch.sparse_coo_tensor(
+        torch.tensor([[0, 0], [0, 0], [0, 1]]), torch.tensor([1.0, 1.0]), (1, 1, 2)
+    ).coalesce()
+    inputs = replace(
+        inputs, activation_matrix=activation_matrix, feat_layers=torch.tensor([0, 0]),
+        feat_pos=torch.tensor([0, 0]), feat_ids=torch.tensor([0, 1]),
+        feature_row_store=feature_store, nonfeature_row_store=nonfeature_store,
+        edge_matrix=None, row_to_node_index=torch.full((2,), -1, dtype=torch.long),
+        anomaly_debug_result=None,
+    )
+    monkeypatch.setattr(phase3, "_log_memory_boundary", lambda *args: None)
+    monkeypatch.setattr(phase3, "_log_phase_metrics", lambda *args: None)
+    monkeypatch.setattr(
+        phase3, "produce_tiled_rows_no_retention",
+        lambda **kwargs: (torch.tensor([[0.25, 0.5]]), (torch.ones(1), torch.ones(1))),
+    )
+    calls: list[object] = []
+
+    def tiled(reader, *args, **kwargs):
+        calls.append(reader)
+        return torch.tensor([2.0, 1.0])
+
+    monkeypatch.setattr(phase3, "compute_partial_feature_influences_tiled", tiled)
+    monkeypatch.setattr(
+        phase3, "compute_partial_feature_influences_streaming",
+        lambda *args, **kwargs: pytest.fail("none_recompute seed selection must use read_tile"),
+    )
+    result = run_phase3(
+        inputs=inputs,
+        config=_config(
+            total_active_feats=2, logit_offset=4, base_max_feature_nodes=1,
+            actual_max_feature_nodes=1, use_compact_feature_row_store=True,
+            exact_chunked_decoder=True, feature_row_retention="none_recompute",
+            capture_phase3_seed_bundle_enabled=True,
+        ),
+    )
+    assert calls == [feature_store.read_tile]
+    assert result.actual_max_feature_nodes == 1
 
 
 def test_phase3_physical_batches_use_global_event_indices(monkeypatch) -> None:

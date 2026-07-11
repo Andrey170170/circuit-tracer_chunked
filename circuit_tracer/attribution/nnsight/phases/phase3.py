@@ -233,6 +233,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
     phase3_gpu_to_cpu_bytes_total = 0
     phase3_cpu_to_gpu_bytes_total = 0
     phase3_copy_count = 0
+    phase3_feature_backward_count_total = 0
     physical_batch_count = 0
     physical_batch_peak_rows = 0
     physical_ranges = ordered_physical_ranges(
@@ -265,6 +266,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
         compute_batch_start = time.perf_counter()
         no_retention = config.feature_row_retention == "none_recompute"
         tiled_production = config.full_retention_backend == "column_tiled_v1" or no_retention
+        tiled_feature_telemetry: dict[str, int | float] = {}
         if no_retention:
             assert feature_row_store is not None and nonfeature_row_store is not None
             rows, tiled_denominator = produce_tiled_rows_no_retention(
@@ -278,6 +280,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 feature_column_tile_size=config.feature_row_column_tile_size,
                 dtype=exact_trace_internal_dtype_resolved,
                 phase_label="phase3_logits",
+                telemetry=tiled_feature_telemetry,
             )
         elif tiled_production:
             assert feature_row_store is not None and nonfeature_row_store is not None
@@ -295,6 +298,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 feature_column_tile_size=config.feature_row_column_tile_size,
                 dtype=exact_trace_internal_dtype_resolved,
                 phase_label="phase3_logits",
+                telemetry=tiled_feature_telemetry,
             )
         else:
             rows = ctx.compute_batch(
@@ -308,6 +312,23 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             )
         phase3_compute_batch_elapsed_ms = (time.perf_counter() - compute_batch_start) * 1000.0
         phase3_compute_batch_elapsed_ms_total += phase3_compute_batch_elapsed_ms
+        if tiled_production:
+            phase3_gpu_to_cpu_bytes_total += int(
+                tiled_feature_telemetry.get("feature_transfer_bytes", 0)
+            )
+            phase3_copy_count += int(tiled_feature_telemetry.get("feature_copy_count", 0))
+            phase3_feature_backward_count_total += int(
+                tiled_feature_telemetry.get("feature_backward_count", 0)
+            )
+            phase3_cpu_staging_elapsed_ms_total += float(
+                tiled_feature_telemetry.get("feature_cpu_copy_elapsed_ms", 0.0)
+            )
+            phase3_denominator_elapsed_ms_total += float(
+                tiled_feature_telemetry.get("feature_denominator_elapsed_ms", 0.0)
+            )
+            phase3_row_store_write_elapsed_ms_total += float(
+                tiled_feature_telemetry.get("feature_store_write_elapsed_ms", 0.0)
+            )
         cpu_staging_start = time.perf_counter()
         if tiled_production:
             rows_cpu = rows
@@ -465,6 +486,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 nonfeature_row_store.append_recipe(
                     recipe, node_index=node_index, denominator=denominator
                 )
+            phase3_row_store_write_elapsed_ms = 0.0
         elif use_compact_feature_row_store and not tiled_production:
             assert feature_row_store is not None
             assert nonfeature_row_store is not None
@@ -595,6 +617,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             "phase3_gpu_to_cpu_bytes_total": int(phase3_gpu_to_cpu_bytes_total),
             "phase3_cpu_to_gpu_bytes_total": int(phase3_cpu_to_gpu_bytes_total),
             "phase3_copy_count": int(phase3_copy_count),
+            "phase3_feature_backward_count_total": int(phase3_feature_backward_count_total),
         },
         wall_clock=True,
     )
@@ -678,7 +701,10 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     feature_row_store.row_abs_max[:pre_phase4_st],
                     feature_row_store.row_l1_scaled[:pre_phase4_st],
                 )
-                if config.full_retention_backend == "column_tiled_v1":
+                if (
+                    config.full_retention_backend == "column_tiled_v1"
+                    or config.feature_row_retention == "none_recompute"
+                ):
                     seed_feature_influences = compute_partial_feature_influences_tiled(
                         feature_row_store.read_tile,
                         row_denominator_prefix,

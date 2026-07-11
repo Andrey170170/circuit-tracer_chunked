@@ -902,6 +902,8 @@ class _ColumnTiledFeatureRowStore:
         column_tile_size: int,
         dtype: torch.dtype,
         row_abs_sum_dtype: torch.dtype = torch.float32,
+        max_request_rows: int | None = None,
+        max_request_columns: int | None = None,
         temp_root_policy: Literal["default", "env_node_local"] = "default",
         temp_root: str | os.PathLike[str] | None = None,
         **_: object,
@@ -913,6 +915,8 @@ class _ColumnTiledFeatureRowStore:
         self.n_rows = int(n_rows)
         self.n_feature_columns = int(n_feature_columns)
         self.column_tile_size = int(column_tile_size)
+        self._max_request_rows = max_request_rows
+        self._max_request_columns = max_request_columns
         self.row_abs_max = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
         self.row_l1_scaled = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
         self._dtype = dtype
@@ -1058,6 +1062,10 @@ class _ColumnTiledFeatureRowStore:
             raise ValueError("requested row slice is out of bounds for column-tiled store")
         if column_start < 0 or column_end < column_start or column_end > self.n_feature_columns:
             raise ValueError("requested column slice is out of bounds for column-tiled store")
+        if self._max_request_rows is not None and row_end - row_start > self._max_request_rows:
+            raise ValueError("tile request exceeds configured row bound")
+        if self._max_request_columns is not None and column_end - column_start > self._max_request_columns:
+            raise ValueError("tile request exceeds configured column bound")
         if column_start == column_end:
             return torch.empty((row_end - row_start, 0), dtype=self._dtype)
         first = column_start // self.column_tile_size
@@ -1101,6 +1109,11 @@ class _ColumnTiledFeatureRowStore:
             "backend": "column_tiled_full_retention_v1",
             "full_width_production": False,
             "column_tile_size": self.column_tile_size,
+            "request_bounds_enforced": bool(
+                self._max_request_rows is not None and self._max_request_columns is not None
+            ),
+            "configured_max_request_rows": self._max_request_rows,
+            "configured_max_request_columns": self._max_request_columns,
             "tile_file_count": len(self._paths),
             "apparent_file_bytes": self.nbytes,
             "allocated_file_bytes": self.allocated_file_bytes,
