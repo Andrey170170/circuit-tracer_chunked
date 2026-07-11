@@ -3,6 +3,7 @@ import pytest
 from circuit_tracer.attribution.nnsight.session_controls import (
     ordered_physical_ranges,
     resolve_nnsight_session_controls,
+    validate_nnsight_session_control_requests,
 )
 
 
@@ -62,3 +63,23 @@ def test_explicit_controls_must_be_positive(name: str, value: int) -> None:
 def test_microbatch_cannot_exceed_session_capacity(name: str) -> None:
     with pytest.raises(ValueError, match="must be <= nnsight_session_capacity"):
         _resolve(nnsight_session_capacity=2, **{name: 3})
+
+
+def test_request_validation_rejects_before_final_effective_resolution() -> None:
+    with pytest.raises(ValueError, match="phase3_compute_microbatch_max_rows must be > 0"):
+        validate_nnsight_session_control_requests(
+            nnsight_session_capacity=None,
+            phase3_compute_microbatch_max_rows=0,
+            phase4_compute_microbatch_max_rows=None,
+        )
+
+
+def test_streaming_legacy_cap_and_explicit_override_are_resolved_by_final_width() -> None:
+    legacy = _resolve(legacy_session_capacity=128, legacy_phase4_batch_rows=64)
+    explicit = _resolve(
+        nnsight_session_capacity=128,
+        phase4_compute_microbatch_max_rows=96,
+        legacy_phase4_batch_rows=64,
+    )
+    assert legacy.phase4_microbatch_max_rows == 64
+    assert explicit.phase4_microbatch_max_rows == 96

@@ -259,6 +259,10 @@ def attribute(
         )
 
     phase4_overrides_requested = (
+        nnsight_session_capacity is not None
+        or phase3_compute_microbatch_max_rows is not None
+        or phase4_compute_microbatch_max_rows is not None
+        or
         phase4_scheduler_mode != "locality"
         or bool(phase4_scheduler_debug)
         or phase4_scheduler_telemetry_detail != "normal"

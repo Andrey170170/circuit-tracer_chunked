@@ -251,6 +251,9 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     phase4_executor_microbatch_size = min(
         phase4_executor_reference_batch_size, config.compute_microbatch_max_rows
     )
+    executor_physically_split = (
+        phase4_executor_microbatch_size < phase4_executor_reference_batch_size
+    )
     phase4_execution_metadata.update(
         {
             "executor_configured_reference_batch_size": int(
@@ -258,6 +261,12 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             ),
             "executor_reference_batch_size": int(phase4_executor_reference_batch_size),
             "executor_microbatch_size": int(phase4_executor_microbatch_size),
+            "executor_physically_split": bool(executor_physically_split),
+            "executor_effective_execution": (
+                "physical_microbatching_v1"
+                if executor_physically_split
+                else phase4_row_executor_effective_mode
+            ),
             "refresh_cycle_batches_reference": int(phase4_refresh_reference_cycle_batches),
             "refresh_cycle_batches_effective": int(phase4_refresh_cycle_batches),
             "refresh_queue_size_reference": int(phase4_refresh_reference_queue_size),
@@ -1561,16 +1570,11 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                 executor_streaming_telemetry = {
                     "executor_reference_batch_size": int(reference_idx_batch.numel()),
                     "executor_microbatch_size": int(phase4_executor_microbatch_size),
-                    "executor_streaming_chunk_index": (
-                        int(streaming_chunk_index)
-                        if phase4_row_executor_effective_mode == "streaming_v1"
-                        else None
-                    ),
-                    "executor_streaming_chunk_count": (
-                        int(streaming_chunk_count)
-                        if phase4_row_executor_effective_mode == "streaming_v1"
-                        else None
-                    ),
+                    "executor_streaming_chunk_index": int(streaming_chunk_index)
+                    if executor_physically_split else None,
+                    "executor_streaming_chunk_count": int(streaming_chunk_count)
+                    if executor_physically_split else None,
+                    "executor_physically_split": bool(executor_physically_split),
                     "scheduler_pending_start_index": int(chunk_pending_start),
                     "scheduler_pending_end_index": int(chunk_pending_end),
                     "scheduler_reference_pending_start_index": int(reference_pending_start),

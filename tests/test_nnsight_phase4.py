@@ -298,3 +298,42 @@ def test_phase4_propagates_failure_after_dense_write_without_finalizing(monkeypa
     assert torch.equal(inputs.edge_matrix[1], torch.tensor([3.0, -4.0]))
     assert inputs.row_to_node_index.tolist() == [7, 0]
     assert observer.phases == []
+
+
+def test_phase4_physical_microbatches_preserve_order_and_refresh_result(monkeypatch) -> None:
+    def inputs_for(observer: FakeObserver) -> Phase4Inputs:
+        def materialize(indices: torch.Tensor) -> torch.Tensor:
+            return indices.to(dtype=torch.float32).reshape(-1, 1)
+
+        def compute_batch(**kwargs: object) -> torch.Tensor:
+            values = kwargs["inject_values"]
+            assert isinstance(values, torch.Tensor)
+            return torch.cat((values, values + 10, values + 20, values + 30), dim=1)
+
+        return replace(
+            _nonzero_inputs(observer),
+            ctx=SimpleNamespace(materialize_encoder_vectors=materialize, compute_batch=compute_batch),
+            edge_matrix=torch.zeros((4, 4)),
+            feat_ids=torch.tensor([20, 21, 22]),
+            feat_layers=torch.zeros(3, dtype=torch.long),
+            feat_pos=torch.zeros(3, dtype=torch.long),
+            row_to_node_index=torch.tensor([7, -1, -1, -1]),
+        )
+
+    monkeypatch.setattr(phase4, "_log_memory_boundary", lambda *args: None)
+    monkeypatch.setattr(phase4, "_log_phase_metrics", lambda *args, **kwargs: None)
+    whole = run_phase4(
+        inputs=inputs_for(FakeObserver()),
+        config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, compute_microbatch_max_rows=3),
+    )
+    split_observer = FakeObserver()
+    split = run_phase4(
+        inputs=inputs_for(split_observer),
+        config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, compute_microbatch_max_rows=2),
+    )
+
+    assert torch.equal(split.edge_matrix, whole.edge_matrix)
+    assert torch.equal(split.row_to_node_index, whole.row_to_node_index)
+    assert split.phase4_refresh_count == whole.phase4_refresh_count
+    assert [batch["batch_index"] for batch in split_observer.batches] == [1, 2]
+    assert all(batch["attrs"]["executor_physically_split"] for batch in split_observer.batches)

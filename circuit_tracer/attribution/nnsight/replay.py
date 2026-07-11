@@ -271,7 +271,7 @@ def _build_phase0_donor_bundle_payload(
     )
 
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "replay_kind": "phase0_active_features_v1",
         "status": str(status),
         "active_features": active_features,
@@ -760,7 +760,7 @@ def _build_phase0_replay_metadata(
         warning_count = int(max(validation_failure_count, 0))
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": str(status),
         "mode": str(mode),
         "context_policy": str(context_policy),
@@ -870,11 +870,14 @@ def _load_phase3_gradient_donor_bundle_npz(
     computed_gradient_hash = _hash_float_tensor(gradients, dtype=torch.float32)
 
     validation_issues: list[str] = []
-    if schema_version != 1:
-        validation_issues.append(f"schema_version mismatch (expected 1, got {schema_version})")
-    if capture_kind != "phase3_gradient_bundle_v1":
+    if schema_version not in {1, 2}:
+        validation_issues.append(f"schema_version mismatch (expected 1 or 2, got {schema_version})")
+    expected_capture_kind = (
+        "phase3_gradient_bundle_v1" if schema_version == 1 else "phase3_gradient_bundle_v2"
+    )
+    if capture_kind != expected_capture_kind:
         validation_issues.append(
-            f"capture_kind mismatch (expected 'phase3_gradient_bundle_v1', got {capture_kind!r})"
+            f"capture_kind mismatch (expected {expected_capture_kind!r}, got {capture_kind!r})"
         )
     if status not in {"captured", "captured_replayed_effective_state"}:
         validation_issues.append(f"unexpected status {status!r}")
@@ -912,17 +915,25 @@ def _load_phase3_gradient_donor_bundle_npz(
         )
     elif (
         int(gradients.shape[0]) != int(expected_n_layers)
-        or int(gradients.shape[1]) != int(expected_gradient_batch_size)
+        or int(gradients.shape[1])
+        != int(expected_gradient_batch_size if schema_version == 1 else target_token_ids_cpu.numel())
         or int(gradients.shape[2]) != int(expected_n_positions)
         or int(gradients.shape[3]) != int(expected_d_model)
     ):
         validation_issues.append(
             "gradients shape mismatch "
             "(expected layers="
-            f"{int(expected_n_layers)}, batch={int(expected_gradient_batch_size)}, "
+            f"{int(expected_n_layers)}, batch={int(expected_gradient_batch_size if schema_version == 1 else target_token_ids_cpu.numel())}, "
             f"positions={int(expected_n_positions)}, d_model={int(expected_d_model)}; "
             f"got={tuple(gradients.shape)})"
         )
+    if schema_version == 2:
+        recorded_width = _phase3_npz_int(donor_payload.get("canonical_target_width"), default=-1)
+        if recorded_width != int(target_token_ids_cpu.numel()):
+            validation_issues.append(
+                "canonical_target_width mismatch "
+                f"(declared={recorded_width}, runtime={int(target_token_ids_cpu.numel())})"
+            )
     elif int(gradients.shape[1]) < int(target_token_ids_cpu.numel()):
         validation_issues.append(
             "gradients batch width is smaller than target token count "
@@ -1279,9 +1290,11 @@ def _build_phase3_gradient_bundle_payload(
         per_layer_max_abs.append(float(abs_values.max().item()) if abs_values.numel() else 0.0)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": status,
-        "capture_kind": "phase3_gradient_bundle_v1",
+        "capture_kind": "phase3_gradient_bundle_v2",
+        "gradient_batch_representation": "canonical_target_width_v1",
+        "canonical_target_width": int(target_token_ids_cpu.numel()),
         "target_token_ids": target_token_ids_cpu,
         "target_probabilities": target_probabilities_cpu,
         "target_token_ids_hash": _hash_index_tensor(target_token_ids_cpu),

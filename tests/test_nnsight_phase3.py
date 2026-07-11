@@ -12,13 +12,13 @@ from circuit_tracer.attribution.nnsight.phases.phase3 import (
 
 
 class FakeTargets:
-    def __init__(self) -> None:
-        self.logit_vectors = torch.tensor([[1.0]])
-        self.logit_probabilities = torch.tensor([1.0])
-        self.logit_targets = [SimpleNamespace(vocab_idx=7)]
+    def __init__(self, count: int = 1) -> None:
+        self.logit_vectors = torch.arange(1, count + 1, dtype=torch.float32).reshape(-1, 1)
+        self.logit_probabilities = torch.ones(count)
+        self.logit_targets = [SimpleNamespace(vocab_idx=7 + index) for index in range(count)]
 
     def __len__(self) -> int:
-        return 1
+        return int(self.logit_vectors.shape[0])
 
 
 class FakeContext:
@@ -30,7 +30,9 @@ class FakeContext:
         self.calls.append("compute_batch")
         if isinstance(self.rows, Exception):
             raise self.rows
-        return self.rows
+        layers = kwargs.get("layers")
+        count = int(layers.shape[0]) if isinstance(layers, torch.Tensor) else 1
+        return self.rows[:count]
 
     def reset_decoder_cache(self) -> None:
         self.calls.append("reset_decoder_cache")
@@ -174,3 +176,49 @@ def test_phase3_propagates_compute_batch_exception_without_finalizing(monkeypatc
     assert ctx.calls == ["compute_batch"]
     assert observer.batches == []
     assert observer.phases == []
+
+
+def test_phase3_physical_batches_use_global_event_indices(monkeypatch) -> None:
+    class BatchAwareContext(FakeContext):
+        def compute_batch(self, **kwargs: object) -> torch.Tensor:
+            self.calls.append("compute_batch")
+            inject_values = kwargs["inject_values"]
+            assert isinstance(inject_values, torch.Tensor)
+            return torch.cat((inject_values, inject_values + 1, inject_values + 2), dim=1)
+
+    ctx = BatchAwareContext(torch.empty(0))
+    observer = FakeObserver()
+    cross_cluster_debug_batches: list[dict[str, object]] = []
+    inputs = _inputs(ctx, observer)
+    inputs = Phase3Inputs(
+        **{
+            **inputs.__dict__,
+            "targets": FakeTargets(3),
+            "edge_matrix": torch.zeros((3, 3)),
+            "row_to_node_index": torch.full((3,), -1, dtype=torch.long),
+            "cross_cluster_debug_batches": cross_cluster_debug_batches,
+        }
+    )
+    monkeypatch.setattr(phase3, "_log_memory_boundary", lambda *args: None)
+    monkeypatch.setattr(phase3, "_log_phase_metrics", lambda *args: None)
+    monkeypatch.setattr(
+        phase3,
+        "_copy_rows_to_cpu_staging",
+        lambda rows, staging_buffer: (rows, staging_buffer),
+    )
+
+    run_phase3(
+        inputs=inputs,
+        config=_config(
+            effective_logit_batch_size=3,
+            compute_microbatch_max_rows=2,
+            n_logits=3,
+        ),
+    )
+
+    assert [batch["batch_index"] for batch in observer.batches] == [1, 2]
+    assert [batch["attrs"]["logical_batch_index"] for batch in observer.batches] == [1, 1]
+    assert [batch["attrs"]["physical_batch_index"] for batch in observer.batches] == [1, 2]
+    assert all(batch["attrs"]["total_physical_batches"] == 2 for batch in observer.batches)
+    assert [event["event_index"] for event in cross_cluster_debug_batches] == [1, 2]
+    assert [event["logical_batch_index"] for event in cross_cluster_debug_batches] == [1, 1]

@@ -12,6 +12,39 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _load_phase3_row_donor_bundle_npz,
 )
 from circuit_tracer.attribution.context_nnsight import _slice_phase3_gradient_replay_batch
+from circuit_tracer.attribution.nnsight.replay import _build_phase3_gradient_bundle_payload
+
+
+def test_phase3_gradient_bundle_v2_replays_canonical_target_width_not_session_capacity(tmp_path):
+    target_ids = torch.tensor([10, 11, 12], dtype=torch.int64)
+    active_features = torch.tensor([[0, 0, 1]], dtype=torch.int64)
+    activation_values = torch.tensor([1.0], dtype=torch.float32)
+    gradients = torch.arange(6, dtype=torch.float32).reshape(2, 3, 1, 1)
+    payload = _build_phase3_gradient_bundle_payload(
+        gradient_captures=[{"gradients": gradients, "layer_mask": torch.tensor([True, True])}],
+        active_features=active_features,
+        activation_values=activation_values,
+        target_token_ids=target_ids,
+        target_probabilities=torch.ones(3),
+        status="captured",
+    )
+    path = tmp_path / "capacity8_targets3_physical2.npz"
+    np.savez_compressed(path, **payload)
+
+    loaded = _load_phase3_gradient_donor_bundle_npz(
+        path,
+        target_token_ids=target_ids,
+        active_features=active_features,
+        activation_values=activation_values,
+        expected_n_layers=2,
+        expected_gradient_batch_size=8,
+        expected_n_positions=1,
+        expected_d_model=1,
+    )
+
+    assert payload["schema_version"] == 2
+    assert payload["canonical_target_width"] == 3
+    assert torch.equal(loaded["gradients"], gradients)
 
 
 def test_phase3_gradient_donor_validation_rejects_target_mismatch(tmp_path):

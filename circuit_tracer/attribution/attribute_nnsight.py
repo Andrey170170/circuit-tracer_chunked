@@ -176,6 +176,7 @@ from circuit_tracer.attribution.nnsight.phase1_policy import (
 )
 from circuit_tracer.attribution.nnsight.session_controls import (
     resolve_nnsight_session_controls,
+    validate_nnsight_session_control_requests,
 )
 from circuit_tracer.attribution.nnsight.phases.phase0 import (
     Phase0CleanupOwner,
@@ -1195,18 +1196,10 @@ def _run_attribution(
     max_phase4_feature_batch_size = (
         phase1_trace_batch_sizing.effective_phase4_max_feature_batch_size
     )
-    legacy_session_capacity = max(
-        effective_source_batch_size,
-        effective_feature_batch_size,
-        effective_logit_batch_size,
-    )
-    session_controls = resolve_nnsight_session_controls(
+    validate_nnsight_session_control_requests(
         nnsight_session_capacity=nnsight_session_capacity,
         phase3_compute_microbatch_max_rows=phase3_compute_microbatch_max_rows,
         phase4_compute_microbatch_max_rows=phase4_compute_microbatch_max_rows,
-        legacy_session_capacity=legacy_session_capacity,
-        legacy_phase3_batch_rows=effective_logit_batch_size,
-        legacy_phase4_batch_rows=effective_feature_batch_size,
     )
     planner_enabled = _resolve_phase4_feature_batch_planner_enabled(
         plan_feature_batch_size=plan_feature_batch_size,
@@ -1299,14 +1292,7 @@ def _run_attribution(
         static_context=telemetry_context,
     )
     telemetry_recorder = telemetry_observer.recorder
-    if session_controls.metadata["legacy_derived_fields"]:
-        telemetry_observer.run(
-            name="compatibility.nnsight_session_controls",
-            attrs=session_controls.metadata,
-        )
-    telemetry_observer.run(
-        name="attribute.start",
-        attrs={
+    attribute_start_attrs = {
             "profile": profile,
             "compact_output": compact_output,
             "transcoder_architecture": transcoder_capabilities.architecture,
@@ -1319,7 +1305,6 @@ def _run_attribution(
             "batch_size": batch_size,
             "feature_batch_size": feature_batch_size,
             "logit_batch_size": logit_batch_size,
-            **session_controls.metadata,
             "telemetry_max_events": telemetry_max_events_resolved,
             "exact_trace_internal_dtype": exact_trace_internal_dtype_name,
             "phase0_activation_threshold_compare_mode": (
@@ -1357,8 +1342,7 @@ def _run_attribution(
             or ("override" if target_logits_override is not None else "context"),
             **{f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()},
             **{f"phase4_{key}": value for key, value in phase4_execution_metadata.items()},
-        },
-    )
+        }
 
     if auto_scale_feature_batch_size and not plan_feature_batch_size:
         logger.info(
@@ -1537,11 +1521,39 @@ def _run_attribution(
             )
             planner_status = "executed"
 
+    legacy_session_capacity = max(
+        effective_source_batch_size,
+        effective_feature_batch_size,
+        effective_logit_batch_size,
+    )
+    legacy_phase4_batch_rows = effective_feature_batch_size
+    if phase4_row_executor_config.effective_mode == "streaming_v1":
+        legacy_phase4_batch_rows = _resolve_phase4_streaming_v1_microbatch_size(
+            effective_feature_batch_size
+        )
+    session_controls = resolve_nnsight_session_controls(
+        nnsight_session_capacity=nnsight_session_capacity,
+        phase3_compute_microbatch_max_rows=phase3_compute_microbatch_max_rows,
+        phase4_compute_microbatch_max_rows=phase4_compute_microbatch_max_rows,
+        legacy_session_capacity=legacy_session_capacity,
+        legacy_phase3_batch_rows=effective_logit_batch_size,
+        legacy_phase4_batch_rows=legacy_phase4_batch_rows,
+    )
     trace_batch_size = session_controls.session_capacity
     phase1_trace_batch_metadata.update(
         trace_batch_size_legacy=int(phase1_trace_batch_sizing.trace_batch_size_legacy),
         trace_batch_size_effective=int(trace_batch_size),
     )
+    if session_controls.metadata["legacy_derived_fields"]:
+        telemetry_observer.run(
+            name="compatibility.nnsight_session_controls",
+            attrs=session_controls.metadata,
+        )
+    attribute_start_attrs.update(session_controls.metadata)
+    attribute_start_attrs.update(
+        {f"phase1_{key}": value for key, value in phase1_trace_batch_metadata.items()}
+    )
+    telemetry_observer.run(name="attribute.start", attrs=attribute_start_attrs)
     ctx = None
     feature_row_store: _FileBackedFeatureRowStore | None = None
     nonfeature_row_store: _FileBackedFeatureRowStore | None = None

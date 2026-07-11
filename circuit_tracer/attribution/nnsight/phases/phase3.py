@@ -376,7 +376,11 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             assert isinstance(logit_row_batches, list)
             logit_row_batches.append(
                 {
-                    "batch_index": int((i // effective_logit_batch_size) + 1),
+                    "batch_index": int(physical_batch_count),
+                    "logical_batch_index": int(logical_batch_index + 1),
+                    "physical_batch_index": int(physical_batch_count),
+                    "total_logical_batches": int(total_logit_batches),
+                    "total_physical_batches": int(len(physical_ranges)),
                     "batch_row_count": int(batch.shape[0]),
                     "row_input_stats": _build_matrix_abs_stats(
                         row_input_slice,
@@ -424,7 +428,7 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
         telemetry_observer.batch(
             name="phase3.logit_batch",
             phase="phase3",
-            batch_index=(i // effective_logit_batch_size) + 1,
+            batch_index=physical_batch_count,
             elapsed_ms=batch_elapsed_ms,
             attrs={
                 "batch_rows": int(batch.shape[0]),
@@ -432,6 +436,8 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 "logical_batch_index": int(logical_batch_index + 1),
                 "physical_batch_index": int(physical_batch_count),
                 "total_logit_batches": int(total_logit_batches),
+                "total_logical_batches": int(total_logit_batches),
+                "total_physical_batches": int(len(physical_ranges)),
                 "compute_batch_elapsed_ms": float(phase3_compute_batch_elapsed_ms),
                 "cpu_staging_elapsed_ms": float(phase3_cpu_staging_elapsed_ms),
                 "denominator_elapsed_ms": float(phase3_denominator_elapsed_ms),
@@ -460,11 +466,15 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                 cross_cluster_debug_batches=cross_cluster_debug_batches,
                 event_name="phase3.logit_batch",
                 phase="phase3",
-                event_index=(i // effective_logit_batch_size) + 1,
+                event_index=physical_batch_count,
                 payload={
                     "batch_rows": int(batch.shape[0]),
                     "batch_start_index": int(i),
                     "total_logit_batches": int(total_logit_batches),
+                    "logical_batch_index": int(logical_batch_index + 1),
+                    "physical_batch_index": int(physical_batch_count),
+                    "total_logical_batches": int(total_logit_batches),
+                    "total_physical_batches": int(len(physical_ranges)),
                     "row_input_nonfinite_count": int(row_input_stats["nonfinite_count"]),
                     "row_input_finite_max_abs": _safe_float(
                         row_input_stats.get("finite_max_abs")
@@ -478,12 +488,12 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     **get_memory_snapshot(model.device),
                 },
             )
-        if profile and ((i // effective_logit_batch_size) + 1) % profile_log_interval == 0:
+        if profile and physical_batch_count % profile_log_interval == 0:
             _log_batch_profile(
                 logger,
                 "Phase 3",
-                (i // effective_logit_batch_size) + 1,
-                total_logit_batches,
+                physical_batch_count,
+                len(physical_ranges),
                 batch_elapsed_ms / 1000.0,
                 ctx_before,
                 _snapshot_diagnostics(ctx),
