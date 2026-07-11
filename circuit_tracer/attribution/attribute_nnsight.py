@@ -436,6 +436,10 @@ def attribute(
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
     row_store_preallocate: bool = True,
+    full_retention_backend: Literal["full_file", "column_tiled_v1"] = "full_file",
+    feature_row_column_tile_size: int = 2048,
+    influence_row_tile_size: int = 4096,
+    influence_column_tile_size: int = 2048,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase3_frontier_buffer_relative_epsilon: float | None = None,
@@ -705,6 +709,10 @@ def attribute(
             row_store_temp_root_policy=row_store_temp_root_policy,
             row_store_temp_root=row_store_temp_root,
             row_store_preallocate=row_store_preallocate,
+            full_retention_backend=full_retention_backend,
+            feature_row_column_tile_size=feature_row_column_tile_size,
+            influence_row_tile_size=influence_row_tile_size,
+            influence_column_tile_size=influence_column_tile_size,
             exact_encoder_residency=exact_encoder_residency,
             exact_trace_internal_dtype=exact_trace_internal_dtype,
             phase3_frontier_buffer_relative_epsilon=phase3_frontier_buffer_relative_epsilon,
@@ -941,6 +949,10 @@ def _run_attribution(
     row_store_temp_root_policy: Literal["default", "env_node_local"] = "default",
     row_store_temp_root: str | os.PathLike[str] | None = None,
     row_store_preallocate: bool = True,
+    full_retention_backend: Literal["full_file", "column_tiled_v1"] = "full_file",
+    feature_row_column_tile_size: int = 2048,
+    influence_row_tile_size: int = 4096,
+    influence_column_tile_size: int = 2048,
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
     exact_trace_internal_dtype: Literal["fp32", "fp64"] = "fp32",
     phase3_frontier_buffer_relative_epsilon: float | None = None,
@@ -995,6 +1007,12 @@ def _run_attribution(
     )
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
+    if full_retention_backend not in ("full_file", "column_tiled_v1"):
+        raise ValueError("full_retention_backend must be 'full_file' or 'column_tiled_v1'")
+    if min(feature_row_column_tile_size, influence_row_tile_size, influence_column_tile_size) <= 0:
+        raise ValueError("feature/influence row and column tile sizes must be > 0")
+    if full_retention_backend == "column_tiled_v1" and not compact_output:
+        raise ValueError("column_tiled_v1 requires compact_output=True; refusing fallback")
     if feature_batch_size is not None and feature_batch_size <= 0:
         raise ValueError("feature_batch_size must be > 0 when provided")
     if logit_batch_size is not None and logit_batch_size <= 0:
@@ -1696,6 +1714,8 @@ def _run_attribution(
                 row_store_temp_root_policy_resolved=row_store_temp_root_policy_resolved,
                 row_store_temp_root=row_store_temp_root,
                 row_store_preallocate=row_store_preallocate,
+                full_retention_backend=full_retention_backend,
+                feature_row_column_tile_size=feature_row_column_tile_size,
                 feature_row_storage_dtype=feature_row_storage_dtype,
                 row_abs_sum_dtype=row_abs_sum_dtype,
                 effective_feature_batch_size=effective_feature_batch_size,
@@ -1793,6 +1813,9 @@ def _run_attribution(
                 semantic_descriptor_dim=semantic_descriptor_dim,
                 profile=profile,
                 profile_log_interval=profile_log_interval,
+                full_retention_backend=full_retention_backend,
+                influence_row_tile_size=influence_row_tile_size,
+                influence_column_tile_size=influence_column_tile_size,
             ),
         )
         row_to_node_index = phase3_result.row_to_node_index
@@ -1858,6 +1881,9 @@ def _run_attribution(
                 phase4_row_executor_config=phase4_row_executor_config,
                 phase4_row_reduction_config=phase4_row_reduction_config,
                 row_store_cache_control_config=row_store_cache_control_config,
+                full_retention_backend=full_retention_backend,
+                influence_row_tile_size=influence_row_tile_size,
+                influence_column_tile_size=influence_column_tile_size,
                 exact_encoder_residency_config=exact_encoder_residency_config,
                 profile=profile,
                 profile_log_interval=profile_log_interval,

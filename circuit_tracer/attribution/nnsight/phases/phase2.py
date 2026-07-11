@@ -33,7 +33,11 @@ from circuit_tracer.attribution.nnsight.replay import (
     _load_phase3_gradient_donor_bundle_npz,
     _load_phase3_row_donor_bundle_npz,
 )
-from circuit_tracer.attribution.nnsight.row_store import _FileBackedFeatureRowStore
+from circuit_tracer.attribution.nnsight.row_store import (
+    FeatureRowStore,
+    _ColumnTiledFeatureRowStore,
+    _FileBackedFeatureRowStore,
+)
 from circuit_tracer.attribution.nnsight.telemetry import (
     _build_cross_cluster_runtime_snapshot,
     _record_cross_cluster_checkpoint,
@@ -68,8 +72,8 @@ class Phase2Inputs:
 class Phase2ResourceOwner:
     """Expose Phase 2 row stores to the orchestrator if setup exits early."""
 
-    feature_row_store: _FileBackedFeatureRowStore | None = None
-    nonfeature_row_store: _FileBackedFeatureRowStore | None = None
+    feature_row_store: FeatureRowStore | None = None
+    nonfeature_row_store: FeatureRowStore | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,8 @@ class Phase2Config:
     row_store_temp_root_policy_resolved: Literal["default", "env_node_local"]
     row_store_temp_root: str | os.PathLike[str] | None
     row_store_preallocate: bool
+    full_retention_backend: Literal["full_file", "column_tiled_v1"]
+    feature_row_column_tile_size: int
     feature_row_storage_dtype: torch.dtype
     row_abs_sum_dtype: torch.dtype
     effective_feature_batch_size: int
@@ -125,8 +131,8 @@ class Phase2Result:
     base_max_feature_nodes: int
     actual_max_feature_nodes: int
     row_store_capacity_feature_nodes: int
-    feature_row_store: _FileBackedFeatureRowStore | None
-    nonfeature_row_store: _FileBackedFeatureRowStore | None
+    feature_row_store: FeatureRowStore | None
+    nonfeature_row_store: FeatureRowStore | None
     edge_matrix: torch.Tensor | None
     row_to_node_index: torch.Tensor
     phase0_donor_bundle_payload: dict[str, object] | None
@@ -189,8 +195,8 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
     trace_batch_size = config.trace_batch_size
     phase3_row_replay_mode_resolved = config.phase3_row_replay_mode_resolved
     phase3_row_donor_bundle_path = config.phase3_row_donor_bundle_path
-    feature_row_store: _FileBackedFeatureRowStore | None = None
-    nonfeature_row_store: _FileBackedFeatureRowStore | None = None
+    feature_row_store: FeatureRowStore | None = None
+    nonfeature_row_store: FeatureRowStore | None = None
     edge_matrix: torch.Tensor | None = None
     phase0_donor_bundle_payload: dict[str, object] | None = None
     phase3_gradient_replay_metadata: dict[str, object] = _build_phase3_replay_metadata(
@@ -545,7 +551,17 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
         assert compact_output
         assert exact_chunked_decoder
         n_nonfeature_columns = int(logit_offset - total_active_feats)
-        feature_row_store = _FileBackedFeatureRowStore(
+        store_class = (
+            _ColumnTiledFeatureRowStore
+            if config.full_retention_backend == "column_tiled_v1"
+            else _FileBackedFeatureRowStore
+        )
+        tiled_kwargs = (
+            {"column_tile_size": config.feature_row_column_tile_size}
+            if config.full_retention_backend == "column_tiled_v1"
+            else {}
+        )
+        feature_row_store = store_class(
             n_rows=row_store_capacity_feature_nodes + n_logits,
             n_feature_columns=total_active_feats,
             dtype=exact_trace_internal_dtype_resolved,
@@ -557,9 +573,10 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
             temp_root=row_store_temp_root,
             preallocate=row_store_preallocate,
             telemetry_recorder=telemetry_recorder,
+            **tiled_kwargs,
         )
         inputs.resource_owner.feature_row_store = feature_row_store
-        nonfeature_row_store = _FileBackedFeatureRowStore(
+        nonfeature_row_store = store_class(
             n_rows=row_store_capacity_feature_nodes + n_logits,
             n_feature_columns=n_nonfeature_columns,
             dtype=exact_trace_internal_dtype_resolved,
@@ -571,6 +588,7 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
             temp_root=row_store_temp_root,
             preallocate=row_store_preallocate,
             telemetry_recorder=telemetry_recorder,
+            **tiled_kwargs,
         )
         inputs.resource_owner.nonfeature_row_store = nonfeature_row_store
     else:

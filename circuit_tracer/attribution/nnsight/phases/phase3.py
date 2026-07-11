@@ -48,6 +48,7 @@ from circuit_tracer.attribution.nnsight.telemetry import (
 from circuit_tracer.attribution.nnsight.session_controls import ordered_physical_ranges
 from circuit_tracer.attribution.targets import AttributionTargets
 from circuit_tracer.graph import (
+    compute_partial_feature_influences_tiled,
     compute_partial_feature_influences_streaming,
     compute_partial_influences,
 )
@@ -120,6 +121,9 @@ class Phase3Config:
     semantic_descriptor_dim: int
     profile: bool
     profile_log_interval: int
+    full_retention_backend: str = "full_file"
+    influence_row_tile_size: int = 4096
+    influence_column_tile_size: int = 2048
 
 
 @dataclass(frozen=True)
@@ -602,7 +606,21 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     feature_row_store.row_abs_max[:pre_phase4_st],
                     feature_row_store.row_l1_scaled[:pre_phase4_st],
                 )
-                seed_feature_influences = compute_partial_feature_influences_streaming(
+                if config.full_retention_backend == "column_tiled_v1":
+                    seed_feature_influences = compute_partial_feature_influences_tiled(
+                        feature_row_store.read_tile,
+                        row_denominator_prefix,
+                        targets.logit_probabilities,
+                        row_to_node_index[:pre_phase4_st],
+                        n_feature_nodes=total_active_feats,
+                        n_logits=n_logits,
+                        row_tile_size=config.influence_row_tile_size,
+                        column_tile_size=config.influence_column_tile_size,
+                        device=feature_row_store.row_abs_max.device,
+                        compute_dtype=planner_compute_dtype,
+                    )
+                else:
+                    seed_feature_influences = compute_partial_feature_influences_streaming(
                     lambda row_start, row_end: feature_row_store.read_feature_rows(
                         row_start,
                         row_end,
@@ -614,8 +632,8 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     n_feature_nodes=total_active_feats,
                     n_logits=n_logits,
                     device=feature_row_store.row_abs_max.device,
-                    compute_dtype=planner_compute_dtype,
-                )
+                        compute_dtype=planner_compute_dtype,
+                    )
                 if cross_cluster_debug_summary is not None:
                     normalization_input_stats = _build_phase4_normalization_stats(
                         (

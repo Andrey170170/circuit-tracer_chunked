@@ -52,7 +52,11 @@ from circuit_tracer.attribution.nnsight.telemetry import (
     _safe_int,
     _tensor_nbytes_estimate,
 )
-from circuit_tracer.graph import compute_partial_feature_influences_streaming, compute_partial_influences
+from circuit_tracer.graph import (
+    compute_partial_feature_influences_streaming,
+    compute_partial_feature_influences_tiled,
+    compute_partial_influences,
+)
 from circuit_tracer.observability.human_logs import _log_batch_profile, _log_memory_boundary, _log_phase_metrics, _snapshot_diagnostics
 from circuit_tracer.utils.telemetry import build_memory_before_after_attrs, diff_numeric_metrics, get_memory_snapshot
 
@@ -117,6 +121,9 @@ class Phase4Config:
     profile: bool
     profile_log_interval: int
     verbose: bool
+    full_retention_backend: str = "full_file"
+    influence_row_tile_size: int = 4096
+    influence_column_tile_size: int = 2048
 
 
 @dataclass(frozen=True)
@@ -465,7 +472,22 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                             phase="phase4",
                         )
     
-                feature_influences = compute_partial_feature_influences_streaming(
+                if config.full_retention_backend == "column_tiled_v1":
+                    feature_influences = compute_partial_feature_influences_tiled(
+                        feature_row_store.read_tile,
+                        row_denominator_prefix,
+                        phase4_logit_probabilities,
+                        row_to_node_index[:st],
+                        n_feature_nodes=total_active_feats,
+                        n_logits=n_logits,
+                        row_tile_size=config.influence_row_tile_size,
+                        column_tile_size=config.influence_column_tile_size,
+                        device=feature_row_store.row_abs_max.device,
+                        compute_dtype=influence_compute_dtype,
+                        telemetry=streaming_chunk_reuse_stats,
+                    )
+                else:
+                    feature_influences = compute_partial_feature_influences_streaming(
                     refresh_row_reader,
                     row_denominator_prefix,
                     phase4_logit_probabilities,
@@ -477,8 +499,8 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     compute_dtype=influence_compute_dtype,
                     active_row_only_chunks=refresh_active_row_only_chunks,
                     row_reader_returns_prepared=refresh_prepared_row_reader,
-                    active_row_accumulation=phase4_refresh_active_row_accumulation_effective,
-                )
+                        active_row_accumulation=phase4_refresh_active_row_accumulation_effective,
+                    )
                 refresh_row_store_read_elapsed_ms = _safe_float(
                     streaming_chunk_reuse_stats.get("row_reader_elapsed_ms_total")
                 )

@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 
 import numpy as np
 import torch
@@ -15,6 +15,24 @@ from circuit_tracer.attribution.nnsight.numerics import _row_abs_sums_to_scaled_
 from circuit_tracer.utils.telemetry import TelemetryRecorder
 
 _ROW_STORE_CACHE_CONTROL_DEFAULT: Literal["off"] = "off"
+
+
+class FeatureRowStore(Protocol):
+    """Storage contract for exact full-retention feature rows."""
+
+    n_rows: int
+    n_feature_columns: int
+    row_abs_max: torch.Tensor
+    row_l1_scaled: torch.Tensor
+
+    def append_rows(self, *, row_start: int, feature_rows: torch.Tensor, **kwargs): ...
+    def read_feature_rows(self, row_start: int, row_end: int, **kwargs) -> torch.Tensor: ...
+    def read_tile(
+        self, row_start: int, row_end: int, column_start: int, column_end: int, **kwargs
+    ) -> torch.Tensor: ...
+    def materialize_dense_feature_slice(self, **kwargs) -> torch.Tensor: ...
+    def get_diagnostic_snapshot(self) -> dict[str, object]: ...
+    def cleanup(self) -> None: ...
 
 _ROW_STORE_TEMP_ROOT_POLICY_DEFAULT: Literal["default"] = "default"
 _ROW_STORE_TEMP_ROOT_POLICY_ENV_NODE_LOCAL: Literal["env_node_local"] = "env_node_local"
@@ -673,6 +691,19 @@ class _FileBackedFeatureRowStore:
         self._sync_read_cache_snapshot()
         return result
 
+    def read_tile(
+        self,
+        row_start: int,
+        row_end: int,
+        column_start: int,
+        column_end: int,
+        *,
+        phase: str | None = None,
+    ) -> torch.Tensor:
+        if column_start < 0 or column_end < column_start or column_end > self.n_feature_columns:
+            raise ValueError("requested column slice is out of bounds for file-backed store")
+        return self.read_feature_rows(row_start, row_end, phase=phase)[:, column_start:column_end]
+
     def read_prepared_feature_rows(
         self,
         row_start: int,
@@ -845,6 +876,177 @@ class _FileBackedFeatureRowStore:
         self._sync_read_cache_snapshot()
         self._sync_prepared_read_cache_snapshot()
 
+        self._tmpdir.cleanup()
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+
+class _ColumnTiledFeatureRowStore:
+    """Exact rows stored as independently auditable column-tile files.
+
+    This Phase-D oracle still accepts full-width rows from ``compute_batch``.  Only
+    storage and downstream influence reads are column bounded.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_rows: int,
+        n_feature_columns: int,
+        column_tile_size: int,
+        dtype: torch.dtype,
+        row_abs_sum_dtype: torch.dtype = torch.float32,
+        temp_root_policy: Literal["default", "env_node_local"] = "default",
+        temp_root: str | os.PathLike[str] | None = None,
+        **_: object,
+    ) -> None:
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError(f"Unsupported feature row store dtype: {dtype}")
+        if column_tile_size <= 0:
+            raise ValueError("column_tile_size must be > 0")
+        self.n_rows = int(n_rows)
+        self.n_feature_columns = int(n_feature_columns)
+        self.column_tile_size = int(column_tile_size)
+        self.row_abs_max = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
+        self.row_l1_scaled = torch.zeros(n_rows, dtype=row_abs_sum_dtype)
+        self._dtype = dtype
+        self._np_dtype = np.float32 if dtype == torch.float32 else np.float64
+        _, self._tmpdir = _select_row_store_temp_root(
+            temp_root_policy=temp_root_policy, temp_root=temp_root
+        )
+        self._tiles: list[np.memmap] = []
+        self._paths: list[str] = []
+        self._closed = False
+        self._max_materialized_tile_bytes = 0
+        for column_start in range(0, n_feature_columns, column_tile_size):
+            width = min(column_tile_size, n_feature_columns - column_start)
+            path = os.path.join(self._tmpdir.name, f"columns_{column_start:012d}_{column_start + width:012d}.memmap")
+            with open(path, "wb") as handle:
+                handle.truncate(n_rows * width * np.dtype(self._np_dtype).itemsize)
+            self._paths.append(path)
+            self._tiles.append(
+                np.memmap(path, mode="r+", dtype=self._np_dtype, shape=(n_rows, width))
+            )
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("feature row store has been cleaned up")
+
+    @property
+    def nbytes(self) -> int:
+        self._require_open()
+        return sum(os.path.getsize(path) for path in self._paths)
+
+    @property
+    def allocated_file_bytes(self) -> int:
+        self._require_open()
+        return sum(os.stat(path).st_blocks * 512 for path in self._paths)
+
+    @property
+    def row_denominator_scaled_l1(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.row_abs_max, self.row_l1_scaled
+
+    def append_rows(
+        self,
+        *,
+        row_start: int,
+        feature_rows: torch.Tensor,
+        row_denominator_scaled_l1: tuple[torch.Tensor, torch.Tensor] | None = None,
+        full_row_abs_sums: torch.Tensor | None = None,
+        **_: object,
+    ) -> dict[str, float]:
+        self._require_open()
+        if feature_rows.shape != (feature_rows.shape[0], self.n_feature_columns):
+            raise ValueError("feature_rows second dimension must equal configured n_feature_columns")
+        row_end = row_start + feature_rows.shape[0]
+        if row_start < 0 or row_end > self.n_rows:
+            raise ValueError("row range is out of bounds for column-tiled store")
+        cpu = feature_rows.detach().to(device="cpu", dtype=self._dtype)
+        for tile_index, column_start in enumerate(
+            range(0, self.n_feature_columns, self.column_tile_size)
+        ):
+            column_end = min(column_start + self.column_tile_size, self.n_feature_columns)
+            tile = cpu[:, column_start:column_end].contiguous()
+            self._max_materialized_tile_bytes = max(
+                self._max_materialized_tile_bytes, tile.numel() * tile.element_size()
+            )
+            self._tiles[tile_index][row_start:row_end] = tile.numpy()
+        if row_denominator_scaled_l1 is None:
+            if full_row_abs_sums is None:
+                raise ValueError("row denominator data must be provided")
+            row_denominator_scaled_l1 = _row_abs_sums_to_scaled_l1(
+                full_row_abs_sums, dtype=self.row_abs_max.dtype
+            )
+        self.row_abs_max[row_start:row_end] = row_denominator_scaled_l1[0].to("cpu")
+        self.row_l1_scaled[row_start:row_end] = row_denominator_scaled_l1[1].to("cpu")
+        return {}
+
+    def read_tile(
+        self, row_start: int, row_end: int, column_start: int, column_end: int, **_: object
+    ) -> torch.Tensor:
+        self._require_open()
+        if row_start < 0 or row_end < row_start or row_end > self.n_rows:
+            raise ValueError("requested row slice is out of bounds for column-tiled store")
+        if column_start < 0 or column_end < column_start or column_end > self.n_feature_columns:
+            raise ValueError("requested column slice is out of bounds for column-tiled store")
+        if column_start == column_end:
+            return torch.empty((row_end - row_start, 0), dtype=self._dtype)
+        first = column_start // self.column_tile_size
+        last = (column_end - 1) // self.column_tile_size
+        result = torch.empty((row_end - row_start, column_end - column_start), dtype=self._dtype)
+        for tile_index in range(first, last + 1):
+            tile_start = tile_index * self.column_tile_size
+            local_start = max(column_start, tile_start) - tile_start
+            local_end = min(column_end, tile_start + self._tiles[tile_index].shape[1]) - tile_start
+            output_start = max(column_start, tile_start) - column_start
+            output_end = output_start + (local_end - local_start)
+            source = torch.from_numpy(
+                np.asarray(self._tiles[tile_index][row_start:row_end, local_start:local_end])
+            )
+            result[:, output_start:output_end].copy_(source)
+        self._max_materialized_tile_bytes = max(
+            self._max_materialized_tile_bytes, result.numel() * result.element_size()
+        )
+        return result
+
+    def read_feature_rows(self, row_start: int, row_end: int, **kwargs) -> torch.Tensor:
+        return self.read_tile(row_start, row_end, 0, self.n_feature_columns, **kwargs)
+
+    def materialize_dense_feature_slice(
+        self, *, row_start: int, row_end: int, selected_feature_columns: torch.Tensor, **_: object
+    ) -> torch.Tensor:
+        selected = selected_feature_columns.to(device="cpu", dtype=torch.long)
+        result = torch.empty((row_end - row_start, selected.numel()), dtype=self._dtype)
+        for output_column, source_column in enumerate(selected.tolist()):
+            if source_column < 0 or source_column >= self.n_feature_columns:
+                raise ValueError("selected feature column indices must be in [0, n_feature_columns)")
+            result[:, output_column : output_column + 1] = self.read_tile(
+                row_start, row_end, source_column, source_column + 1
+            )
+        return result
+
+    def get_diagnostic_snapshot(self) -> dict[str, object]:
+        return {
+            "backend": "column_tiled_full_retention_v1",
+            "full_width_production": True,
+            "column_tile_size": self.column_tile_size,
+            "tile_file_count": len(self._paths),
+            "apparent_file_bytes": self.nbytes,
+            "allocated_file_bytes": self.allocated_file_bytes,
+            "maximum_materialized_tile_bytes": self._max_materialized_tile_bytes,
+        }
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for tile in self._tiles:
+            tile.flush()
+        self._tiles.clear()
         self._tmpdir.cleanup()
 
     def __del__(self) -> None:

@@ -1198,3 +1198,91 @@ def compute_partial_feature_influences_streaming(
         )
 
     return influences
+
+
+def compute_partial_feature_influences_tiled(
+    tile_reader: Callable[[int, int, int, int], torch.Tensor],
+    row_abs_sums: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    logit_p: torch.Tensor,
+    row_to_node_index: torch.Tensor,
+    *,
+    n_feature_nodes: int,
+    n_logits: int,
+    row_tile_size: int,
+    column_tile_size: int,
+    max_iter: int = 128,
+    device=None,
+    compute_dtype: torch.dtype | None = None,
+    telemetry: dict[str, int | str] | None = None,
+) -> torch.Tensor:
+    """Canonical deterministic 2-D tiled full-retention influence oracle."""
+    if row_tile_size <= 0 or column_tile_size <= 0:
+        raise ValueError("row_tile_size and column_tile_size must be > 0")
+    if isinstance(row_abs_sums, torch.Tensor):
+        n_rows = row_abs_sums.numel()
+        denominator_dtype = row_abs_sums.dtype
+        denominator_device = row_abs_sums.device
+    elif isinstance(row_abs_sums, tuple) and len(row_abs_sums) == 2:
+        n_rows = row_abs_sums[0].numel()
+        denominator_dtype = row_abs_sums[0].dtype
+        denominator_device = row_abs_sums[0].device
+    else:
+        raise TypeError("row_abs_sums must be a Tensor or a scaled-L1 tuple")
+    if row_to_node_index.numel() != n_rows or logit_p.numel() != n_logits:
+        raise ValueError("inconsistent tiled influence inputs")
+    device = device or denominator_device
+    dtype = compute_dtype or denominator_dtype
+    denom_mode, denom_primary, denom_secondary = _resolve_row_denominator(
+        row_abs_sums, expected_rows=n_rows, device=device, dtype=dtype
+    )
+    row_index = row_to_node_index.to(device=device, dtype=torch.long)
+    feature_row_index = row_index[n_logits:]
+    influences = torch.zeros(n_feature_nodes, device=device, dtype=dtype)
+    row_weights = torch.zeros(n_rows, device=device, dtype=dtype)
+    row_weights[:n_logits] = logit_p.to(device=device, dtype=dtype)
+    maximum_tile_bytes = 0
+    tile_reads = 0
+    for _ in range(max_iter):
+        next_feature = torch.zeros_like(influences)
+        # Column-major accumulation fixes both traversal and floating-point order.
+        for column_start in range(0, n_feature_nodes, column_tile_size):
+            column_end = min(column_start + column_tile_size, n_feature_nodes)
+            column_accumulator = torch.zeros(column_end - column_start, device=device, dtype=dtype)
+            for row_start in range(0, n_rows, row_tile_size):
+                row_end = min(row_start + row_tile_size, n_rows)
+                weights = row_weights[row_start:row_end]
+                if not weights.any():
+                    continue
+                tile = tile_reader(row_start, row_end, column_start, column_end)
+                if tile.shape != (row_end - row_start, column_end - column_start):
+                    raise ValueError("tile_reader returned an unexpected shape")
+                tile = tile.to(device=device, dtype=dtype).abs_()
+                maximum_tile_bytes = max(maximum_tile_bytes, tile.numel() * tile.element_size())
+                tile_reads += 1
+                normalized = _normalize_row_weights_from_denominator(
+                    weights,
+                    denom_mode=denom_mode,
+                    denom_primary=denom_primary[row_start:row_end],
+                    denom_secondary=(
+                        denom_secondary[row_start:row_end] if denom_secondary is not None else None
+                    ),
+                )
+                column_accumulator += normalized @ tile
+            next_feature[column_start:column_end] = column_accumulator
+        if not next_feature.any():
+            break
+        influences += next_feature
+        row_weights.zero_()
+        if feature_row_index.numel():
+            row_weights[n_logits:] = next_feature[feature_row_index]
+    else:
+        raise RuntimeError("Failed to converge")
+    if telemetry is not None:
+        telemetry.update(
+            solver="canonical_2d_tiled_v1",
+            row_tile_size=row_tile_size,
+            column_tile_size=column_tile_size,
+            maximum_materialized_tile_bytes=maximum_tile_bytes,
+            tile_read_count=tile_reads,
+        )
+    return influences
