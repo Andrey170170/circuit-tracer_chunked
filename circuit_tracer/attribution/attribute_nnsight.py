@@ -52,7 +52,6 @@ from circuit_tracer.utils.telemetry import (
     diff_numeric_metrics,
     get_memory_snapshot,
     format_memory_snapshot,
-    format_numeric_metrics,
 )
 
 from circuit_tracer.observability.exception_export import (
@@ -64,7 +63,6 @@ from circuit_tracer.observability.human_logs import (
     _log_batch_profile,
     _log_memory_boundary,
     _log_phase_metrics,
-    _log_sparsification_profile,
     _snapshot_diagnostics,
 )
 from circuit_tracer.observability.lifecycle import (
@@ -186,6 +184,13 @@ from circuit_tracer.attribution.nnsight.phase1_policy import (
     _resolve_phase1_trace_batch_policy as _resolve_phase1_trace_batch_policy,
     _resolve_phase1_trace_batch_size_max as _resolve_phase1_trace_batch_size_max,
     _resolve_phase1_trace_batch_sizing as _resolve_phase1_trace_batch_sizing,
+)
+from circuit_tracer.attribution.nnsight.phases.phase0 import (
+    Phase0CleanupOwner,
+    Phase0Config,
+    Phase0ExecutionError,
+    Phase0Inputs,
+    run_phase0,
 )
 from circuit_tracer.attribution.nnsight.phases.phase1 import (
     _run_phase1_forward_pass as _run_phase1_forward_pass,
@@ -1473,386 +1478,71 @@ def _run_attribution(
     )
     loaded_phase3_row_donor_bundle: dict[str, object] | None = None
 
-    # Phase 0: precompute
-    logger.info("Phase 0: Precomputing activations and vectors")
-    phase_start = time.perf_counter()
-    input_ids = model.ensure_tokenized(prompt)
-    n_input_pos = int(input_ids.shape[-1])
-    if output_position is not None:
-        output_position = int(output_position)
-        if output_position < 0 or output_position >= n_input_pos:
-            raise ValueError(
-                f"output_position must be in [0, {n_input_pos}) (got {output_position})"
-            )
-    trace_input_ids, prefix_view_length = _resolve_prefix_view_trace_input_ids(
-        input_ids, prefix_view_metadata
-    )
-    _log_memory_boundary(logger, "Phase 0 start", model.device)
-
-    configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
-    if callable(configure_trace_logging):
-        configure_trace_logging(
-            logger.info if profile else None,
-            telemetry_recorder=telemetry_recorder,
-        )
-
-    reset_diagnostics = getattr(model.transcoders, "reset_diagnostic_stats", None)
-    if callable(reset_diagnostics):
-        reset_diagnostics()
-
-    configure_phase0_compare_mode = getattr(
-        model.transcoders,
-        "configure_phase0_activation_threshold_compare",
-        None,
-    )
-    if callable(configure_phase0_compare_mode):
-        configure_phase0_compare_mode(
-            mode=phase0_activation_threshold_compare_mode_resolved,
-            collect_diagnostics=cross_cluster_debug_enabled,
-            sample_limit_per_layer=3,
-        )
-
-    if profile:
-        logger.info(
-            "Profiling enabled | "
-            f"lazy_encoder={getattr(model.transcoders, 'lazy_encoder', 'n/a')} | "
-            f"lazy_decoder={getattr(model.transcoders, 'lazy_decoder', 'n/a')} | "
-            f"exact_chunked_provider_enabled={exact_chunked_provider_enabled} | "
-            f"exact_chunked_decoder={exact_chunked_decoder} | "
-            f"decoder_chunk_size={getattr(model.transcoders, 'decoder_chunk_size', 'n/a')} | "
-            f"decoder_cache_bytes={getattr(model.transcoders, 'cross_batch_decoder_cache_bytes', 0)} | "
-            f"chunked_feature_replay_window={chunked_feature_replay_window} | "
-            f"error_vector_prefetch_lookahead={error_vector_prefetch_lookahead} | "
-            f"stage_encoder_vecs_on_cpu={stage_encoder_vecs_on_cpu} | "
-            f"stage_error_vectors_on_cpu={stage_error_vectors_on_cpu} | "
-            f"row_subchunk_size={row_subchunk_size} | "
-            f"planner_enabled={planner_enabled} | "
-            f"feature_batch_size_max={max_phase4_feature_batch_size} | "
-            f"phase1_trace_batch_policy={phase1_trace_batch_config.requested_policy} "
-            f"(effective={phase1_trace_batch_config.effective_policy}, "
-            f"size_max={phase1_trace_batch_config.requested_batch_size_max}, "
-            f"size_max_effective={phase1_trace_batch_config.effective_batch_size_max}) | "
-            f"phase4_refresh_policy={phase4_refresh_policy_config.requested_policy} "
-            f"(effective={phase4_refresh_policy_config.effective_policy}, "
-            f"interval_multiplier={phase4_refresh_policy_config.requested_interval_multiplier}, "
-            f"interval_multiplier_effective={phase4_refresh_policy_config.effective_interval_multiplier}, "
-            f"queue_multiplier_effective={phase4_refresh_policy_config.effective_queue_multiplier}) | "
-            f"phase4_ranker={phase4_ranker_config.requested_mode} "
-            f"(effective={phase4_ranker_config.effective_mode}) | "
-            f"row_store_cache_control={row_store_cache_control_config.requested_mode} "
-            f"(effective={row_store_cache_control_config.effective_mode}) | "
-            f"exact_encoder_residency={exact_encoder_residency_config.requested_mode} "
-            f"(effective={exact_encoder_residency_config.effective_mode}) | "
-            f"exact_trace_internal_dtype={exact_trace_internal_dtype_name} | "
-            f"prompt_tokens={input_ids.shape[-1]} | "
-            f"source_batch_size={effective_source_batch_size} | "
-            f"feature_batch_size={effective_feature_batch_size} | "
-            f"logit_batch_size={effective_logit_batch_size} | "
-            f"trace_batch_cap_reason={phase1_trace_batch_metadata.get('trace_batch_cap_reason')}"
-        )
-
-    if phase0_context_override is not None:
-        ctx = phase0_context_override
-    else:
-        ctx = model.setup_attribution(
-            input_ids,
-            sparsification=sparsification,
-            retain_full_logits=output_position is not None and output_position != n_input_pos - 1,
-            chunked_feature_replay_window=chunked_feature_replay_window,
-            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
-            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
-            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
-            row_subchunk_size=row_subchunk_size,
-            exact_encoder_residency=exact_encoder_residency_config.effective_mode,
-            internal_precision_requested=internal_precision_requested,
-            resolved_dtype_map=resolved_dtype_map,
-            prefix_view_length=prefix_view_length,
-            decoder_chunk_cache=decoder_chunk_cache,
-            decoder_cache_fingerprint=decoder_cache_fingerprint,
-        )
-    exact_encoder_runtime_metadata = {
-        "exact_encoder_staging_destination": getattr(
-            ctx, "exact_encoder_staging_destination", "none"
-        ),
-        "exact_encoder_materialized_during_phase0": bool(
-            getattr(ctx, "exact_encoder_materialized_during_phase0", False)
-        ),
-        "active_encoder_shape": tuple(getattr(ctx, "encoder_vecs").shape),
-        "active_encoder_bytes": int(
-            getattr(ctx, "encoder_vecs").numel() * getattr(ctx, "encoder_vecs").element_size()
-        ),
-        "exact_encoder_pinned_effective": bool(
-            getattr(ctx, "exact_encoder_pinned_effective", False)
-        ),
-        "exact_encoder_pinning_success": getattr(ctx, "exact_encoder_pinning_success", None),
-        "exact_encoder_pinning_failure_reason": getattr(
-            ctx, "exact_encoder_pinning_failure_reason", None
-        ),
-    }
-    exact_encoder_residency_metadata.update(exact_encoder_runtime_metadata)
-    phase4_execution_metadata.update(exact_encoder_runtime_metadata)
-    if hasattr(ctx, "set_diagnostic_mode"):
-        ctx.set_diagnostic_mode(profile)
-    if capture_phase3_gradient_bundle_enabled:
-        setattr(ctx, "capture_phase3_gradients", True)
-    configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
-    if callable(configure_ctx_trace_logging):
-        configure_ctx_trace_logging(
-            logger.info if profile else None,
-            telemetry_recorder=telemetry_recorder,
-        )
-    if isinstance(getattr(ctx, "setup_diagnostic_stats", None), dict):
-        ctx.setup_diagnostic_stats.update(
-            {
-                "phase1_trace_batch": dict(phase1_trace_batch_metadata),
-                "phase4_execution": dict(phase4_execution_metadata),
-            }
-        )
-
-    prefix_view_activation_mask_metadata: dict[str, int] | None = None
-    if (
-        prefix_view_metadata is not None
-        and prefix_view_metadata.get("mode") == "full_sequence_target_position"
-    ):
-        replace_phase0_activation_state = getattr(ctx, "replace_phase0_activation_state", None)
-        if not callable(replace_phase0_activation_state):
-            raise RuntimeError(
-                "Attribution context does not support Phase-0 activation-state replacement"
-            )
-        prefix_view_activation_mask_metadata = _apply_prefix_view_activation_mask(
-            ctx, int(prefix_view_metadata["target_position"])
-        )
-        if isinstance(getattr(ctx, "setup_diagnostic_stats", None), dict):
-            ctx.setup_diagnostic_stats["prefix_view_activation_mask"] = dict(
-                prefix_view_activation_mask_metadata
-            )
-
-    if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
-        before_cap, after_cap = ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
-        logger.info(
-            f"Diagnostic feature cap applied before attribution rows: {before_cap} -> {after_cap} active features"
-        )
-    if profile and getattr(ctx, "sparsification_stats", None):
-        _log_sparsification_profile(logger, ctx.sparsification_stats)
-
+    phase0_failure: BaseException | None = None
     try:
-        activation_matrix = ctx.activation_matrix
-
-        _log_phase_metrics(
-            logger,
-            "Precomputation",
-            phase_start,
-            model.device,
-            active_features=ctx.activation_matrix._nnz(),
-            logit_retention=getattr(ctx, "logit_retention", "full"),
+        phase0_result = run_phase0(
+            inputs=Phase0Inputs(
+                logger=logger,
+                model=model,
+                prompt=prompt,
+                sparsification=sparsification,
+                telemetry_observer=telemetry_observer,
+                telemetry_recorder=telemetry_recorder,
+                phase0_context_override=phase0_context_override,
+                prefix_view_metadata=prefix_view_metadata,
+                exact_encoder_residency_metadata=exact_encoder_residency_metadata,
+                phase4_execution_metadata=phase4_execution_metadata,
+                cross_cluster_debug_summary=(
+                    cross_cluster_debug_summary if cross_cluster_debug_enabled else None
+                ),
+                cross_cluster_debug_checkpoints=(cross_cluster_debug_checkpoints if cross_cluster_debug_enabled else []),
+                cleanup_owner=Phase0CleanupOwner(),
+            ),
+            config=Phase0Config(
+                output_position=output_position,
+                profile=profile,
+                phase0_activation_threshold_compare_mode=phase0_activation_threshold_compare_mode_resolved,
+                cross_cluster_debug_enabled=cross_cluster_debug_enabled,
+                exact_chunked_provider_enabled=exact_chunked_provider_enabled,
+                exact_chunked_decoder=exact_chunked_decoder,
+                chunked_feature_replay_window=chunked_feature_replay_window,
+                error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+                stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu,
+                stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+                row_subchunk_size=row_subchunk_size,
+                planner_enabled=planner_enabled,
+                max_phase4_feature_batch_size=max_phase4_feature_batch_size,
+                phase1_trace_batch_config=phase1_trace_batch_config,
+                phase1_trace_batch_metadata=phase1_trace_batch_metadata,
+                phase4_refresh_policy_config=phase4_refresh_policy_config,
+                phase4_ranker_config=phase4_ranker_config,
+                row_store_cache_control_config=row_store_cache_control_config,
+                exact_encoder_residency_config=exact_encoder_residency_config,
+                exact_trace_internal_dtype_name=exact_trace_internal_dtype_name,
+                effective_source_batch_size=effective_source_batch_size,
+                effective_feature_batch_size=effective_feature_batch_size,
+                effective_logit_batch_size=effective_logit_batch_size,
+                internal_precision_requested=internal_precision_requested,
+                resolved_dtype_map=resolved_dtype_map,
+                decoder_chunk_cache=decoder_chunk_cache,
+                decoder_cache_fingerprint=decoder_cache_fingerprint,
+                capture_phase3_gradient_bundle_enabled=capture_phase3_gradient_bundle_enabled,
+                diagnostic_feature_cap=diagnostic_feature_cap,
+            ),
         )
-        phase0_elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
-        telemetry_observer.phase(
-            name="phase0.precompute",
-            phase="phase0",
-            elapsed_ms=phase0_elapsed_ms,
-            attrs={
-                "active_features": int(ctx.activation_matrix._nnz()),
-                "logit_retention": getattr(ctx, "logit_retention", "full"),
-            },
-            wall_clock=True,
-        )
-        if profile:
-            if getattr(ctx, "setup_diagnostic_stats", None):
-                logger.info(
-                    f"Phase 0 setup diagnostics | {format_numeric_metrics(ctx.setup_diagnostic_stats, limit=20)}"
-                )
-            transcoder_snapshot = _snapshot_diagnostics(model.transcoders)
-            if transcoder_snapshot:
-                logger.info(
-                    f"Precompute diagnostics | {format_numeric_metrics(transcoder_snapshot, limit=20)}"
-                )
-        logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
-        if cross_cluster_debug_summary is not None:
-            phase0_runtime_summary, phase0_runtime_stream = _build_cross_cluster_runtime_snapshot(
-                device=model.device,
-                ctx=ctx,
-                transcoder=model.transcoders,
-            )
-            activation_matrix = activation_matrix.coalesce()
-            activation_indices = activation_matrix.indices().detach().cpu()
-            activation_values = activation_matrix.values().detach().cpu()
-            raw_sparse_index_hash = _hash_sparse_membership_indices(
-                activation_indices,
-                shape=activation_matrix.shape,
-                canonicalize=False,
-            )
-            canonical_membership_hash = _hash_sparse_membership_indices(
-                activation_indices,
-                shape=activation_matrix.shape,
-                canonicalize=True,
-            )
-            phase0_n_layers = int(activation_matrix.shape[0])
-            layer_counts = (
-                torch.bincount(activation_indices[0], minlength=phase0_n_layers).tolist()
-                if activation_indices.numel() > 0
-                else [0] * phase0_n_layers
-            )
-            transcoder_snapshot = phase0_runtime_summary.get("transcoder_diagnostic_snapshot")
-            phase0_threshold_membership = (
-                transcoder_snapshot.get("phase0_threshold_membership")
-                if isinstance(transcoder_snapshot, dict)
-                else None
-            )
-            if not isinstance(phase0_threshold_membership, dict):
-                phase0_threshold_membership = None
-            phase0_boundary_fingerprints = (
-                transcoder_snapshot.get("phase0_boundary_fingerprints")
-                if isinstance(transcoder_snapshot, dict)
-                else None
-            )
-            if not isinstance(phase0_boundary_fingerprints, dict):
-                phase0_boundary_fingerprints = None
-
-            setup_diagnostic_stats = getattr(ctx, "setup_diagnostic_stats", None)
-            phase0_pre_clt_input_fingerprints = (
-                setup_diagnostic_stats.get("phase0_pre_clt_input_fingerprints")
-                if isinstance(setup_diagnostic_stats, dict)
-                else None
-            )
-            if not isinstance(phase0_pre_clt_input_fingerprints, dict):
-                phase0_pre_clt_input_fingerprints = None
-
-            phase0_boundary_global_hashes = (
-                phase0_boundary_fingerprints.get("global_hashes")
-                if isinstance(phase0_boundary_fingerprints, dict)
-                else None
-            )
-            if not isinstance(phase0_boundary_global_hashes, dict):
-                phase0_boundary_global_hashes = None
-            activation_value_stats = _build_vector_stats(
-                activation_values,
-                epsilon=1e-12,
-                top_k=8,
-            )
-            phase0_summary_checkpoint = {
-                "active_feature_count": int(activation_matrix._nnz()),
-                "per_layer_retained_counts": [int(v) for v in layer_counts],
-                "active_feature_indices_hash": raw_sparse_index_hash,
-                "active_feature_indices_hash_raw_order": raw_sparse_index_hash,
-                "active_feature_membership_hash_canonical": canonical_membership_hash,
-                "activation_value_stats": activation_value_stats,
-                "phase0_activation_threshold_compare_mode": (
-                    phase0_activation_threshold_compare_mode_resolved
-                ),
-                "phase0_threshold_membership": phase0_threshold_membership,
-                "phase0_boundary_fingerprints": phase0_boundary_fingerprints,
-                "phase0_pre_clt_input_fingerprints": phase0_pre_clt_input_fingerprints,
-                "phase0_pre_clt_input_global_hash": (
-                    phase0_pre_clt_input_fingerprints.get("global_hash")
-                    if isinstance(phase0_pre_clt_input_fingerprints, dict)
-                    else None
-                ),
-                "logit_retention": getattr(ctx, "logit_retention", None),
-                "staging_flags": {
-                    "stage_encoder_vecs_on_cpu": bool(stage_encoder_vecs_on_cpu),
-                    "stage_error_vectors_on_cpu": bool(stage_error_vectors_on_cpu),
-                },
-                "setup_diagnostic_stats": setup_diagnostic_stats,
-                **phase0_runtime_summary,
-            }
-            phase0_stream_checkpoint = {
-                "active_feature_count": int(activation_matrix._nnz()),
-                "retained_layer_count": int(phase0_n_layers),
-                "retained_nonzero_layer_count": int(
-                    sum(1 for value in layer_counts if int(value) > 0)
-                ),
-                "active_feature_indices_hash": phase0_summary_checkpoint[
-                    "active_feature_indices_hash"
-                ],
-                "active_feature_membership_hash_canonical": canonical_membership_hash,
-                "phase0_activation_threshold_compare_mode": (
-                    phase0_activation_threshold_compare_mode_resolved
-                ),
-                "activation_value_count": int(activation_value_stats["count"]),
-                "activation_value_nonfinite_count": int(activation_value_stats["nonfinite_count"]),
-                "activation_value_abs_sum": _safe_float(activation_value_stats.get("abs_sum")),
-                "activation_value_max": _safe_float(activation_value_stats.get("max")),
-                "activation_value_effectively_all_zero": bool(
-                    activation_value_stats["effectively_all_zero"]
-                ),
-                "phase0_threshold_membership_layer_count": (
-                    int(len(phase0_threshold_membership.get("per_layer", {})))
-                    if isinstance(phase0_threshold_membership, dict)
-                    else None
-                ),
-                "phase0_threshold_membership_borderline_sample_count": (
-                    int(phase0_threshold_membership.get("borderline_sample_count", 0))
-                    if isinstance(phase0_threshold_membership, dict)
-                    else None
-                ),
-                "phase0_threshold_membership_near_count_abs_lte_1e_04": (
-                    int(
-                        phase0_threshold_membership.get("near_counts_by_epsilon", {}).get(
-                            "abs_lte_1e-04",
-                            0,
-                        )
-                    )
-                    if isinstance(phase0_threshold_membership, dict)
-                    else None
-                ),
-                "phase0_pre_clt_input_global_hash": (
-                    phase0_summary_checkpoint.get("phase0_pre_clt_input_global_hash")
-                ),
-                "phase0_pre_clt_input_layer_count": (
-                    int(phase0_pre_clt_input_fingerprints.get("layer_count", 0))
-                    if isinstance(phase0_pre_clt_input_fingerprints, dict)
-                    else None
-                ),
-                "phase0_boundary_layer_count": (
-                    int(len(phase0_boundary_fingerprints.get("per_layer", {})))
-                    if isinstance(phase0_boundary_fingerprints, dict)
-                    else None
-                ),
-                "phase0_boundary_transcoder_constants_global_hash": (
-                    phase0_boundary_fingerprints.get("transcoder_constant_fingerprints", {}).get(
-                        "global_hash"
-                    )
-                    if isinstance(phase0_boundary_fingerprints, dict)
-                    else None
-                ),
-                "phase0_boundary_preactivation_hash_global": (
-                    phase0_boundary_global_hashes.get("pre_activation_hash_global")
-                    if isinstance(phase0_boundary_global_hashes, dict)
-                    else None
-                ),
-                "phase0_boundary_margin_hash_global": (
-                    phase0_boundary_global_hashes.get("compare_margin_hash_global")
-                    if isinstance(phase0_boundary_global_hashes, dict)
-                    else None
-                ),
-                "phase0_boundary_mask_membership_hash_global": (
-                    phase0_boundary_global_hashes.get("mask_membership_hash_global")
-                    if isinstance(phase0_boundary_global_hashes, dict)
-                    else None
-                ),
-                "phase0_boundary_post_activation_hash_global": (
-                    phase0_boundary_global_hashes.get("post_activation_hash_global")
-                    if isinstance(phase0_boundary_global_hashes, dict)
-                    else None
-                ),
-                "logit_retention": getattr(ctx, "logit_retention", None),
-                "stage_encoder_vecs_on_cpu": bool(stage_encoder_vecs_on_cpu),
-                "stage_error_vectors_on_cpu": bool(stage_error_vectors_on_cpu),
-                "setup_diagnostic_stats_present": bool(
-                    getattr(ctx, "setup_diagnostic_stats", None)
-                ),
-                **phase0_runtime_stream,
-            }
-            _record_cross_cluster_checkpoint(
-                cross_cluster_debug_summary=cross_cluster_debug_summary,
-                cross_cluster_debug_checkpoints=cross_cluster_debug_checkpoints,
-                checkpoint_name="phase0_sparse_setup",
-                phase="phase0",
-                summary_payload=phase0_summary_checkpoint,
-                stream_payload=phase0_stream_checkpoint,
-            )
-
+    except Phase0ExecutionError as exc:
+        ctx = exc.ctx
+        phase0_failure = exc.cause
+    else:
+        ctx = phase0_result.ctx
+        input_ids = phase0_result.input_ids
+        n_input_pos = phase0_result.n_input_pos
+        output_position = phase0_result.output_position
+        trace_input_ids = phase0_result.trace_input_ids
+        activation_matrix = phase0_result.activation_matrix
+    try:
+        if phase0_failure is not None:
+            raise phase0_failure
         if offload and not model.skip_transcoder and not exact_chunked_decoder:
             offload_handles += offload_modules(model.transcoders, offload)
 
