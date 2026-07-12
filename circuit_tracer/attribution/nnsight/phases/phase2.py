@@ -154,6 +154,21 @@ class Phase2Result:
     loaded_phase3_row_donor_bundle: dict[str, object] | None
 
 
+def _make_replay_lifecycle(ctx: Any, offload_handles: list[Any]) -> ReplayGraphLifecycle:
+    def rebuild_forward() -> None:
+        while offload_handles:
+            reload_handle = offload_handles[0]
+            reload_handle()
+            del offload_handles[0]
+        ctx.rebuild_saved_graph_handles()
+
+    return ReplayGraphLifecycle(
+        reset=ctx.reset_saved_graph_handles,
+        rebuild_forward=rebuild_forward,
+        release=ctx.release_saved_graph_handles,
+    )
+
+
 def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
     """Run the complete Phase 2 setup contract."""
     logger = inputs.logger
@@ -562,13 +577,6 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
         assert exact_chunked_decoder
         n_nonfeature_columns = int(logit_offset - total_active_feats)
         if config.feature_row_retention == "none_recompute":
-            def make_lifecycle() -> ReplayGraphLifecycle:
-                return ReplayGraphLifecycle(
-                    reset=ctx.reset_saved_graph_handles,
-                    rebuild_forward=ctx.rebuild_saved_graph_handles,
-                    release=ctx.release_saved_graph_handles,
-                )
-
             def feature_producer(recipe, start: int, end: int) -> torch.Tensor:
                 assert recipe.injection is not None
                 return ctx.compute_batch(
@@ -607,14 +615,14 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
             feature_row_store = RowRecipeLedger(
                 n_feature_columns=total_active_feats,
                 producer=feature_producer,
-                lifecycle=make_lifecycle(),
+                lifecycle=_make_replay_lifecycle(ctx, offload_handles),
                 **common,
             )
             inputs.resource_owner.feature_row_store = feature_row_store
             nonfeature_row_store = NonfeatureProjectionLedger(
                 n_feature_columns=n_nonfeature_columns,
                 producer=nonfeature_producer,
-                lifecycle=make_lifecycle(),
+                lifecycle=_make_replay_lifecycle(ctx, offload_handles),
                 **common,
             )
             inputs.resource_owner.nonfeature_row_store = nonfeature_row_store

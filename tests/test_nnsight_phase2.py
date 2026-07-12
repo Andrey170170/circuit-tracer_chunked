@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import circuit_tracer.attribution.attribute_nnsight as attribute_nnsight
+from circuit_tracer.attribution.nnsight.phases.phase2 import _make_replay_lifecycle
 from circuit_tracer.attribution.nnsight.phases.phase2 import Phase2Inputs, Phase2ResourceOwner
 from circuit_tracer.attribution.nnsight.row_store import _FileBackedFeatureRowStore
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
@@ -224,6 +225,34 @@ def test_phase2_returned_stores_cleanup_once_after_ownership_transfer(
 
 def test_phase2_resource_owner_starts_empty() -> None:
     assert Phase2ResourceOwner() == Phase2ResourceOwner()
+
+
+def test_replay_lifecycle_restores_offloaded_modules_once_before_rebuild() -> None:
+    events: list[str] = []
+    ctx = SimpleNamespace(
+        reset_saved_graph_handles=lambda: events.append("reset"),
+        rebuild_saved_graph_handles=lambda: events.append("rebuild"),
+        release_saved_graph_handles=lambda: events.append("release"),
+    )
+    handles = [lambda: events.append("restore-1"), lambda: events.append("restore-2")]
+    lifecycle = _make_replay_lifecycle(ctx, handles)
+
+    lifecycle.begin_request()
+    lifecycle.release()
+    lifecycle.begin_request()
+    lifecycle.release()
+
+    assert events == [
+        "reset",
+        "restore-1",
+        "restore-2",
+        "rebuild",
+        "release",
+        "reset",
+        "rebuild",
+        "release",
+    ]
+    assert handles == []
 
 
 def test_lifecycle_cleanup_failures_do_not_replace_primary_and_all_actions_run(
