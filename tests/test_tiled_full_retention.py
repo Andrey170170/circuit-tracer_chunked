@@ -199,7 +199,7 @@ def test_true_tiled_production_streams_tiles_and_matches_full_row_denominator() 
         nonfeature.cleanup()
 
 
-def test_none_recompute_labels_first_pass_reduction_copy_separately() -> None:
+def test_none_recompute_reuses_first_pass_tiles_and_reports_transient_storage() -> None:
     rows = torch.tensor([[1.0, -2.0, 3.0]], dtype=torch.float32)
 
     class Context:
@@ -214,10 +214,14 @@ def test_none_recompute_labels_first_pass_reduction_copy_separately() -> None:
         inject_values=torch.ones((1, 1)), feature_column_tile_size=2,
         dtype=torch.float64, phase_label="test", telemetry=telemetry,
     )
-    assert telemetry["feature_reduction_copy_count"] == 1
     assert telemetry["feature_copy_count"] == 1
-    assert telemetry["feature_reduction_transfer_bytes"] == 0
     assert telemetry["feature_transfer_bytes"] == 0
+    assert telemetry["feature_produced_tile_count"] == 1
+    assert telemetry["feature_backward_tile_count"] == 2
+    assert telemetry["feature_backward_count"] == 2
+    assert telemetry["feature_transient_peak_bytes"] == 2 * 8 + 3 * 8
+    assert telemetry["feature_denominator_global_max_elapsed_ms"] >= 0
+    assert telemetry["feature_denominator_scaled_sum_elapsed_ms"] >= 0
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -304,8 +308,41 @@ def test_none_recompute_denominator_replays_and_matches_concatenated_reference(
     scaled = torch.zeros_like(maximum)
     for start in range(0, full.shape[1], 4096):
         scaled += (full[:, start : start + 4096].abs() / maximum[:, None]).sum(dim=1)
-    assert ctx.calls == 2
+    assert ctx.calls == 1
     assert ctx.reset_calls == 0
     assert ctx.rebuild_calls == 0
     assert torch.equal(actual[0], maximum)
     assert torch.equal(actual[1], scaled)
+
+
+def test_none_recompute_rejects_malformed_feature_tile_width() -> None:
+    class Context:
+        def produce_row_tiles(self, *args, consume_feature_tile, **kwargs):
+            del args, kwargs
+            consume_feature_tile(0, 3, torch.ones((1, 2)))
+            return torch.ones((1, 1))
+
+    with pytest.raises(RuntimeError, match="tile width"):
+        produce_tiled_rows_no_retention(
+            ctx=Context(), layers=torch.tensor([0]), positions=torch.tensor([0]),
+            inject_values=torch.ones((1, 1)), feature_column_tile_size=3,
+            dtype=torch.float32, phase_label="test",
+        )
+
+
+def test_none_recompute_denominator_handles_nonfeature_only_rows() -> None:
+    nonfeature = torch.tensor([[2.0, -4.0, 1.0]], dtype=torch.float64)
+
+    class Context:
+        def produce_row_tiles(self, *args, **kwargs):
+            del args, kwargs
+            return nonfeature
+
+    _, denominator = produce_tiled_rows_no_retention(
+        ctx=Context(), layers=torch.tensor([0]), positions=torch.tensor([0]),
+        inject_values=torch.ones((1, 1)), feature_column_tile_size=3,
+        dtype=torch.float64, phase_label="test",
+    )
+    expected = _compute_row_denominator_scaled_l1(nonfeature, dtype=torch.float64)
+    assert torch.equal(denominator[0], expected[0])
+    assert torch.equal(denominator[1], expected[1])

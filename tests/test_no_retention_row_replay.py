@@ -249,6 +249,156 @@ def test_selected_projection_reads_column_buckets_and_preserves_order() -> None:
     ]
 
 
+def test_replay_cache_reuses_fixed_chunks_across_growing_prefixes_and_clones() -> None:
+    rows = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    requests: list[list[int]] = []
+
+    def produce(recipes, start: int, end: int) -> torch.Tensor:
+        ordinals = [recipe.ordinal for recipe in recipes]
+        requests.append(ordinals)
+        return rows[ordinals, start:end]
+
+    ledger = RowRecipeLedger(
+        n_rows=6, n_feature_columns=4, dtype=torch.float32, producer=produce,
+        lifecycle=ReplayGraphLifecycle(
+            reset=lambda: None, rebuild_forward=lambda: None, release=lambda: None
+        ),
+        semantic_fingerprint={}, execution_fingerprint={}, provider_fingerprint={},
+        replay_batch_rows=2, tile_cache_bytes=4 * 4 * 4,
+    )
+    for ordinal in range(6):
+        ledger.append_recipe(
+            RowRecipe(ordinal, "feature", 0, 0, stable_reference=("row", ordinal)),
+            node_index=ordinal, denominator=(torch.ones(1), torch.ones(1)),
+        )
+
+    first = ledger.read_tile(0, 2, 0, 4)
+    first.zero_()
+    second = ledger.read_tile(0, 4, 0, 4)
+
+    assert torch.equal(second, rows[:4])
+    assert requests == [[0, 1], [2, 3]]
+    snapshot = ledger.get_diagnostic_snapshot()
+    assert snapshot["replay_cache_hit_count"] == 1
+    assert snapshot["replay_cache_miss_count"] == 2
+    assert snapshot["graph_backward_count"] == 2
+
+
+def test_replay_cache_composes_partial_growth_without_replaying_cached_rows() -> None:
+    rows = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    requests: list[list[int]] = []
+    events: list[str] = []
+
+    def produce(recipes, start: int, end: int) -> torch.Tensor:
+        ordinals = [recipe.ordinal for recipe in recipes]
+        requests.append(ordinals)
+        return rows[ordinals, start:end]
+
+    lifecycle = ReplayGraphLifecycle(
+        reset=lambda: events.append("reset"), rebuild_forward=lambda: events.append("forward"),
+        release=lambda: events.append("release"),
+    )
+    ledger = RowRecipeLedger(
+        n_rows=3, n_feature_columns=4, dtype=torch.float32, producer=produce,
+        lifecycle=lifecycle, semantic_fingerprint={}, execution_fingerprint={},
+        provider_fingerprint={}, replay_batch_rows=2, tile_cache_bytes=64,
+    )
+    for ordinal in range(2):
+        ledger.append_recipe(
+            RowRecipe(ordinal, "feature", 0, 0, stable_reference=("row", ordinal)),
+            node_index=ordinal, denominator=(torch.ones(1), torch.ones(1)),
+        )
+
+    assert torch.equal(ledger.read_tile(0, 1, 0, 4), rows[:1])
+    assert torch.equal(ledger.read_tile(0, 2, 0, 4), rows[:2])
+    events_before_all_hit = list(events)
+    assert torch.equal(ledger.read_tile(0, 2, 0, 4), rows[:2])
+
+    assert requests == [[0], [1]]
+    assert events == events_before_all_hit
+    snapshot = ledger.get_diagnostic_snapshot()
+    assert snapshot["replay_cache_hit_count"] == 3
+    assert snapshot["replay_cache_miss_count"] == 2
+    assert snapshot["graph_rebuild_count"] == 2
+
+
+def test_replay_cache_composes_unaligned_overlaps() -> None:
+    rows = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    requests: list[list[int]] = []
+
+    def produce(recipes, start: int, end: int) -> torch.Tensor:
+        ordinals = [recipe.ordinal for recipe in recipes]
+        requests.append(ordinals)
+        return rows[ordinals, start:end]
+
+    ledger = RowRecipeLedger(
+        n_rows=5, n_feature_columns=4, dtype=torch.float32, producer=produce,
+        lifecycle=ReplayGraphLifecycle(
+            reset=lambda: None, rebuild_forward=lambda: None, release=lambda: None
+        ),
+        semantic_fingerprint={}, execution_fingerprint={}, provider_fingerprint={},
+        replay_batch_rows=2, tile_cache_bytes=128,
+    )
+    for ordinal in range(4):
+        ledger.append_recipe(
+            RowRecipe(ordinal, "feature", 0, 0, stable_reference=("row", ordinal)),
+            node_index=ordinal, denominator=(torch.ones(1), torch.ones(1)),
+        )
+
+    assert torch.equal(ledger.read_tile(1, 4, 0, 4), rows[1:4])
+    assert torch.equal(ledger.read_tile(0, 3, 0, 4), rows[:3])
+    assert requests == [[1], [2, 3], [0]]
+
+
+def test_replay_cache_mixed_hits_misses_preserve_order_during_eviction() -> None:
+    rows = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    requests: list[list[int]] = []
+
+    def produce(recipes, start: int, end: int) -> torch.Tensor:
+        ordinals = [recipe.ordinal for recipe in recipes]
+        requests.append(ordinals)
+        return rows[ordinals, start:end]
+
+    ledger = RowRecipeLedger(
+        n_rows=5, n_feature_columns=4, dtype=torch.float32, producer=produce,
+        lifecycle=ReplayGraphLifecycle(
+            reset=lambda: None, rebuild_forward=lambda: None, release=lambda: None
+        ),
+        semantic_fingerprint={}, execution_fingerprint={}, provider_fingerprint={},
+        replay_batch_rows=2, tile_cache_bytes=2 * 4 * 4,
+    )
+    for ordinal in range(4):
+        ledger.append_recipe(
+            RowRecipe(ordinal, "feature", 0, 0, stable_reference=("row", ordinal)),
+            node_index=ordinal, denominator=(torch.ones(1), torch.ones(1)),
+        )
+
+    ledger.read_tile(1, 3, 0, 4)
+    actual = ledger.read_tile(0, 4, 0, 4)
+
+    assert torch.equal(actual, rows[:4])
+    assert requests == [[1], [2], [0], [3]]
+    snapshot = ledger.get_diagnostic_snapshot()
+    assert snapshot["replay_cache_hit_count"] == 2
+    assert snapshot["replay_cache_miss_count"] == 4
+    assert snapshot["replay_cache_eviction_count"] >= 2
+    assert snapshot["cache_bytes"] <= 2 * 4 * 4
+
+
+def test_replay_cache_evicts_chunks_within_byte_budget() -> None:
+    rows = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    ledger, _ = _ledger(rows)
+    ledger._cache_limit = 2 * 4 * 4
+    ledger._replay_batch_rows = 2
+
+    ledger.read_tile(0, 2, 0, 4)
+    ledger.read_tile(2, 4, 0, 4)
+
+    snapshot = ledger.get_diagnostic_snapshot()
+    assert snapshot["cache_bytes"] <= 2 * 4 * 4
+    assert snapshot["replay_cache_eviction_count"] == 1
+
+
 @pytest.mark.parametrize("architecture", ["clt", "plt"])
 def test_provider_capability_gate_rejects_fallback(architecture: str) -> None:
     class Provider:

@@ -229,11 +229,16 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
     phase3_compute_batch_elapsed_ms_total = 0.0
     phase3_cpu_staging_elapsed_ms_total = 0.0
     phase3_denominator_elapsed_ms_total = 0.0
+    phase3_denominator_global_max_elapsed_ms_total = 0.0
+    phase3_denominator_scaled_sum_elapsed_ms_total = 0.0
     phase3_row_store_write_elapsed_ms_total = 0.0
     phase3_gpu_to_cpu_bytes_total = 0
     phase3_cpu_to_gpu_bytes_total = 0
     phase3_copy_count = 0
     phase3_feature_backward_count_total = 0
+    phase3_feature_produced_tile_count_total = 0
+    phase3_feature_backward_tile_count_total = 0
+    phase3_feature_transient_peak_bytes = 0
     physical_batch_count = 0
     physical_batch_peak_rows = 0
     physical_ranges = ordered_physical_ranges(
@@ -320,11 +325,27 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             phase3_feature_backward_count_total += int(
                 tiled_feature_telemetry.get("feature_backward_count", 0)
             )
+            phase3_feature_produced_tile_count_total += int(
+                tiled_feature_telemetry.get("feature_produced_tile_count", 0)
+            )
+            phase3_feature_backward_tile_count_total += int(
+                tiled_feature_telemetry.get("feature_backward_tile_count", 0)
+            )
+            phase3_feature_transient_peak_bytes = max(
+                phase3_feature_transient_peak_bytes,
+                int(tiled_feature_telemetry.get("feature_transient_peak_bytes", 0)),
+            )
             phase3_cpu_staging_elapsed_ms_total += float(
                 tiled_feature_telemetry.get("feature_cpu_copy_elapsed_ms", 0.0)
             )
             phase3_denominator_elapsed_ms_total += float(
                 tiled_feature_telemetry.get("feature_denominator_elapsed_ms", 0.0)
+            )
+            phase3_denominator_global_max_elapsed_ms_total += float(
+                tiled_feature_telemetry.get("feature_denominator_global_max_elapsed_ms", 0.0)
+            )
+            phase3_denominator_scaled_sum_elapsed_ms_total += float(
+                tiled_feature_telemetry.get("feature_denominator_scaled_sum_elapsed_ms", 0.0)
             )
             phase3_row_store_write_elapsed_ms_total += float(
                 tiled_feature_telemetry.get("feature_store_write_elapsed_ms", 0.0)
@@ -615,6 +636,12 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             "phase3_compute_batch_elapsed_ms_total": float(phase3_compute_batch_elapsed_ms_total),
             "phase3_cpu_staging_elapsed_ms_total": float(phase3_cpu_staging_elapsed_ms_total),
             "phase3_denominator_elapsed_ms_total": float(phase3_denominator_elapsed_ms_total),
+            "phase3_denominator_global_max_elapsed_ms_total": float(
+                phase3_denominator_global_max_elapsed_ms_total
+            ),
+            "phase3_denominator_scaled_sum_elapsed_ms_total": float(
+                phase3_denominator_scaled_sum_elapsed_ms_total
+            ),
             "phase3_row_store_write_elapsed_ms_total": float(
                 phase3_row_store_write_elapsed_ms_total
             ),
@@ -622,6 +649,13 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
             "phase3_cpu_to_gpu_bytes_total": int(phase3_cpu_to_gpu_bytes_total),
             "phase3_copy_count": int(phase3_copy_count),
             "phase3_feature_backward_count_total": int(phase3_feature_backward_count_total),
+            "phase3_feature_produced_tile_count_total": int(
+                phase3_feature_produced_tile_count_total
+            ),
+            "phase3_feature_backward_tile_count_total": int(
+                phase3_feature_backward_tile_count_total
+            ),
+            "phase3_feature_transient_peak_bytes": int(phase3_feature_transient_peak_bytes),
         },
         wall_clock=True,
     )

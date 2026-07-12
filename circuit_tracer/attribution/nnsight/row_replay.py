@@ -155,6 +155,9 @@ class RowRecipeLedger:
             "max_tile_rows": 0,
             "max_tile_columns": 0,
             "max_tile_bytes": 0,
+            "replay_cache_hit_count": 0,
+            "replay_cache_miss_count": 0,
+            "replay_cache_eviction_count": 0,
         }
 
     @property
@@ -192,21 +195,56 @@ class RowRecipeLedger:
     ) -> torch.Tensor:
         self._ensure_open()
         self._validate_range(row_start, row_end, column_start, column_end)
-        key = (row_start, row_end, column_start, column_end)
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            return cached.clone()
         optional_recipes = self._recipes[row_start:row_end]
         if any(recipe is None for recipe in optional_recipes):
             raise RuntimeError("requested replay tile contains unrecorded rows")
         recipes = [recipe for recipe in optional_recipes if recipe is not None]
         self._stats["replay_request_count"] += 1
-        self._lifecycle.begin_request()
         tiles: list[torch.Tensor] = []
+        missing: list[tuple[tuple[int, int, int, int], list[RowRecipe]]] = []
+        chunks: list[tuple[tuple[int, int, int, int], torch.Tensor | None, int, int]] = []
+        cursor = row_start
+        while cursor < row_end:
+            cache_matches = [
+                (key, value)
+                for key, value in self._cache.items()
+                if key[2:] == (column_start, column_end) and key[0] <= cursor < key[1]
+            ]
+            if cache_matches:
+                key, cached = max(cache_matches, key=lambda item: item[0][1])
+                piece_end = min(key[1], row_end)
+                self._cache.move_to_end(key)
+                self._stats["replay_cache_hit_count"] += 1
+                chunks.append((key, cached, cursor - key[0], piece_end - key[0]))
+                cursor = piece_end
+                continue
+
+            boundary = ((cursor // self._replay_batch_rows) + 1) * self._replay_batch_rows
+            missing_end = min(row_end, boundary)
+            later_cached_starts = [
+                key[0]
+                for key in self._cache
+                if key[2:] == (column_start, column_end) and cursor < key[0] < missing_end
+            ]
+            if later_cached_starts:
+                missing_end = min(later_cached_starts)
+            key = (cursor, missing_end, column_start, column_end)
+            cached = self._cache.get(key)
+            if cached is None:
+                batch = recipes[cursor - row_start : missing_end - row_start]
+                missing.append((key, batch))
+                self._stats["replay_cache_miss_count"] += 1
+            else:
+                self._cache.move_to_end(key)
+                self._stats["replay_cache_hit_count"] += 1
+            chunks.append((key, cached, 0, missing_end - cursor))
+            cursor = missing_end
+
+        produced: dict[tuple[int, int, int, int], torch.Tensor] = {}
+        if missing:
+            self._lifecycle.begin_request()
         try:
-            for batch_start in range(0, len(recipes), self._replay_batch_rows):
-                batch = recipes[batch_start : batch_start + self._replay_batch_rows]
+            for key, batch in missing:
                 tile = self._producer(batch, column_start, column_end)
                 self._lifecycle.record_backward()
                 expected = (len(batch), column_end - column_start)
@@ -214,16 +252,25 @@ class RowRecipeLedger:
                     raise ValueError(
                         f"replay producer returned shape {tuple(tile.shape)}; expected {expected}"
                     )
-                tiles.append(tile.detach().to(device="cpu", dtype=self.dtype))
+                tile_cpu = tile.detach().to(device="cpu", dtype=self.dtype)
+                produced[key] = tile_cpu
                 self._stats["replay_batch_count"] += 1
                 self._stats["max_replay_batch_rows"] = max(
                     self._stats["max_replay_batch_rows"], len(batch)
                 )
-            result = torch.cat(tiles, dim=0) if tiles else torch.empty(
-                (0, column_end - column_start), dtype=self.dtype
-            )
         finally:
-            self._lifecycle.release()
+            if missing:
+                self._lifecycle.release()
+        for key, cached, slice_start, slice_end in chunks:
+            tile = produced.get(key, cached)
+            if tile is None:
+                raise RuntimeError("replay cache bookkeeping lost a row chunk")
+            tiles.append(tile[slice_start:slice_end])
+        for key, tile in produced.items():
+            self._cache_put(key, tile)
+        result = torch.cat(tiles, dim=0) if tiles else torch.empty(
+            (0, column_end - column_start), dtype=self.dtype
+        )
         tile_bytes = int(result.numel() * result.element_size())
         self._stats["replay_tile_count"] += 1
         self._stats["replay_row_count"] += row_end - row_start
@@ -232,8 +279,7 @@ class RowRecipeLedger:
             self._stats["max_tile_columns"], column_end - column_start
         )
         self._stats["max_tile_bytes"] = max(self._stats["max_tile_bytes"], tile_bytes)
-        self._cache_put(key, result)
-        return result
+        return result.clone()
 
     def materialize_dense_feature_slice(
         self,
@@ -306,6 +352,7 @@ class RowRecipeLedger:
         while self._cache and self._cache_bytes + nbytes > self._cache_limit:
             _, evicted = self._cache.popitem(last=False)
             self._cache_bytes -= int(evicted.numel() * evicted.element_size())
+            self._stats["replay_cache_eviction_count"] += 1
         self._cache[key] = value.clone()
         self._cache_bytes += nbytes
 

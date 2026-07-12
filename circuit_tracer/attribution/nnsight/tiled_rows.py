@@ -173,34 +173,48 @@ def produce_tiled_rows_no_retention(
     phase_label: str,
     telemetry: dict[str, int | float] | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Replay feature tiles for the canonical global-max/scaled-sum second pass."""
+    """Reuse current-microbatch tiles for the canonical denominator reduction."""
     feature_columns = 0
     global_max: torch.Tensor | None = None
-    first_pass_tiles: list[tuple[int, int]] = []
+    feature_tiles: list[tuple[int, int, torch.Tensor]] = []
+    transient_bytes = 0
+    global_max_elapsed_ms = 0.0
 
-    def consume(_start: int, _end: int, tile: torch.Tensor) -> None:
-        nonlocal feature_columns, global_max
+    def record_transient_peak(extra_bytes: int = 0) -> None:
+        if telemetry is not None:
+            telemetry["feature_transient_peak_bytes"] = max(
+                int(telemetry.get("feature_transient_peak_bytes", 0)),
+                transient_bytes + extra_bytes,
+            )
+
+    def consume(start: int, end: int, tile: torch.Tensor) -> None:
+        nonlocal feature_columns, global_max, transient_bytes, global_max_elapsed_ms
         copy_start = time.perf_counter()
-        first_pass_tiles.append((_start, _end))
-        feature_columns = max(feature_columns, _end)
-        tile_max_device = tile.detach().abs().amax(dim=1)
-        tile_max = tile_max_device.to(device="cpu", dtype=dtype)
+        tile_cpu = tile.detach().to(device="cpu", dtype=dtype)
+        if tile_cpu.ndim != 2 or int(tile_cpu.shape[0]) != int(layers.numel()):
+            raise RuntimeError("none_recompute feature tile had an unexpected row shape")
+        if end <= start or int(tile_cpu.shape[1]) != end - start:
+            raise RuntimeError("none_recompute feature tile width did not match its column range")
+        feature_tiles.append((start, end, tile_cpu))
+        feature_columns = max(feature_columns, end)
+        transient_bytes += int(tile_cpu.numel() * tile_cpu.element_size())
+        global_max_start = time.perf_counter()
+        tile_max = tile_cpu.abs().amax(dim=1)
+        global_max_elapsed_ms += (time.perf_counter() - global_max_start) * 1000.0
         if telemetry is not None:
             transferred = (
-                int(tile_max_device.numel() * tile_max_device.element_size())
-                if tile_max_device.device.type != "cpu"
+                int(tile.numel() * tile.element_size())
+                if tile.device.type != "cpu"
                 else 0
             )
             telemetry["feature_transfer_bytes"] = int(telemetry.get("feature_transfer_bytes", 0)) + transferred
-            telemetry["feature_reduction_transfer_bytes"] = int(
-                telemetry.get("feature_reduction_transfer_bytes", 0)
-            ) + transferred
-            telemetry["feature_reduction_copy_count"] = int(
-                telemetry.get("feature_reduction_copy_count", 0)
-            ) + int(tile_max_device.device.type != "cpu" or tile_max_device.dtype != dtype)
-            telemetry["feature_reduction_copy_elapsed_ms"] = float(
-                telemetry.get("feature_reduction_copy_elapsed_ms", 0.0)
+            telemetry["feature_copy_count"] = int(
+                telemetry.get("feature_copy_count", 0)
+            ) + int(tile.device.type != "cpu" or tile.dtype != dtype)
+            telemetry["feature_cpu_copy_elapsed_ms"] = float(
+                telemetry.get("feature_cpu_copy_elapsed_ms", 0.0)
             ) + (time.perf_counter() - copy_start) * 1000.0
+            record_transient_peak()
         global_max = tile_max if global_max is None else torch.maximum(global_max, tile_max)
 
     nonfeature = ctx.produce_row_tiles(
@@ -212,13 +226,13 @@ def produce_tiled_rows_no_retention(
         phase_label=phase_label,
         retain_graph=True,
     ).detach().to(device="cpu", dtype=dtype)
+    global_max_start = time.perf_counter()
     nonfeature_max = nonfeature.abs().amax(dim=1)
     global_max = nonfeature_max if global_max is None else torch.maximum(global_max, nonfeature_max)
+    global_max_elapsed_ms += (time.perf_counter() - global_max_start) * 1000.0
     scaled_sum = torch.zeros_like(global_max)
     finite = (global_max > 0) & torch.isfinite(global_max)
     pending: torch.Tensor | None = None
-    replay_tiles: list[tuple[int, int]] = []
-
     def consume_values(values: torch.Tensor) -> None:
         nonlocal pending, scaled_sum
         values = values.detach().to(device="cpu", dtype=dtype)
@@ -231,6 +245,7 @@ def produce_tiled_rows_no_retention(
             )
             piece = values[:, offset : offset + take]
             pending = piece if pending is None else torch.cat((pending, piece), dim=1)
+            record_transient_peak(int(pending.numel() * pending.element_size()))
             offset += take
             if pending.shape[1] == _CANONICAL_DENOMINATOR_CHUNK_SIZE:
                 if bool(finite.any()):
@@ -239,43 +254,38 @@ def produce_tiled_rows_no_retention(
                     ).sum(dim=1)
                 pending = None
 
-    def consume_replay(start: int, end: int, tile: torch.Tensor) -> None:
-        replay_tiles.append((start, end))
-        copy_start = time.perf_counter()
+    scaled_sum_start = time.perf_counter()
+    expected_start = 0
+    for start, end, tile in feature_tiles:
+        if start != expected_start or end <= start:
+            raise RuntimeError("none_recompute feature tiles were not contiguous and ordered")
         consume_values(tile)
-        if telemetry is not None:
-            telemetry["feature_transfer_bytes"] = int(telemetry.get("feature_transfer_bytes", 0)) + (
-                int(tile.numel() * tile.element_size()) if tile.device.type != "cpu" else 0
-            )
-            telemetry["feature_copy_count"] = int(telemetry.get("feature_copy_count", 0)) + int(
-                tile.device.type != "cpu" or tile.dtype != dtype
-            )
-            telemetry["feature_cpu_copy_elapsed_ms"] = float(
-                telemetry.get("feature_cpu_copy_elapsed_ms", 0.0)
-            ) + (time.perf_counter() - copy_start) * 1000.0
-
-    denominator_start = time.perf_counter()
-    replay_nonfeature = ctx.produce_row_tiles(
-        layers,
-        positions,
-        inject_values,
-        feature_column_tile_size=feature_column_tile_size,
-        consume_feature_tile=consume_replay,
-        phase_label=f"{phase_label}_denominator_replay",
-        retain_graph=True,
-    ).detach().to(device="cpu", dtype=dtype)
-    if first_pass_tiles != replay_tiles or not torch.equal(replay_nonfeature, nonfeature):
-        raise RuntimeError("none_recompute denominator replay was not deterministic")
+        expected_start = end
+    if expected_start != feature_columns:
+        raise RuntimeError("none_recompute feature tile coverage was incomplete")
     consume_values(nonfeature)
     if pending is not None and bool(finite.any()):
         scaled_sum[finite] += (pending[finite].abs() / global_max[finite, None]).sum(dim=1)
     scaled_sum[torch.isinf(global_max)] = 1
     if telemetry is not None:
-        tile_count = len(first_pass_tiles)
-        telemetry["feature_backward_count"] = int(telemetry.get("feature_backward_count", 0)) + (
-            2 * (tile_count + 1)
-        )
+        tile_count = len(feature_tiles)
+        backward_count = tile_count + 1
+        telemetry["feature_produced_tile_count"] = int(
+            telemetry.get("feature_produced_tile_count", 0)
+        ) + tile_count
+        telemetry["feature_backward_tile_count"] = int(
+            telemetry.get("feature_backward_tile_count", 0)
+        ) + backward_count
+        telemetry["feature_backward_count"] = int(
+            telemetry.get("feature_backward_count", 0)
+        ) + backward_count
         telemetry["feature_denominator_elapsed_ms"] = float(
             telemetry.get("feature_denominator_elapsed_ms", 0.0)
-        ) + (time.perf_counter() - denominator_start) * 1000.0
+        ) + global_max_elapsed_ms + (time.perf_counter() - scaled_sum_start) * 1000.0
+        telemetry["feature_denominator_global_max_elapsed_ms"] = float(
+            telemetry.get("feature_denominator_global_max_elapsed_ms", 0.0)
+        ) + global_max_elapsed_ms
+        telemetry["feature_denominator_scaled_sum_elapsed_ms"] = float(
+            telemetry.get("feature_denominator_scaled_sum_elapsed_ms", 0.0)
+        ) + (time.perf_counter() - scaled_sum_start) * 1000.0
     return nonfeature, (global_max, scaled_sum)

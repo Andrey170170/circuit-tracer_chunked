@@ -388,12 +388,17 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     phase4_executor_compute_batch_elapsed_ms_total = 0.0
     phase4_executor_cpu_staging_elapsed_ms_total = 0.0
     phase4_executor_denominator_elapsed_ms_total = 0.0
+    phase4_executor_denominator_global_max_elapsed_ms_total = 0.0
+    phase4_executor_denominator_scaled_sum_elapsed_ms_total = 0.0
     phase4_executor_row_store_write_elapsed_ms_total = 0.0
     phase4_gpu_to_cpu_bytes_total = 0
     phase4_row_reduction_gpu_to_cpu_bytes_saved_total = 0
     phase4_cpu_to_gpu_bytes_total = 0
     phase4_copy_count = 0
     phase4_feature_backward_count_total = 0
+    phase4_feature_produced_tile_count_total = 0
+    phase4_feature_backward_tile_count_total = 0
+    phase4_feature_transient_peak_bytes = 0
     phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
     previous_phase4_pending: torch.Tensor | None = None
     first_phase4_pending: torch.Tensor | None = None
@@ -1410,11 +1415,31 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
                     phase4_feature_backward_count_total += int(
                         tiled_feature_telemetry.get("feature_backward_count", 0)
                     )
+                    phase4_feature_produced_tile_count_total += int(
+                        tiled_feature_telemetry.get("feature_produced_tile_count", 0)
+                    )
+                    phase4_feature_backward_tile_count_total += int(
+                        tiled_feature_telemetry.get("feature_backward_tile_count", 0)
+                    )
+                    phase4_feature_transient_peak_bytes = max(
+                        phase4_feature_transient_peak_bytes,
+                        int(tiled_feature_telemetry.get("feature_transient_peak_bytes", 0)),
+                    )
                     phase4_executor_cpu_staging_elapsed_ms_total += float(
                         tiled_feature_telemetry.get("feature_cpu_copy_elapsed_ms", 0.0)
                     )
                     phase4_executor_denominator_elapsed_ms_total += float(
                         tiled_feature_telemetry.get("feature_denominator_elapsed_ms", 0.0)
+                    )
+                    phase4_executor_denominator_global_max_elapsed_ms_total += float(
+                        tiled_feature_telemetry.get(
+                            "feature_denominator_global_max_elapsed_ms", 0.0
+                        )
+                    )
+                    phase4_executor_denominator_scaled_sum_elapsed_ms_total += float(
+                        tiled_feature_telemetry.get(
+                            "feature_denominator_scaled_sum_elapsed_ms", 0.0
+                        )
                     )
                     phase4_executor_row_store_write_elapsed_ms_total += float(
                         tiled_feature_telemetry.get("feature_store_write_elapsed_ms", 0.0)
@@ -1796,6 +1821,12 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             "phase4_executor_denominator_elapsed_ms_total": float(
                 phase4_executor_denominator_elapsed_ms_total
             ),
+            "phase4_executor_denominator_global_max_elapsed_ms_total": float(
+                phase4_executor_denominator_global_max_elapsed_ms_total
+            ),
+            "phase4_executor_denominator_scaled_sum_elapsed_ms_total": float(
+                phase4_executor_denominator_scaled_sum_elapsed_ms_total
+            ),
             "phase4_executor_row_store_write_elapsed_ms_total": float(
                 phase4_executor_row_store_write_elapsed_ms_total
             ),
@@ -1806,6 +1837,13 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
             "phase4_cpu_to_gpu_bytes_total": int(phase4_cpu_to_gpu_bytes_total),
             "phase4_copy_count": int(phase4_copy_count),
             "phase4_feature_backward_count_total": int(phase4_feature_backward_count_total),
+            "phase4_feature_produced_tile_count_total": int(
+                phase4_feature_produced_tile_count_total
+            ),
+            "phase4_feature_backward_tile_count_total": int(
+                phase4_feature_backward_tile_count_total
+            ),
+            "phase4_feature_transient_peak_bytes": int(phase4_feature_transient_peak_bytes),
             **phase4_execution_metadata,
             **(phase4_no_refresh_plan_telemetry or {}),
         },
