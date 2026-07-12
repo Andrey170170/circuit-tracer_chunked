@@ -161,6 +161,11 @@ class RowRecipeLedger:
     def path(self) -> None:
         return None
 
+    @property
+    def nbytes(self) -> int:
+        """Bytes in a retained KxN backing store; replay ledgers have none."""
+        return 0
+
     def append_recipe(
         self,
         recipe: RowRecipe,

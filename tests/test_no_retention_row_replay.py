@@ -57,6 +57,7 @@ def test_huge_ledger_has_no_kxn_allocation_or_file() -> None:
         semantic_fingerprint={}, execution_fingerprint={}, provider_fingerprint={},
     )
     assert ledger.path is None
+    assert ledger.nbytes == 0
     assert ledger.row_abs_max.shape == (1_000_000,)
     assert ledger.get_diagnostic_snapshot()["retained_recipe_bytes"] == 0
 
