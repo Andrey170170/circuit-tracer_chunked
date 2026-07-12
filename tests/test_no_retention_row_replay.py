@@ -14,7 +14,9 @@ def _ledger(rows: torch.Tensor):
     )
     ledger = RowRecipeLedger(
         n_rows=rows.shape[0], n_feature_columns=rows.shape[1], dtype=rows.dtype,
-        producer=lambda recipe, start, end: rows[recipe.ordinal : recipe.ordinal + 1, start:end],
+        producer=lambda recipes, start, end: rows[
+            [recipe.ordinal for recipe in recipes], start:end
+        ],
         lifecycle=lifecycle, semantic_fingerprint={"s": 1}, execution_fingerprint={"e": 1},
         provider_fingerprint={"architecture": "clt"},
     )
@@ -95,6 +97,47 @@ def test_each_uncached_replay_request_rebuilds_then_releases_its_graph() -> None
     assert snapshot["apparent_file_bytes"] == snapshot["allocated_file_bytes"] == 0
 
 
+def test_replay_tile_batches_recipes_within_one_graph_lifecycle() -> None:
+    rows = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    events: list[str] = []
+    batch_sizes: list[int] = []
+    lifecycle = ReplayGraphLifecycle(
+        reset=lambda: events.append("reset"),
+        rebuild_forward=lambda: events.append("forward"),
+        release=lambda: events.append("release"),
+    )
+
+    def produce(recipes, start: int, end: int) -> torch.Tensor:
+        batch_sizes.append(len(recipes))
+        return rows[[recipe.ordinal for recipe in recipes], start:end]
+
+    ledger = RowRecipeLedger(
+        n_rows=5,
+        n_feature_columns=4,
+        dtype=torch.float32,
+        producer=produce,
+        lifecycle=lifecycle,
+        semantic_fingerprint={},
+        execution_fingerprint={},
+        provider_fingerprint={},
+        replay_batch_rows=2,
+    )
+    for ordinal in range(5):
+        ledger.append_recipe(
+            RowRecipe(ordinal, "feature", 0, 0, stable_reference=("row", ordinal)),
+            node_index=ordinal,
+            denominator=(torch.ones(1), torch.ones(1)),
+        )
+
+    assert torch.equal(ledger.read_tile(0, 5, 1, 4), rows[:, 1:4])
+    assert batch_sizes == [2, 2, 1]
+    assert events == ["reset", "forward", "release"]
+    snapshot = ledger.get_diagnostic_snapshot()
+    assert snapshot["replay_batch_count"] == 3
+    assert snapshot["max_replay_batch_rows"] == 2
+    assert snapshot["graph_backward_count"] == 3
+
+
 def test_rebuild_failure_releases_and_resets_lifecycle() -> None:
     events: list[str] = []
     lifecycle = ReplayGraphLifecycle(
@@ -137,7 +180,9 @@ def test_replay_reader_enforces_configured_request_bounds() -> None:
     lifecycle = ReplayGraphLifecycle(reset=lambda: None, rebuild_forward=lambda: None, release=lambda: None)
     ledger = RowRecipeLedger(
         n_rows=2, n_feature_columns=4, dtype=torch.float32,
-        producer=lambda recipe, start, end: rows[recipe.ordinal : recipe.ordinal + 1, start:end],
+        producer=lambda recipes, start, end: rows[
+            [recipe.ordinal for recipe in recipes], start:end
+        ],
         lifecycle=lifecycle, semantic_fingerprint={}, execution_fingerprint={},
         provider_fingerprint={}, max_request_rows=1, max_request_columns=2,
     )

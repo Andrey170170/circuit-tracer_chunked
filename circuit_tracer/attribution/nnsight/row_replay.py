@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -11,7 +11,7 @@ import torch
 
 
 RowSourceKind = Literal["logit", "feature"]
-ReplayTileProducer = Callable[["RowRecipe", int, int], torch.Tensor]
+ReplayTileProducer = Callable[[Sequence["RowRecipe"], int, int], torch.Tensor]
 ReplayLifecycleHook = Callable[[], None]
 
 
@@ -113,6 +113,7 @@ class RowRecipeLedger:
         execution_fingerprint: Mapping[str, object],
         provider_fingerprint: Mapping[str, object],
         tile_cache_bytes: int = 0,
+        replay_batch_rows: int = 1,
         max_request_rows: int | None = None,
         max_request_columns: int | None = None,
     ) -> None:
@@ -120,6 +121,8 @@ class RowRecipeLedger:
             raise ValueError("ledger dimensions must be nonnegative")
         if tile_cache_bytes < 0:
             raise ValueError("tile_cache_bytes must be >= 0")
+        if replay_batch_rows <= 0:
+            raise ValueError("replay_batch_rows must be > 0")
         if max_request_rows is not None and max_request_rows <= 0:
             raise ValueError("max_request_rows must be > 0")
         if max_request_columns is not None and max_request_columns <= 0:
@@ -137,6 +140,7 @@ class RowRecipeLedger:
         self._lifecycle = lifecycle
         self._recipes: list[RowRecipe | None] = [None] * n_rows
         self._cache_limit = int(tile_cache_bytes)
+        self._replay_batch_rows = int(replay_batch_rows)
         self._max_request_rows = max_request_rows
         self._max_request_columns = max_request_columns
         self._cache: OrderedDict[tuple[int, int, int, int], torch.Tensor] = OrderedDict()
@@ -146,6 +150,8 @@ class RowRecipeLedger:
             "replay_request_count": 0,
             "replay_tile_count": 0,
             "replay_row_count": 0,
+            "replay_batch_count": 0,
+            "max_replay_batch_rows": 0,
             "max_tile_rows": 0,
             "max_tile_columns": 0,
             "max_tile_bytes": 0,
@@ -186,23 +192,28 @@ class RowRecipeLedger:
         if cached is not None:
             self._cache.move_to_end(key)
             return cached.clone()
-        recipes = self._recipes[row_start:row_end]
-        if any(recipe is None for recipe in recipes):
+        optional_recipes = self._recipes[row_start:row_end]
+        if any(recipe is None for recipe in optional_recipes):
             raise RuntimeError("requested replay tile contains unrecorded rows")
+        recipes = [recipe for recipe in optional_recipes if recipe is not None]
         self._stats["replay_request_count"] += 1
         self._lifecycle.begin_request()
         tiles: list[torch.Tensor] = []
         try:
-            for recipe in recipes:
-                assert recipe is not None
-                tile = self._producer(recipe, column_start, column_end)
+            for batch_start in range(0, len(recipes), self._replay_batch_rows):
+                batch = recipes[batch_start : batch_start + self._replay_batch_rows]
+                tile = self._producer(batch, column_start, column_end)
                 self._lifecycle.record_backward()
-                expected = (1, column_end - column_start)
+                expected = (len(batch), column_end - column_start)
                 if tuple(tile.shape) != expected:
                     raise ValueError(
                         f"replay producer returned shape {tuple(tile.shape)}; expected {expected}"
                     )
                 tiles.append(tile.detach().to(device="cpu", dtype=self.dtype))
+                self._stats["replay_batch_count"] += 1
+                self._stats["max_replay_batch_rows"] = max(
+                    self._stats["max_replay_batch_rows"], len(batch)
+                )
             result = torch.cat(tiles, dim=0) if tiles else torch.empty(
                 (0, column_end - column_start), dtype=self.dtype
             )
@@ -256,6 +267,7 @@ class RowRecipeLedger:
             ),
             "configured_max_request_rows": self._max_request_rows,
             "configured_max_request_columns": self._max_request_columns,
+            "replay_batch_rows": self._replay_batch_rows,
             "retained_recipe_bytes": retained_recipe_bytes,
             **self._stats,
             "graph_rebuild_count": self._lifecycle.graph_rebuild_count,

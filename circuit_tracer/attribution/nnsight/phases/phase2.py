@@ -41,6 +41,7 @@ from circuit_tracer.attribution.nnsight.row_store import (
 from circuit_tracer.attribution.nnsight.row_replay import (
     NonfeatureProjectionLedger,
     ReplayGraphLifecycle,
+    RowRecipe,
     RowRecipeLedger,
 )
 from circuit_tracer.transcoder.provider import provider_fingerprint
@@ -577,23 +578,31 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
         assert exact_chunked_decoder
         n_nonfeature_columns = int(logit_offset - total_active_feats)
         if config.feature_row_retention == "none_recompute":
-            def feature_producer(recipe, start: int, end: int) -> torch.Tensor:
-                assert recipe.injection is not None
+            def feature_producer(
+                recipes: Sequence[RowRecipe], start: int, end: int
+            ) -> torch.Tensor:
+                assert all(recipe.injection is not None for recipe in recipes)
                 return ctx.compute_batch(
-                    layers=torch.tensor([recipe.layer]),
-                    positions=torch.tensor([recipe.position]),
-                    inject_values=recipe.injection.unsqueeze(0),
+                    layers=torch.tensor([recipe.layer for recipe in recipes]),
+                    positions=torch.tensor([recipe.position for recipe in recipes]),
+                    inject_values=torch.stack(
+                        [cast(torch.Tensor, recipe.injection) for recipe in recipes]
+                    ),
                     feature_column_range=(start, end),
                     include_nonfeature=False,
                     phase_label="row_replay_feature",
                 ).detach().to(device="cpu", dtype=exact_trace_internal_dtype_resolved)
 
-            def nonfeature_producer(recipe, start: int, end: int) -> torch.Tensor:
-                assert recipe.injection is not None
+            def nonfeature_producer(
+                recipes: Sequence[RowRecipe], start: int, end: int
+            ) -> torch.Tensor:
+                assert all(recipe.injection is not None for recipe in recipes)
                 values = ctx.compute_batch(
-                    layers=torch.tensor([recipe.layer]),
-                    positions=torch.tensor([recipe.position]),
-                    inject_values=recipe.injection.unsqueeze(0),
+                    layers=torch.tensor([recipe.layer for recipe in recipes]),
+                    positions=torch.tensor([recipe.position for recipe in recipes]),
+                    inject_values=torch.stack(
+                        [cast(torch.Tensor, recipe.injection) for recipe in recipes]
+                    ),
                     feature_column_range=(0, 0),
                     include_nonfeature=True,
                     phase_label="row_replay_nonfeature",
@@ -609,6 +618,7 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
                 "execution_fingerprint": {"trace_batch_size": int(trace_batch_size)},
                 "provider_fingerprint": provider_fingerprint(model.transcoders),
                 "tile_cache_bytes": int(config.replay_tile_cache_bytes),
+                "replay_batch_rows": int(trace_batch_size),
                 "max_request_rows": int(config.influence_row_tile_size),
                 "max_request_columns": int(config.influence_column_tile_size),
             }
