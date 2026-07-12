@@ -180,6 +180,43 @@ def test_phase3_propagates_compute_batch_exception_without_finalizing(monkeypatc
     assert observer.phases == []
 
 
+def test_column_tiled_phase3_does_not_require_dense_edge_matrix(monkeypatch) -> None:
+    observer = FakeObserver()
+    ctx = FakeContext(torch.empty(0))
+    feature_store = SimpleNamespace()
+    nonfeature_store = SimpleNamespace()
+    inputs = replace(
+        _inputs(ctx, observer),
+        feature_row_store=feature_store,
+        nonfeature_row_store=nonfeature_store,
+        edge_matrix=None,
+        anomaly_debug_result=None,
+    )
+    monkeypatch.setattr(phase3, "_log_memory_boundary", lambda *args: None)
+    monkeypatch.setattr(phase3, "_log_phase_metrics", lambda *args: None)
+    calls: list[dict[str, object]] = []
+
+    def produce(**kwargs: object):
+        calls.append(kwargs)
+        return torch.tensor([[2.0, 3.0]]), (torch.tensor([3.0]), torch.tensor([2.0]))
+
+    monkeypatch.setattr(phase3, "produce_and_store_tiled_rows", produce)
+
+    result = run_phase3(
+        inputs=inputs,
+        config=_config(
+            exact_chunked_decoder=True,
+            use_compact_feature_row_store=True,
+            full_retention_backend="column_tiled_v1",
+        ),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["feature_row_store"] is feature_store
+    assert result.stored_row_count == 1
+    assert torch.equal(result.row_to_node_index, torch.tensor([3]))
+
+
 def test_none_recompute_seed_selection_uses_tiled_reader_when_feature_cap_is_smaller(
     monkeypatch,
 ) -> None:

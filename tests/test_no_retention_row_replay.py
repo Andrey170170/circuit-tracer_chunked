@@ -109,6 +109,22 @@ def test_rebuild_failure_releases_and_resets_lifecycle() -> None:
     assert events == ["reset", "release"]
 
 
+def test_rebuild_failure_unwraps_nnsight_style_original_exception() -> None:
+    original = RuntimeError("actionable replay failure")
+    wrapped = RuntimeError("broken formatter")
+    wrapped.original = original  # type: ignore[attr-defined]
+    lifecycle = ReplayGraphLifecycle(
+        reset=lambda: None,
+        rebuild_forward=lambda: (_ for _ in ()).throw(wrapped),
+        release=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="actionable replay failure") as raised:
+        lifecycle.begin_request()
+
+    assert raised.value is original
+
+
 def test_row_recipe_clones_cpu_injection_immutably() -> None:
     source = torch.tensor([1.0, 2.0])
     recipe = RowRecipe(0, "feature", 0, 0, injection=source)

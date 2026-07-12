@@ -67,8 +67,11 @@ class ReplayGraphLifecycle:
         try:
             self._reset()
             self._rebuild_forward()
-        except BaseException:
+        except BaseException as error:
             self.release()
+            original = getattr(error, "original", None)
+            if isinstance(original, BaseException):
+                raise original.with_traceback(original.__traceback__) from None
             raise
         self.graph_rebuild_count += 1
         self.forward_count += 1

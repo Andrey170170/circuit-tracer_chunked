@@ -487,6 +487,10 @@ def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
                     recipe, node_index=node_index, denominator=denominator
                 )
             phase3_row_store_write_elapsed_ms = 0.0
+        elif tiled_production:
+            # produce_and_store_tiled_rows already committed both projections.
+            # There is deliberately no dense edge matrix in this mode.
+            phase3_row_store_write_elapsed_ms = 0.0
         elif use_compact_feature_row_store and not tiled_production:
             assert feature_row_store is not None
             assert nonfeature_row_store is not None
