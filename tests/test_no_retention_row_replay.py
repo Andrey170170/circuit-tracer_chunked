@@ -201,6 +201,53 @@ def test_replay_reader_enforces_configured_request_bounds() -> None:
     torch.testing.assert_close(actual, rows[:, selected])
 
 
+def test_selected_projection_reads_column_buckets_and_preserves_order() -> None:
+    rows = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+    requests: list[tuple[int, int, int, int]] = []
+
+    def produce(recipes, start: int, end: int) -> torch.Tensor:
+        ordinals = [recipe.ordinal for recipe in recipes]
+        requests.append((min(ordinals), max(ordinals) + 1, start, end))
+        return rows[ordinals, start:end]
+
+    ledger = RowRecipeLedger(
+        n_rows=2,
+        n_feature_columns=6,
+        dtype=torch.float32,
+        producer=produce,
+        lifecycle=ReplayGraphLifecycle(
+            reset=lambda: None, rebuild_forward=lambda: None, release=lambda: None
+        ),
+        semantic_fingerprint={},
+        execution_fingerprint={},
+        provider_fingerprint={},
+        replay_batch_rows=2,
+        max_request_rows=1,
+        max_request_columns=2,
+    )
+    for ordinal in range(2):
+        ledger.append_recipe(
+            RowRecipe(ordinal, "feature", 0, 0, stable_reference=("row", ordinal)),
+            node_index=ordinal,
+            denominator=(torch.ones(1), torch.ones(1)),
+        )
+
+    selected = torch.tensor([5, 1, 4, 5, 2])
+    actual = ledger.materialize_dense_feature_slice(
+        row_start=0, row_end=2, selected_feature_columns=selected
+    )
+
+    assert torch.equal(actual, rows[:, selected])
+    assert requests == [
+        (0, 1, 0, 2),
+        (0, 1, 2, 4),
+        (0, 1, 4, 6),
+        (1, 2, 0, 2),
+        (1, 2, 2, 4),
+        (1, 2, 4, 6),
+    ]
+
+
 @pytest.mark.parametrize("architecture", ["clt", "plt"])
 def test_provider_capability_gate_rejects_fallback(architecture: str) -> None:
     class Provider:

@@ -241,17 +241,23 @@ class RowRecipeLedger:
         columns = selected_feature_columns.detach().to(device="cpu", dtype=torch.long)
         if columns.numel() == 0:
             return torch.empty((row_end - row_start, 0), dtype=self.dtype)
+        if bool(torch.any(columns < 0)) or bool(torch.any(columns >= self.n_feature_columns)):
+            raise IndexError("selected replay column is out of bounds")
         result = torch.empty((row_end - row_start, columns.numel()), dtype=self.dtype)
         row_step = self._max_request_rows or max(row_end - row_start, 1)
+        column_step = self._max_request_columns or max(self.n_feature_columns, 1)
+        column_buckets = torch.div(columns, column_step, rounding_mode="floor")
         for chunk_start in range(row_start, row_end, row_step):
             chunk_end = min(chunk_start + row_step, row_end)
             output_start = chunk_start - row_start
             output_end = chunk_end - row_start
-            pieces = [
-                self.read_tile(chunk_start, chunk_end, int(column), int(column) + 1)
-                for column in columns
-            ]
-            result[output_start:output_end] = torch.cat(pieces, dim=1)
+            for bucket in torch.unique(column_buckets, sorted=True):
+                output_columns = torch.nonzero(column_buckets == bucket, as_tuple=False).flatten()
+                tile_start = int(bucket) * column_step
+                tile_end = min(tile_start + column_step, self.n_feature_columns)
+                tile = self.read_tile(chunk_start, chunk_end, tile_start, tile_end)
+                local_columns = columns[output_columns] - tile_start
+                result[output_start:output_end, output_columns] = tile[:, local_columns]
         return result
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:
