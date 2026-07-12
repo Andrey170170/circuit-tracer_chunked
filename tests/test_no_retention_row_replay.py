@@ -79,6 +79,22 @@ def test_release_runs_after_replay_failure_and_cleanup_is_idempotent() -> None:
     ledger.cleanup()
 
 
+def test_each_uncached_replay_request_rebuilds_then_releases_its_graph() -> None:
+    rows = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    ledger, events = _ledger(rows)
+
+    torch.testing.assert_close(ledger.read_tile(0, 1, 0, 1), rows[:, 0:1])
+    torch.testing.assert_close(ledger.read_tile(0, 1, 1, 3), rows[:, 1:3])
+
+    assert events == ["reset", "forward", "release", "reset", "forward", "release"]
+    snapshot = ledger.get_diagnostic_snapshot()
+    assert snapshot["graph_rebuild_count"] == 2
+    assert snapshot["graph_forward_count"] == 2
+    assert snapshot["graph_backward_count"] == 2
+    assert snapshot["no_kxn_file"] is True
+    assert snapshot["apparent_file_bytes"] == snapshot["allocated_file_bytes"] == 0
+
+
 def test_rebuild_failure_releases_and_resets_lifecycle() -> None:
     events: list[str] = []
     lifecycle = ReplayGraphLifecycle(

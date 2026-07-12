@@ -254,11 +254,6 @@ def produce_tiled_rows_no_retention(
                 telemetry.get("feature_cpu_copy_elapsed_ms", 0.0)
             ) + (time.perf_counter() - copy_start) * 1000.0
 
-    reset = getattr(ctx, "reset_saved_graph_handles", None)
-    rebuild = getattr(ctx, "rebuild_saved_graph_handles", None)
-    if callable(reset) and callable(rebuild):
-        reset()
-        rebuild()
     denominator_start = time.perf_counter()
     replay_nonfeature = ctx.produce_row_tiles(
         layers,

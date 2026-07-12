@@ -274,7 +274,16 @@ def test_none_recompute_denominator_replays_and_matches_concatenated_reference(
     nonfeature = torch.tensor([[3e-4, -2e5, 9e-9], [7e7, -9e-6, 2e3]], dtype=dtype)
 
     class Context:
-        calls = 0
+        def __init__(self) -> None:
+            self.calls = 0
+            self.reset_calls = 0
+            self.rebuild_calls = 0
+
+        def reset_saved_graph_handles(self) -> None:
+            self.reset_calls += 1
+
+        def rebuild_saved_graph_handles(self) -> None:
+            self.rebuild_calls += 1
 
         def produce_row_tiles(self, *args, feature_column_tile_size, consume_feature_tile, **kwargs):
             del args, kwargs
@@ -296,5 +305,7 @@ def test_none_recompute_denominator_replays_and_matches_concatenated_reference(
     for start in range(0, full.shape[1], 4096):
         scaled += (full[:, start : start + 4096].abs() / maximum[:, None]).sum(dim=1)
     assert ctx.calls == 2
+    assert ctx.reset_calls == 0
+    assert ctx.rebuild_calls == 0
     assert torch.equal(actual[0], maximum)
     assert torch.equal(actual[1], scaled)
