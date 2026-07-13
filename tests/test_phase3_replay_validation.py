@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 import torch
 
-from circuit_tracer.attribution.attribute_nnsight import (
+from circuit_tracer.attribution.nnsight.replay import (
+    _build_phase3_gradient_bundle_payload,
     _hash_float_tensor,
     _hash_index_tensor,
     _hash_tensor_raw_bytes,
@@ -12,7 +13,6 @@ from circuit_tracer.attribution.attribute_nnsight import (
     _load_phase3_row_donor_bundle_npz,
 )
 from circuit_tracer.attribution.context_nnsight import _slice_phase3_gradient_replay_batch
-from circuit_tracer.attribution.nnsight.replay import _build_phase3_gradient_bundle_payload
 
 
 def test_phase3_gradient_bundle_v2_replays_canonical_target_width_not_session_capacity(tmp_path):

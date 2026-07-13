@@ -1,6 +1,6 @@
 import torch
 
-from circuit_tracer.attribution.attribute_nnsight import _build_phase3_frontier_buffer_metadata
+from circuit_tracer.attribution.nnsight.phase_support import _build_phase3_frontier_buffer_metadata
 
 
 def test_phase3_frontier_buffer_expands_near_cutoff_candidates():

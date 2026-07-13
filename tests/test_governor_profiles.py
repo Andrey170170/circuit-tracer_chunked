@@ -6,13 +6,13 @@ from types import MappingProxyType
 
 import pytest
 
-from circuit_tracer import ValidationEvidence
 from circuit_tracer.governor import GRANITE_H200_CALIBRATIONS
 from circuit_tracer.governor import HISTORICAL_STRESS_FIXTURES
 from circuit_tracer.governor import RECORDED_PROVIDER_PROFILES
 from circuit_tracer.governor import ResourceEnvelope
 from circuit_tracer.governor import TRUSTED_VALIDATION_EVIDENCE_REGISTRY
 from circuit_tracer.governor import resolve_trace_plan
+from circuit_tracer.governor.contracts import ValidationEvidence
 
 
 GIB = 1024**3
@@ -161,7 +161,6 @@ def test_root_and_governor_imports_are_lazy_and_torch_free():
             sys.executable,
             "-c",
             "import sys; import circuit_tracer; import circuit_tracer.governor; "
-            "from circuit_tracer import ValidationEvidence; "
             "assert 'torch' not in sys.modules",
         ],
         check=False,

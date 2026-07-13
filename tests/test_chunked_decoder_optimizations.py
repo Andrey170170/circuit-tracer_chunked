@@ -7,91 +7,102 @@ import torch
 import yaml
 from safetensors.torch import save_file
 
-from circuit_tracer.attribution.attribute import attribute as attribute_top_level
 from circuit_tracer.attribution.context_transformerlens import (
     AttributionContext as TransformerLensAttributionContext,
 )
-from circuit_tracer.attribution.attribute_nnsight import (
+from circuit_tracer.attribution.nnsight.backend import (
+    _resolve_phase0_activation_threshold_compare_mode,
+    _resolve_phase4_anomaly_debug_enabled,
+    _resolve_telemetry_max_events,
+)
+from circuit_tracer.attribution.nnsight.phase1_policy import (
+    _build_phase1_trace_batch_metadata,
+    _build_phase1_trace_batch_sizing_metadata,
+    _resolve_phase1_trace_batch_config,
+    _resolve_phase1_trace_batch_policy,
+    _resolve_phase1_trace_batch_size_max,
+    _resolve_phase1_trace_batch_sizing,
+)
+from circuit_tracer.attribution.nnsight.phase4_policy import (
+    _apply_phase4_planner_v2_refresh_plan,
+    _build_exact_encoder_residency_metadata,
+    _build_phase4_batch_locality_summary,
+    _build_phase4_planner_v2_candidate_window,
+    _build_phase4_ranker_metadata,
+    _build_phase4_refresh_optimization_metadata,
+    _build_phase4_refresh_policy_metadata,
+    _build_phase4_row_executor_metadata,
+    _build_phase4_row_reduction_metadata,
+    _build_phase4_scheduler_metadata,
+    _build_phase4_scheduler_plan_telemetry,
+    _compute_phase4_locality_shaped_batch_end,
+    _compute_phase4_locality_shaped_frontier_size,
+    _compute_phase4_planned_feature_batch_size,
+    _compute_phase4_refresh_queue_window_size,
+    _plan_phase4_frontier_membership_preserving_v1,
+    _reorder_pending_for_phase4_locality,
+    _resolve_exact_encoder_residency,
+    _resolve_exact_encoder_residency_config,
+    _resolve_phase4_feature_batch_planner_status,
+    _resolve_phase4_ranker,
+    _resolve_phase4_ranker_config,
+    _resolve_phase4_refresh_interval_multiplier,
+    _resolve_phase4_refresh_optimization_config,
+    _resolve_phase4_refresh_optimization_mode,
+    _resolve_phase4_refresh_policy,
+    _resolve_phase4_refresh_policy_config,
+    _resolve_phase4_row_executor_config,
+    _resolve_phase4_row_executor_mode,
+    _resolve_phase4_row_reduction_config,
+    _resolve_phase4_row_reduction_mode,
+    _resolve_phase4_scheduler_config,
+    _resolve_phase4_scheduler_mode,
+    _resolve_phase4_scheduler_telemetry_detail,
+    _resolve_phase4_streaming_v1_microbatch_size,
+    _select_phase4_frontier_rank_selection,
+    _select_phase4_planner_v2_membership,
+    _build_phase4_probe_pending_frontier,
+)
+from circuit_tracer.attribution.nnsight.phase_support import (
     _annotate_phase4_selection_on_feature_semantic_descriptors,
-    _build_cross_cluster_runtime_snapshot,
-    _build_matrix_abs_stats,
     _build_feature_semantic_descriptors_payload,
+    _build_matrix_abs_stats,
+    _build_phase4_normalization_stats,
+    _copy_feature_rows_to_cpu_staging,
+    _build_phase4_deterministic_shadow_pending,
+    _build_phase4_cutoff_debug,
+    _build_vector_stats,
+    _compare_phase4_frontiers,
+    _resolve_internal_dtype_map,
+    _resolve_internal_precision_requested,
+)
+from circuit_tracer.attribution.nnsight.replay import (
     _build_phase0_activation_matrix_from_loaded_bundle,
     _build_phase0_donor_bundle_payload,
     _build_phase0_replay_metadata,
     _build_phase0_replay_validation_context,
-    _build_phase4_batch_locality_summary,
-    _build_phase4_executor_batch_telemetry,
-    _build_phase4_executor_substage_telemetry,
-    _build_phase4_normalization_stats,
-    _compute_row_denominator_scaled_l1,
-    _copy_feature_rows_to_cpu_staging,
-    _FileBackedFeatureRowStore,
-    _build_phase4_planner_v2_candidate_window,
-    _build_phase4_refresh_substage_telemetry,
-    _select_phase4_planner_v2_membership,
-    _apply_phase4_planner_v2_refresh_plan,
-    _build_phase4_deterministic_shadow_pending,
-    _build_phase4_cutoff_debug,
-    _build_phase4_probe_pending_frontier,
     _build_phase3_seed_bundle_payload,
-    _load_phase0_donor_bundle_npz,
-    _build_phase4_scheduler_metadata,
-    _build_phase4_scheduler_plan_telemetry,
-    _record_cross_cluster_batch_event,
-    _record_cross_cluster_checkpoint,
     _compute_row_abs_sums,
-    _build_vector_stats,
-    _compare_phase4_frontiers,
-    _compute_phase4_planned_feature_batch_size,
-    _compute_phase4_locality_shaped_batch_end,
-    _compute_phase4_locality_shaped_frontier_size,
-    _compute_phase4_refresh_queue_window_size,
-    _plan_phase4_frontier_membership_preserving_v1,
-    _reorder_pending_for_phase4_locality,
-    _resolve_internal_dtype_map,
-    _resolve_internal_precision_requested,
-    _resolve_telemetry_max_events,
-    _resolve_phase0_activation_threshold_compare_mode,
+    _compute_row_denominator_scaled_l1,
+    _hash_sparse_membership_indices,
+    _load_phase0_donor_bundle_npz,
     _resolve_phase0_donor_context_policy,
     _resolve_phase0_replay_mode,
-    _resolve_phase4_anomaly_debug_enabled,
-    _resolve_phase4_feature_batch_planner_status,
-    _hash_sparse_membership_indices,
-    _resolve_phase4_refresh_optimization_mode,
-    _resolve_phase4_refresh_optimization_config,
-    _build_phase4_refresh_optimization_metadata,
-    _resolve_phase1_trace_batch_policy,
-    _resolve_phase1_trace_batch_size_max,
-    _resolve_phase1_trace_batch_config,
-    _build_phase1_trace_batch_metadata,
-    _resolve_phase1_trace_batch_sizing,
-    _build_phase1_trace_batch_sizing_metadata,
-    _resolve_phase4_refresh_policy,
-    _resolve_phase4_refresh_interval_multiplier,
-    _resolve_phase4_refresh_policy_config,
-    _build_phase4_refresh_policy_metadata,
-    _resolve_phase4_ranker,
-    _resolve_phase4_ranker_config,
-    _build_phase4_ranker_metadata,
-    _select_phase4_frontier_rank_selection,
+)
+from circuit_tracer.attribution.nnsight.row_store import (
+    _FileBackedFeatureRowStore,
+    _build_row_store_cache_control_metadata,
     _resolve_row_store_cache_control,
     _resolve_row_store_cache_control_config,
-    _build_row_store_cache_control_metadata,
-    _resolve_exact_encoder_residency,
-    _resolve_exact_encoder_residency_config,
-    _build_exact_encoder_residency_metadata,
-    _resolve_phase4_row_executor_mode,
-    _resolve_phase4_row_executor_config,
-    _resolve_phase4_streaming_v1_microbatch_size,
-    _build_phase4_row_executor_metadata,
-    _resolve_phase4_row_reduction_config,
-    _resolve_phase4_row_reduction_mode,
-    _build_phase4_row_reduction_metadata,
+)
+from circuit_tracer.attribution.nnsight.telemetry import (
+    _build_cross_cluster_runtime_snapshot,
+    _build_phase4_executor_batch_telemetry,
+    _build_phase4_executor_substage_telemetry,
     _build_phase4_gpu_row_reduction_transfer_telemetry,
-    _resolve_phase4_scheduler_mode,
-    _resolve_phase4_scheduler_config,
-    _resolve_phase4_scheduler_telemetry_detail,
+    _build_phase4_refresh_substage_telemetry,
+    _record_cross_cluster_batch_event,
+    _record_cross_cluster_checkpoint,
 )
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
@@ -2210,7 +2221,7 @@ def test_phase4_planner_v2_refresh_fails_closed_when_candidate_window_raises(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight._build_phase4_planner_v2_candidate_window",
+        "circuit_tracer.attribution.nnsight.phase4_policy._build_phase4_planner_v2_candidate_window",
         _raise_candidate_window,
     )
 
@@ -3325,153 +3336,6 @@ def test_phase4_probe_frontier_preserves_full_frontier_order_when_all_features_i
     )
 
     assert torch.equal(pending, torch.tensor([0, 1, 2, 3], dtype=torch.long))
-
-
-def test_top_level_attribute_rejects_phase4_planner_flags() -> None:
-    class _DummyModel:
-        backend = "nnsight"
-
-    with pytest.raises(
-        ValueError,
-        match=r"unsupported via circuit_tracer\.attribution\.attribute",
-    ):
-        attribute_top_level(
-            prompt="hello",
-            model=cast(object, _DummyModel()),
-            plan_feature_batch_size=True,
-        )
-
-
-def test_top_level_attribute_forwards_phase4_scheduler_args_to_nnsight(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def _fake_attribute(**kwargs):
-        captured.update(kwargs)
-        return sentinel
-
-    monkeypatch.setattr("circuit_tracer.attribution.attribute_nnsight.attribute", _fake_attribute)
-
-    class _DummyModel:
-        backend = "nnsight"
-
-    result = attribute_top_level(
-        prompt="hello",
-        model=cast(object, _DummyModel()),
-        phase4_scheduler_mode="planner_v1",
-        phase4_scheduler_debug=True,
-        phase4_scheduler_telemetry_detail="debug",
-        phase4_refresh_optimization="v1",
-        phase4_row_executor="streaming_v1",
-        phase1_trace_batch_policy="cap_effective_batches",
-        phase1_trace_batch_size_max=32,
-        phase4_refresh_policy="deferred_v1",
-        phase4_refresh_interval_multiplier=2,
-        phase4_ranker="topk_v1",
-        row_store_cache_control="fadvise_dontneed_after_append_v1",
-        exact_encoder_residency="active_cpu",
-    )
-
-    assert result is sentinel
-    assert captured["phase4_scheduler_mode"] == "planner_v1"
-    assert captured["phase4_scheduler_debug"] is True
-    assert captured["phase4_scheduler_telemetry_detail"] == "debug"
-    assert captured["phase4_refresh_optimization"] == "v1"
-    assert captured["phase4_row_executor"] == "streaming_v1"
-    assert captured["phase1_trace_batch_policy"] == "cap_effective_batches"
-    assert captured["phase1_trace_batch_size_max"] == 32
-    assert captured["phase4_refresh_policy"] == "deferred_v1"
-    assert captured["phase4_refresh_interval_multiplier"] == 2
-    assert captured["phase4_ranker"] == "topk_v1"
-    assert captured["row_store_cache_control"] == "fadvise_dontneed_after_append_v1"
-    assert captured["exact_encoder_residency"] == "active_cpu"
-
-
-def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transformerlens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def _fake_attribute(**kwargs):
-        captured.update(kwargs)
-        return sentinel
-
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_transformerlens.attribute",
-        _fake_attribute,
-    )
-
-    class _DummyModel:
-        backend = "transformerlens"
-
-    result = attribute_top_level(
-        prompt="hello",
-        model=cast(object, _DummyModel()),
-        phase4_scheduler_mode="locality",
-        phase4_scheduler_debug=False,
-        phase4_scheduler_telemetry_detail="normal",
-        phase4_refresh_optimization="v1",
-        phase4_row_executor="batched",
-        phase1_trace_batch_policy="legacy",
-        phase1_trace_batch_size_max=None,
-        phase4_refresh_policy="standard",
-        phase4_refresh_interval_multiplier=1,
-        phase4_ranker="argsort",
-        row_store_cache_control="off",
-        exact_encoder_residency="lazy",
-    )
-
-    assert result is sentinel
-    assert "phase4_scheduler_mode" not in captured
-    assert "phase4_scheduler_debug" not in captured
-    assert "phase4_scheduler_telemetry_detail" not in captured
-    assert "phase4_refresh_optimization" not in captured
-    assert "phase4_row_executor" not in captured
-    assert "phase1_trace_batch_policy" not in captured
-    assert "phase1_trace_batch_size_max" not in captured
-    assert "phase4_refresh_policy" not in captured
-    assert "phase4_refresh_interval_multiplier" not in captured
-    assert "phase4_ranker" not in captured
-    assert "row_store_cache_control" not in captured
-    assert "exact_encoder_residency" not in captured
-
-
-@pytest.mark.parametrize(
-    "scheduler_kwargs",
-    [
-        {"phase4_scheduler_mode": "planner_v1"},
-        {"phase4_scheduler_mode": "planner_v2"},
-        {"phase4_scheduler_debug": True},
-        {"phase4_scheduler_telemetry_detail": "summary"},
-        {"phase4_refresh_optimization": "off"},
-        {"phase4_row_executor": "streaming_v1"},
-        {"phase1_trace_batch_policy": "cap_effective_batches"},
-        {"phase1_trace_batch_size_max": 8},
-        {"phase4_refresh_policy": "deferred_v1"},
-        {"phase4_refresh_interval_multiplier": 2},
-        {"phase4_ranker": "topk_v1"},
-        {"row_store_cache_control": "fadvise_dontneed_after_append_v1"},
-        {"exact_encoder_residency": "active_cpu"},
-    ],
-)
-def test_top_level_attribute_rejects_non_default_phase4_scheduler_args_on_transformerlens(
-    scheduler_kwargs: dict[str, object],
-) -> None:
-    class _DummyModel:
-        backend = "transformerlens"
-
-    with pytest.raises(
-        ValueError,
-        match=r"Phase-4 execution settings are only supported for the NNSight backend",
-    ):
-        attribute_top_level(
-            prompt="hello",
-            model=cast(object, _DummyModel()),
-            **scheduler_kwargs,
-        )
 
 
 def test_chunked_feature_replay_windows_match_full_replay() -> None:

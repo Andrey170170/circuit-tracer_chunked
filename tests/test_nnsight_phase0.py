@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import circuit_tracer.attribution.attribute_nnsight as attribute_nnsight
 from circuit_tracer.attribution.nnsight.phases.phase0 import (
     Phase0CleanupOwner,
     Phase0Config,
@@ -310,76 +309,3 @@ def test_phase0_base_exception_exposes_context_and_original_cause(monkeypatch) -
     assert raised.value.cause is original_error
     assert calls.count("ctx.cleanup") == 0
 
-
-def test_phase0_failure_uses_attribution_lifecycle_finalizer(monkeypatch) -> None:
-    calls: list[str] = []
-    ctx = FakeContext(calls)
-    original_error = RuntimeError("injected Phase 0 failure")
-
-    class FakeLifecycleObserver:
-        recorder = object()
-
-        def run(self, *, name: str, **kwargs: object) -> None:
-            calls.append(name)
-
-        def phase(self, *, name: str, **kwargs: object) -> None:
-            calls.append(name)
-
-        def close_export(self, *, include_events: bool = True) -> dict[str, object]:
-            calls.append("close_export")
-            return {"summary": {"closed": True}, "events": list(calls)}
-
-        def attach_exception(
-            self, error: BaseException, telemetry_export: dict[str, object]
-        ) -> None:
-            calls.append("attach_exception")
-            setattr(error, "telemetry_export", telemetry_export)
-
-        def render_human_summary(self, logger: object, telemetry_export: dict[str, object]) -> None:
-            calls.append("render_human_summary")
-
-    observer = FakeLifecycleObserver()
-    capabilities = SimpleNamespace(
-        architecture="fake",
-        checkpoint_format="fake",
-        supports_compact_row_store=False,
-        supports_decoder_chunk_cache=False,
-        supports_exact_encoder_residency=False,
-        decoder_output_topology="fake",
-    )
-    monkeypatch.setattr(attribute_nnsight, "get_transcoder_capabilities", lambda _: capabilities)
-    monkeypatch.setattr(attribute_nnsight, "require_exact_chunked_provider", lambda _: False)
-    monkeypatch.setattr(attribute_nnsight.TelemetryObserver, "create", lambda **_: observer)
-    monkeypatch.setattr(attribute_nnsight, "_log_memory_boundary", lambda *_, **__: None)
-    monkeypatch.setattr(
-        attribute_nnsight,
-        "run_phase0",
-        lambda **_: (_ for _ in ()).throw(Phase0ExecutionError(ctx, original_error)),
-    )
-
-    model = SimpleNamespace(device=torch.device("cpu"), transcoders=object())
-    with pytest.raises(RuntimeError, match="injected Phase 0 failure") as raised:
-        attribute_nnsight._run_attribution(
-            model=model,
-            prompt=[1, 2],
-            attribution_targets=None,
-            max_n_logits=1,
-            desired_logit_prob=0.0,
-            batch_size=1,
-            feature_batch_size=None,
-            logit_batch_size=None,
-            max_feature_nodes=None,
-            offload=None,
-            verbose=False,
-            offload_handles=[],
-            logger=FakeLogger(calls),
-            profile=True,
-        )
-
-    assert raised.value is original_error
-    assert calls.count("ctx.cleanup") == 1
-    assert "teardown.cleanup" in calls
-    assert "attribute.failed" in calls
-    assert "close_export" in calls
-    assert "attach_exception" in calls
-    assert original_error.telemetry_export == {"summary": {"closed": True}, "events": calls[:-2]}

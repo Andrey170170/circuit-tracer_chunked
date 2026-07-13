@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from circuit_tracer.attribution.context_nnsight import AttributionContext
-from circuit_tracer.attribution.attribute_nnsight import (
+from circuit_tracer.attribution.nnsight.prefix_view import (
     _compact_nonfeature_column_counts,
     _compact_selected_feature_columns,
     _hash_token_ids,

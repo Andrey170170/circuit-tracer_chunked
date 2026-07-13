@@ -2,25 +2,8 @@
 
 import logging
 import torch
-from circuit_tracer.attribution import attribute_nnsight
 from circuit_tracer.attribution.nnsight import telemetry
-from circuit_tracer.observability import exception_export, human_logs
-
-
-def test_attribute_nnsight_reexports_extracted_helpers():
-    assert (
-        attribute_nnsight._attach_telemetry_export_to_exception
-        is exception_export._attach_telemetry_export_to_exception
-    )
-    assert attribute_nnsight._log_batch_profile is human_logs._log_batch_profile
-    assert (
-        attribute_nnsight._build_phase4_refresh_substage_telemetry
-        is telemetry._build_phase4_refresh_substage_telemetry
-    )
-    assert (
-        attribute_nnsight._record_cross_cluster_checkpoint
-        is telemetry._record_cross_cluster_checkpoint
-    )
+from circuit_tracer.observability import human_logs
 
 
 def test_human_log_rendering_keeps_existing_message_shape(caplog):
