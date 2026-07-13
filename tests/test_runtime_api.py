@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+from circuit_tracer.observability.events import TraceEvent
 from circuit_tracer.tracing import (
     AttributionProblem,
     DecoderCachePolicy,
@@ -13,6 +14,7 @@ from circuit_tracer.tracing import (
     FrontierExpansionPlan,
     FrontierSemantics,
     ObservabilityPolicy,
+    PrefixViewTarget,
     ReplayPlan,
     RowStoragePlan,
     SessionPlan,
@@ -65,9 +67,15 @@ def test_every_top_level_export_is_reachable() -> None:
 def test_trace_one_passes_owned_problem_and_resolved_plan(monkeypatch) -> None:
     captured = {}
 
-    def execute(problem, plan):
-        captured.update(problem=problem, plan=plan)
-        return {"value": problem.prompt[0], "telemetry_summary": {"events": 2}}
+    def execute(problem, plan, *, observer, forward_overrides, execution_identity):
+        execution_identity.mark_requested_as_effective()
+        captured.update(
+            problem=problem,
+            plan=plan,
+            observer=observer,
+            forward_overrides=forward_overrides,
+        )
+        return {"value": problem.prompt[0]}
 
     monkeypatch.setattr(
         "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
@@ -92,12 +100,24 @@ def test_trace_one_passes_owned_problem_and_resolved_plan(monkeypatch) -> None:
     result = trace_one(selected)
 
     assert result.output["value"] == 3
-    assert result.telemetry_summary == {"events": 2}
+    assert result.effective_execution_fingerprint == result.requested_execution_fingerprint
+    assert result.execution_fingerprint == result.effective_execution_fingerprint
+    assert result.telemetry_summary["event_count"] == 2
+    assert result.telemetry_summary["requested_execution_fingerprint"] == (
+        result.requested_execution_fingerprint
+    )
+    assert result.telemetry_summary["effective_execution_fingerprint"] == (
+        result.effective_execution_fingerprint
+    )
+    assert result.telemetry_events[-1]["attrs"]["effective_execution_fingerprint"] == (
+        result.effective_execution_fingerprint
+    )
     assert captured["problem"] is selected.problem
     plan = captured["plan"]
     assert plan.semantics is selected.semantics
     assert plan.execution is selected.execution
     assert plan.backend == "nnsight"
+    assert captured["forward_overrides"] is None
 
 
 def test_fingerprints_are_stable_and_split_semantics_from_execution() -> None:
@@ -168,6 +188,55 @@ def test_evidence_provenance_does_not_change_fingerprints() -> None:
     )
     assert first.semantic_fingerprint == second.semantic_fingerprint
     assert first.execution_fingerprint == second.execution_fingerprint
+
+
+def test_prefix_view_target_and_mode_change_semantic_fingerprint() -> None:
+    base = resolve_trace_request(request([1, 2, 3], output_position=1))
+    independent = resolve_trace_request(
+        request(
+            [1, 2, 3],
+            output_position=1,
+            prefix_view=PrefixViewTarget(mode="independent_prefix", target_position=2),
+        )
+    )
+    reused = resolve_trace_request(
+        request(
+            [1, 2, 3],
+            output_position=1,
+            prefix_view=PrefixViewTarget(
+                mode="full_sequence_target_position",
+                target_position=2,
+            ),
+        )
+    )
+    assert len({base.semantic_fingerprint, independent.semantic_fingerprint, reused.semantic_fingerprint}) == 3
+    assert base.execution_fingerprint == independent.execution_fingerprint
+    assert independent.execution_fingerprint == reused.execution_fingerprint
+
+
+def test_observability_sink_output_fields_do_not_change_execution_fingerprint() -> None:
+    base = resolve_trace_request(request(4))
+    sink_only = resolve_trace_request(
+        request(
+            4,
+            execution=ExecutionConstraints(
+                observability=ObservabilityPolicy(
+                    telemetry_jsonl_path="/different/output/telemetry.jsonl",
+                    telemetry_context={"run_id": "different"},
+                )
+            ),
+        )
+    )
+    behavior = resolve_trace_request(
+        request(
+            4,
+            execution=ExecutionConstraints(
+                observability=ObservabilityPolicy(telemetry_max_events=3),
+            ),
+        )
+    )
+    assert base.execution_fingerprint == sink_only.execution_fingerprint
+    assert base.execution_fingerprint != behavior.execution_fingerprint
 
 
 def test_decoder_cache_policy_changes_only_execution_fingerprint() -> None:
@@ -259,9 +328,12 @@ def test_transformerlens_rejects_nondefault_execution_constraints() -> None:
 
 
 def test_mixed_batch_order_isolation_failure_and_cancellation(monkeypatch) -> None:
-    def execute(problem, _plan):
+    def execute(problem, _plan, *, observer, forward_overrides, execution_identity):
+        del observer
+        assert forward_overrides is None
         if problem.prompt == [2]:
             raise LookupError("bad shape")
+        execution_identity.mark_requested_as_effective()
         return list(problem.prompt)
 
     monkeypatch.setattr(
@@ -274,6 +346,8 @@ def test_mixed_batch_order_isolation_failure_and_cancellation(monkeypatch) -> No
         TraceStatus.SUCCEEDED,
     ]
     assert [result.output for result in results] == [[1], None, [3]]
+    assert results[1].effective_execution_fingerprint is None
+    assert results[1].execution_fingerprint == results[1].requested_execution_fingerprint
     with pytest.raises(LookupError, match="bad shape"):
         trace_batch([request(1), request(2), request(3)])
 
@@ -286,7 +360,7 @@ def test_mixed_batch_order_isolation_failure_and_cancellation(monkeypatch) -> No
 
 
 def test_batch_does_not_convert_base_exceptions(monkeypatch) -> None:
-    def cancel(*_args):
+    def cancel(*_args, **_kwargs):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(
@@ -296,15 +370,25 @@ def test_batch_does_not_convert_base_exceptions(monkeypatch) -> None:
         trace_batch([request(1)], failure="return")
 
 
-def test_graph_style_telemetry_summary_is_extracted(monkeypatch) -> None:
+def test_canonical_observer_owns_telemetry_summary(monkeypatch) -> None:
     class Output:
         telemetry_summary = {"event_count": 9}
 
+    def execute(*_args, observer, execution_identity, **_kwargs):
+        execution_identity.mark_requested_as_effective()
+        observer.observe(TraceEvent(scope="phase", name="test.event", phase="test"))
+        return Output()
+
     monkeypatch.setattr(
         "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace",
-        lambda *_: Output(),
+        execute,
     )
-    assert trace_one(request()).telemetry_summary == {"event_count": 9}
+    selected = request(
+        execution=ExecutionConstraints(
+            observability=ObservabilityPolicy(profile=True)
+        )
+    )
+    assert trace_one(selected).telemetry_summary["event_count"] == 3
 
 
 def test_session_reuse_reset_close_and_failure_recovery(monkeypatch) -> None:
@@ -316,11 +400,13 @@ def test_session_reuse_reset_close_and_failure_recovery(monkeypatch) -> None:
             self.fail = True
             delegates.append(self)
 
-        def trace_target_position(self, position, _request, _plan):
+        def prepare_target_position(self, position, selected):
             if self.fail:
                 self.fail = False
                 raise RuntimeError("injected")
-            return f"graph-{position}"
+            from circuit_tracer.attribution.nnsight.forward_session import ForwardOverrides
+
+            return selected.problem, ForwardOverrides(target_logit_source=f"position-{position}")
 
         def close(self):
             self.closed += 1
@@ -328,6 +414,14 @@ def test_session_reuse_reset_close_and_failure_recovery(monkeypatch) -> None:
     monkeypatch.setattr(
         "circuit_tracer.attribution.nnsight.forward_session.ForwardTraceSession",
         Delegate,
+    )
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace",
+        lambda _problem, _plan, *, observer, forward_overrides, execution_identity: (
+            execution_identity.mark_requested_as_effective(),
+            observer.observe(TraceEvent(scope="phase", name="window.test", phase="test")),
+            f"graph-{forward_overrides.target_logit_source.removeprefix('position-')}",
+        )[2],
     )
     session = open_session(request([1, 2, 3]), window=SessionWindow(max_prefix_len=3))
     with pytest.raises(RuntimeError, match="injected"):
@@ -374,7 +468,13 @@ def test_session_owns_bounded_decoder_cache_across_traces_and_failures(monkeypat
     seen: list[object] = []
     fail = False
 
-    def execute(_problem, _plan, *, forward_overrides):
+    observers = []
+
+    def execute(
+        _problem, _plan, *, observer, forward_overrides, execution_identity
+    ):
+        execution_identity.mark_requested_as_effective()
+        observers.append(observer)
         seen.append(forward_overrides.decoder_chunk_cache)
         if fail:
             raise RuntimeError("injected decoder-cache failure")
@@ -397,6 +497,7 @@ def test_session_owns_bounded_decoder_cache_across_traces_and_failures(monkeypat
     session.trace()
     session.trace()
     assert seen[0] is seen[1]
+    assert observers[0] is not observers[1]
     assert model.transcoders.created[0][1] == 4096
     assert model.transcoders.created[0][2]["architecture"] == "clt"
 
@@ -423,9 +524,11 @@ def test_session_window_resolves_effective_request(monkeypatch) -> None:
         def __init__(self, **_kwargs):
             pass
 
-        def trace_target_position(self, position, selected, plan):
-            calls.append((position, selected, plan))
-            return "graph"
+        def prepare_target_position(self, position, selected):
+            from circuit_tracer.attribution.nnsight.forward_session import ForwardOverrides
+
+            calls.append((position, selected))
+            return selected.problem, ForwardOverrides()
 
         def close(self):
             pass
@@ -433,6 +536,17 @@ def test_session_window_resolves_effective_request(monkeypatch) -> None:
     monkeypatch.setattr(
         "circuit_tracer.attribution.nnsight.forward_session.ForwardTraceSession",
         Delegate,
+    )
+    backend_calls = []
+
+    def execute(problem, plan, *, observer, forward_overrides, execution_identity):
+        execution_identity.mark_requested_as_effective()
+        backend_calls.append((problem, plan, observer, forward_overrides))
+        return "graph"
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace",
+        execute,
     )
     base = request(
         [1, 2, 3],
@@ -448,9 +562,68 @@ def test_session_window_resolves_effective_request(monkeypatch) -> None:
     second = session.trace_window(3, reuse=True, request=override)
 
     assert calls[0][1].problem.targets == ["base"]
-    assert calls[0][2].semantics.source_batch_size == 6
-    assert calls[0][2].execution.storage.influence_row_tile_size == 2
+    assert backend_calls[0][1].semantics.source_batch_size == 6
+    assert backend_calls[0][1].execution.storage.influence_row_tile_size == 2
     assert calls[1][1].problem.max_n_logits == 3
     assert calls[0][1].problem.output_position == 1
     assert calls[1][1].problem.output_position == 2
+    assert all(call[2] is not None for call in backend_calls)
     assert first.semantic_fingerprint != second.semantic_fingerprint
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+def test_session_cleanup_attempts_delegate_and_cache_and_groups_failures(operation) -> None:
+    calls = []
+
+    class Delegate:
+        def close(self):
+            calls.append("delegate")
+            raise RuntimeError("delegate cleanup")
+
+    class CacheOwner:
+        def reset(self):
+            calls.append("cache-reset")
+            raise LookupError("cache reset cleanup")
+
+        def close(self):
+            calls.append("cache-close")
+            raise LookupError("cache close cleanup")
+
+    session = open_session(request([1, 2, 3]))
+    session._delegate = Delegate()
+    session._decoder_cache = CacheOwner()
+
+    exception_group_type = getattr(__import__("builtins"), "ExceptionGroup", None)
+    if exception_group_type is None:
+        exception_group_type = getattr(__import__("exceptiongroup"), "ExceptionGroup")
+    with pytest.raises(exception_group_type) as captured:
+        getattr(session, operation)()
+
+    assert calls == ["delegate", f"cache-{operation}"]
+    assert len(captured.value.exceptions) == 2
+
+
+def test_session_context_preserves_primary_exception_and_attaches_cleanup_failures() -> None:
+    calls = []
+
+    class Delegate:
+        def close(self):
+            calls.append("delegate")
+            raise RuntimeError("delegate cleanup")
+
+    class CacheOwner:
+        def close(self):
+            calls.append("cache")
+            raise LookupError("cache cleanup")
+
+    session = open_session(request([1, 2, 3]))
+    session._delegate = Delegate()
+    session._decoder_cache = CacheOwner()
+
+    with pytest.raises(ValueError, match="primary") as captured:
+        with session:
+            raise ValueError("primary")
+
+    assert calls == ["delegate", "cache"]
+    assert len(captured.value.__notes__) == 2
+    assert all("cleanup also failed" in note for note in captured.value.__notes__)

@@ -13,6 +13,7 @@ from circuit_tracer.attribution.targets import TargetSpec
 
 Prompt = str | torch.Tensor | list[int]
 AttributionTargets = Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None
+PrefixViewMode = Literal["independent_prefix", "full_sequence_target_position"]
 
 
 def _positive(name: str, value: int | float | None) -> None:
@@ -26,6 +27,17 @@ def _nonnegative(name: str, value: int | None) -> None:
 
 
 @dataclass(frozen=True)
+class PrefixViewTarget:
+    """Semantic target selection for a causal prefix view."""
+
+    mode: PrefixViewMode
+    target_position: int
+
+    def __post_init__(self) -> None:
+        _positive("prefix view target_position", self.target_position)
+
+
+@dataclass(frozen=True)
 class AttributionProblem:
     """Model, input, target selection, and graph objective for one trace."""
 
@@ -35,6 +47,7 @@ class AttributionProblem:
     max_n_logits: int = 10
     desired_logit_prob: float = 0.95
     output_position: int | None = None
+    prefix_view: PrefixViewTarget | None = None
 
     def __post_init__(self) -> None:
         if self.model is None:
@@ -45,6 +58,12 @@ class AttributionProblem:
         if not 0 < self.desired_logit_prob <= 1:
             raise ValueError("desired_logit_prob must be in (0, 1]")
         _nonnegative("output_position", self.output_position)
+        if (
+            self.prefix_view is not None
+            and self.output_position is not None
+            and self.output_position != self.prefix_view.target_position - 1
+        ):
+            raise ValueError("output_position must equal prefix view target_position - 1")
 
 
 @dataclass(frozen=True)

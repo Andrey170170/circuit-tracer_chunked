@@ -1,6 +1,7 @@
 import torch
 
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
+from circuit_tracer.observability.lifecycle import TelemetryObserver
 from circuit_tracer.utils.telemetry import TelemetryRecorder
 
 
@@ -15,7 +16,9 @@ def test_emit_trace_event_forwards_to_structured_recorder() -> None:
         lazy_decoder=False,
         lazy_encoder=False,
     )
-    transcoder.configure_trace_logging(logger=None, telemetry_recorder=recorder)
+    transcoder.configure_trace_logging(
+        logger=None, trace_observer=TelemetryObserver(recorder)
+    )
 
     transcoder.emit_trace_event(
         "phase0.custom_event",

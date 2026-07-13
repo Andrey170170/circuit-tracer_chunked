@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
+from circuit_tracer.transcoder.attribution_result import AttributionComponents
+
 
 TranscoderArchitecture = Literal["clt", "plt"]
 DecoderOutputTopology = Literal["cross_layer", "same_layer"]
@@ -45,7 +47,7 @@ class ExactChunkedProvider(Protocol):
 
     def get_decoder_chunk(self, layer_id: int, chunk_id: int, **kwargs): ...
 
-    def compute_attribution_components(self, *args, **kwargs) -> dict[str, object]: ...
+    def compute_attribution_components(self, *args, **kwargs) -> AttributionComponents: ...
 
     def materialize_encoder_rows(self, source_layers, feature_ids): ...
 

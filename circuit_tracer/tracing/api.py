@@ -46,9 +46,15 @@ def _terminal_result(request: TraceRequest, status: TraceStatus, error: object) 
     return TraceResult(
         output=None,
         semantic_fingerprint=plan.semantic_fingerprint,
-        execution_fingerprint=plan.execution_fingerprint,
+        requested_execution_fingerprint=plan.requested_execution_fingerprint,
         status=status,
-        telemetry_summary={"error_type": type(error).__name__, "error_message": str(error)},
+        telemetry_summary={
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "requested_execution_fingerprint": plan.requested_execution_fingerprint,
+            "effective_execution_fingerprint": None,
+            "execution_fingerprint": plan.requested_execution_fingerprint,
+        },
         admission_report=plan.admission_report,
     )
 
@@ -58,4 +64,3 @@ def open_session(
 ) -> TraceSession:
     resolve_trace_request(request)
     return TraceSession(request, window)
-

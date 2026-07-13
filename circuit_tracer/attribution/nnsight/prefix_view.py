@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from circuit_tracer.attribution.targets import TargetSpec
+from circuit_tracer.tracing.problem import PrefixViewTarget
 
 
 class PrefixViewMetadata(TypedDict, total=False):
@@ -67,34 +68,46 @@ def validate_prefix_view_metadata(
     *,
     prompt: str | torch.Tensor | list[int],
     attribution_targets: Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None,
+    prefix_view: PrefixViewTarget | None,
     prefix_view_metadata: Mapping[str, Any] | None,
 ) -> PrefixViewMetadata | None:
-    """Validate independent-prefix metadata without changing attribution semantics."""
-    if prefix_view_metadata is None:
+    """Validate prefix evidence against the typed semantic target."""
+    if prefix_view is None:
+        if prefix_view_metadata is not None:
+            raise ValueError("prefix-view evidence requires a typed problem prefix_view")
         return None
     prefix_tokens = _tokens_from_prompt_for_prefix_view(prompt)
     target_ids = _token_ids_from_attribution_targets(attribution_targets)
+    evidence = prefix_view_metadata or {}
+    reserved = {"mode", "target_position"}.intersection(evidence)
+    if reserved:
+        names = ", ".join(sorted(reserved))
+        raise ValueError(f"prefix-view {names} belong to the typed problem, not evidence")
+    prefix_token_count = int(prefix_view.target_position)
     normalized: PrefixViewMetadata = {
-        "schema_version": int(prefix_view_metadata.get("schema_version", 1)),
-        "mode": str(prefix_view_metadata.get("mode", "independent_prefix")),
-        "target_position": int(prefix_view_metadata["target_position"]),
-        "prefix_token_count": int(prefix_view_metadata["prefix_token_count"]),
-        "target_token_ids": [
-            int(token_id) for token_id in prefix_view_metadata["target_token_ids"]
-        ],
-        "prefix_token_ids_sha256": str(prefix_view_metadata["prefix_token_ids_sha256"]),
+        "schema_version": int(evidence.get("schema_version", 1)),
+        "mode": prefix_view.mode,
+        "target_position": prefix_view.target_position,
+        "prefix_token_count": int(evidence.get("prefix_token_count", prefix_token_count)),
+        "target_token_ids": [int(token_id) for token_id in evidence.get("target_token_ids", target_ids)],
+        "prefix_token_ids_sha256": str(
+            evidence.get(
+                "prefix_token_ids_sha256",
+                _hash_token_ids(prefix_tokens[:prefix_token_count]),
+            )
+        ),
     }
     for key in ("trace_id", "trajectory_id"):
-        if key in prefix_view_metadata and prefix_view_metadata[key] is not None:
-            normalized[key] = str(prefix_view_metadata[key])
+        if key in evidence and evidence[key] is not None:
+            normalized[key] = str(evidence[key])
     for key in ("output_position", "input_token_count", "full_sequence_token_count"):
-        if key in prefix_view_metadata and prefix_view_metadata[key] is not None:
-            normalized[key] = int(prefix_view_metadata[key])
+        if key in evidence and evidence[key] is not None:
+            normalized[key] = int(evidence[key])
     if (
-        "input_token_ids_sha256" in prefix_view_metadata
-        and prefix_view_metadata["input_token_ids_sha256"] is not None
+        "input_token_ids_sha256" in evidence
+        and evidence["input_token_ids_sha256"] is not None
     ):
-        normalized["input_token_ids_sha256"] = str(prefix_view_metadata["input_token_ids_sha256"])
+        normalized["input_token_ids_sha256"] = str(evidence["input_token_ids_sha256"])
     if normalized["mode"] not in ("independent_prefix", "full_sequence_target_position"):
         raise ValueError(
             "prefix_view_metadata mode must be 'independent_prefix' or "

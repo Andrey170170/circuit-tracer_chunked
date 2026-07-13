@@ -3,7 +3,7 @@ from typing import cast
 import torch
 
 from circuit_tracer.transcoder.decoder_cache import DecoderChunkCache
-from circuit_tracer.utils.telemetry import TelemetryRecorder
+from circuit_tracer.observability.events import TraceEvent, TraceObserver
 
 
 class DiagnosticsMixin:
@@ -47,10 +47,10 @@ class DiagnosticsMixin:
         *,
         chunk_interval: int = 16,
         decoder_load_interval: int = 32,
-        telemetry_recorder: TelemetryRecorder | None = None,
+        trace_observer: TraceObserver | None = None,
     ) -> None:
         self._trace_logger = logger
-        self._telemetry_recorder = telemetry_recorder
+        self._trace_observer = trace_observer
         self._trace_chunk_interval = max(1, chunk_interval)
         self._trace_decoder_load_interval = max(1, decoder_load_interval)
 
@@ -71,19 +71,21 @@ class DiagnosticsMixin:
                 message = f"{message} | {payload}"
             self._trace_logger(message)
 
-        if self._telemetry_recorder is not None:
+        if self._trace_observer is not None:
             elapsed_ms = fields.get("elapsed_ms")
             elapsed_ms_value: float | None
             if isinstance(elapsed_ms, (int, float)):
                 elapsed_ms_value = float(elapsed_ms)
             else:
                 elapsed_ms_value = None
-            self._telemetry_recorder.record_event(
-                scope="op",
-                name=f"transcoder.{event}",
-                phase=self._infer_phase_from_trace_event(event),
-                elapsed_ms=elapsed_ms_value,
-                attrs=fields,
+            self._trace_observer.observe(
+                TraceEvent(
+                    scope="op",
+                    name=f"transcoder.{event}",
+                    phase=self._infer_phase_from_trace_event(event),
+                    elapsed_ms=elapsed_ms_value,
+                    attrs=fields,
+                )
             )
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:

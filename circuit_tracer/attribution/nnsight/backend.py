@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from typing import TYPE_CHECKING, Any
 
 from circuit_tracer.attribution.nnsight.execution import (
@@ -29,9 +28,9 @@ from circuit_tracer.attribution.nnsight.preparation import (
 )
 from circuit_tracer.attribution.nnsight.run_scope import AttributionRunScope
 from circuit_tracer.graph import Graph
-from circuit_tracer.observability.human_logs import _log_memory_boundary
-from circuit_tracer.observability.lifecycle import TelemetryObserver
+from circuit_tracer.observability.events import TraceObserver
 from circuit_tracer.tracing.plan import ResolvedTracePlan
+from circuit_tracer.execution_identity import ExecutionIdentityState
 from circuit_tracer.tracing.problem import AttributionProblem
 from circuit_tracer.transcoder.provider import (
     get_transcoder_capabilities,
@@ -46,7 +45,9 @@ def run_nnsight_trace(
     problem: AttributionProblem,
     plan: ResolvedTracePlan,
     *,
+    observer: TraceObserver | None = None,
     forward_overrides: ForwardOverrides | None = None,
+    execution_identity: ExecutionIdentityState,
 ) -> Graph | dict[str, object]:
     """Execute one resolved plan while owning logging and module offload cleanup."""
     from circuit_tracer.attribution.nnsight.forward_session import ForwardOverrides
@@ -66,12 +67,15 @@ def run_nnsight_trace(
     prefix_view_metadata = validate_prefix_view_metadata(
         prompt=problem.prompt,
         attribution_targets=problem.targets,
+        prefix_view=problem.prefix_view,
         prefix_view_metadata=plan.evidence_metadata.get("prefix_view_metadata"),
     )
     output_position = _resolve_prefix_view_output_position(
         prefix_view_metadata,
         problem.output_position,
     )
+    if observer is None:
+        raise RuntimeError("run_nnsight_trace must be invoked through the canonical trace runner")
     offload_handles: list[Any] = []
     try:
         return _run_attribution(
@@ -82,10 +86,10 @@ def run_nnsight_trace(
             forward_overrides=forward_overrides or ForwardOverrides(),
             prefix_view_metadata=prefix_view_metadata,
             output_position=output_position,
+            observer=observer,
+            execution_identity=execution_identity,
         )
     finally:
-        for reload_handle in offload_handles:
-            reload_handle()
         if handler is not None:
             logger.removeHandler(handler)
 
@@ -99,49 +103,42 @@ def _run_attribution(
     forward_overrides: ForwardOverrides,
     prefix_view_metadata: PrefixViewMetadata | None,
     output_position: int | None,
+    observer: TraceObserver,
+    execution_identity: ExecutionIdentityState,
 ) -> Graph | dict[str, object]:
     """Prepare mechanisms, execute Phase 0-5 operations, then close the lifecycle."""
-    prepared = prepare_backend(
-        problem=problem,
-        plan=plan,
-        logger=logger,
-        offload_handles=offload_handles,
-        forward_overrides=forward_overrides,
-        prefix_view_metadata=prefix_view_metadata,
-        output_position=output_position,
-        dependencies=PreparationDependencies(
-            get_capabilities=get_transcoder_capabilities,
-            require_exact_provider=require_exact_chunked_provider,
-            telemetry_observer_type=TelemetryObserver,
-        ),
-    )
-    scope = AttributionRunScope(
-        logger=logger,
-        model=problem.model,
-        telemetry_observer=prepared.diagnostics.observer,
-        compact_output=plan.execution.compact_output,
-        profile=plan.execution.observability.profile,
-        prefix_view_metadata=prefix_view_metadata,
-        log_memory_boundary=_log_memory_boundary,
-        anomaly_debug_result=prepared.diagnostics.anomaly_debug_result,
-        cross_cluster_debug_summary=prepared.diagnostics.cross_cluster_summary,
-        cross_cluster_debug_checkpoints=prepared.diagnostics.cross_cluster_checkpoints,
-        cross_cluster_debug_batches=prepared.diagnostics.cross_cluster_batches,
-    )
-    execution = AttributionExecution(
-        prepared=prepared,
-        scope=scope,
-        operations=BackendOperations(
-            run_phase0=run_phase0,
-            run_phase1=_run_phase1_forward_pass,
-            run_phase2=run_phase2,
-            run_phase3=run_phase3,
-            run_phase4=run_phase4,
-            run_phase5=run_phase5,
-        ),
-    )
+    scope = AttributionRunScope(offload_handles=offload_handles)
     try:
+        prepared = prepare_backend(
+            problem=problem,
+            plan=plan,
+            logger=logger,
+            offload_handles=offload_handles,
+            forward_overrides=forward_overrides,
+            prefix_view_metadata=prefix_view_metadata,
+            output_position=output_position,
+            observer=observer,
+            dependencies=PreparationDependencies(
+                get_capabilities=get_transcoder_capabilities,
+                require_exact_provider=require_exact_chunked_provider,
+            ),
+        )
+        execution_identity.mark_effective(prepared.effective_execution)
+        execution = AttributionExecution(
+            prepared=prepared,
+            scope=scope,
+            operations=BackendOperations(
+                run_phase0=run_phase0,
+                run_phase1=_run_phase1_forward_pass,
+                run_phase2=run_phase2,
+                run_phase3=run_phase3,
+                run_phase4=run_phase4,
+                run_phase5=run_phase5,
+            ),
+        )
         return execution.run()
     finally:
+        import sys
+
         _, primary_error, _ = sys.exc_info()
         scope.close(primary_error)

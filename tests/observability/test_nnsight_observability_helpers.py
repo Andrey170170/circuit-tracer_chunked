@@ -4,6 +4,7 @@ import logging
 import torch
 from circuit_tracer.attribution.nnsight import telemetry
 from circuit_tracer.observability import human_logs
+from circuit_tracer.observability.lifecycle import TelemetryObserver
 
 
 def test_human_log_rendering_keeps_existing_message_shape(caplog):
@@ -21,6 +22,7 @@ def test_cross_cluster_runtime_snapshot_keeps_hash_and_scalar_shapes():
             return {"batches": 2}
 
     summary, stream = telemetry._build_cross_cluster_runtime_snapshot(
+        observer=TelemetryObserver.create(),
         device=torch.device("cpu"), ctx=Diagnostics()
     )
     assert summary["ctx_diagnostic_snapshot"] == {"batches": 2}

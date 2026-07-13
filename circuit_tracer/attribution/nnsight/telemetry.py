@@ -3,12 +3,11 @@
 import hashlib
 import json
 import math
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, cast
 
 import torch
 
-from circuit_tracer.observability.human_logs import _snapshot_diagnostics
-from circuit_tracer.observability.resources import get_memory_snapshot
+from circuit_tracer.observability.events import RuntimeSnapshot, TraceObserver
 
 
 def _safe_float(value: torch.Tensor | float | int | None) -> float | None:
@@ -341,34 +340,14 @@ def _hash_json_payload(payload: object) -> str:
 
 def _build_cross_cluster_runtime_snapshot(
     *,
+    observer: TraceObserver,
     device: torch.device | None,
     ctx=None,
     transcoder=None,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    memory_snapshot = get_memory_snapshot(device)
-    ctx_snapshot = _snapshot_diagnostics(ctx)
-    transcoder_snapshot = _snapshot_diagnostics(transcoder)
-    summary_payload: dict[str, object] = {
-        "memory_snapshot": memory_snapshot,
-        "ctx_diagnostic_snapshot": ctx_snapshot,
-        "transcoder_diagnostic_snapshot": transcoder_snapshot,
-        "ctx_diagnostic_snapshot_hash": (
-            _hash_json_payload(ctx_snapshot) if ctx_snapshot is not None else None
+    return cast(
+        tuple[dict[str, object], dict[str, object]],
+        observer.observe(
+            RuntimeSnapshot(device=device, context=ctx, transcoder=transcoder)
         ),
-        "transcoder_diagnostic_snapshot_hash": (
-            _hash_json_payload(transcoder_snapshot) if transcoder_snapshot is not None else None
-        ),
-    }
-    stream_payload: dict[str, object] = {
-        "rss_current_gib": memory_snapshot.get("rss_current_gib"),
-        "rss_gib": memory_snapshot.get("rss_gib"),
-        "cuda_allocated_gib": memory_snapshot.get("cuda_allocated_gib"),
-        "cuda_reserved_gib": memory_snapshot.get("cuda_reserved_gib"),
-        "cuda_max_allocated_gib": memory_snapshot.get("cuda_max_allocated_gib"),
-        "cuda_max_reserved_gib": memory_snapshot.get("cuda_max_reserved_gib"),
-        "ctx_diagnostic_snapshot_hash": summary_payload.get("ctx_diagnostic_snapshot_hash"),
-        "transcoder_diagnostic_snapshot_hash": summary_payload.get(
-            "transcoder_diagnostic_snapshot_hash"
-        ),
-    }
-    return summary_payload, stream_payload
+    )

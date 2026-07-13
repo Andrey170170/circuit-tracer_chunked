@@ -4,13 +4,26 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import circuit_tracer.attribution.nnsight.phases.phase3 as phase3
 from circuit_tracer.attribution.nnsight.phases.phase3 import (
     Phase3Config,
     Phase3Inputs,
     run_phase3,
 )
+from circuit_tracer.attribution.nnsight.phases import (
+    phase3_evidence,
+    phase3_frontier,
+    phase3_rows,
+)
 from circuit_tracer.attribution.nnsight.row_replay import ReplayGraphLifecycle, RowRecipeLedger
+from circuit_tracer.observability.events import (
+    BatchProfile,
+    DiagnosticSnapshot,
+    MemoryBoundary,
+    MemoryDelta,
+    MemorySnapshot,
+    PhaseMetrics,
+    TraceEvent,
+)
 
 
 class FakeTargets:
@@ -45,11 +58,21 @@ class FakeObserver:
         self.batches: list[dict[str, object]] = []
         self.phases: list[dict[str, object]] = []
 
-    def batch(self, **payload: object) -> None:
-        self.batches.append(payload)
-
-    def phase(self, **payload: object) -> None:
-        self.phases.append(payload)
+    def observe(self, observation: object) -> object | None:
+        if isinstance(observation, TraceEvent):
+            payload = {"name": observation.name, "attrs": dict(observation.attrs)}
+            if observation.scope == "batch":
+                payload["batch_index"] = observation.batch_index
+                self.batches.append(payload)
+            elif observation.scope == "phase":
+                self.phases.append(payload)
+        elif isinstance(observation, (MemoryBoundary, PhaseMetrics, BatchProfile)):
+            return None
+        elif isinstance(observation, (MemorySnapshot, MemoryDelta)):
+            return {}
+        elif isinstance(observation, DiagnosticSnapshot):
+            return None
+        return None
 
 
 def _config(**overrides: object) -> Phase3Config:
@@ -130,18 +153,24 @@ def test_phase3_returns_updated_state_and_captured_payloads(monkeypatch) -> None
     gradient_payload = {"capture": "gradient"}
     row_payload = {"capture": "row"}
     expected_staging_buffer = torch.empty((1, 3))
-    monkeypatch.setattr(phase3, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase3, "_log_phase_metrics", lambda *args: None)
     monkeypatch.setattr(
-        phase3,
+        phase3_rows,
         "_copy_rows_to_cpu_staging",
         lambda rows, staging_buffer: (
             rows,
             staging_buffer if staging_buffer is not None else expected_staging_buffer,
         ),
     )
-    monkeypatch.setattr(phase3, "_build_phase3_gradient_bundle_payload", lambda **kwargs: gradient_payload)
-    monkeypatch.setattr(phase3, "_build_phase3_row_bundle_payload", lambda **kwargs: row_payload)
+    monkeypatch.setattr(
+        phase3_evidence,
+        "_build_phase3_gradient_bundle_payload",
+        lambda **kwargs: gradient_payload,
+    )
+    monkeypatch.setattr(
+        phase3_evidence,
+        "_build_phase3_row_bundle_payload",
+        lambda **kwargs: row_payload,
+    )
 
     result = run_phase3(
         inputs=inputs,
@@ -170,7 +199,6 @@ def test_phase3_propagates_compute_batch_exception_without_finalizing(monkeypatc
     failure = RuntimeError("injected phase3 failure")
     ctx = FakeContext(failure)
     observer = FakeObserver()
-    monkeypatch.setattr(phase3, "_log_memory_boundary", lambda *args: None)
 
     with pytest.raises(RuntimeError, match="injected phase3 failure"):
         run_phase3(inputs=_inputs(ctx, observer), config=_config())
@@ -192,15 +220,13 @@ def test_column_tiled_phase3_does_not_require_dense_edge_matrix(monkeypatch) -> 
         edge_matrix=None,
         anomaly_debug_result=None,
     )
-    monkeypatch.setattr(phase3, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase3, "_log_phase_metrics", lambda *args: None)
     calls: list[dict[str, object]] = []
 
     def produce(**kwargs: object):
         calls.append(kwargs)
         return torch.tensor([[2.0, 3.0]]), (torch.tensor([3.0]), torch.tensor([2.0]))
 
-    monkeypatch.setattr(phase3, "produce_and_store_tiled_rows", produce)
+    monkeypatch.setattr(phase3_rows, "produce_and_store_tiled_rows", produce)
 
     result = run_phase3(
         inputs=inputs,
@@ -247,10 +273,8 @@ def test_none_recompute_seed_selection_uses_tiled_reader_when_feature_cap_is_sma
         edge_matrix=None, row_to_node_index=torch.full((2,), -1, dtype=torch.long),
         anomaly_debug_result=None,
     )
-    monkeypatch.setattr(phase3, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase3, "_log_phase_metrics", lambda *args: None)
     monkeypatch.setattr(
-        phase3, "produce_tiled_rows_no_retention",
+        phase3_rows, "produce_tiled_rows_no_retention",
         lambda **kwargs: (torch.tensor([[0.25, 0.5]]), (torch.ones(1), torch.ones(1))),
     )
     calls: list[object] = []
@@ -259,9 +283,9 @@ def test_none_recompute_seed_selection_uses_tiled_reader_when_feature_cap_is_sma
         calls.append(reader)
         return torch.tensor([2.0, 1.0])
 
-    monkeypatch.setattr(phase3, "compute_partial_feature_influences_tiled", tiled)
+    monkeypatch.setattr(phase3_frontier, "compute_partial_feature_influences_tiled", tiled)
     monkeypatch.setattr(
-        phase3, "compute_partial_feature_influences_streaming",
+        phase3_frontier, "compute_partial_feature_influences_streaming",
         lambda *args, **kwargs: pytest.fail("none_recompute seed selection must use read_tile"),
     )
     result = run_phase3(
@@ -298,10 +322,8 @@ def test_phase3_physical_batches_use_global_event_indices(monkeypatch) -> None:
             "cross_cluster_debug_batches": cross_cluster_debug_batches,
         }
     )
-    monkeypatch.setattr(phase3, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase3, "_log_phase_metrics", lambda *args: None)
     monkeypatch.setattr(
-        phase3,
+        phase3_rows,
         "_copy_rows_to_cpu_staging",
         lambda rows, staging_buffer: (rows, staging_buffer),
     )

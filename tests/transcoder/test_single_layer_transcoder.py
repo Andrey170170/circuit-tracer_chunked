@@ -94,20 +94,20 @@ def test_transcoder_set_attribution_components(create_test_transcoder_file, skip
     )
 
     # Verify all required components are present
-    assert "activation_matrix" in components
-    assert "reconstruction" in components
-    assert "encoder_vecs" in components
-    assert "decoder_vecs" in components
-    assert "encoder_to_decoder_map" in components
-    assert "decoder_locations" in components
+    assert components.activation_matrix is not None
+    assert components.reconstruction is not None
+    assert components.encoder_vectors is not None
+    assert components.decoder_vectors is not None
+    assert components.encoder_to_decoder_map is not None
+    assert components.decoder_locations is not None
 
     # Check activation matrix
-    act_matrix = components["activation_matrix"]
+    act_matrix = components.activation_matrix
     assert act_matrix.is_sparse
     assert act_matrix.shape == (n_layers, n_pos, 512)
 
     # Check reconstruction (only positions 1 and beyond)
-    reconstruction = components["reconstruction"]
+    reconstruction = components.reconstruction
     assert reconstruction.shape == (n_layers, n_pos, d_model)
     for layer, transcoder in enumerate(transcoder_set.transcoders):
         assert torch.allclose(
@@ -116,12 +116,12 @@ def test_transcoder_set_attribution_components(create_test_transcoder_file, skip
 
     # Check encoder/decoder vectors have matching counts
     n_active = act_matrix._nnz()
-    assert components["encoder_vecs"].shape[0] == n_active
-    assert components["decoder_vecs"].shape[0] == n_active
-    assert components["encoder_to_decoder_map"].shape[0] == n_active
+    assert components.encoder_vectors.shape[0] == n_active
+    assert components.decoder_vectors.shape[0] == n_active
+    assert components.encoder_to_decoder_map.shape[0] == n_active
 
     # Check decoder locations
-    decoder_locs = components["decoder_locations"]
+    decoder_locs = components.decoder_locations
     assert decoder_locs.shape == (2, n_active)
 
 

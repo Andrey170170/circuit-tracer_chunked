@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import partial
 import time
-from typing import Callable, Iterator, Literal, cast
+from typing import Callable, Iterator, Literal
 
 import torch
 from torch import nn
@@ -13,21 +13,25 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from nnsight.intervention.tracing.tracer import Barrier
 from nnsight import LanguageModel, Envoy, save, CONFIG as NNSIGHT_CONFIG
 
-from circuit_tracer.attribution.context_nnsight import AttributionContext
 from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
-from circuit_tracer.transcoder.provider import (
-    get_transcoder_capabilities,
-    require_exact_chunked_provider,
+from circuit_tracer.replacement_model.model_adapter import (
+    NNSightModelAdapter,
+    resolve_model_adapter,
 )
+from circuit_tracer.replacement_model.nnsight_configuration import (
+    configure_nnsight_replacement_model,
+)
+from circuit_tracer.replacement_model.attribution_setup import (
+    AttributionSetupOperation,
+    AttributionSetupOptions,
+    AttributionSetupInput,
+    Phase0ActivationCapture,
+)
+from circuit_tracer.observability.events import TraceObserver
 from circuit_tracer.utils import get_default_device
 from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
-from circuit_tracer.utils.telemetry import get_memory_snapshot
-from circuit_tracer.utils.tl_nnsight_mapping import (
-    get_mapping,
-    convert_nnsight_config_to_transformerlens,
-)
 
 NNSIGHT_CONFIG.APP.PYMOUNT = False
 NNSIGHT_CONFIG.APP.CROSS_INVOKER = False
@@ -192,6 +196,7 @@ class NNSightReplacementModel(LanguageModel):
     skip_transcoder: bool
     scan: str | list[str] | None
     backend: Literal["nnsight"]
+    model_adapter: NNSightModelAdapter
 
     @classmethod
     def from_config(
@@ -341,52 +346,12 @@ class NNSightReplacementModel(LanguageModel):
         self,
         transcoder_set: TranscoderSet | CrossLayerTranscoder,
     ):
-        self.backend = "nnsight"
-        self.eval()
-        self.cfg = convert_nnsight_config_to_transformerlens(self.config)
-
-        # special case to zero out <bos><start_of_turn>user\n for gemmascope 2 (-it) transcoders
-        gemma_3_it = "gemma-3" in self.cfg.model_name and self.cfg.model_name.endswith("-it")
-        self.zero_positions = slice(0, 4) if gemma_3_it else slice(0, 1)
-
-        transcoder_set.to(self.device, self.dtype)
-        self.transcoders = transcoder_set
-        self.skip_transcoder = transcoder_set.skip_connection
-
-        # ------------------------------------------------------------------
-        # Instead of eagerly resolving hook locations here (which can fail
-        # outside of a `self.trace` context when multiple `.source`s exist),
-        # we cache the *patterns* needed to resolve them and provide dynamic
-        # property accessors which resolve the hooks on-demand inside the
-        # appropriate trace context.
-        # ------------------------------------------------------------------
-        nnsight_config = get_mapping(self.config.architectures[0])  # type: ignore
-
-        self._feature_input_pattern, self._feature_input_io = nnsight_config.feature_hook_mapping[
-            transcoder_set.feature_input_hook
-        ]
-        self._feature_output_pattern, _ = nnsight_config.feature_hook_mapping[
-            transcoder_set.feature_output_hook
-        ]
-
-        self._attention_pattern = nnsight_config.attention_location_pattern
-        # Ensure we consistently store LayerNorm scale patterns as a list.
-        self._layernorm_scale_patterns = nnsight_config.layernorm_scale_location_patterns
-        self._pre_logit_location = nnsight_config.pre_logit_location
-        self._embed_location = nnsight_config.embed_location
-
-        # these are real weights, not envoys
-        self.embed_weight = cast(
-            torch.Tensor, self._resolve_attr(self, nnsight_config.embed_weight)
+        architecture = str(self.config.architectures[0])  # type: ignore
+        adapter = resolve_model_adapter(
+            architecture=architecture,
+            has_chat_template=bool(getattr(self.tokenizer, "chat_template", None)),
         )
-        self.unembed_weight = cast(
-            torch.Tensor, self._resolve_attr(self, nnsight_config.unembed_weight)
-        )
-        self.scan = transcoder_set.scan
-
-        # Make sure the replacement model is entirely frozen by default.
-        for param in self.parameters():
-            param.requires_grad = False
+        configure_nnsight_replacement_model(self, transcoder_set, adapter)
 
     def configure_gradient_flow(self, tracer):
         with tracer.invoke():
@@ -573,17 +538,7 @@ class NNSightReplacementModel(LanguageModel):
 
         tokens = tokens.to(self.device)
 
-        gemma_3_it = "gemma-3" in self.cfg.model_name and self.cfg.model_name.endswith("-it")
-        if gemma_3_it:
-            ignore_prefix = torch.tensor(
-                [2, 105, 2364, 107], dtype=tokens.dtype, device=tokens.device
-            )
-            tokenization_error = (
-                "Input tokens should start with <bos><start_of_turn>user\n, but got {tokens}"
-            )
-            assert tokens.size(0) >= 4 and torch.all(tokens[:4] == ignore_prefix), (
-                tokenization_error.format(tokens=self.tokenizer.decode(tokens.cpu().tolist()))
-            )
+        if self.model_adapter.validate_preserved_prefix(tokens):
             return tokens
 
         # Check if a special token is already present at the beginning
@@ -626,6 +581,7 @@ class NNSightReplacementModel(LanguageModel):
         prefix_view_length: int | None = None,
         decoder_chunk_cache=None,
         decoder_cache_fingerprint: object | None = None,
+        trace_observer: TraceObserver | None = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
@@ -642,281 +598,40 @@ class NNSightReplacementModel(LanguageModel):
             tokens = inputs.squeeze()
 
         assert isinstance(tokens, torch.Tensor), "Tokens must be a tensor"
-        assert tokens.ndim == 1, "Tokens must be a 1D tensor"
-        prefix_view_length_int = None if prefix_view_length is None else int(prefix_view_length)
-        if prefix_view_length_int is not None and (
-            prefix_view_length_int <= 0 or prefix_view_length_int > int(tokens.numel())
-        ):
-            raise ValueError(
-                "prefix_view_length must be in [1, token_count] "
-                f"({prefix_view_length_int} not in [1, {int(tokens.numel())}])"
-            )
-
-        mlp_in_cache = [None] * self.cfg.n_layers
-        mlp_out_cache = [None] * self.cfg.n_layers
-
+        setup_input = AttributionSetupInput.resolve(tokens, prefix_view_length)
         transcoders = self.transcoders
         trace_event = getattr(transcoders, "emit_trace_event", None)
         collect_phase0_pre_clt_input_fingerprints = bool(
             getattr(transcoders, "_phase0_threshold_membership_debug_enabled", False)
         )
-        trace_tokens = tokens
-        if prefix_view_length_int is not None:
-            trace_tokens = tokens[:prefix_view_length_int].contiguous()
-
-        trace_start = time.perf_counter()
-        if callable(trace_event):
-            trace_event(
-                "phase0.setup.trace_start",
-                backend="nnsight",
-                token_count=int(trace_tokens.numel()),
-                original_token_count=int(tokens.numel()),
-            )
-
-        with self.trace(trace_tokens):
-            mlp_in_cache, mlp_out_cache = [], []
-            for feature_input_loc, feature_output_loc in zip(
-                self.feature_input_locs, self.feature_output_locs
-            ):
-                mlp_in_cache.append(feature_input_loc.output)
-
-                # we expect a dummy dimension 0, but GPT-OSS doesn't have one, so we add it.
-                y = feature_output_loc.output
-                if y.ndim == 2:
-                    y = y.unsqueeze(0)  # type: ignore
-                mlp_out_cache.append(y)
-
-            mlp_in_cache = save(torch.cat(mlp_in_cache, dim=0))  # type: ignore
-            mlp_out_cache = save(torch.cat(mlp_out_cache, dim=0))  # type: ignore
-            logits = save(self.output.logits)
-        trace_seconds = time.perf_counter() - trace_start
-        if callable(trace_event):
-            trace_event(
-                "phase0.setup.trace_done",
-                backend="nnsight",
-                elapsed_s=f"{trace_seconds:.2f}",
-                mlp_in_shape=tuple(mlp_in_cache.shape),
-                mlp_out_shape=tuple(mlp_out_cache.shape),
-            )
-
+        captured = Phase0ActivationCapture.run(self, setup_input.phase0_tokens, trace_event)
         phase0_pre_clt_input_fingerprints = (
-            _build_phase0_pre_clt_input_fingerprints(mlp_in_cache)
+            _build_phase0_pre_clt_input_fingerprints(captured.mlp_inputs)
             if collect_phase0_pre_clt_input_fingerprints
             else None
         )
-        phase0_tokens = trace_tokens
-        if prefix_view_length_int is not None:
-            mlp_in_cache = mlp_in_cache[..., :prefix_view_length_int, :].contiguous()
-            mlp_out_cache = mlp_out_cache[..., :prefix_view_length_int, :].contiguous()
-            phase0_pre_clt_input_fingerprints = (
-                _build_phase0_pre_clt_input_fingerprints(mlp_in_cache)
-                if collect_phase0_pre_clt_input_fingerprints
-                else None
-            )
-
-        component_start = time.perf_counter()
-        if callable(trace_event):
-            trace_event("phase0.setup.components_start", backend="nnsight")
-        transcoder_capabilities = get_transcoder_capabilities(transcoders)
-        exact_chunked_decoder = require_exact_chunked_provider(transcoders)
-        exact_encoder_residency_requested = str(exact_encoder_residency).strip().lower()
-        allowed_residency_modes = {"lazy", "active_cpu", "active_pinned_cpu"}
-        if exact_encoder_residency_requested not in allowed_residency_modes:
-            allowed = ", ".join(sorted(allowed_residency_modes))
-            raise ValueError(
-                f"exact_encoder_residency must be one of: {allowed} "
-                f"(got {exact_encoder_residency!r})"
-            )
-
-        exact_encoder_residency_effective = cast(
-            Literal["lazy", "active_cpu", "active_pinned_cpu"],
-            exact_encoder_residency_requested,
-        )
-        exact_encoder_residency_fallback_reason: str | None = None
-        exact_encoder_residency_supported = bool(
-            exact_chunked_decoder and transcoder_capabilities.supports_exact_encoder_residency
-        )
-        if exact_encoder_residency_effective != "lazy" and not exact_encoder_residency_supported:
-            exact_encoder_residency_effective = "lazy"
-            exact_encoder_residency_fallback_reason = (
-                "active encoder residency requires exact encoder-residency provider support; "
-                "falling back to lazy execution"
-            )
-
-        materialize_encoder_vecs_phase0 = bool(
-            exact_chunked_decoder and exact_encoder_residency_effective != "lazy"
-        )
-
-        stage_encoder_vecs_on_cpu_effective = stage_encoder_vecs_on_cpu
-        if materialize_encoder_vecs_phase0:
-            stage_encoder_vecs_on_cpu_effective = True
-
-        if exact_chunked_decoder:
-            attribution_data = transcoders.compute_attribution_components(
-                mlp_in_cache,
-                self.zero_positions,
+        return AttributionSetupOperation(
+            model=self,
+            setup_input=setup_input,
+            capture=captured,
+            options=AttributionSetupOptions(
                 sparsification=sparsification,
-                materialize_encoder_vecs=materialize_encoder_vecs_phase0,
-            )  # type: ignore
-        else:
-            attribution_data = transcoders.compute_attribution_components(
-                mlp_in_cache,
-                self.zero_positions,
-                sparsification=sparsification,
-            )  # type: ignore
-        activation_matrix = cast(torch.Tensor, attribution_data["activation_matrix"])
-        reconstruction = cast(torch.Tensor, attribution_data["reconstruction"])
-        decoder_vecs = cast(torch.Tensor, attribution_data["decoder_vecs"])
-        encoder_vecs = cast(torch.Tensor, attribution_data["encoder_vecs"])
-        encoder_to_decoder_map = cast(torch.Tensor, attribution_data["encoder_to_decoder_map"])
-        decoder_locations = cast(torch.Tensor, attribution_data["decoder_locations"])
-        active_features = int(activation_matrix._nnz())
-        mlp_in_shape = tuple(mlp_in_cache.shape)
-        mlp_out_shape = tuple(mlp_out_cache.shape)
-        reconstruction_shape = tuple(reconstruction.shape)
-        component_seconds = time.perf_counter() - component_start
-        if callable(trace_event):
-            trace_event(
-                "phase0.setup.components_done",
-                backend="nnsight",
-                elapsed_s=f"{component_seconds:.2f}",
-                active_features=active_features,
-            )
-
-        # Compute error vectors
-        error_start = time.perf_counter()
-        if callable(trace_event):
-            trace_event("phase0.setup.error_start", backend="nnsight")
-        error_vectors = mlp_out_cache - reconstruction
-
-        error_vectors[:, self.zero_positions] = 0
-        token_vectors = self.embed_weight[  # type: ignore
-            phase0_tokens
-        ].detach()  # (n_pos, d_model)  # type: ignore
-        retained_logits = logits
-        full_logits = logits if retain_full_logits else None
-        if exact_chunked_decoder and not retain_full_logits:
-            retained_logits = logits[:, -1:, :].contiguous()
-        error_seconds = time.perf_counter() - error_start
-        if callable(trace_event):
-            trace_event(
-                "phase0.setup.error_done",
-                backend="nnsight",
-                elapsed_s=f"{error_seconds:.2f}",
-            )
-        chunked_decoder_state = cast(
-            dict[str, torch.Tensor] | None, attribution_data.get("chunked_decoder_state")
-        )
-
-        memory_device: torch.device | None
-        if isinstance(self.device, torch.device):
-            memory_device = self.device
-        else:
-            try:
-                memory_device = torch.device(str(self.device))
-            except (TypeError, RuntimeError, ValueError):
-                memory_device = None
-
-        encoder_move_memory_before = (
-            get_memory_snapshot(memory_device) if materialize_encoder_vecs_phase0 else None
-        )
-
-        ctx = AttributionContext(
-            activation_matrix=activation_matrix,
-            logits=retained_logits,
-            full_logits=full_logits,
-            error_vectors=error_vectors,
-            token_vectors=token_vectors,
-            decoder_vecs=decoder_vecs,
-            encoder_vecs=encoder_vecs,
-            encoder_to_decoder_map=encoder_to_decoder_map,
-            decoder_locations=decoder_locations,
-            decoder_provider=transcoders if exact_chunked_decoder else None,
-            chunked_decoder_state=chunked_decoder_state,
-            chunked_feature_replay_window=chunked_feature_replay_window,
-            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
-            stage_encoder_vecs_on_cpu=stage_encoder_vecs_on_cpu_effective,
-            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
-            row_subchunk_size=row_subchunk_size,
-            exact_encoder_residency=cast(
-                Literal["lazy", "active_cpu", "active_pinned_cpu"],
-                exact_encoder_residency_effective,
+                retain_full_logits=retain_full_logits,
+                chunked_feature_replay_window=chunked_feature_replay_window,
+                error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+                stage_encoder_vectors_on_cpu=stage_encoder_vecs_on_cpu,
+                stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+                row_subchunk_size=row_subchunk_size,
+                exact_encoder_residency=exact_encoder_residency,
+                internal_precision_requested=internal_precision_requested,
+                resolved_dtype_map=resolved_dtype_map,
+                decoder_chunk_cache=decoder_chunk_cache,
+                decoder_cache_fingerprint=decoder_cache_fingerprint,
             ),
-            materialized_encoder_vecs_during_phase0=materialize_encoder_vecs_phase0,
-            internal_precision_requested=internal_precision_requested,
-            resolved_dtype_map=resolved_dtype_map,
-            decoder_chunk_cache=decoder_chunk_cache,
-            decoder_cache_fingerprint=decoder_cache_fingerprint,
-        )
-        encoder_move_memory_after_stage = (
-            get_memory_snapshot(memory_device) if materialize_encoder_vecs_phase0 else None
-        )
-
-        if materialize_encoder_vecs_phase0:
-            attribution_data.pop("encoder_vecs", None)
-            del encoder_vecs
-        encoder_move_memory_after_free = (
-            get_memory_snapshot(memory_device) if materialize_encoder_vecs_phase0 else None
-        )
-
-        del reconstruction
-        del attribution_data["reconstruction"]
-        del mlp_in_cache
-        del mlp_out_cache
-        del logits
-        del retained_logits
-        if full_logits is not None:
-            del full_logits
-        ctx.setup_diagnostic_stats = {
-            "backend": "nnsight",
-            "token_count": int(tokens.numel()),
-            "phase0_token_count": int(phase0_tokens.numel()),
-            "prefix_view_length": prefix_view_length_int,
-            "trace_seconds": trace_seconds,
-            "component_seconds": component_seconds,
-            "error_seconds": error_seconds,
-            "setup_total_seconds": time.perf_counter() - setup_start,
-            "mlp_in_shape": mlp_in_shape,
-            "mlp_out_shape": mlp_out_shape,
-            "reconstruction_shape": reconstruction_shape,
-            "active_features": active_features,
-            "logit_retention": ctx.logit_retention,
-            "chunked_feature_replay_window": chunked_feature_replay_window,
-            "error_vector_prefetch_lookahead": error_vector_prefetch_lookahead,
-            "stage_encoder_vecs_on_cpu": stage_encoder_vecs_on_cpu,
-            "stage_encoder_vecs_on_cpu_effective": stage_encoder_vecs_on_cpu_effective,
-            "stage_error_vectors_on_cpu": stage_error_vectors_on_cpu,
-            "row_subchunk_size": row_subchunk_size,
-            "exact_encoder_residency_requested": exact_encoder_residency_requested,
-            "exact_encoder_residency_effective": exact_encoder_residency_effective,
-            "exact_encoder_residency_fallback_reason": exact_encoder_residency_fallback_reason,
-            "exact_encoder_staging_destination": getattr(
-                ctx, "exact_encoder_staging_destination", "none"
-            ),
-            "exact_encoder_materialized_during_phase0": bool(materialize_encoder_vecs_phase0),
-            "active_encoder_shape": tuple(ctx.encoder_vecs.shape),
-            "active_encoder_bytes": int(ctx.encoder_vecs.numel() * ctx.encoder_vecs.element_size()),
-            "exact_encoder_pinned_requested": bool(
-                getattr(ctx, "exact_encoder_pinned_requested", False)
-            ),
-            "exact_encoder_pinned_effective": bool(
-                getattr(ctx, "exact_encoder_pinned_effective", False)
-            ),
-            "exact_encoder_pinning_success": getattr(ctx, "exact_encoder_pinning_success", None),
-            "exact_encoder_pinning_failure_reason": getattr(
-                ctx, "exact_encoder_pinning_failure_reason", None
-            ),
-            "exact_encoder_gpu_memory_before_stage": encoder_move_memory_before,
-            "exact_encoder_gpu_memory_after_stage": encoder_move_memory_after_stage,
-            "exact_encoder_gpu_memory_after_free": encoder_move_memory_after_free,
-            "internal_precision_requested": internal_precision_requested,
-            "resolved_dtype_map": resolved_dtype_map,
-            "phase0_pre_clt_input_fingerprints": phase0_pre_clt_input_fingerprints,
-        }
-        ctx.sparsification_stats = cast(
-            dict[str, object] | None, attribution_data.get("sparsification_stats")
-        )
-        return ctx
+            setup_started_at=setup_start,
+            phase0_input_fingerprints=phase0_pre_clt_input_fingerprints,
+            trace_observer=trace_observer,
+        ).run()
 
     def setup_intervention_with_freeze(
         self, inputs: str | torch.Tensor, constrained_layers: range | None = None

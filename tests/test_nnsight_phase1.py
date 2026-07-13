@@ -1,9 +1,9 @@
-import time
 from types import SimpleNamespace
 
 import torch
 
 from circuit_tracer.attribution.nnsight.phases.phase1 import _run_phase1_forward_pass
+from circuit_tracer.observability.events import MemoryBoundary, PhaseMetrics, TraceEvent
 
 
 def test_phase1_forward_pass_call_and_event_order_and_payload(monkeypatch) -> None:
@@ -29,24 +29,13 @@ def test_phase1_forward_pass_call_and_event_order_and_payload(monkeypatch) -> No
             )
 
     class FakeObserver:
-        def phase(self, **payload: object) -> None:
-            calls.append(("event", payload))
+        def observe(self, observation: object) -> None:
+            calls.append(("observation", observation))
 
-    timestamps = iter((10.0, 10.25, 10.5))
+    timestamps = iter((10.0, 10.5))
     monkeypatch.setattr(
         "circuit_tracer.attribution.nnsight.phases.phase1.time.perf_counter",
         lambda: next(timestamps),
-    )
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase1._log_memory_boundary",
-        lambda logger, label, device: calls.append(("memory", (label, device))),
-    )
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase1._log_phase_metrics",
-        lambda logger, label, phase_start, device: (
-            calls.append(("metrics", (label, phase_start, device))),
-            time.perf_counter(),
-        ),
     )
 
     model = SimpleNamespace(device=torch.device("cpu"))
@@ -80,10 +69,10 @@ def test_phase1_forward_pass_call_and_event_order_and_payload(monkeypatch) -> No
     assert [name for name, _ in calls] == [
         "log",
         "log",
-        "memory",
+        "observation",
         "forward",
-        "metrics",
-        "event",
+        "observation",
+        "observation",
     ]
     assert calls[0][1] == "Phase 1: Running forward pass"
     assert calls[1][1] == (
@@ -93,19 +82,17 @@ def test_phase1_forward_pass_call_and_event_order_and_payload(monkeypatch) -> No
         "feature_batch_size=4 | logit_batch_size=3 | cap_reason=test-cap | "
         "trace_batch_size=4"
     )
-    assert calls[2][1] == ("Phase 1 start", torch.device("cpu"))
+    assert calls[2][1] == MemoryBoundary("Phase 1 start", torch.device("cpu"))
     forward_model, forward_ids, forward_batch_size = calls[3][1]
     assert forward_model is model
     assert torch.equal(forward_ids, trace_input_ids)
     assert forward_batch_size == 4
-    assert calls[4][1] == ("Forward pass", 10.0, torch.device("cpu"))
-    assert calls[5][1] == {
-        "name": "phase1.forward_pass",
-        "phase": "phase1",
-        "elapsed_ms": 500.0,
-        "attrs": {
-            "trace_batch_size": 4,
-            **metadata,
-        },
-        "wall_clock": True,
-    }
+    assert calls[4][1] == PhaseMetrics("Forward pass", 10.0, torch.device("cpu"))
+    assert calls[5][1] == TraceEvent(
+        scope="phase",
+        name="phase1.forward_pass",
+        phase="phase1",
+        elapsed_ms=500.0,
+        attrs={"trace_batch_size": 4, **metadata},
+        wall_clock=True,
+    )

@@ -8,9 +8,11 @@ def test_production_has_no_legacy_tracing_entrypoints_or_references() -> None:
     assert not (PACKAGE_ROOT / "runtime.py").exists()
     assert not (PACKAGE_ROOT / "attribution" / "attribute.py").exists()
     assert not (PACKAGE_ROOT / "attribution" / "attribute_nnsight.py").exists()
+    assert not (PACKAGE_ROOT / "attribution" / "attribute_transformerlens.py").exists()
 
     forbidden = (
         "attribute_nnsight",
+        "attribute_transformerlens",
         "circuit_tracer.runtime",
         "circuit_tracer.attribution.attribute import",
     )

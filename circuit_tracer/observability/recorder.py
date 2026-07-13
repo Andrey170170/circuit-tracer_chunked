@@ -171,6 +171,10 @@ class TelemetryRecorder:
         self._sink_last_error = _truncate_text(f"{type(exc).__name__}: {exc}")
         self._sink_status = "error"
 
+    @property
+    def incremental_sink_enabled(self) -> bool:
+        return self._jsonl_path is not None
+
     def _open_sink(self) -> None:
         if self._jsonl_path is None or self._sink is not None:
             return
@@ -394,4 +398,3 @@ class TelemetryRecorder:
             summary = cast(dict[str, object], payload["summary"])
             summary["export_truncated_event_count"] = truncated_count
         return payload
-

@@ -3,21 +3,32 @@ from __future__ import annotations
 import torch
 
 from circuit_tracer.attribution.context_nnsight import AttributionContext
-from circuit_tracer.attribution.nnsight import forward_session
+from circuit_tracer.attribution.nnsight.context_state import (
+    AttributionTensorState,
+    ContextExecutionPolicy,
+    ContextNumericPolicy,
+    DecoderRuntime,
+)
 from circuit_tracer.attribution.nnsight.forward_session import ForwardTraceSession
-from circuit_tracer.tracing import AttributionProblem, TraceRequest, resolve_trace_request
+from circuit_tracer.tracing import AttributionProblem, PrefixViewTarget, TraceRequest
 
 
 class FakeBackendModel:
     backend = "nnsight"
 
 
-def _request(model, *, output_position: int | None = None) -> TraceRequest:
+def _request(
+    model,
+    *,
+    output_position: int | None = None,
+    prefix_view: PrefixViewTarget | None = None,
+) -> TraceRequest:
     return TraceRequest(
         problem=AttributionProblem(
             model=model,
             prompt=[1, 2, 3, 4],
             output_position=output_position,
+            prefix_view=prefix_view,
         )
     )
 
@@ -28,9 +39,53 @@ def _sparse_activation() -> torch.Tensor:
     return torch.sparse_coo_tensor(indices, values, size=(2, 4, 10)).coalesce()
 
 
+def _context(
+    *,
+    activation_matrix: torch.Tensor,
+    error_vectors: torch.Tensor,
+    token_vectors: torch.Tensor,
+    decoder_vecs: torch.Tensor,
+    encoder_vecs: torch.Tensor,
+    encoder_to_decoder_map: torch.Tensor,
+    decoder_locations: torch.Tensor,
+    logits: torch.Tensor,
+    full_logits: torch.Tensor | None = None,
+    chunked_decoder_state: dict[str, torch.Tensor] | None = None,
+) -> AttributionContext:
+    return AttributionContext(
+        tensor_state=AttributionTensorState(
+            activation_matrix=activation_matrix,
+            error_vectors=error_vectors,
+            token_vectors=token_vectors,
+            decoder_vectors=decoder_vecs,
+            encoder_vectors=encoder_vecs,
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=decoder_locations,
+            logits=logits,
+            full_logits=full_logits,
+        ),
+        execution_policy=ContextExecutionPolicy.resolve(
+            chunked_decoder_state=chunked_decoder_state,
+            encoder_vectors=encoder_vecs,
+            error_vectors=error_vectors,
+            exact_encoder_residency="lazy",
+            stage_encoder_vectors_on_cpu=False,
+            stage_error_vectors_on_cpu=False,
+            error_vector_prefetch_lookahead=1,
+            chunked_feature_replay_window=4,
+            row_subchunk_size=None,
+        ),
+        decoder_runtime=DecoderRuntime.resolve(
+            provider=None,
+            chunked_state=chunked_decoder_state,
+        ),
+        numeric_policy=ContextNumericPolicy(),
+    )
+
+
 def test_derive_prefix_view_context_filters_without_mutating_parent() -> None:
     activation = _sparse_activation()
-    ctx = AttributionContext(
+    ctx = _context(
         activation_matrix=activation,
         error_vectors=torch.randn(2, 4, 3),
         token_vectors=torch.randn(4, 3),
@@ -62,17 +117,13 @@ def test_derive_prefix_view_context_filters_without_mutating_parent() -> None:
     assert torch.equal(view.encoder_vecs, ctx.encoder_vecs[torch.tensor([0, 2])])
 
 
-def test_forward_session_delegates_prefix_when_reuse_disabled(monkeypatch) -> None:
-    calls = []
-
-    def fake_run(problem, plan, **kwargs):
-        calls.append((problem, plan, kwargs))
-        return "graph"
-
-    monkeypatch.setattr(forward_session, "run_nnsight_trace", fake_run)
+def test_forward_session_prepares_prefix_when_reuse_disabled() -> None:
     model = FakeBackendModel()
-    selected = _request(model, output_position=1)
-    plan = resolve_trace_request(selected)
+    selected = _request(
+        model,
+        output_position=1,
+        prefix_view=PrefixViewTarget(mode="independent_prefix", target_position=2),
+    )
     session = ForwardTraceSession(
         model=model,
         full_token_ids=[1, 2, 3, 4],
@@ -81,16 +132,13 @@ def test_forward_session_delegates_prefix_when_reuse_disabled(monkeypatch) -> No
         reuse_target_logits=False,
     )
 
-    assert session.trace_target_position(2, selected, plan) == "graph"
-    problem, _, kwargs = calls[0]
+    problem, overrides = session.prepare_target_position(2, selected)
     assert problem.prompt.tolist() == [1, 2]
     assert problem.output_position == 1
-    assert kwargs == {}
+    assert overrides.decoder_chunk_cache is None
 
 
-def test_forward_session_reuses_context_and_window_logits(monkeypatch) -> None:
-    calls = []
-
+def test_forward_session_reuses_context_and_window_logits() -> None:
     class FakeContext:
         def __init__(self):
             self.derived = object()
@@ -118,14 +166,15 @@ def test_forward_session_reuses_context_and_window_logits(monkeypatch) -> None:
             assert kwargs["retain_full_logits"] is True
             return self.ctx
 
-    def fake_run(problem, plan, **kwargs):
-        calls.append((problem, plan, kwargs))
-        return "graph"
-
-    monkeypatch.setattr(forward_session, "run_nnsight_trace", fake_run)
     model = FakeModel()
-    selected = _request(model, output_position=2)
-    plan = resolve_trace_request(selected)
+    selected = _request(
+        model,
+        output_position=2,
+        prefix_view=PrefixViewTarget(
+            mode="full_sequence_target_position",
+            target_position=3,
+        ),
+    )
     session = ForwardTraceSession(
         model=model,
         full_token_ids=[1, 2, 3, 4, 5],
@@ -134,9 +183,9 @@ def test_forward_session_reuses_context_and_window_logits(monkeypatch) -> None:
         reuse_target_logits=True,
     )
 
-    assert session.trace_target_position(3, selected, plan) == "graph"
+    problem, overrides = session.prepare_target_position(3, selected)
+    assert problem is selected.problem
     assert model.setup_calls == 1
-    overrides = calls[0][2]["forward_overrides"]
     assert overrides.phase0_context is model.ctx.derived
     assert overrides.target_logit_source == "full_sequence_window_logits"
     assert torch.equal(overrides.target_logits, torch.arange(10, dtype=torch.float32))

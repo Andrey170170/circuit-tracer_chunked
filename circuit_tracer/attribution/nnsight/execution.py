@@ -13,10 +13,17 @@ from circuit_tracer.attribution.nnsight.phases.phase0 import (
     Phase0Result,
 )
 from circuit_tracer.attribution.nnsight.phases.phase2 import (
+    FrontierBufferPolicy,
     Phase2Config,
+    Phase2ExecutionPolicy,
     Phase2Inputs,
     Phase2ResourceOwner,
     Phase2Result,
+    Phase0ReplayPolicy,
+    Phase3ReplayPolicy,
+    RowStoreLayout,
+    RowStoreRuntime,
+    TargetSelectionPolicy,
 )
 from circuit_tracer.attribution.nnsight.phases.phase3 import (
     Phase3Config,
@@ -29,9 +36,22 @@ from circuit_tracer.attribution.nnsight.phases.phase4 import (
     Phase4Result,
 )
 from circuit_tracer.attribution.nnsight.phases.phase5 import (
+    BatchExecutionSummary,
+    DiagnosticArtifacts,
+    GraphAssemblyLimits,
+    GraphAssemblyRuntime,
+    GraphAssemblyState,
+    GraphOutputOwnership,
+    NumericExecutionSummary,
+    OutputArtifactPolicy,
+    Phase4PolicySummary,
+    Phase4TimingSummary,
+    Phase4WorkSummary,
     Phase5Config,
     Phase5Inputs,
     Phase5Result,
+    ReplayArtifacts,
+    RunProvenance,
 )
 from circuit_tracer.attribution.nnsight.preparation import PreparedBackend
 from circuit_tracer.attribution.nnsight.run_scope import AttributionRunScope
@@ -84,7 +104,6 @@ class AttributionExecution:
                     prompt=p.problem.prompt,
                     sparsification=plan.semantics.sparsification,
                     telemetry_observer=p.diagnostics.observer,
-                    telemetry_recorder=p.diagnostics.recorder,
                     phase0_context_override=p.forward_overrides.phase0_context,
                     prefix_view_metadata=p.prefix_view_metadata,
                     exact_encoder_residency_metadata=(
@@ -178,7 +197,6 @@ class AttributionExecution:
                 input_ids=phase0.input_ids,
                 activation_matrix=phase0.activation_matrix,
                 telemetry_observer=p.diagnostics.observer,
-                telemetry_recorder=p.diagnostics.recorder,
                 cross_cluster_debug_summary=p.diagnostics.cross_cluster_summary,
                 cross_cluster_debug_checkpoints=p.diagnostics.cross_cluster_checkpoints,
                 offload_handles=p.offload_handles,
@@ -187,51 +205,63 @@ class AttributionExecution:
                 resource_owner=owner,
             ),
             config=Phase2Config(
-                output_position=phase0.output_position,
-                n_input_pos=phase0.n_input_pos,
-                max_n_logits=p.problem.max_n_logits,
-                desired_logit_prob=p.problem.desired_logit_prob,
-                phase0_replay_mode_resolved=p.replay.phase0_mode,
-                phase0_donor_bundle_path=p.replay.phase0_bundle_path,
-                phase0_donor_context_policy_resolved=p.replay.phase0_context_policy,
-                capture_phase0_donor_bundle_enabled=(
-                    plan.execution.observability.capture_phase0_donor_bundle
+                targets=TargetSelectionPolicy(
+                    output_position=phase0.output_position,
+                    n_input_pos=phase0.n_input_pos,
+                    max_n_logits=p.problem.max_n_logits,
+                    desired_logit_prob=p.problem.desired_logit_prob,
                 ),
-                offload=plan.execution.offload,
-                max_feature_nodes=plan.semantics.max_feature_nodes,
-                phase3_frontier_buffer_relative_epsilon=frontier.phase3_buffer_relative_epsilon,
-                phase3_frontier_buffer_max_extra=frontier.phase3_buffer_max_extra,
-                phase4_frontier_buffer_relative_epsilon=frontier.phase4_buffer_relative_epsilon,
-                phase4_frontier_buffer_max_extra_per_refresh=(
-                    frontier.phase4_buffer_max_extra_per_refresh
+                phase0_replay=Phase0ReplayPolicy(
+                    mode=p.replay.phase0_mode,
+                    donor_bundle_path=p.replay.phase0_bundle_path,
+                    context_policy=p.replay.phase0_context_policy,
+                    capture_bundle=(
+                        plan.execution.observability.capture_phase0_donor_bundle
+                    ),
                 ),
-                phase4_frontier_buffer_max_extra_total=frontier.phase4_buffer_max_extra_total,
-                compact_output=plan.execution.compact_output,
-                exact_chunked_decoder=p.provider.exact_chunked,
-                use_compact_feature_row_store=p.provider.use_compact_feature_row_store,
-                exact_trace_internal_dtype_resolved=p.numerics.exact_dtype,
-                phase4_refresh_prepared_chunk_cache_bytes_effective=(
-                    p.frontier.prepared_chunk_cache_bytes_effective
+                phase3_replay=Phase3ReplayPolicy(
+                    gradient_mode=p.replay.phase3_gradient_mode,
+                    gradient_bundle_path=p.replay.phase3_gradient_bundle_path,
+                    row_mode=p.replay.phase3_row_mode,
+                    row_bundle_path=p.replay.phase3_row_bundle_path,
+                    validation_policy=p.replay.phase3_validation_policy,
                 ),
-                row_store_cache_control_config=p.frontier.row_store_cache_control,
-                row_store_temp_root_policy_resolved=_resolve_storage_temp_policy(storage),
-                row_store_temp_root=storage.temp_root,
-                row_store_preallocate=storage.preallocate,
-                full_retention_backend=storage.full_retention_backend,
-                feature_row_column_tile_size=storage.feature_column_tile_size,
-                influence_row_tile_size=storage.influence_row_tile_size,
-                influence_column_tile_size=storage.influence_column_tile_size,
-                feature_row_retention=storage.retention,
-                replay_tile_cache_bytes=int(storage.replay_tile_cache_bytes or 0),
-                feature_row_storage_dtype=p.numerics.feature_row_storage_dtype,
-                row_abs_sum_dtype=p.numerics.row_abs_sum_dtype,
-                effective_feature_batch_size=p.batches.feature_batch_size,
-                phase3_gradient_replay_mode_resolved=p.replay.phase3_gradient_mode,
-                phase3_gradient_donor_bundle_path=p.replay.phase3_gradient_bundle_path,
-                phase3_replay_validation_policy_resolved=p.replay.phase3_validation_policy,
-                trace_batch_size=p.batches.trace_batch_size,
-                phase3_row_replay_mode_resolved=p.replay.phase3_row_mode,
-                phase3_row_donor_bundle_path=p.replay.phase3_row_bundle_path,
+                frontier=FrontierBufferPolicy(
+                    phase3_relative_epsilon=frontier.phase3_buffer_relative_epsilon,
+                    phase3_max_extra=frontier.phase3_buffer_max_extra,
+                    phase4_relative_epsilon=frontier.phase4_buffer_relative_epsilon,
+                    phase4_max_extra_per_refresh=frontier.phase4_buffer_max_extra_per_refresh,
+                    phase4_max_extra_total=frontier.phase4_buffer_max_extra_total,
+                ),
+                storage_layout=RowStoreLayout(
+                    retention=storage.retention,
+                    backend=storage.full_retention_backend,
+                    feature_column_tile_size=storage.feature_column_tile_size,
+                    influence_row_tile_size=storage.influence_row_tile_size,
+                    influence_column_tile_size=storage.influence_column_tile_size,
+                    feature_dtype=p.numerics.feature_row_storage_dtype,
+                    row_abs_sum_dtype=p.numerics.row_abs_sum_dtype,
+                ),
+                storage_runtime=RowStoreRuntime(
+                    cache_control=p.frontier.row_store_cache_control,
+                    temp_root_policy=_resolve_storage_temp_policy(storage),
+                    temp_root=storage.temp_root,
+                    preallocate=storage.preallocate,
+                    prepared_chunk_cache_bytes=(
+                        p.frontier.prepared_chunk_cache_bytes_effective
+                    ),
+                    replay_tile_cache_bytes=int(storage.replay_tile_cache_bytes or 0),
+                ),
+                execution=Phase2ExecutionPolicy(
+                    offload=plan.execution.offload,
+                    max_feature_nodes=plan.semantics.max_feature_nodes,
+                    compact_output=plan.execution.compact_output,
+                    exact_chunked_decoder=p.provider.exact_chunked,
+                    use_compact_feature_row_store=p.provider.use_compact_feature_row_store,
+                    exact_dtype=p.numerics.exact_dtype,
+                    effective_feature_batch_size=p.batches.feature_batch_size,
+                    trace_batch_size=p.batches.trace_batch_size,
+                ),
             ),
         )
         self.scope.feature_row_store = self.phase2.feature_row_store
@@ -316,7 +346,6 @@ class AttributionExecution:
                 feature_row_retention=storage.retention,
             ),
         )
-        self.scope.anomaly_debug_result = self.phase3.anomaly_debug_result
 
     def expand_feature_frontier(self) -> None:
         p = self.prepared
@@ -403,12 +432,6 @@ class AttributionExecution:
         )
         self.scope.feature_row_store = self.phase4.feature_row_store
         self.scope.nonfeature_row_store = self.phase4.nonfeature_row_store
-        self.scope.anomaly_debug_result = self.phase4.anomaly_debug_result
-        self.scope.cross_cluster_debug_summary = self.phase4.cross_cluster_debug_summary
-        self.scope.cross_cluster_debug_checkpoints = (
-            self.phase4.cross_cluster_debug_checkpoints
-        )
-        self.scope.cross_cluster_debug_batches = self.phase4.cross_cluster_debug_batches
 
     def assemble_graph(self) -> Any:
         p = self.prepared
@@ -421,133 +444,143 @@ class AttributionExecution:
         frontier = plan.execution.frontier
         edge_matrix = phase4.edge_matrix
 
-        def publish(result: dict[str, object]) -> None:
-            self.scope.compact_output_result = result
-
         def release_dense_matrix() -> None:
             nonlocal edge_matrix
             edge_matrix = None
 
         result = self.operations.run_phase5(
             inputs=Phase5Inputs(
-                logger=p.logger,
-                model=p.problem.model,
-                ctx=phase0.ctx,
-                targets=phase2.targets,
-                telemetry_observer=p.diagnostics.observer,
-                activation_matrix=phase2.activation_matrix,
-                visited=phase4.visited,
-                edge_matrix=edge_matrix,
-                row_to_node_index=phase4.row_to_node_index,
-                input_ids=phase0.input_ids,
-                feature_row_store=phase4.feature_row_store,
-                nonfeature_row_store=phase4.nonfeature_row_store,
-                phase0_replay_metadata=phase2.phase0_replay_metadata,
-                phase3_gradient_replay_metadata=phase2.phase3_gradient_replay_metadata,
-                phase3_row_replay_metadata=phase2.phase3_row_replay_metadata,
-                phase3_frontier_buffer_metadata=phase3.phase3_frontier_buffer_metadata,
-                phase4_frontier_buffer_metadata=phase4.phase4_frontier_buffer_metadata,
-                phase4_execution_metadata=phase4.phase4_execution_metadata,
-                phase0_donor_bundle_payload=phase2.phase0_donor_bundle_payload,
-                phase3_seed_bundle_payload=phase3.phase3_seed_bundle_payload,
-                phase3_gradient_bundle_payload=phase3.phase3_gradient_bundle_payload,
-                phase3_row_bundle_payload=phase3.phase3_row_bundle_payload,
-                feature_semantic_descriptors_payload=(
-                    phase3.feature_semantic_descriptors_payload
+                runtime=GraphAssemblyRuntime(
+                    logger=p.logger,
+                    model=p.problem.model,
+                    ctx=phase0.ctx,
+                    targets=phase2.targets,
+                    observer=p.diagnostics.observer,
+                    input_ids=phase0.input_ids,
                 ),
-                cross_cluster_debug_summary=phase4.cross_cluster_debug_summary,
-                cross_cluster_debug_checkpoints=phase4.cross_cluster_debug_checkpoints,
-                cross_cluster_debug_batches=phase4.cross_cluster_debug_batches,
-                prefix_view_metadata=p.prefix_view_metadata,
-                publish_compact_output_result=publish,
-                release_dense_edge_matrix=release_dense_matrix,
+                graph=GraphAssemblyState(
+                    activation_matrix=phase2.activation_matrix,
+                    visited=phase4.visited,
+                    edge_matrix=edge_matrix,
+                    row_to_node_index=phase4.row_to_node_index,
+                    feature_row_store=phase4.feature_row_store,
+                    nonfeature_row_store=phase4.nonfeature_row_store,
+                ),
+                replay=ReplayArtifacts(
+                    phase0_replay_metadata=phase2.phase0_replay_metadata,
+                    phase3_gradient_replay_metadata=phase2.phase3_gradient_replay_metadata,
+                    phase3_row_replay_metadata=phase2.phase3_row_replay_metadata,
+                    phase0_donor_bundle_payload=phase2.phase0_donor_bundle_payload,
+                    phase3_seed_bundle_payload=phase3.phase3_seed_bundle_payload,
+                    phase3_gradient_bundle_payload=phase3.phase3_gradient_bundle_payload,
+                    phase3_row_bundle_payload=phase3.phase3_row_bundle_payload,
+                ),
+                diagnostics=DiagnosticArtifacts(
+                    phase3_frontier_buffer_metadata=phase3.phase3_frontier_buffer_metadata,
+                    phase4_frontier_buffer_metadata=phase4.phase4_frontier_buffer_metadata,
+                    phase4_execution_metadata=phase4.phase4_execution_metadata,
+                    feature_semantic_descriptors_payload=(
+                        phase3.feature_semantic_descriptors_payload
+                    ),
+                    cross_cluster_debug_summary=phase4.cross_cluster_debug_summary,
+                    cross_cluster_debug_checkpoints=phase4.cross_cluster_debug_checkpoints,
+                    cross_cluster_debug_batches=phase4.cross_cluster_debug_batches,
+                ),
+                output=GraphOutputOwnership(
+                    prefix_view_metadata=p.prefix_view_metadata,
+                    publish_compact_output_result=lambda _result: None,
+                    release_dense_edge_matrix=release_dense_matrix,
+                ),
             ),
             config=Phase5Config(
-                compact_output=plan.execution.compact_output,
-                use_compact_feature_row_store=p.provider.use_compact_feature_row_store,
-                capture_feature_semantic_descriptors_enabled=(
-                    policy.capture_feature_semantic_descriptors
+                output_policy=OutputArtifactPolicy(
+                    compact_output=plan.execution.compact_output,
+                    use_compact_feature_row_store=p.provider.use_compact_feature_row_store,
+                    capture_feature_semantic_descriptors=(
+                        policy.capture_feature_semantic_descriptors
+                    ),
+                    capture_phase0_donor_bundle=policy.capture_phase0_donor_bundle,
+                    capture_phase3_seed_bundle=policy.capture_phase3_seed_bundle,
+                    capture_phase3_gradient_bundle=policy.capture_phase3_gradient_bundle,
+                    capture_phase3_row_bundle=policy.capture_phase3_row_bundle,
+                    cross_cluster_debug_enabled=policy.cross_cluster_debug,
+                    phase4_anomaly_debug_enabled=policy.phase4_anomaly_debug,
                 ),
-                capture_phase0_donor_bundle_enabled=policy.capture_phase0_donor_bundle,
-                capture_phase3_seed_bundle_enabled=policy.capture_phase3_seed_bundle,
-                capture_phase3_gradient_bundle_enabled=policy.capture_phase3_gradient_bundle,
-                capture_phase3_row_bundle_enabled=policy.capture_phase3_row_bundle,
-                cross_cluster_debug_enabled=policy.cross_cluster_debug,
-                phase4_anomaly_debug_enabled=policy.phase4_anomaly_debug,
-                n_pos=phase2.n_pos,
-                n_logits=phase2.n_logits,
-                st=phase4.st,
-                total_active_feats=phase2.total_active_feats,
-                total_nodes=phase2.total_nodes,
-                actual_max_feature_nodes=phase4.actual_max_feature_nodes,
-                batch_size=plan.semantics.source_batch_size,
-                feature_batch_size=plan.semantics.feature_batch_size,
-                max_phase4_feature_batch_size=p.batches.max_phase4_feature_batch_size,
-                planner_enabled=p.batches.planner_enabled,
-                planner_status=p.batches.planner_status,
-                planner_skip_reason=p.batches.planner_skip_reason,
-                phase4_scheduler_config=p.frontier.scheduler,
-                phase4_refresh_optimization_config=p.frontier.refresh_optimization,
-                phase4_row_executor_config=p.frontier.row_executor,
-                phase4_row_reduction_config=p.frontier.row_reduction,
-                phase1_trace_batch_metadata=p.batches.phase1_metadata,
-                internal_precision_requested=p.numerics.internal_precision_requested,
-                resolved_dtype_map=p.numerics.dtype_map,
-                phase0_activation_threshold_compare_mode_resolved=(
-                    p.numerics.activation_compare_mode
+                graph_limits=GraphAssemblyLimits(
+                    n_pos=phase2.n_pos,
+                    n_logits=phase2.n_logits,
+                    st=phase4.st,
+                    total_active_feats=phase2.total_active_feats,
+                    total_nodes=phase2.total_nodes,
+                    actual_max_feature_nodes=phase4.actual_max_feature_nodes,
                 ),
-                exact_trace_internal_dtype_name=p.numerics.exact_dtype_name,
-                telemetry_max_events_resolved=p.diagnostics.telemetry_max_events,
-                semantic_descriptor_top_k=policy.semantic_descriptor_top_k,
-                semantic_descriptor_dim=policy.semantic_descriptor_dim,
-                phase4_feature_batch_size=phase4.phase4_feature_batch_size,
-                phase4_executor_reference_batch_size=(
-                    phase4.phase4_executor_reference_batch_size
+                batches=BatchExecutionSummary(
+                    batch_size=plan.semantics.source_batch_size,
+                    feature_batch_size=plan.semantics.feature_batch_size,
+                    max_phase4_feature_batch_size=p.batches.max_phase4_feature_batch_size,
+                    planner_enabled=p.batches.planner_enabled,
+                    planner_status=p.batches.planner_status,
+                    planner_skip_reason=p.batches.planner_skip_reason,
+                    phase1_trace_batch_metadata=p.batches.phase1_metadata,
                 ),
-                phase4_executor_microbatch_size=phase4.phase4_executor_microbatch_size,
-                phase4_refresh_count=phase4.phase4_refresh_count,
-                phase4_scheduler_reference_batch_count=(
-                    phase4.phase4_scheduler_reference_batch_count
+                phase4_policy=Phase4PolicySummary(
+                    phase4_scheduler_config=p.frontier.scheduler,
+                    phase4_refresh_optimization_config=p.frontier.refresh_optimization,
+                    phase4_row_executor_config=p.frontier.row_executor,
+                    phase4_row_reduction_config=p.frontier.row_reduction,
+                    prepared_chunk_cache_bytes=frontier.refresh_prepared_chunk_cache_bytes,
+                    prepared_chunk_cache_bytes_effective=(
+                        p.frontier.prepared_chunk_cache_bytes_effective
+                    ),
+                    active_row_accumulation=frontier.refresh_active_row_accumulation,
+                    active_row_accumulation_effective=(
+                        p.frontier.active_row_accumulation_effective
+                    ),
+                    refresh_aux_fallback_reason=p.frontier.refresh_aux_fallback_reason,
+                    refresh_aux_applicable=p.frontier.refresh_aux_applicable,
                 ),
-                phase4_executor_microbatch_count=phase4.phase4_executor_microbatch_count,
-                phase4_elapsed_ms=phase4.phase4_elapsed_ms,
-                phase4_refresh_elapsed_ms_total=phase4.phase4_refresh_elapsed_ms_total,
-                phase4_feature_batch_elapsed_ms_total=(
-                    phase4.phase4_feature_batch_elapsed_ms_total
+                numerics=NumericExecutionSummary(
+                    internal_precision_requested=p.numerics.internal_precision_requested,
+                    resolved_dtype_map=p.numerics.dtype_map,
+                    activation_compare_mode=p.numerics.activation_compare_mode,
+                    exact_dtype_name=p.numerics.exact_dtype_name,
+                    telemetry_max_events=p.diagnostics.telemetry_max_events,
                 ),
-                phase4_refresh_partial_influence_elapsed_ms_total=(
-                    phase4.phase4_refresh_partial_influence_elapsed_ms_total
+                phase4_work=Phase4WorkSummary(
+                    semantic_descriptor_top_k=policy.semantic_descriptor_top_k,
+                    semantic_descriptor_dim=policy.semantic_descriptor_dim,
+                    feature_batch_size=phase4.phase4_feature_batch_size,
+                    executor_reference_batch_size=phase4.phase4_executor_reference_batch_size,
+                    executor_microbatch_size=phase4.phase4_executor_microbatch_size,
+                    refresh_count=phase4.phase4_refresh_count,
+                    scheduler_reference_batch_count=(
+                        phase4.phase4_scheduler_reference_batch_count
+                    ),
+                    executor_microbatch_count=phase4.phase4_executor_microbatch_count,
                 ),
-                phase4_refresh_rank_topk_elapsed_ms_total=(
-                    phase4.phase4_refresh_rank_topk_elapsed_ms_total
+                phase4_timings=Phase4TimingSummary(
+                    elapsed_ms=phase4.phase4_elapsed_ms,
+                    refresh_elapsed_ms=phase4.phase4_refresh_elapsed_ms_total,
+                    feature_batch_elapsed_ms=phase4.phase4_feature_batch_elapsed_ms_total,
+                    partial_influence_elapsed_ms=(
+                        phase4.phase4_refresh_partial_influence_elapsed_ms_total
+                    ),
+                    rank_topk_elapsed_ms=phase4.phase4_refresh_rank_topk_elapsed_ms_total,
+                    frontier_plan_elapsed_ms=(
+                        phase4.phase4_refresh_frontier_plan_elapsed_ms_total
+                    ),
+                    row_store_read_elapsed_ms=(
+                        phase4.phase4_refresh_row_store_read_elapsed_ms_total
+                    ),
                 ),
-                phase4_refresh_frontier_plan_elapsed_ms_total=(
-                    phase4.phase4_refresh_frontier_plan_elapsed_ms_total
+                provenance=RunProvenance(
+                    start_time=p.start_time,
+                    phase0_context_override=p.forward_overrides.phase0_context,
+                    target_logit_source=p.forward_overrides.target_logit_source,
+                    target_logits_override=p.forward_overrides.target_logits,
                 ),
-                phase4_refresh_row_store_read_elapsed_ms_total=(
-                    phase4.phase4_refresh_row_store_read_elapsed_ms_total
-                ),
-                phase4_refresh_prepared_chunk_cache_bytes=(
-                    frontier.refresh_prepared_chunk_cache_bytes
-                ),
-                phase4_refresh_prepared_chunk_cache_bytes_effective=(
-                    p.frontier.prepared_chunk_cache_bytes_effective
-                ),
-                phase4_refresh_active_row_accumulation=(
-                    frontier.refresh_active_row_accumulation
-                ),
-                phase4_refresh_active_row_accumulation_effective=(
-                    p.frontier.active_row_accumulation_effective
-                ),
-                phase4_refresh_aux_fallback_reason=p.frontier.refresh_aux_fallback_reason,
-                phase4_refresh_aux_applicable=p.frontier.refresh_aux_applicable,
-                start_time=p.start_time,
-                phase0_context_override=p.forward_overrides.phase0_context,
-                target_logit_source=p.forward_overrides.target_logit_source,
-                target_logits_override=p.forward_overrides.target_logits,
             ),
         )
-        self.scope.compact_output_result = result.compact_output_result
         return result.output
 
     def _phase0(self) -> Phase0Result:

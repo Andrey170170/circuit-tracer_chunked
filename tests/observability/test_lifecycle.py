@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from circuit_tracer.observability.lifecycle import TelemetryObserver, _TelemetryObserver
+from circuit_tracer.observability.lifecycle import TelemetryObserver
 from circuit_tracer.observability.recorder import TelemetryRecorder
 
 
@@ -18,7 +18,6 @@ def test_observer_records_paired_lifecycle_event_and_wall_clock() -> None:
     )
     telemetry_export = observer.close_export()
 
-    assert _TelemetryObserver is TelemetryObserver
     assert telemetry_export["events"] == [
         {
             "t_rel_ms": telemetry_export["events"][0]["t_rel_ms"],
@@ -35,9 +34,7 @@ def test_observer_records_paired_lifecycle_event_and_wall_clock() -> None:
     assert summary["wall_clock_elapsed_ms_by_phase"] == {"phase3": 12.5}
 
 
-def test_observer_terminal_success_attaches_compact_result_and_renders_summary(
-    caplog,
-) -> None:
+def test_observer_terminal_success_does_not_mutate_scientific_result(caplog) -> None:
     observer = TelemetryObserver(TelemetryRecorder())
     observer.run(
         name="attribute.done",
@@ -46,14 +43,11 @@ def test_observer_terminal_success_attaches_compact_result_and_renders_summary(
         wall_clock=True,
     )
     telemetry_export = observer.close_export()
-    result: dict[str, object] = {}
 
-    observer.attach_compact_result(result, telemetry_export)
     with caplog.at_level(logging.INFO):
         observer.render_human_summary(logging.getLogger("observer-test"), telemetry_export)
 
-    assert result["telemetry_summary"] == telemetry_export["summary"]
-    assert result["telemetry_events"] == telemetry_export["events"]
+    assert not hasattr(observer, "attach_compact_result")
     assert "event_count=1 | stored_event_count=1 | dropped_event_count=0" in caplog.text
 
 

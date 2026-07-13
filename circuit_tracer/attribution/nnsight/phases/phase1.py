@@ -8,11 +8,12 @@ from typing import Protocol
 
 import torch
 
-from circuit_tracer.observability.human_logs import (
-    _log_memory_boundary,
-    _log_phase_metrics,
+from circuit_tracer.observability.events import (
+    MemoryBoundary,
+    PhaseMetrics,
+    TraceEvent,
+    TraceObserver,
 )
-from circuit_tracer.observability.lifecycle import TelemetryObserver
 
 
 class _Logger(Protocol):
@@ -53,7 +54,7 @@ def _run_phase1_forward_pass(
     effective_source_batch_size: int,
     effective_feature_batch_size: int,
     effective_logit_batch_size: int,
-    telemetry_observer: TelemetryObserver,
+    telemetry_observer: TraceObserver,
 ) -> None:
     """Run Phase 1 while preserving its logging and telemetry contract."""
     logger.info("Phase 1: Running forward pass")
@@ -71,22 +72,25 @@ def _run_phase1_forward_pass(
         f"trace_batch_size={trace_batch_size}"
     )
     phase_start = time.perf_counter()
-    _log_memory_boundary(logger, "Phase 1 start", model.device)
+    telemetry_observer.observe(MemoryBoundary("Phase 1 start", model.device))
     ctx.run_forward_pass(
         model,
         trace_input_ids,
         trace_batch_size=trace_batch_size,
     )
 
-    _log_phase_metrics(logger, "Forward pass", phase_start, model.device)
+    telemetry_observer.observe(PhaseMetrics("Forward pass", phase_start, model.device))
     phase1_elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
-    telemetry_observer.phase(
-        name="phase1.forward_pass",
-        phase="phase1",
-        elapsed_ms=phase1_elapsed_ms,
-        attrs={
-            "trace_batch_size": int(trace_batch_size),
-            **trace_batch_metadata,
-        },
-        wall_clock=True,
+    telemetry_observer.observe(
+        TraceEvent(
+            scope="phase",
+            name="phase1.forward_pass",
+            phase="phase1",
+            elapsed_ms=phase1_elapsed_ms,
+            attrs={
+                "trace_batch_size": int(trace_batch_size),
+                **trace_batch_metadata,
+            },
+            wall_clock=True,
+        )
     )

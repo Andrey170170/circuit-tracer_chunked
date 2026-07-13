@@ -1,6 +1,10 @@
 """Canonical typed tracing API."""
 
 from .api import open_session, trace_batch, trace_one
+from circuit_tracer.execution_identity import (
+    EffectiveExecutionDescriptor,
+    EffectiveExecutionIdentity,
+)
 from .plan import (
     DecoderCachePolicy,
     ExecutionConstraints,
@@ -13,7 +17,7 @@ from .plan import (
     TraceEvidence,
 )
 from .planning import resolve_trace_request
-from .problem import AttributionProblem, FrontierSemantics, TraceSemantics
+from .problem import AttributionProblem, FrontierSemantics, PrefixViewTarget, TraceSemantics
 from .request import TraceRequest
 from .result import TraceResult, TraceStatus
 from .session import SessionWindow, TraceSession
@@ -22,9 +26,12 @@ __all__ = [
     "AttributionProblem",
     "DecoderCachePolicy",
     "ExecutionConstraints",
+    "EffectiveExecutionDescriptor",
+    "EffectiveExecutionIdentity",
     "FrontierExpansionPlan",
     "FrontierSemantics",
     "ObservabilityPolicy",
+    "PrefixViewTarget",
     "ReplayPlan",
     "ResolvedTracePlan",
     "RowStoragePlan",

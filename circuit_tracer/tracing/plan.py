@@ -197,12 +197,17 @@ class TraceEvidence:
 
 @dataclass(frozen=True)
 class ResolvedTracePlan:
-    """Validated, fingerprinted plan consumed by tracing phases without fallback resolution."""
+    """Validated requested policy; backend preparation may resolve effective mechanisms."""
 
     semantics: TraceSemantics
     execution: ExecutionConstraints
     semantic_fingerprint: str
-    execution_fingerprint: str
+    requested_execution_fingerprint: str
     backend: Literal["nnsight", "transformerlens"]
     evidence_metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
     admission_report: Any = None
+
+    @property
+    def execution_fingerprint(self) -> str:
+        """Compatibility alias for the pre-execution requested-policy fingerprint."""
+        return self.requested_execution_fingerprint

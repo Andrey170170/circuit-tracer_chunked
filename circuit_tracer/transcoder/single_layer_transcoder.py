@@ -17,6 +17,7 @@ from circuit_tracer.attribution.sparsification import (
     select_candidate_feature_indices,
 )
 from circuit_tracer.transcoder.activation_functions import JumpReLU
+from circuit_tracer.transcoder.attribution_result import AttributionComponents
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
 from circuit_tracer.utils import get_default_device
 
@@ -614,7 +615,7 @@ class TranscoderSet(nn.Module):
         sparsification: SparsificationConfig | None = None,
         *,
         materialize_encoder_vecs: bool = True,
-    ) -> dict[str, object]:
+    ) -> AttributionComponents:
         """Extract active features and their encoder/decoder vectors for attribution.
 
         Args:
@@ -677,23 +678,21 @@ class TranscoderSet(nn.Module):
                 (0, self.d_model), device=device, dtype=activation_matrix.dtype
             )
             empty_locations = torch.empty((2, 0), device=device, dtype=torch.long)
-            attribution_data = {
-                "activation_matrix": activation_matrix,
-                "reconstruction": reconstruction,
-                "encoder_vecs": encoder_vecs,
-                "decoder_vecs": empty_decoder_vecs,
-                "encoder_to_decoder_map": torch.empty((0,), device=device, dtype=torch.long),
-                "decoder_locations": empty_locations,
-                "chunked_decoder_state": {
+            return AttributionComponents(
+                activation_matrix=activation_matrix,
+                reconstruction=reconstruction,
+                encoder_vectors=encoder_vecs,
+                decoder_vectors=empty_decoder_vecs,
+                encoder_to_decoder_map=torch.empty((0,), device=device, dtype=torch.long),
+                decoder_locations=empty_locations,
+                chunked_decoder_state={
                     "source_layers": layer_ids,
                     "positions": pos_ids,
                     "feature_ids": feat_ids,
                     "activation_values": activation_matrix.values(),
                 },
-            }
-            if sparsification_stats is not None:
-                attribution_data["sparsification_stats"] = sparsification_stats
-            return attribution_data
+                sparsification_stats=sparsification_stats,
+            )
 
         for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
             layer_mask = layer_ids == layer
@@ -713,21 +712,19 @@ class TranscoderSet(nn.Module):
 
         encoder_to_decoder_map = torch.arange(activation_matrix._nnz(), device=device)
 
-        attribution_data = {
-            "activation_matrix": activation_matrix,
-            "reconstruction": reconstruction,
-            "encoder_vecs": torch.cat(encoder_vectors, dim=0)
+        return AttributionComponents(
+            activation_matrix=activation_matrix,
+            reconstruction=reconstruction,
+            encoder_vectors=torch.cat(encoder_vectors, dim=0)
             if encoder_vectors
             else torch.empty((0, self.d_model), device=device, dtype=self.dtype),
-            "decoder_vecs": torch.cat(decoder_vectors, dim=0)
+            decoder_vectors=torch.cat(decoder_vectors, dim=0)
             if decoder_vectors
             else torch.empty((0, self.d_model), device=device, dtype=activation_matrix.dtype),
-            "encoder_to_decoder_map": encoder_to_decoder_map,
-            "decoder_locations": activation_matrix.indices()[:2],
-        }
-        if sparsification_stats is not None:
-            attribution_data["sparsification_stats"] = sparsification_stats
-        return attribution_data
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=activation_matrix.indices()[:2],
+            sparsification_stats=sparsification_stats,
+        )
 
     def encode_layer(self, x, layer_id, apply_activation_function=True):
         return self.transcoders[layer_id].encode(

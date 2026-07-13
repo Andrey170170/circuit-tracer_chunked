@@ -73,33 +73,33 @@ def test_compute_attribution_components(create_test_clt_files, skip_connection):
     components = clt.compute_attribution_components(inputs, zero_positions=slice(0, 1))
 
     # Verify all required components are present
-    assert "activation_matrix" in components
-    assert "reconstruction" in components
-    assert "encoder_vecs" in components
-    assert "decoder_vecs" in components
-    assert "encoder_to_decoder_map" in components
-    assert "decoder_locations" in components
+    assert components.activation_matrix is not None
+    assert components.reconstruction is not None
+    assert components.encoder_vectors is not None
+    assert components.decoder_vectors is not None
+    assert components.encoder_to_decoder_map is not None
+    assert components.decoder_locations is not None
 
     # Check activation matrix
-    act_matrix = components["activation_matrix"]
+    act_matrix = components.activation_matrix
     assert act_matrix.is_sparse
     assert act_matrix.shape == (clt.n_layers, n_pos, clt.d_transcoder)
 
     # Check reconstruction (only positions 1 and beyond)
-    reconstruction = components["reconstruction"]
+    reconstruction = components.reconstruction
     assert reconstruction.shape == (clt.n_layers, n_pos, clt.d_model)
     assert torch.allclose(reconstruction[:, 1:], clt(inputs)[:, 1:])
 
     # Check encoder/decoder vectors have consistent counts
     n_active_encoders = act_matrix._nnz()
-    assert components["encoder_vecs"].shape[0] == n_active_encoders
+    assert components.encoder_vectors.shape[0] == n_active_encoders
 
     # Decoder count should be >= encoder count due to cross-layer writing
-    assert components["decoder_vecs"].shape[0] >= n_active_encoders
-    assert components["decoder_vecs"].shape[1] == clt.d_model
+    assert components.decoder_vectors.shape[0] >= n_active_encoders
+    assert components.decoder_vectors.shape[1] == clt.d_model
 
     # Check decoder locations
-    decoder_locs = components["decoder_locations"]
+    decoder_locs = components.decoder_locations
     assert decoder_locs.shape[0] == 2
 
 

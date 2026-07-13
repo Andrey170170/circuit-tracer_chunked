@@ -8,6 +8,8 @@ from typing import cast
 
 import torch
 
+from circuit_tracer.observability.events import CudaMemoryProbe, CudaMemorySnapshot
+
 try:
     import resource
 except ImportError:  # pragma: no cover - non-Unix fallback
@@ -324,6 +326,28 @@ def get_memory_snapshot(device: torch.device | None = None) -> dict[str, float |
     return snapshot
 
 
+def probe_cuda_memory(probe: CudaMemoryProbe) -> CudaMemorySnapshot:
+    """Execute one typed CUDA allocator operation for domain code."""
+
+    if not torch.cuda.is_available():
+        return CudaMemorySnapshot(available=False)
+
+    device = torch.cuda.current_device() if probe.device is None else probe.device
+    if probe.operation == "reset_peak":
+        torch.cuda.reset_peak_memory_stats(device)
+    elif probe.operation == "synchronize":
+        torch.cuda.synchronize(device)
+    elif probe.operation != "snapshot":
+        raise ValueError(f"unsupported CUDA memory probe: {probe.operation}")
+
+    return CudaMemorySnapshot(
+        available=True,
+        current_reserved_bytes=int(torch.cuda.memory_reserved(device)),
+        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        total_bytes=int(torch.cuda.get_device_properties(device).total_memory),
+    )
+
+
 def format_memory_snapshot(
     device: torch.device | None = None, extra: Mapping[str, object] | None = None
 ) -> str:
@@ -386,4 +410,3 @@ def format_numeric_metrics(metrics: Mapping[str, object], limit: int | None = No
         f"{key}={value:.4f}" if isinstance(value, float) else f"{key}={value}"
         for key, value in items
     )
-

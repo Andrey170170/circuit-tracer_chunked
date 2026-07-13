@@ -4,11 +4,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import circuit_tracer.attribution.nnsight.phases.phase4 as phase4
 from circuit_tracer.attribution.nnsight.phases.phase4 import (
     Phase4Config,
     Phase4Inputs,
     run_phase4,
+)
+from circuit_tracer.observability.events import (
+    BatchProfile,
+    DiagnosticSnapshot,
+    MemoryBoundary,
+    MemoryDelta,
+    MemorySnapshot,
+    NumericDelta,
+    PhaseMetrics,
+    TraceEvent,
 )
 
 
@@ -17,11 +26,21 @@ class FakeObserver:
         self.phases: list[dict[str, object]] = []
         self.batches: list[dict[str, object]] = []
 
-    def phase(self, **payload: object) -> None:
-        self.phases.append(payload)
-
-    def batch(self, **payload: object) -> None:
-        self.batches.append(payload)
+    def observe(self, observation: object) -> object | None:
+        if isinstance(observation, TraceEvent):
+            payload = {"name": observation.name, "attrs": dict(observation.attrs)}
+            if observation.scope == "batch":
+                payload["batch_index"] = observation.batch_index
+                self.batches.append(payload)
+            elif observation.scope == "phase":
+                self.phases.append(payload)
+        elif isinstance(observation, (MemoryBoundary, PhaseMetrics, BatchProfile)):
+            return None
+        elif isinstance(observation, (MemorySnapshot, MemoryDelta, NumericDelta)):
+            return {}
+        elif isinstance(observation, DiagnosticSnapshot):
+            return None
+        return None
 
 
 class FakeRowStore:
@@ -139,11 +158,9 @@ def _inputs(observer: FakeObserver) -> Phase4Inputs:
     )
 
 
-def test_phase4_returns_boundary_state_without_replacing_owned_buffers(monkeypatch) -> None:
+def test_phase4_returns_boundary_state_without_replacing_owned_buffers() -> None:
     observer = FakeObserver()
     inputs = _inputs(observer)
-    monkeypatch.setattr(phase4, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase4, "_log_phase_metrics", lambda *args, **kwargs: None)
 
     result = run_phase4(inputs=inputs, config=_config())
 
@@ -201,8 +218,6 @@ def test_phase4_nonzero_dense_execution_writes_rows_and_returns_owned_state(
     config = replace(
         _config(), actual_max_feature_nodes=1, total_active_feats=1, logit_offset=2
     )
-    monkeypatch.setattr(phase4, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase4, "_log_phase_metrics", lambda *args, **kwargs: None)
 
     result = run_phase4(inputs=inputs, config=config)
 
@@ -250,8 +265,6 @@ def test_phase4_nonzero_compact_execution_appends_partitioned_rows_to_owned_stor
         row_store_capacity_feature_nodes=1,
         use_compact_feature_row_store=True,
     )
-    monkeypatch.setattr(phase4, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase4, "_log_phase_metrics", lambda *args, **kwargs: None)
 
     result = run_phase4(inputs=inputs, config=config)
 
@@ -284,12 +297,14 @@ def test_phase4_propagates_failure_after_dense_write_without_finalizing(monkeypa
     )
     failure = RuntimeError("injected post-write phase4 failure")
 
-    def fail_after_write(**payload: object) -> None:
-        raise failure
+    original_observe = observer.observe
 
-    monkeypatch.setattr(phase4, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase4, "_log_phase_metrics", lambda *args, **kwargs: None)
-    monkeypatch.setattr(observer, "batch", fail_after_write)
+    def fail_after_write(observation: object) -> object | None:
+        if isinstance(observation, TraceEvent) and observation.name == "phase4.feature_batch":
+            raise failure
+        return original_observe(observation)
+
+    monkeypatch.setattr(observer, "observe", fail_after_write)
 
     with pytest.raises(RuntimeError, match="injected post-write phase4 failure") as exc_info:
         run_phase4(inputs=inputs, config=config)
@@ -320,8 +335,6 @@ def test_phase4_physical_microbatches_preserve_order_and_refresh_result(monkeypa
             row_to_node_index=torch.tensor([7, -1, -1, -1]),
         )
 
-    monkeypatch.setattr(phase4, "_log_memory_boundary", lambda *args: None)
-    monkeypatch.setattr(phase4, "_log_phase_metrics", lambda *args, **kwargs: None)
     whole = run_phase4(
         inputs=inputs_for(FakeObserver()),
         config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, compute_microbatch_max_rows=3),

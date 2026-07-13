@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Callable, Sequence
 
 from circuit_tracer.transcoder.provider import (
     get_transcoder_capabilities,
@@ -12,9 +13,15 @@ from circuit_tracer.transcoder.provider import (
 
 from .planning import resolve_trace_request
 from .plan import DecoderCachePolicy
+from .problem import PrefixViewTarget
 from .request import TraceRequest
-from .result import TraceResult, TraceStatus
+from .result import TraceResult
 from .runner import run_trace
+
+if sys.version_info >= (3, 11):
+    from builtins import BaseExceptionGroup, ExceptionGroup
+else:
+    from exceptiongroup import BaseExceptionGroup, ExceptionGroup
 
 
 @dataclass(frozen=True)
@@ -77,6 +84,37 @@ class _SessionDecoderCache:
             self._provider.clear_decoder_block_cache(cache)
 
 
+def _raise_cleanup_failures(failures: Sequence[BaseException]) -> None:
+    if not failures:
+        return
+    if all(isinstance(error, Exception) for error in failures):
+        raise ExceptionGroup(
+            "Trace session cleanup failed",
+            [error for error in failures if isinstance(error, Exception)],
+        )
+    raise BaseExceptionGroup("Trace session cleanup failed", list(failures))
+
+
+def _attempt_cleanup(
+    label: str,
+    callback: Callable[[], object],
+    *,
+    primary_error: BaseException | None,
+    failures: list[BaseException],
+) -> None:
+    try:
+        callback()
+    except BaseException as cleanup_error:
+        failures.append(cleanup_error)
+        if primary_error is not None:
+            try:
+                primary_error.add_note(
+                    f"trace session {label} cleanup also failed: {cleanup_error!r}"
+                )
+            except BaseException:
+                pass
+
+
 class TraceSession:
     def __init__(self, request: TraceRequest, window: SessionWindow | None = None) -> None:
         self.request = request
@@ -101,12 +139,11 @@ class TraceSession:
         if not self.request.execution.session.decoder_cache.enabled:
             return run_trace(selected.problem, resolve_trace_request(selected))
         from circuit_tracer.attribution.nnsight.forward_session import ForwardOverrides
-        from circuit_tracer.attribution.nnsight.backend import run_nnsight_trace
 
         plan = resolve_trace_request(selected)
         cache, fingerprint = self._decoder_cache.acquire()
         try:
-            output = run_nnsight_trace(
+            return run_trace(
                 selected.problem,
                 plan,
                 forward_overrides=ForwardOverrides(
@@ -114,17 +151,9 @@ class TraceSession:
                     decoder_cache_fingerprint=fingerprint,
                 ),
             )
-        except BaseException:
-            self._decoder_cache.reset()
+        except BaseException as primary_error:
+            self._cleanup_decoder_cache_after_failure(primary_error)
             raise
-        return TraceResult(
-            output=output,
-            semantic_fingerprint=plan.semantic_fingerprint,
-            execution_fingerprint=plan.execution_fingerprint,
-            status=TraceStatus.SUCCEEDED,
-            telemetry_summary=getattr(output, "telemetry_summary", {}),
-            admission_report=plan.admission_report,
-        )
 
     def trace_window(
         self,
@@ -153,44 +182,89 @@ class TraceSession:
             self._reuse = reuse
         elif self._reuse != reuse:
             raise ValueError("reuse cannot change without reset()")
-        window_problem = replace(selected.problem, output_position=target_position - 1)
-        window_request = replace(selected, problem=window_problem)
-        plan = resolve_trace_request(window_request)
-        output = self._delegate.trace_target_position(target_position, window_request, plan)
-        return TraceResult(
-            output=output,
-            semantic_fingerprint=plan.semantic_fingerprint,
-            execution_fingerprint=plan.execution_fingerprint,
-            status=TraceStatus.SUCCEEDED,
-            telemetry_summary=getattr(output, "telemetry_summary", {}),
-            admission_report=plan.admission_report,
+        window_problem = replace(
+            selected.problem,
+            output_position=target_position - 1,
+            prefix_view=PrefixViewTarget(
+                mode=("full_sequence_target_position" if reuse else "independent_prefix"),
+                target_position=target_position,
+            ),
         )
+        window_request = replace(selected, problem=window_problem)
+        problem, overrides = self._delegate.prepare_target_position(
+            target_position,
+            window_request,
+        )
+        plan = resolve_trace_request(replace(window_request, problem=problem))
+        try:
+            return run_trace(problem, plan, forward_overrides=overrides)
+        except BaseException as primary_error:
+            self._cleanup_decoder_cache_after_failure(primary_error)
+            raise
 
     def reset(self) -> None:
         self._ensure_open()
+        failures: list[BaseException] = []
         if self._delegate is not None:
             delegate, self._delegate = self._delegate, None
             self._reuse = None
-            delegate.close()
-        self._decoder_cache.reset()
+            _attempt_cleanup(
+                "forward delegate",
+                delegate.close,
+                primary_error=None,
+                failures=failures,
+            )
+        _attempt_cleanup(
+            "decoder cache",
+            self._decoder_cache.reset,
+            primary_error=None,
+            failures=failures,
+        )
+        _raise_cleanup_failures(failures)
 
     def close(self) -> None:
+        self._close(primary_error=None)
+
+    def _close(self, primary_error: BaseException | None) -> None:
         if self._closed:
             return
-        try:
-            if self._delegate is not None:
-                delegate, self._delegate = self._delegate, None
-                delegate.close()
-        finally:
-            try:
-                self._decoder_cache.close()
-            finally:
-                self._reuse = None
-                self._closed = True
+        failures: list[BaseException] = []
+        if self._delegate is not None:
+            delegate, self._delegate = self._delegate, None
+            _attempt_cleanup(
+                "forward delegate",
+                delegate.close,
+                primary_error=primary_error,
+                failures=failures,
+            )
+        _attempt_cleanup(
+            "decoder cache",
+            self._decoder_cache.close,
+            primary_error=primary_error,
+            failures=failures,
+        )
+        self._reuse = None
+        self._closed = True
+        if primary_error is None:
+            _raise_cleanup_failures(failures)
+
+    def _cleanup_decoder_cache_after_failure(self, primary_error: BaseException) -> None:
+        failures: list[BaseException] = []
+        _attempt_cleanup(
+            "decoder cache reset",
+            self._decoder_cache.reset,
+            primary_error=primary_error,
+            failures=failures,
+        )
 
     def __enter__(self) -> "TraceSession":
         self._ensure_open()
         return self
 
-    def __exit__(self, *_: Any) -> None:
-        self.close()
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        _traceback: Any,
+    ) -> None:
+        self._close(primary_error=exc)

@@ -4,7 +4,7 @@ import os
 import tempfile
 import time
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from circuit_tracer.attribution.nnsight.numerics import _row_abs_sums_to_scaled_l1
-from circuit_tracer.utils.telemetry import TelemetryRecorder
+from circuit_tracer.observability.events import TraceEvent, TraceObserver
 
 _ROW_STORE_CACHE_CONTROL_DEFAULT: Literal["off"] = "off"
 
@@ -98,7 +98,7 @@ class _FileBackedFeatureRowStore:
         temp_root_policy: Literal["default", "env_node_local"] = "default",
         temp_root: str | os.PathLike[str] | None = None,
         preallocate: bool = False,
-        telemetry_recorder: TelemetryRecorder | None = None,
+        trace_observer: TraceObserver | None = None,
     ) -> None:
         if dtype not in (torch.float32, torch.float64):
             raise ValueError(f"Unsupported feature row store dtype: {dtype}")
@@ -172,7 +172,7 @@ class _FileBackedFeatureRowStore:
             OrderedDict()
         )
         self._prepared_read_cache_nbytes = 0
-        self._telemetry_recorder = telemetry_recorder
+        self._trace_observer = trace_observer
         self._closed = False
         self._diagnostic_stats: dict[str, object] = {
             "append_call_count": 0,
@@ -249,6 +249,7 @@ class _FileBackedFeatureRowStore:
             "materialize_last_row_end": None,
         }
 
+    @contextmanager
     def _telemetry_timer(
         self,
         *,
@@ -256,14 +257,20 @@ class _FileBackedFeatureRowStore:
         phase: str | None,
         attrs: dict[str, object],
     ):
-        if self._telemetry_recorder is None:
-            return nullcontext()
-        return self._telemetry_recorder.timer(
-            scope="op",
-            name=name,
-            phase=phase,
-            attrs=attrs,
-        )
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self._trace_observer is not None:
+                self._trace_observer.observe(
+                    TraceEvent(
+                        scope="op",
+                        name=name,
+                        phase=phase,
+                        elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                        attrs=attrs,
+                    )
+                )
 
     @property
     def path(self) -> str:

@@ -1,314 +1,58 @@
 # Research usage notes for this fork
 
-This fork is tuned for **single-GPU, memory-bounded, exact tracing** of **GemmaScope-2 cross-layer transcoders (CLTs)**.
+This fork supports single-GPU, memory-bounded exact tracing of GemmaScope-2 CLTs through the Phase C2 typed API. The legacy compatibility interfaces were removed.
 
-## What changed relative to upstream
-
-- GemmaScope-2 CLTs use an **exact chunked decoder** path automatically.
-- Full decoder expansion is avoided during attribution setup.
-- Optional double-pass sparsification can screen feature candidates before reconstruction and later attribution.
-- Phase 4 partial-influence computation no longer performs an implicit full dense CUDA copy.
-- Verbose attribution runs emit phase-level time and memory telemetry.
-
-The repo-facing API is intentionally kept close to upstream:
-
-- `ReplacementModel.from_pretrained(...)` still works as before.
-- `attribute(...)` still works as before.
-- `attribute_phase0_stats(...)` now exposes a compact Phase-0-only count/timing API.
-- Existing graph consumers should continue to work with the produced `Graph` objects.
-
-## Runtime module ownership
-
-The NNSight attribution runtime is decomposed by responsibility while retaining
-`circuit_tracer.attribution.attribute_nnsight` as the compatibility entry point:
-
-- `attribution/nnsight/phases/phase0.py` through `phase5.py` own typed phase
-  inputs, configuration, execution, and returned state;
-- `attribution/nnsight/phase1_policy.py` and `phase4_policy.py` own execution
-  policy resolution, while replay, row-store, prefix-view, numerics, and shared
-  phase support live beside them;
-- `observability/` owns lifecycle events, bounded recording, incremental JSONL,
-  resource sampling, exception export, and human rendering;
-- `transcoder/` keeps loading, decoder caching, diagnostics, and fingerprints
-  separate from transcoder math objects.
-
-The memory governor resolver remains advisory. This decomposition does not
-apply a plan or change attribution defaults.
-
-## Recommended usage for GemmaScope-2 CLTs
-
-Use:
-
-- `backend="nnsight"`
-- `dtype=torch.bfloat16`
-- `lazy_encoder=True`
-- `lazy_decoder=True`
-- small initial `batch_size`
-- conservative `max_feature_nodes` for smoke runs
-
-Example:
+## Canonical request and result
 
 ```python
 import torch
+from circuit_tracer import (AttributionProblem, ExecutionConstraints, ObservabilityPolicy, ReplacementModel, TraceRequest, TraceSemantics, trace_one)
 
-from circuit_tracer import ReplacementModel
-from circuit_tracer import SparsificationConfig
-from circuit_tracer.attribution.attribute_nnsight import attribute
-
-model = ReplacementModel.from_pretrained(
-    "google/gemma-3-1b-pt",
-    "mwhanna/gemma-scope-2-1b-pt/clt/width_262k_l0_medium_affine",
-    backend="nnsight",
-    dtype=torch.bfloat16,
-    lazy_encoder=True,
-    lazy_decoder=True,
+model = ReplacementModel.from_pretrained("google/gemma-3-1b-pt", "mwhanna/gemma-scope-2-1b-pt/clt/width_262k_l0_medium_affine", backend="nnsight", dtype=torch.bfloat16, lazy_encoder=True, lazy_decoder=True)
+request = TraceRequest(
+    problem=AttributionProblem(model=model, prompt="If Alice has 3 apples and buys 2 more, she has", max_n_logits=4),
+    semantics=TraceSemantics(source_batch_size=16, max_feature_nodes=128),
+    execution=ExecutionConstraints(offload="cpu", observability=ObservabilityPolicy(verbose=True, profile=True, profile_log_interval=1)),
 )
-
-graph = attribute(
-    "If Alice has 3 apples and buys 2 more, she has",
-    model,
-    max_n_logits=4,
-    batch_size=16,
-    max_feature_nodes=128,
-    offload="cpu",
-    verbose=True,
-)
+result = trace_one(request)
+if result.status.value != "succeeded":
+    raise RuntimeError(result.telemetry_summary)
+graph = result.graph
+print(result.semantic_fingerprint, result.execution_fingerprint)
+print(result.telemetry_summary)
 ```
 
-## Enabling Phase 4 cross-batch decoder caching
+`TraceResult` is the provenance boundary: it carries `status`, `graph` (and `output`), independent semantic and execution fingerprints, structured telemetry, and an admission report when produced. Persist the fingerprints and telemetry; do not infer success from a partially written graph artifact.
 
-The exact chunked GemmaScope-2 path now supports an optional **run-scoped cross-batch decoder cache** for Phase 4.
+## Policy ownership
 
-- The cache is **disabled by default**.
-- You must set an explicit budget with `cross_batch_decoder_cache_bytes`.
-- The cache is created once per prompt/run, reused across Phase 4 batches, and cleared on teardown.
-- Telemetry includes cache hits, misses, evictions, resident bytes, and decoder load timing/counts.
+`AttributionProblem` owns the scientific input: model, prompt, optional `targets`, logit-selection objective, and output position. `TraceSemantics` owns choices that can alter the mathematical result, including source/feature batching semantics, maximum retained feature nodes, sparsification, precision, and frontier membership/ranking.
 
-### Recommended script-level usage
+`ExecutionConstraints` owns physical policy: session capacity and microbatches, row storage and staging, replay windows, execution mechanisms, offload, decoder-cache budgeting, and observability. Execution-only changes get a distinct execution fingerprint while preserving the semantic fingerprint, enabling comparisons across hardware and memory policies without conflating them with a changed scientific trace.
 
-There is currently **no CLI flag** and no direct `ReplacementModel.from_pretrained(...)` kwarg for this budget.
-To enable it in scripts, load the GemmaScope-2 CLT explicitly and then build the replacement model from that transcoder object:
+`ObservabilityPolicy`, nested in `ExecutionConstraints`, controls verbose rendering, profiling, bounded event capture, JSONL telemetry paths, and provenance/debug capture. It does not define scientific meaning.
+
+## Targets and sessions
+
+Pass targets through `AttributionProblem(targets=...)`: `None` selects salient logits, a sequence of strings selects token targets, a tensor selects token IDs, and `CustomTarget` / `TargetSpec` values select custom residual directions.
 
 ```python
-import torch
-
-from circuit_tracer import ReplacementModel
-from circuit_tracer.transcoder.cross_layer_transcoder import load_gemma_scope_2_clt
-from circuit_tracer.utils.hf_utils import resolve_transcoder_paths
-
-config = {
-    "repo_id": "mwhanna/gemma-scope-2-1b-pt",
-    "subfolder": "clt/width_262k_l0_medium_affine",
-    "scan": "mwhanna/gemma-scope-2-1b-pt/clt/width_262k_l0_medium_affine",
-    "feature_input_hook": "hook_resid_mid",
-    "feature_output_hook": "hook_mlp_out",
-}
-
-layer_paths = resolve_transcoder_paths(config)
-transcoders = load_gemma_scope_2_clt(
-    layer_paths,
-    device=torch.device("cuda"),
-    dtype=torch.bfloat16,
-    lazy_encoder=True,
-    lazy_decoder=True,
-    decoder_chunk_size=1024,
-    cross_batch_decoder_cache_bytes=2 * 1024**3,  # 2 GiB budget
-)
-
-model = ReplacementModel.from_pretrained_and_transcoders(
-    "google/gemma-3-1b-pt",
-    transcoders,
-    backend="nnsight",
-    device=torch.device("cuda"),
-    dtype=torch.bfloat16,
-)
+from circuit_tracer import SessionWindow, open_session
+session = open_session(request, window=SessionWindow(max_prefix_len=64))
+try:
+    # Submit the session's typed prefix operations here.
+    pass
+finally:
+    session.close()
 ```
 
-### Config-driven usage
+## GemmaScope-2 operational guidance
 
-If you maintain your own transcoder `config.yaml` (for example in a private HuggingFace repo or local cache metadata), you can add:
-
-```yaml
-cross_batch_decoder_cache_bytes: 2147483648
-```
-
-The hub/cache loaders will pass that through automatically.
-
-### Budget guidance
-
-- Start around **1-2 GiB** on single-GPU GemmaScope-2 exact runs.
-- Too-small budgets can cause churn and reduce benefit.
-- If you are tight on memory, set the value to `0` or omit it to disable the cache.
-- Keep `decoder_chunk_size=1024` as the baseline unless you have a strong reason to change it.
-
-To enable early screening on retained candidates, pass a sparsification config:
+Use `backend="nnsight"`, `dtype=torch.bfloat16`, and lazy encoder/decoder loading. The runtime chooses exact chunked decoder handling; callers express only problem semantics and physical constraints. Start with small `TraceSemantics.source_batch_size` and conservative `max_feature_nodes` for smoke work. Adjust `ExecutionConstraints` rather than silently changing the scientific request when capacity is constrained.
 
 ```python
-graph = attribute(
-    prompt,
-    model,
-    batch_size=16,
-    max_feature_nodes=128,
-    sparsification=SparsificationConfig(
-        per_layer_position_topk=4,
-        global_cap=512,
-    ),
-)
+from circuit_tracer import DecoderCachePolicy, ExecutionConstraints, SessionPlan
+execution = ExecutionConstraints(session=SessionPlan(decoder_cache=DecoderCachePolicy(enabled=True, max_bytes=2 * 1024**3)))
 ```
 
-This keeps `attribute(...)` backward compatible when sparsification is omitted, while allowing phase 0 reconstruction and later attribution to reuse the same retained candidate set.
-
-## Offload behavior
-
-- Model/component offload still works.
-- For the exact GemmaScope-2 chunked path, **transcoder offload is intentionally skipped during attribution**.
-- This is required so decoder chunks remain readable during backward scoring.
-
-So if you pass `offload="cpu"` or `offload="disk"`, expect it to help with model memory pressure, but not by moving the active GemmaScope-2 transcoder itself away during attribution.
-
-## Phase 0 count-only analysis
-
-If you want prompt-level feature-count scaling data without tracing the full graph, use:
-
-```python
-from circuit_tracer import attribute_phase0_stats
-
-stats = attribute_phase0_stats(prompt, model)
-```
-
-This returns a compact dict with:
-
-- `token_count`
-- `prompt_token_count`
-- `total_active_features`
-- `active_features_by_layer`
-- `active_features_by_token`
-- `phase0_encode_seconds`
-- `phase0_reconstruction_seconds`
-
-This is the recommended path for Phase-0-only scaling studies, because it avoids Phases 1-4 and does not build a full `Graph` object.
-
-The CLT setup path in this fork also reduces Phase 0 VRAM spikes by replacing the previous list-plus-`torch.cat(...)` active-encoder assembly with a single final allocation plus layer-wise writes.
-
-## Telemetry and logging
-
-With `verbose=True`, attribution logs include:
-
-- per-phase wall time
-- process RSS
-- CUDA allocated/reserved memory
-- peak CUDA allocated/reserved memory
-- key matrix shapes
-
-This is intended for SLURM/HPC debugging.
-
-For deeper bottleneck-finding runs, this fork also supports:
-
-- `profile=True`: emit batch-level profiling logs for attribution
-- `profile_log_interval=N`: log every N batches while profiling
-- `diagnostic_feature_cap=K`: debug-only early active-feature cap for scaling experiments
-- `sparsification=SparsificationConfig(...)`: early candidate screening before reconstruction
-- `feature_batch_size=...`: optional Phase 4-only feature microbatch override
-- `logit_batch_size=...`: optional Phase 3-only logit microbatch override
-
-Example diagnostic comparison:
-
-```python
-graph = attribute(
-    prompt,
-    model,
-    batch_size=16,
-    feature_batch_size=8,
-    logit_batch_size=4,
-    max_feature_nodes=128,
-    profile=True,
-    profile_log_interval=1,
-)
-```
-
-Notes:
-
-- You do **not** need to opt in to the new GemmaScope-2 VRAM behavior separately; it is automatic for GemmaScope-2 CLTs on `backend="nnsight"`.
-- `batch_size` still sets the main trace width; use the split batch knobs only when you want smaller Phase 3/Phase 4 work chunks without changing the legacy call shape.
-- Internal NNSight `setup_attribution(...)` now keeps only last-token logits by default on the exact chunked path. If you explicitly call that method and need full-sequence logits, pass `retain_full_logits=True`.
-
-And to test whether lazy decoder loading is the dominant cost, compare otherwise identical runs with:
-
-- `lazy_decoder=True`
-- `lazy_decoder=False`
-
-The profiling logs report, where applicable:
-
-- setup/precompute timing inside `setup_attribution`
-- live `TRACE ...` progress lines during long-running setup/reconstruction/chunked attribution work
-- per-batch timing in Phases 3 and 4
-- `compute_batch` cumulative timing
-- per-layer feature/error attribution timing
-- decoder load count and decoder load time
-- decoder cache hit/miss/eviction counts and resident bytes
-- chunk counts and chunked attribution timing by layer
-- sparsification candidate counts, per-layer retained counts, and retained activation-mass proxy
-- whether exact chunked teardown completed and phase-boundary memory stayed bounded
-
-If you set `cross_batch_decoder_cache_bytes > 0`, the decoder cache now stays enabled for the full attribution run; interpret hit/miss/eviction counts directly rather than expecting an auto-disable guardrail.
-
-## HPC guidance
-
-- Do **not** run large-model or GPU-heavy validation on shared login nodes.
-- Use batch jobs for GPU tests and smoke runs.
-- A reference script is included at:
-
-```bash
-scripts/slurm/test_gemmascope2_chunked_a100.sbatch
-```
-
-- The expanded VRAM/memory-policy regression job added for this work is:
-
-```bash
-scripts/slurm/test_gemmascope2_chunked_memory_policy_a100.sbatch
-```
-
-- A focused Phase 0 stats / encoder-gather regression job is included at:
-
-```bash
-scripts/slurm/test_phase0_stats_a100.sbatch
-```
-
-- Prefer `uv` commands in jobs and local environments.
-
-Example:
-
-```bash
-uv run pytest -q tests/test_partial_influences.py tests/test_gemmascope2_chunked.py
-```
-
-CLI profiling example:
-
-```bash
-uv run circuit-tracer attribute \
-  --prompt "The capital of France is" \
-  --transcoder_set "mwhanna/gemma-scope-2-1b-pt/clt/width_262k_l0_medium_affine" \
-  --backend nnsight \
-  --dtype bf16 \
-  --lazy-encoder \
-  --profile \
-  --profile-log-interval 1 \
-  --no-lazy-decoder \
-  --diagnostic-feature-cap 256 \
-  --graph_output_path /tmp/debug_graph.pt
-```
-
-## Known fork-specific caveats
-
-- The exact chunked path is enabled specifically for **GemmaScope-2 CLTs**.
-- Some GemmaScope-2 configs contain a duplicated final shard path; the loader normalizes this automatically.
-- The NNSight backend remains more operationally fragile than TransformerLens, so keep an eye on SLURM logs for tracing/runtime issues.
-
-## Validation status in this repo
-
-Validated in this fork with:
-
-- lightweight CPU tests for chunked loading and partial influences
-- A100 40GB SLURM smoke test for Gemma-3-1B + GemmaScope-2 CLT exact chunked tracing
-
-If you scale up prompt counts, steps, or feature budgets, increase them gradually and watch the emitted telemetry.
+The decoder cache is physical session policy. A diagnostic feature cap changes semantics and is appropriate only for explicitly diagnostic runs. Run GPU/model work in scheduled jobs and retain the typed telemetry with the job record.

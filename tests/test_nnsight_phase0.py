@@ -10,6 +10,12 @@ from circuit_tracer.attribution.nnsight.phases.phase0 import (
     Phase0Inputs,
     run_phase0,
 )
+from circuit_tracer.observability.events import (
+    MemoryBoundary,
+    PhaseMetrics,
+    RuntimeSnapshot,
+    TraceEvent,
+)
 
 
 class FakeLogger:
@@ -24,7 +30,7 @@ class FakeTranscoders:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
 
-    def configure_trace_logging(self, callback: object, *, telemetry_recorder: object) -> None:
+    def configure_trace_logging(self, callback: object, *, trace_observer: object) -> None:
         self.calls.append("transcoder.configure")
 
     def reset_diagnostic_stats(self) -> None:
@@ -56,7 +62,7 @@ class FakeContext:
     def set_diagnostic_mode(self, enabled: bool) -> None:
         self.calls.append(f"ctx.diagnostic:{enabled}")
 
-    def configure_trace_logging(self, callback: object, *, telemetry_recorder: object) -> None:
+    def configure_trace_logging(self, callback: object, *, trace_observer: object) -> None:
         self.calls.append("ctx.configure")
 
     def replace_phase0_activation_state(self, matrix: torch.Tensor) -> None:
@@ -92,8 +98,16 @@ class FakeObserver:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
 
-    def phase(self, **payload: object) -> None:
-        self.calls.append(f"event:{payload['name']}")
+    def observe(self, observation: object) -> object | None:
+        if isinstance(observation, MemoryBoundary):
+            self.calls.append("memory")
+        elif isinstance(observation, PhaseMetrics):
+            self.calls.append("metrics")
+        elif isinstance(observation, TraceEvent):
+            self.calls.append(f"event:{observation.name}")
+        elif isinstance(observation, RuntimeSnapshot):
+            return {}, {}
+        return None
 
 
 def _config(**overrides: object) -> Phase0Config:
@@ -162,7 +176,6 @@ def _inputs(
         prompt=[10, 20, 30, 40],
         sparsification=None,
         telemetry_observer=FakeObserver(calls),
-        telemetry_recorder=object(),
         phase0_context_override=override,
         prefix_view_metadata=prefix_view_metadata,  # type: ignore[arg-type]
         exact_encoder_residency_metadata={},
@@ -173,19 +186,10 @@ def _inputs(
     )
 
 
-def test_phase0_ordinary_setup_returns_runtime_values_and_preserves_order(monkeypatch) -> None:
+def test_phase0_ordinary_setup_returns_runtime_values_and_preserves_order() -> None:
     calls: list[str] = []
     ctx = FakeContext(calls)
     model = FakeModel(calls, ctx)
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._log_memory_boundary",
-        lambda *args, **kwargs: calls.append("memory"),
-    )
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._log_phase_metrics",
-        lambda *args, **kwargs: calls.append("metrics"),
-    )
-
     result = run_phase0(inputs=_inputs(calls, model), config=_config(output_position=1))
 
     assert result.ctx is ctx
@@ -207,24 +211,12 @@ def test_phase0_override_prefix_mask_and_event_checkpoint_order(monkeypatch) -> 
     model = FakeModel(calls, ctx)
     checkpoints: list[dict[str, object]] = []
     summary: dict[str, object] = {"checkpoints": {}}
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._log_memory_boundary",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._log_phase_metrics",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._build_cross_cluster_runtime_snapshot",
-        lambda **kwargs: ({}, {}),
-    )
 
     def record_checkpoint(**kwargs: object) -> None:
         calls.append("checkpoint:phase0_sparse_setup")
 
     monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._record_cross_cluster_checkpoint",
+        "circuit_tracer.attribution.nnsight.phases.phase0_evidence._record_cross_cluster_checkpoint",
         record_checkpoint,
     )
     prefix_metadata = {
@@ -259,21 +251,17 @@ def test_phase0_metrics_failure_exposes_context_and_original_cause(monkeypatch) 
     calls: list[str] = []
     ctx = FakeContext(calls)
     model = FakeModel(calls, ctx)
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._log_memory_boundary",
-        lambda *args, **kwargs: None,
-    )
 
-    def fail_metrics(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("injected metrics failure")
+    def fail_metrics(observation: object) -> object | None:
+        if isinstance(observation, PhaseMetrics):
+            raise RuntimeError("injected metrics failure")
+        return None
 
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._log_phase_metrics",
-        fail_metrics,
-    )
+    inputs = _inputs(calls, model)
+    monkeypatch.setattr(inputs.telemetry_observer, "observe", fail_metrics)
 
     try:
-        run_phase0(inputs=_inputs(calls, model), config=_config())
+        run_phase0(inputs=inputs, config=_config())
     except Phase0ExecutionError as exc:
         assert exc.ctx is ctx
         assert isinstance(exc.cause, RuntimeError)
@@ -284,28 +272,34 @@ def test_phase0_metrics_failure_exposes_context_and_original_cause(monkeypatch) 
     assert calls.count("ctx.cleanup") == 0
 
 
+def test_phase0_validation_failure_before_context_is_not_wrapped() -> None:
+    calls: list[str] = []
+    ctx = FakeContext(calls)
+    model = FakeModel(calls, ctx)
+
+    with pytest.raises(ValueError, match="output_position"):
+        run_phase0(inputs=_inputs(calls, model), config=_config(output_position=4))
+
+    assert "model.setup" not in calls
+
+
 def test_phase0_base_exception_exposes_context_and_original_cause(monkeypatch) -> None:
     calls: list[str] = []
     ctx = FakeContext(calls)
     model = FakeModel(calls, ctx)
     original_error = KeyboardInterrupt("injected interrupt")
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._log_memory_boundary",
-        lambda *args, **kwargs: None,
-    )
 
-    def fail_metrics(*args: object, **kwargs: object) -> None:
-        raise original_error
+    def fail_metrics(observation: object) -> object | None:
+        if isinstance(observation, PhaseMetrics):
+            raise original_error
+        return None
 
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.phases.phase0._log_phase_metrics",
-        fail_metrics,
-    )
+    inputs = _inputs(calls, model)
+    monkeypatch.setattr(inputs.telemetry_observer, "observe", fail_metrics)
 
     with pytest.raises(Phase0ExecutionError) as raised:
-        run_phase0(inputs=_inputs(calls, model), config=_config())
+        run_phase0(inputs=inputs, config=_config())
 
     assert raised.value.ctx is ctx
     assert raised.value.cause is original_error
     assert calls.count("ctx.cleanup") == 0
-

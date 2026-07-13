@@ -22,195 +22,98 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
 
 import logging
 import time
-from collections.abc import Sequence
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import torch
 from tqdm import tqdm
 
-from circuit_tracer.attribution.targets import (
-    AttributionTargets,
-    TargetSpec,
-    log_attribution_target_info,
-)
-from circuit_tracer.attribution.sparsification import SparsificationConfig
+from circuit_tracer.attribution.targets import AttributionTargets, log_attribution_target_info
 from circuit_tracer.graph import Graph, compute_partial_influences
+from circuit_tracer.observability.events import (
+    BatchProfile,
+    DiagnosticSnapshot,
+    DiagnosticsMessage,
+    PhaseMetrics,
+    SparsificationProfile,
+    TraceObserver,
+)
 from circuit_tracer.replacement_model.replacement_model_transformerlens import (
     TransformerLensReplacementModel,
 )
-from circuit_tracer.transcoder.provider import exact_chunked_provider_usable, get_transcoder_capabilities
-from circuit_tracer.utils.disk_offload import offload_modules
-from circuit_tracer.utils.telemetry import (
-    diff_numeric_metrics,
-    format_memory_snapshot,
-    format_numeric_metrics,
+from circuit_tracer.tracing.plan import ResolvedTracePlan
+from circuit_tracer.tracing.problem import AttributionProblem
+from circuit_tracer.transcoder.provider import (
+    exact_chunked_provider_usable,
+    get_transcoder_capabilities,
 )
+from circuit_tracer.utils.disk_offload import offload_modules
 
 
-def _log_phase_metrics(logger, label: str, phase_start: float, device, **extra):
-    logger.info(
-        f"{label} completed in {time.time() - phase_start:.2f}s | "
-        f"{format_memory_snapshot(device=device, extra=extra)}"
-    )
+@dataclass
+class _TransformerLensRuntime:
+    observer: TraceObserver
+    logger: logging.Logger
+    offload_handles: list[Any] = field(default_factory=list)
 
 
-def _snapshot_diagnostics(obj) -> dict[str, object] | None:
-    if obj is None or not hasattr(obj, "get_diagnostic_snapshot"):
-        return None
-    return obj.get_diagnostic_snapshot()
-
-
-def _log_batch_profile(
-    logger,
-    label: str,
-    batch_idx: int,
-    total_batches: int,
-    elapsed: float,
-    ctx_before: dict[str, object] | None,
-    ctx_after: dict[str, object] | None,
-    transcoder_before: dict[str, object] | None,
-    transcoder_after: dict[str, object] | None,
-):
-    parts = [f"{label} batch {batch_idx}/{total_batches} in {elapsed:.2f}s"]
-    ctx_delta = diff_numeric_metrics(ctx_before, ctx_after) if ctx_after is not None else {}
-    transcoder_delta = (
-        diff_numeric_metrics(transcoder_before, transcoder_after)
-        if transcoder_after is not None
-        else {}
-    )
-    if ctx_delta:
-        parts.append(f"ctx[{format_numeric_metrics(ctx_delta, limit=12)}]")
-    if transcoder_delta:
-        parts.append(f"transcoder[{format_numeric_metrics(transcoder_delta, limit=12)}]")
-    logger.info(" | ".join(parts))
-
-
-def _log_sparsification_profile(logger, stats: dict[str, object]) -> None:
-    retained = stats.get("per_layer_retained_counts", {})
-    logger.info(
-        "Sparsification screening | "
-        f"candidates={stats.get('candidate_count_before')}->{stats.get('candidate_count_after')} | "
-        f"per_layer_position_topk={stats.get('per_layer_position_topk')} | "
-        f"global_cap={stats.get('global_cap')} | "
-        f"retained_activation_mass={stats.get('retained_activation_mass', 1.0):.4f} | "
-        f"screen_seconds={stats.get('screen_seconds', 0.0):.4f} | "
-        f"per_layer_retained={retained}"
-    )
-
-
-def attribute(
-    prompt: str | torch.Tensor | list[int],
-    model: TransformerLensReplacementModel,
+def run_transformerlens_trace(
+    problem: AttributionProblem,
+    plan: ResolvedTracePlan,
     *,
-    attribution_targets: Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None = None,
-    max_n_logits: int = 10,
-    desired_logit_prob: float = 0.95,
-    batch_size: int = 512,
-    max_feature_nodes: int | None = None,
-    offload: Literal["cpu", "disk", None] = None,
-    verbose: bool = False,
-    update_interval: int = 4,
-    profile: bool = False,
-    profile_log_interval: int = 1,
-    diagnostic_feature_cap: int | None = None,
-    sparsification: SparsificationConfig | None = None,
+    observer: TraceObserver,
 ) -> Graph:
-    """Compute an attribution graph for *prompt* using TransformerLens backend.
-
-    Args:
-        prompt: Text, token ids, or tensor - will be tokenized if str.
-        model: Frozen ``TransformerLensReplacementModel``
-        attribution_targets: Target specification in one of four formats:
-                          - None: Auto-select salient logits based on probability threshold
-                          - torch.Tensor: Tensor of token indices
-                          - Sequence[str]: Token strings (tokenized, auto-computes probability
-                            and unembed vector)
-                          - Sequence[TargetSpec]: Fully specified custom targets (CustomTarget or tuple)
-                            with arbitrary unembed directions
-        max_n_logits: Max number of logit nodes (used when attribution_targets is None).
-        desired_logit_prob: Keep logits until cumulative prob >= this value
-                           (used when attribution_targets is None).
-        batch_size: How many source nodes to process per backward pass.
-        max_feature_nodes: Max number of feature nodes to include in the graph.
-        offload: Method for offloading model parameters to save memory.
-                 Options are "cpu" (move to CPU), "disk" (save to disk),
-                 or None (no offloading).
-        verbose: Whether to show progress information.
-        update_interval: Number of batches to process before updating the feature ranking.
-        profile: Whether to emit batch-level diagnostic profiling logs.
-        profile_log_interval: Log every N batches when profiling.
-        diagnostic_feature_cap: Optional debug-only early cap on active features.
-            This changes attribution semantics and should only be used for profiling.
-        sparsification: Optional candidate-screening config applied before
-            reconstruction and reused by later attribution phases.
-
-    Returns:
-        Graph: Fully dense adjacency (unpruned).
-    """
-
+    """Execute one resolved TransformerLens trace through the canonical contract."""
+    observability = plan.execution.observability
     logger = logging.getLogger("attribution")
     logger.propagate = False
     handler = None
-    if (verbose or profile) and not logger.handlers:
+    if (observability.verbose or observability.profile) and not logger.handlers:
         handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(message)s")
-        handler.setFormatter(formatter)
+        handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
     else:
         logger.setLevel(logging.WARNING)
 
-    offload_handles = []
+    runtime = _TransformerLensRuntime(observer=observer, logger=logger)
     try:
-        return _run_attribution(
-            model=model,
-            prompt=prompt,
-            attribution_targets=attribution_targets,
-            max_n_logits=max_n_logits,
-            desired_logit_prob=desired_logit_prob,
-            batch_size=batch_size,
-            max_feature_nodes=max_feature_nodes,
-            offload=offload,
-            verbose=verbose,
-            offload_handles=offload_handles,
-            update_interval=update_interval,
-            profile=profile,
-            profile_log_interval=profile_log_interval,
-            diagnostic_feature_cap=diagnostic_feature_cap,
-            sparsification=sparsification,
-            logger=logger,
-        )
+        return _execute_attribution(problem, plan, runtime)
     finally:
-        for reload_handle in offload_handles:
+        for reload_handle in runtime.offload_handles:
             reload_handle()
-
-        if handler:
+        if handler is not None:
             logger.removeHandler(handler)
 
 
-def _run_attribution(
-    model,
-    prompt,
-    attribution_targets,
-    max_n_logits,
-    desired_logit_prob,
-    batch_size,
-    max_feature_nodes,
-    offload,
-    verbose,
-    offload_handles,
-    logger,
-    update_interval=4,
-    profile: bool = False,
-    profile_log_interval: int = 1,
-    diagnostic_feature_cap: int | None = None,
-    sparsification: SparsificationConfig | None = None,
-):
+def _diagnostic_snapshot(
+    observer: TraceObserver, source: object
+) -> dict[str, object] | None:
+    return cast(dict[str, object] | None, observer.observe(DiagnosticSnapshot(source)))
+
+
+def _execute_attribution(
+    problem: AttributionProblem,
+    plan: ResolvedTracePlan,
+    runtime: _TransformerLensRuntime,
+) -> Graph:
+    model = cast(TransformerLensReplacementModel, problem.model)
+    semantics = plan.semantics
+    observability = plan.execution.observability
+    batch_size = semantics.source_batch_size
+    max_feature_nodes = semantics.max_feature_nodes
+    update_interval = semantics.update_interval
+    profile = observability.profile
+    profile_log_interval = observability.profile_log_interval
+    verbose = observability.verbose
+    offload = plan.execution.offload
+    logger = runtime.logger
+    observer = runtime.observer
     start_time = time.time()
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
     phase_start = time.time()
-    input_ids = model.ensure_tokenized(prompt)
+    input_ids = model.ensure_tokenized(problem.prompt)
 
     configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
     if callable(configure_trace_logging):
@@ -231,44 +134,49 @@ def _run_attribution(
             f"prompt_tokens={input_ids.shape[-1]} | attribution_batch_size={batch_size}"
         )
 
-    ctx = model.setup_attribution(input_ids, sparsification=sparsification)
+    ctx = model.setup_attribution(input_ids, sparsification=semantics.sparsification)
     if hasattr(ctx, "set_diagnostic_mode"):
         ctx.set_diagnostic_mode(profile)
     configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
     if callable(configure_ctx_trace_logging):
         configure_ctx_trace_logging(logger.info if profile else None)
 
-    if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
-        before_cap, after_cap = ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
+    if semantics.diagnostic_feature_cap is not None:
+        before_cap, after_cap = ctx.apply_diagnostic_feature_cap(
+            semantics.diagnostic_feature_cap
+        )
         logger.info(
             f"Diagnostic feature cap applied before attribution rows: {before_cap} -> {after_cap} active features"
         )
     if profile and getattr(ctx, "sparsification_stats", None):
-        _log_sparsification_profile(logger, ctx.sparsification_stats)
+        observer.observe(SparsificationProfile(ctx.sparsification_stats))
     try:
         activation_matrix = ctx.activation_matrix
 
-        _log_phase_metrics(
-            logger,
-            "Precomputation",
-            phase_start,
-            model.cfg.device,
-            active_features=ctx.activation_matrix._nnz(),
+        observer.observe(
+            PhaseMetrics(
+                "Precomputation",
+                phase_start,
+                model.cfg.device,
+                {"active_features": ctx.activation_matrix._nnz()},
+            )
         )
         if profile:
             if getattr(ctx, "setup_diagnostic_stats", None):
-                logger.info(
-                    f"Phase 0 setup diagnostics | {format_numeric_metrics(ctx.setup_diagnostic_stats, limit=20)}"
+                observer.observe(
+                    DiagnosticsMessage(
+                        "Phase 0 setup diagnostics", ctx.setup_diagnostic_stats
+                    )
                 )
-            transcoder_snapshot = _snapshot_diagnostics(model.transcoders)
+            transcoder_snapshot = _diagnostic_snapshot(observer, model.transcoders)
             if transcoder_snapshot:
-                logger.info(
-                    f"Precompute diagnostics | {format_numeric_metrics(transcoder_snapshot, limit=20)}"
+                observer.observe(
+                    DiagnosticsMessage("Precompute diagnostics", transcoder_snapshot)
                 )
         logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
 
         if offload and not exact_chunked_provider_usable(model.transcoders):
-            offload_handles += offload_modules(model.transcoders, offload)
+            runtime.offload_handles += offload_modules(model.transcoders, offload)
 
         # Phase 1: forward pass
         logger.info("Phase 1: Running forward pass")
@@ -278,10 +186,12 @@ def _run_attribution(
                 input_ids.expand(batch_size, -1), stop_at_layer=model.cfg.n_layers
             )
             ctx._resid_activations[-1] = model.ln_final(residual)
-        _log_phase_metrics(logger, "Forward pass", phase_start, model.cfg.device)
+        observer.observe(PhaseMetrics("Forward pass", phase_start, model.cfg.device))
 
         if offload:
-            offload_handles += offload_modules([block.mlp for block in model.blocks], offload)
+            runtime.offload_handles += offload_modules(
+                [block.mlp for block in model.blocks], offload
+            )
 
         # Phase 2: build input vector list
         logger.info("Phase 2: Building input vectors")
@@ -291,18 +201,20 @@ def _run_attribution(
         total_active_feats = activation_matrix._nnz()
 
         targets = AttributionTargets(
-            attribution_targets=attribution_targets,
+            attribution_targets=problem.targets,
             logits=ctx.logits[0, -1],
             unembed_proj=model.unembed.W_U,
             tokenizer=model.tokenizer,
-            max_n_logits=max_n_logits,
-            desired_logit_prob=desired_logit_prob,
+            max_n_logits=problem.max_n_logits,
+            desired_logit_prob=problem.desired_logit_prob,
         )
 
-        log_attribution_target_info(targets, attribution_targets, logger)
+        log_attribution_target_info(targets, problem.targets, logger)
 
         if offload:
-            offload_handles += offload_modules([model.unembed, model.embed], offload)
+            runtime.offload_handles += offload_modules(
+                [model.unembed, model.embed], offload
+            )
 
         logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
         n_logits = len(targets)
@@ -315,13 +227,16 @@ def _run_attribution(
         # Maps row indices in edge_matrix to original feature/node indices
         # First populated with logit node IDs, then feature IDs in attribution order
         row_to_node_index = torch.zeros(max_feature_nodes + n_logits, dtype=torch.int32)
-        _log_phase_metrics(
-            logger,
-            "Input vector build",
-            phase_start,
-            model.cfg.device,
-            edge_matrix_shape=f"{tuple(edge_matrix.shape)}",
-            edge_matrix_dtype=edge_matrix.dtype,
+        observer.observe(
+            PhaseMetrics(
+                "Input vector build",
+                phase_start,
+                model.cfg.device,
+                {
+                    "edge_matrix_shape": f"{tuple(edge_matrix.shape)}",
+                    "edge_matrix_dtype": edge_matrix.dtype,
+                },
+            )
         )
 
         # Phase 3: logit attribution
@@ -330,8 +245,10 @@ def _run_attribution(
         total_logit_batches = max((len(targets) + batch_size - 1) // batch_size, 1)
         for i in range(0, len(targets), batch_size):
             batch = targets.logit_vectors[i : i + batch_size]
-            ctx_before = _snapshot_diagnostics(ctx) if profile else None
-            transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
+            ctx_before = _diagnostic_snapshot(observer, ctx) if profile else None
+            transcoder_before = (
+                _diagnostic_snapshot(observer, model.transcoders) if profile else None
+            )
             batch_start = time.perf_counter()
             rows = ctx.compute_batch(
                 layers=torch.full((batch.shape[0],), n_layers),
@@ -344,18 +261,21 @@ def _run_attribution(
                 torch.arange(i, i + batch.shape[0]) + logit_offset
             )
             if profile and ((i // batch_size) + 1) % profile_log_interval == 0:
-                _log_batch_profile(
-                    logger,
-                    "Phase 3",
-                    (i // batch_size) + 1,
-                    total_logit_batches,
-                    time.perf_counter() - batch_start,
-                    ctx_before,
-                    _snapshot_diagnostics(ctx),
-                    transcoder_before,
-                    _snapshot_diagnostics(model.transcoders),
+                observer.observe(
+                    BatchProfile(
+                        "Phase 3",
+                        (i // batch_size) + 1,
+                        total_logit_batches,
+                        time.perf_counter() - batch_start,
+                        ctx_before,
+                        _diagnostic_snapshot(observer, ctx),
+                        transcoder_before,
+                        _diagnostic_snapshot(observer, model.transcoders),
+                    )
                 )
-        _log_phase_metrics(logger, "Logit attributions", phase_start, model.cfg.device)
+        observer.observe(
+            PhaseMetrics("Logit attributions", phase_start, model.cfg.device)
+        )
         reset_decoder_cache = getattr(ctx, "reset_decoder_cache", None)
         if callable(reset_decoder_cache):
             reset_decoder_cache()
@@ -390,8 +310,10 @@ def _run_attribution(
             for idx_batch in queue:
                 n_visited += len(idx_batch)
 
-                ctx_before = _snapshot_diagnostics(ctx) if profile else None
-                transcoder_before = _snapshot_diagnostics(model.transcoders) if profile else None
+                ctx_before = _diagnostic_snapshot(observer, ctx) if profile else None
+                transcoder_before = (
+                    _diagnostic_snapshot(observer, model.transcoders) if profile else None
+                )
                 batch_start = time.perf_counter()
                 rows = ctx.compute_batch(
                     layers=feat_layers[idx_batch],
@@ -410,25 +332,30 @@ def _run_attribution(
                 if profile:
                     batch_number = max(1, (n_visited + batch_size - 1) // batch_size)
                     if batch_number % profile_log_interval == 0:
-                        _log_batch_profile(
-                            logger,
-                            "Phase 4",
-                            batch_number,
-                            max((max_feature_nodes + batch_size - 1) // batch_size, 1),
-                            time.perf_counter() - batch_start,
-                            ctx_before,
-                            _snapshot_diagnostics(ctx),
-                            transcoder_before,
-                            _snapshot_diagnostics(model.transcoders),
+                        observer.observe(
+                            BatchProfile(
+                                "Phase 4",
+                                batch_number,
+                                max(
+                                    (max_feature_nodes + batch_size - 1) // batch_size,
+                                    1,
+                                ),
+                                time.perf_counter() - batch_start,
+                                ctx_before,
+                                _diagnostic_snapshot(observer, ctx),
+                                transcoder_before,
+                                _diagnostic_snapshot(observer, model.transcoders),
+                            )
                         )
 
         pbar.close()
-        _log_phase_metrics(
-            logger,
-            "Feature attributions",
-            phase_start,
-            model.cfg.device,
-            selected_features=int(visited.sum().item()),
+        observer.observe(
+            PhaseMetrics(
+                "Feature attributions",
+                phase_start,
+                model.cfg.device,
+                {"selected_features": int(visited.sum().item())},
+            )
         )
 
         # Phase 5: packaging graph
@@ -461,9 +388,13 @@ def _run_attribution(
             scan=model.scan,
         )
 
-        logger.info(
-            f"Attribution completed in {time.time() - start_time:.2f}s | "
-            f"{format_memory_snapshot(device=model.cfg.device, extra={'adjacency_shape': tuple(full_edge_matrix.shape)})}"
+        observer.observe(
+            PhaseMetrics(
+                "Attribution",
+                start_time,
+                model.cfg.device,
+                {"adjacency_shape": tuple(full_edge_matrix.shape)},
+            )
         )
 
         return graph

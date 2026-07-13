@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Callable
 
 import torch
@@ -59,7 +59,12 @@ from circuit_tracer.attribution.nnsight.session_controls import (
     resolve_nnsight_session_controls,
     validate_nnsight_session_control_requests,
 )
-from circuit_tracer.observability.lifecycle import TelemetryObserver
+from circuit_tracer.observability.events import TraceObserver
+from circuit_tracer.governor.contracts import fingerprint
+from circuit_tracer.execution_identity import (
+    EffectiveExecutionDescriptor,
+    EffectiveExecutionIdentity,
+)
 from circuit_tracer.tracing.plan import ResolvedTracePlan
 from circuit_tracer.tracing.problem import AttributionProblem
 from circuit_tracer.transcoder.provider import (
@@ -153,8 +158,7 @@ class FrontierMechanisms:
 
 @dataclass
 class PreparedDiagnostics:
-    observer: Any
-    recorder: Any
+    observer: TraceObserver
     telemetry_max_events: int
     anomaly_debug_result: dict[str, object] | None
     cross_cluster_summary: dict[str, object] | None
@@ -179,6 +183,7 @@ class PreparedBackend:
     batches: BatchMechanisms
     frontier: FrontierMechanisms
     diagnostics: PreparedDiagnostics
+    effective_execution: EffectiveExecutionIdentity
     start_time: float
 
 
@@ -186,7 +191,6 @@ class PreparedBackend:
 class PreparationDependencies:
     get_capabilities: Callable[[Any], Any] = get_transcoder_capabilities
     require_exact_provider: Callable[[Any], bool] = require_exact_chunked_provider
-    telemetry_observer_type: Any = TelemetryObserver
 
 
 def resolve_phase0_activation_threshold_compare_mode(value: str) -> str:
@@ -212,9 +216,9 @@ def resolve_telemetry_max_events(
     if telemetry_max_events is not None and telemetry_max_events > 0:
         return int(telemetry_max_events)
     if compact_output and exact_chunked_decoder:
-        return 120_000
+        return 20_000
     if profile or phase4_anomaly_debug_enabled:
-        return 60_000
+        return 20_000
     return 20_000
 
 
@@ -485,7 +489,7 @@ def _resolve_batches(
             resolved_dtype_map=numerics.dtype_map,
             row_abs_sum_dtype=numerics.row_abs_sum_dtype,
             planner_compute_dtype=numerics.planner_compute_dtype,
-            telemetry_recorder=diagnostics.recorder,
+            trace_observer=diagnostics.observer,
             prefix_view_metadata=prefix_view_metadata,
         )
         planner_status = "executed"
@@ -524,7 +528,7 @@ def _prepare_diagnostics(
     provider: ProviderMechanisms,
     numerics: NumericMechanisms,
     replay: ReplayMechanisms,
-    observer_type: Any,
+    observer: TraceObserver,
 ) -> PreparedDiagnostics:
     policy = plan.execution.observability
     limit = resolve_telemetry_max_events(
@@ -533,20 +537,6 @@ def _prepare_diagnostics(
         exact_chunked_decoder=provider.exact_chunked,
         profile=policy.profile,
         phase4_anomaly_debug_enabled=policy.phase4_anomaly_debug,
-    )
-    context = dict(policy.telemetry_context)
-    context["runtime_plan"] = {
-        "schema_version": 3,
-        "semantic_fingerprint": plan.semantic_fingerprint,
-        "execution_fingerprint": plan.execution_fingerprint,
-    }
-    observer = observer_type.create(
-        enabled=bool(
-            policy.profile or plan.execution.compact_output or policy.phase4_anomaly_debug
-        ),
-        max_events=limit,
-        jsonl_path=policy.telemetry_jsonl_path,
-        static_context=context,
     )
     anomaly = None
     if policy.phase4_anomaly_debug:
@@ -585,7 +575,6 @@ def _prepare_diagnostics(
         batches = []
     return PreparedDiagnostics(
         observer=observer,
-        recorder=observer.recorder,
         telemetry_max_events=limit,
         anomaly_debug_result=anomaly,
         cross_cluster_summary=cross_cluster,
@@ -632,6 +621,95 @@ def _validate_provider_requirements(
             raise ValueError(f"{label} requires compact_output=True and exact provider support")
 
 
+def _capability_descriptor(capabilities: Any) -> dict[str, Any]:
+    if is_dataclass(capabilities) and not isinstance(capabilities, type):
+        return asdict(capabilities)
+    names = (
+        "architecture",
+        "checkpoint_format",
+        "decoder_output_topology",
+        "supports_exact_chunked_provider",
+        "supports_compact_row_store",
+        "supports_decoder_chunk_cache",
+        "supports_exact_encoder_residency",
+    )
+    return {name: getattr(capabilities, name) for name in names if hasattr(capabilities, name)}
+
+
+def _effective_execution_identity(
+    provider: ProviderMechanisms,
+    numerics: NumericMechanisms,
+    replay: ReplayMechanisms,
+    batches: BatchMechanisms,
+    frontier: FrontierMechanisms,
+) -> EffectiveExecutionIdentity:
+    """Describe only mechanisms fixed by successful NNSight preparation."""
+    descriptor = EffectiveExecutionDescriptor(
+        schema_version=1,
+        backend="nnsight",
+        provider={
+            "capabilities": _capability_descriptor(provider.capabilities),
+            "exact_chunked": provider.exact_chunked,
+            "compact_row_store": provider.compact_row_store,
+            "decoder_chunk_cache": provider.decoder_chunk_cache,
+            "exact_encoder_residency": provider.exact_encoder_residency,
+            "use_compact_feature_row_store": provider.use_compact_feature_row_store,
+        },
+        numerics={
+            "exact_dtype": numerics.exact_dtype_name,
+            "internal_precision": numerics.internal_precision_requested,
+            "dtype_map": numerics.dtype_map,
+            "feature_row_storage_dtype": str(numerics.feature_row_storage_dtype),
+            "row_abs_sum_dtype": str(numerics.row_abs_sum_dtype),
+            "influence_compute_dtype": str(numerics.influence_compute_dtype),
+            "planner_compute_dtype": str(numerics.planner_compute_dtype),
+            "shadow_debug_compute_dtype": str(numerics.shadow_debug_compute_dtype),
+            "activation_compare_mode": numerics.activation_compare_mode,
+        },
+        replay=asdict(replay),
+        batches={
+            "phase1_policy": batches.phase1_config.effective_policy,
+            "phase1_batch_size_max": batches.phase1_config.effective_batch_size_max,
+            "phase1_fallback_reason": batches.phase1_config.fallback_reason,
+            "source_batch_size": batches.source_batch_size,
+            "feature_batch_size": batches.feature_batch_size,
+            "logit_batch_size": batches.logit_batch_size,
+            "max_phase4_feature_batch_size": batches.max_phase4_feature_batch_size,
+            "feature_batch_planner_enabled": batches.planner_enabled,
+            "feature_batch_planner_status": batches.planner_status,
+            "feature_batch_planner_skip_reason": batches.planner_skip_reason,
+            "session_capacity": batches.session_controls.session_capacity,
+            "phase3_microbatch_max_rows": batches.session_controls.phase3_microbatch_max_rows,
+            "phase4_microbatch_max_rows": batches.session_controls.phase4_microbatch_max_rows,
+            "trace_batch_size": batches.trace_batch_size,
+        },
+        frontier={
+            "scheduler_mode": frontier.scheduler.effective_mode,
+            "scheduler_version": frontier.scheduler.effective_version,
+            "scheduler_policy": frontier.scheduler.effective_policy,
+            "refresh_optimization_mode": frontier.refresh_optimization.effective_mode,
+            "refresh_optimization_version": frontier.refresh_optimization.effective_version,
+            "refresh_policy": frontier.refresh_policy.effective_policy,
+            "refresh_interval_multiplier": frontier.refresh_policy.effective_interval_multiplier,
+            "refresh_policy_fallback_reason": frontier.refresh_policy.fallback_reason,
+            "ranker_mode": frontier.ranker.effective_mode,
+            "row_executor_mode": frontier.row_executor.effective_mode,
+            "row_executor_version": frontier.row_executor.effective_version,
+            "row_reduction_mode": frontier.row_reduction.effective_mode,
+            "row_reduction_version": frontier.row_reduction.effective_version,
+            "row_store_cache_control_mode": frontier.row_store_cache_control.effective_mode,
+            "row_store_cache_control_fallback_reason": frontier.row_store_cache_control.fallback_reason,
+            "exact_encoder_residency_mode": frontier.exact_encoder_residency.effective_mode,
+            "exact_encoder_residency_fallback_reason": frontier.exact_encoder_residency.fallback_reason,
+            "refresh_aux_applicable": frontier.refresh_aux_applicable,
+            "prepared_chunk_cache_bytes": frontier.prepared_chunk_cache_bytes_effective,
+            "active_row_accumulation": frontier.active_row_accumulation_effective,
+            "refresh_aux_fallback_reason": frontier.refresh_aux_fallback_reason,
+        },
+    )
+    return EffectiveExecutionIdentity(descriptor=descriptor, fingerprint=fingerprint(descriptor))
+
+
 def prepare_backend(
     *,
     problem: AttributionProblem,
@@ -641,6 +719,7 @@ def prepare_backend(
     forward_overrides: Any,
     prefix_view_metadata: dict[str, object] | None,
     output_position: int | None,
+    observer: TraceObserver,
     dependencies: PreparationDependencies = PreparationDependencies(),
 ) -> PreparedBackend:
     """Resolve and validate every physical mechanism before Phase 0 starts."""
@@ -649,7 +728,7 @@ def prepare_backend(
     _validate_provider_requirements(plan, provider, replay)
     frontier = _resolve_frontier(plan, provider)
     diagnostics = _prepare_diagnostics(
-        plan, provider, numerics, replay, dependencies.telemetry_observer_type
+        plan, provider, numerics, replay, observer
     )
     batches = _resolve_batches(
         problem,
@@ -666,24 +745,8 @@ def prepare_backend(
         "phase1_trace_batch": batches.phase1_metadata,
         "phase4_execution": frontier.execution_metadata,
     }
-    diagnostics.observer.run(
-        name="attribute.start",
-        attrs={
-            "profile": plan.execution.observability.profile,
-            "compact_output": plan.execution.compact_output,
-            "transcoder_architecture": provider.capabilities.architecture,
-            "transcoder_checkpoint_format": provider.capabilities.checkpoint_format,
-            "exact_chunked_provider_enabled": provider.exact_chunked,
-            "supports_compact_row_store": provider.compact_row_store,
-            "batch_size": plan.semantics.source_batch_size,
-            "feature_batch_size": plan.semantics.feature_batch_size,
-            "logit_batch_size": plan.semantics.logit_batch_size,
-            "telemetry_max_events": diagnostics.telemetry_max_events,
-            "exact_trace_internal_dtype": numerics.exact_dtype_name,
-            **batches.session_controls.metadata,
-            **{f"phase1_{key}": value for key, value in batches.phase1_metadata.items()},
-            **{f"phase4_{key}": value for key, value in frontier.execution_metadata.items()},
-        },
+    effective_execution = _effective_execution_identity(
+        provider, numerics, replay, batches, frontier
     )
     return PreparedBackend(
         problem=problem,
@@ -699,5 +762,6 @@ def prepare_backend(
         batches=batches,
         frontier=frontier,
         diagnostics=diagnostics,
+        effective_execution=effective_execution,
         start_time=time.time(),
     )

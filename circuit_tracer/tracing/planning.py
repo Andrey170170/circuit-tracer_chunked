@@ -98,20 +98,26 @@ def resolve_trace_request(request: TraceRequest) -> ResolvedTracePlan:
             "max_n_logits": request.problem.max_n_logits,
             "desired_logit_prob": request.problem.desired_logit_prob,
             "output_position": request.problem.output_position,
+            "prefix_view": _stable(request.problem.prefix_view),
         },
         "semantics": _stable(request.semantics),
         "provider": semantic_provider,
     }
+    execution_constraints = _stable(request.execution)
+    observability = execution_constraints.get("observability")
+    if isinstance(observability, dict):
+        observability.pop("telemetry_jsonl_path", None)
+        observability.pop("telemetry_context", None)
     execution = {
         "schema_version": RUNTIME_SCHEMA_VERSION,
-        "constraints": _stable(request.execution),
+        "constraints": execution_constraints,
         "provider": physical_provider,
     }
     return ResolvedTracePlan(
         semantics=request.semantics,
         execution=request.execution,
         semantic_fingerprint=fingerprint(semantics),
-        execution_fingerprint=fingerprint(execution),
+        requested_execution_fingerprint=fingerprint(execution),
         backend=backend,
         evidence_metadata=request.evidence.metadata,
         admission_report=request.evidence.advisory_governor_plan,

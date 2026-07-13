@@ -25,8 +25,8 @@ from circuit_tracer.transcoder.loaders import (
     load_gemma_scope_2_clt as load_gemma_scope_2_clt,
 )
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
+from circuit_tracer.transcoder.attribution_result import AttributionComponents
 from circuit_tracer.utils import get_default_device
-from circuit_tracer.utils.telemetry import TelemetryRecorder
 
 
 
@@ -106,7 +106,7 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
         self.cross_batch_decoder_cache_bytes = max(0, int(cross_batch_decoder_cache_bytes))
         self._diagnostic_stats = self._make_empty_diagnostic_stats()
         self._trace_logger = None
-        self._telemetry_recorder: TelemetryRecorder | None = None
+        self._trace_observer = None
         self._trace_chunk_interval = 16
         self._trace_decoder_load_interval = 32
         self._phase0_activation_threshold_compare_mode = "baseline"
@@ -1109,7 +1109,7 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
         sparsification: SparsificationConfig | None = None,
         *,
         materialize_encoder_vecs: bool = True,
-    ):
+    ) -> AttributionComponents:
         """Extract active features and their encoder/decoder vectors for attribution.
 
         Args:
@@ -1178,19 +1178,16 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
             decoder_locations = torch.stack((layer_ids, pos_ids))
             chunked_decoder_state = None
 
-        attribution_data = {
-            "activation_matrix": features,
-            "reconstruction": reconstruction,
-            "encoder_vecs": encoder_vectors,
-            "decoder_vecs": decoder_vectors,
-            "encoder_to_decoder_map": encoder_to_decoder_map,
-            "decoder_locations": decoder_locations,
-        }
-
-        if chunked_decoder_state is not None:
-            attribution_data["chunked_decoder_state"] = chunked_decoder_state
-        if sparsification_stats is not None:
-            attribution_data["sparsification_stats"] = sparsification_stats
+        attribution_result = AttributionComponents(
+            activation_matrix=features,
+            reconstruction=reconstruction,
+            encoder_vectors=encoder_vectors,
+            decoder_vectors=decoder_vectors,
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=decoder_locations,
+            chunked_decoder_state=chunked_decoder_state,
+            sparsification_stats=sparsification_stats,
+        )
 
         component_elapsed = time.perf_counter() - component_start
         self.emit_trace_event(
@@ -1200,7 +1197,7 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
             elapsed_ms=component_elapsed * 1000.0,
         )
 
-        return attribution_data
+        return attribution_result
 
     def to_safetensors(self, save_path: str):
         """Save CLT to safetensors format compatible with lazy loading.

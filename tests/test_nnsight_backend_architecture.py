@@ -6,6 +6,7 @@ import ast
 from pathlib import Path
 
 BACKEND_ROOT = Path("circuit_tracer/attribution/nnsight")
+PHASE_ROOT = BACKEND_ROOT / "phases"
 OWNED_MODULES = {
     "backend": BACKEND_ROOT / "backend.py",
     "execution": BACKEND_ROOT / "execution.py",
@@ -97,3 +98,103 @@ def test_backend_has_no_private_compatibility_exports() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     assert definitions.isdisjoint(forbidden)
+
+
+def test_phases_depend_only_on_typed_observability_boundary() -> None:
+    forbidden_modules = {
+        "circuit_tracer.observability.human_logs",
+        "circuit_tracer.observability.recorder",
+        "circuit_tracer.observability.resources",
+        "circuit_tracer.utils.telemetry",
+    }
+    violations = []
+    for path in sorted(PHASE_ROOT.glob("phase[0-5].py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        imports = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        }
+        bad_imports = sorted(imports & forbidden_modules)
+        raw_recorder_names = sorted(
+            {
+                node.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and "telemetry_recorder" in node.id
+            }
+        )
+        if bad_imports or raw_recorder_names:
+            violations.append(
+                f"{path.name}: imports={bad_imports}, raw_recorders={raw_recorder_names}"
+            )
+    assert not violations, "phase observability boundary violations:\n" + "\n".join(
+        violations
+    )
+
+
+def test_canonical_nnsight_modules_cannot_reach_raw_telemetry_recorder() -> None:
+    paths = [
+        *BACKEND_ROOT.rglob("*.py"),
+        Path("circuit_tracer/attribution/context_nnsight.py"),
+        Path("circuit_tracer/replacement_model/attribution_setup.py"),
+        Path("circuit_tracer/replacement_model/replacement_model_nnsight.py"),
+        *Path("circuit_tracer/transcoder").glob("*.py"),
+    ]
+    violations = []
+    for path in sorted(set(paths)):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        imports = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        }
+        bad_imports = sorted(
+            imports
+            & {
+                "circuit_tracer.observability.human_logs",
+                "circuit_tracer.observability.recorder",
+                "circuit_tracer.observability.resources",
+                "circuit_tracer.utils.telemetry",
+            }
+        )
+        raw_names = sorted(
+            {
+                node.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and "TelemetryRecorder" in node.id
+            }
+        )
+        recorder_accesses = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr == "recorder"
+        ]
+        if bad_imports or raw_names or recorder_accesses:
+            violations.append(
+                f"{path}: imports={bad_imports}, raw_names={raw_names}, "
+                f"recorder_accesses={recorder_accesses}"
+            )
+    assert not violations, "raw telemetry capability leaks:\n" + "\n".join(violations)
+
+
+def test_terminal_lifecycle_is_not_owned_by_nnsight_run_scope() -> None:
+    source = OWNED_MODULES["run_scope"].read_text()
+    assert "attribute.done" not in source
+    assert "attribute.failed" not in source
+    assert "close_export" not in source
+    assert "attach_exception" not in source
+
+
+def test_observability_has_no_private_observer_compatibility_alias() -> None:
+    lifecycle = Path("circuit_tracer/observability/lifecycle.py").read_text()
+    tree = ast.parse(lifecycle)
+    assigned_names = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+        if isinstance(target, ast.Name)
+    }
+    assert "_TelemetryObserver" not in assigned_names

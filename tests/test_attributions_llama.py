@@ -7,7 +7,6 @@ import torch.nn as nn
 from transformer_lens import HookedTransformerConfig
 
 from circuit_tracer import ReplacementModel
-from circuit_tracer.attribution.attribute_transformerlens import attribute
 from circuit_tracer.replacement_model.replacement_model_transformerlens import (
     TransformerLensReplacementModel,
 )
@@ -15,6 +14,7 @@ from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
 from circuit_tracer.transcoder.activation_functions import TopK
 from circuit_tracer.utils import get_default_device
 from tests.test_attributions_gemma import (
+    trace_graph,
     verify_feature_edges,
     verify_token_and_error_edges,
 )
@@ -129,7 +129,7 @@ def test_small_llama_model():
     cfg = HookedTransformerConfig.from_dict(llama_small_cfg)
     k = 4
     model = load_dummy_llama_model(cfg, k)
-    graph = attribute(s, model)
+    graph = trace_graph(s, model)
 
     verify_token_and_error_edges(model, graph)
     verify_feature_edges(model, graph)
@@ -208,7 +208,7 @@ def test_large_llama_model():
     cfg = HookedTransformerConfig.from_dict(llama_large_cfg)
     k = 16
     model = load_dummy_llama_model(cfg, k)
-    graph = attribute(s, model)
+    graph = trace_graph(s, model)
 
     verify_token_and_error_edges(model, graph)
     verify_feature_edges(model, graph)
@@ -219,7 +219,7 @@ def test_llama_3_2_1b():
     s = "The National Digital Analytics Group (ND"
     model = ReplacementModel.from_pretrained("meta-llama/Llama-3.2-1B", "llama")
     assert isinstance(model, TransformerLensReplacementModel)
-    graph = attribute(s, model, batch_size=128)
+    graph = trace_graph(s, model, source_batch_size=128)
 
     verify_token_and_error_edges(model, graph)
     verify_feature_edges(model, graph)
@@ -232,7 +232,7 @@ def test_llama_3_2_1b_clt():
         "meta-llama/Llama-3.2-1B", "mntss/clt-llama-3.2-1b-524k"
     )
     assert isinstance(model, TransformerLensReplacementModel)
-    graph = attribute(s, model, batch_size=128)
+    graph = trace_graph(s, model, source_batch_size=128)
 
     verify_token_and_error_edges(model, graph)
     verify_feature_edges(model, graph)

@@ -15,9 +15,10 @@ import torch
 from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.attribution.targets import AttributionTargets
 from circuit_tracer.graph import compute_partial_feature_influences
+from circuit_tracer.observability import CudaMemoryProbe, probe_cuda_memory
+from circuit_tracer.observability.events import TraceEvent, TraceObserver
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 from circuit_tracer.transcoder.provider import require_exact_chunked_provider
-from circuit_tracer.utils.telemetry import TelemetryRecorder
 
 from circuit_tracer.attribution.nnsight.numerics import _exact_trace_internal_dtype_name
 from circuit_tracer.attribution.nnsight.prefix_view import (
@@ -2300,16 +2301,6 @@ def _compute_phase4_planned_feature_batch_size(
     return min(max_feature_batch_size, scaled_batch_size)
 
 
-def _get_cuda_reserved_snapshot() -> tuple[int, int] | None:
-    if not torch.cuda.is_available():
-        return None
-
-    device_index = torch.cuda.current_device()
-    peak_reserved = int(torch.cuda.memory_reserved(device_index))
-    total_cuda_bytes = int(torch.cuda.get_device_properties(device_index).total_memory)
-    return peak_reserved, total_cuda_bytes
-
-
 def _build_phase4_probe_pending_frontier(
     *,
     feature_influences: torch.Tensor | None,
@@ -2398,7 +2389,7 @@ def _plan_phase4_feature_batch_size_preflight(
     resolved_dtype_map: dict[str, str] | None = None,
     row_abs_sum_dtype: torch.dtype = torch.float64,
     planner_compute_dtype: torch.dtype = torch.float64,
-    telemetry_recorder: TelemetryRecorder | None = None,
+    trace_observer: TraceObserver | None = None,
     prefix_view_metadata: PrefixViewMetadata | None = None,
 ) -> int:
     # Runtime import avoids the phase_support -> phase4_policy module cycle.
@@ -2415,23 +2406,26 @@ def _plan_phase4_feature_batch_size_preflight(
         planner_status: str,
         attrs: dict[str, object] | None = None,
     ) -> int:
-        if telemetry_recorder is not None:
+        if trace_observer is not None:
             payload = {
                 "planner_status": planner_status,
                 "planned_feature_batch_size": planned_feature_batch_size,
             }
             if attrs:
                 payload.update(attrs)
-            telemetry_recorder.record_event(
-                scope="phase",
-                name="phase4.planner.preflight",
-                phase="phase4",
-                elapsed_ms=(time.perf_counter() - planner_start) * 1000.0,
-                attrs=payload,
+            trace_observer.observe(
+                TraceEvent(
+                    scope="phase",
+                    name="phase4.planner.preflight",
+                    phase="phase4",
+                    elapsed_ms=(time.perf_counter() - planner_start) * 1000.0,
+                    attrs=payload,
+                )
             )
         return planned_feature_batch_size
 
-    if not torch.cuda.is_available():
+    cuda_snapshot = probe_cuda_memory(CudaMemoryProbe("snapshot"))
+    if not cuda_snapshot.available:
         logger.info(
             "Phase 4 planner skipped (CUDA unavailable); using fixed feature batch size "
             f"{min(initial_feature_batch_size, max_feature_batch_size)}"
@@ -2450,8 +2444,8 @@ def _plan_phase4_feature_batch_size_preflight(
     total_cuda_bytes: int | None = None
 
     configure_trace_logging = getattr(model.transcoders, "configure_trace_logging", None)
-    if callable(configure_trace_logging):
-        configure_trace_logging(None, telemetry_recorder=telemetry_recorder)
+    if callable(configure_trace_logging) and trace_observer is not None:
+        configure_trace_logging(None, trace_observer=trace_observer)
 
     try:
         logger.info(
@@ -2479,12 +2473,13 @@ def _plan_phase4_feature_batch_size_preflight(
             internal_precision_requested=internal_precision_requested,
             resolved_dtype_map=resolved_dtype_map,
             prefix_view_length=prefix_view_length,
+            trace_observer=trace_observer,
         )
         if hasattr(ctx, "set_diagnostic_mode"):
             ctx.set_diagnostic_mode(False)
         configure_ctx_trace_logging = getattr(ctx, "configure_trace_logging", None)
-        if callable(configure_ctx_trace_logging):
-            configure_ctx_trace_logging(None, telemetry_recorder=telemetry_recorder)
+        if callable(configure_ctx_trace_logging) and trace_observer is not None:
+            configure_ctx_trace_logging(None, trace_observer=trace_observer)
 
         if diagnostic_feature_cap is not None and diagnostic_feature_cap > 0:
             ctx.apply_diagnostic_feature_cap(diagnostic_feature_cap)
@@ -2600,8 +2595,7 @@ def _plan_phase4_feature_batch_size_preflight(
             pending_offset += int(idx_batch.numel())
             observed_feature_batch_size = max(observed_feature_batch_size, int(idx_batch.numel()))
 
-            device_index = torch.cuda.current_device()
-            torch.cuda.reset_peak_memory_stats(device_index)
+            probe_cuda_memory(CudaMemoryProbe("reset_peak"))
             probe_batch_start = time.perf_counter()
             rows = ctx.compute_batch(
                 layers=feat_layers[idx_batch],
@@ -2611,25 +2605,26 @@ def _plan_phase4_feature_batch_size_preflight(
                 phase_label="phase4_probe",
             )
             del rows
-            torch.cuda.synchronize(device_index)
+            probe_snapshot = probe_cuda_memory(CudaMemoryProbe("synchronize"))
+            observed_batch_peak_reserved_bytes = int(probe_snapshot.peak_reserved_bytes or 0)
             observed_peak_reserved_bytes = max(
                 observed_peak_reserved_bytes,
-                int(torch.cuda.max_memory_reserved(device_index)),
+                observed_batch_peak_reserved_bytes,
             )
             probe_batches_ran += 1
-            if telemetry_recorder is not None:
-                telemetry_recorder.record_event(
-                    scope="batch",
-                    name="phase4.planner.probe_batch",
-                    phase="phase4",
-                    batch_index=probe_batches_ran,
-                    elapsed_ms=(time.perf_counter() - probe_batch_start) * 1000.0,
-                    attrs={
-                        "batch_nodes": int(idx_batch.numel()),
-                        "observed_peak_reserved_bytes": int(
-                            torch.cuda.max_memory_reserved(device_index)
-                        ),
-                    },
+            if trace_observer is not None:
+                trace_observer.observe(
+                    TraceEvent(
+                        scope="batch",
+                        name="phase4.planner.probe_batch",
+                        phase="phase4",
+                        batch_index=probe_batches_ran,
+                        elapsed_ms=(time.perf_counter() - probe_batch_start) * 1000.0,
+                        attrs={
+                            "batch_nodes": int(idx_batch.numel()),
+                            "observed_peak_reserved_bytes": observed_batch_peak_reserved_bytes,
+                        },
+                    )
                 )
 
         if probe_batches_ran <= 0 or observed_feature_batch_size <= 0:
@@ -2642,11 +2637,13 @@ def _plan_phase4_feature_batch_size_preflight(
                 planner_status="skipped_no_probe_batches",
             )
 
-        cuda_snapshot = _get_cuda_reserved_snapshot()
+        cuda_snapshot = probe_cuda_memory(CudaMemoryProbe("snapshot"))
         observed_reserved_bytes: int | None = None
-        if cuda_snapshot is not None:
-            current_reserved_bytes, total_cuda_bytes = cuda_snapshot
-            observed_reserved_bytes = max(current_reserved_bytes, observed_peak_reserved_bytes)
+        if cuda_snapshot.available:
+            total_cuda_bytes = cuda_snapshot.total_bytes
+            observed_reserved_bytes = max(
+                int(cuda_snapshot.current_reserved_bytes or 0), observed_peak_reserved_bytes
+            )
 
         planned_feature_batch_size = _compute_phase4_planned_feature_batch_size(
             observed_feature_batch_size,

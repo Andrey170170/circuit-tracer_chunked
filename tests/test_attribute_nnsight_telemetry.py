@@ -21,6 +21,7 @@ from circuit_tracer.attribution.nnsight.row_store import (
 )
 from circuit_tracer.attribution.nnsight.telemetry import _build_row_transfer_telemetry
 from circuit_tracer.observability.exception_export import _attach_telemetry_export_to_exception
+from circuit_tracer.observability.lifecycle import TelemetryObserver
 from circuit_tracer.tracing import (
     ExecutionConstraints,
     FrontierExpansionPlan,
@@ -39,7 +40,7 @@ def test_file_backed_feature_row_store_emits_structured_events() -> None:
         n_feature_columns=3,
         dtype=torch.float32,
         read_chunk_cache_bytes=4096,
-        telemetry_recorder=recorder,
+        trace_observer=TelemetryObserver(recorder),
     )
 
     try:
