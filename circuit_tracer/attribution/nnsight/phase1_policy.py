@@ -1,7 +1,7 @@
 """Phase-1 trace-batch policy support.
 
 This module owns Phase-1 trace-batch configuration, sizing, and metadata.
-The Phase-1 execution body remains in :mod:`attribute_nnsight`.
+The Phase-1 execution body remains in :mod:`circuit_tracer.attribution.nnsight.backend`.
 """
 
 from dataclasses import dataclass

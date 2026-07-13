@@ -1,12 +1,29 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import threading
+from dataclasses import replace
 
 import pytest
 
-import circuit_tracer.runtime as runtime
+from circuit_tracer.tracing import (
+    AttributionProblem,
+    ExecutionConstraints,
+    FrontierExpansionPlan,
+    ObservabilityPolicy,
+    ReplayPlan,
+    RowStoragePlan,
+    SessionPlan,
+    SessionWindow,
+    TraceEvidence,
+    TraceRequest,
+    TraceSemantics,
+    TraceStatus,
+    open_session,
+    resolve_trace_request,
+    trace_batch,
+    trace_one,
+)
 
 
 class FakeModel:
@@ -14,323 +31,248 @@ class FakeModel:
     provider_id = "fake-v1"
 
 
-def request(value=1, **kwargs):
-    return runtime.TraceRequest(prompt=[value], model=FakeModel(), **kwargs)
+def request(
+    value: int | list[int] = 1,
+    *,
+    semantics: TraceSemantics | None = None,
+    execution: ExecutionConstraints | None = None,
+    evidence: TraceEvidence | None = None,
+    **problem_overrides: object,
+) -> TraceRequest:
+    prompt = value if isinstance(value, list) else [value]
+    return TraceRequest(
+        problem=AttributionProblem(
+            prompt=prompt,
+            model=FakeModel(),
+            **problem_overrides,
+        ),
+        semantics=semantics or TraceSemantics(),
+        execution=execution or ExecutionConstraints(),
+        evidence=evidence or TraceEvidence(),
+    )
 
 
-def test_every_top_level_export_is_reachable():
+def test_every_top_level_export_is_reachable() -> None:
     import circuit_tracer
 
     for name in circuit_tracer.__all__:
         assert getattr(circuit_tracer, name) is not None, name
 
 
-def test_attribute_facade_and_trace_one_share_implementation(monkeypatch):
-    calls = []
-
-    def execute(prompt, model, **kwargs):
-        calls.append((prompt, model, kwargs))
-        return {"value": prompt[0], "telemetry_summary": {"events": 2}}
-
-    monkeypatch.setattr("circuit_tracer.attribution.attribute_nnsight._attribute_impl", execute)
-    from circuit_tracer.attribution.attribute_nnsight import attribute
-
-    direct = runtime.trace_one(request(3, legacy_kwargs={"batch_size": 7}))
-    facade = attribute([3], FakeModel(), batch_size=7)
-
-    assert direct.output == facade
-    assert direct.telemetry_summary == {"events": 2}
-    assert len(calls) == 2
-    assert calls[0][2]["batch_size"] == calls[1][2]["batch_size"] == 7
-    assert calls[0][2]["telemetry_context"]["runtime_compatibility"]["translator"] == runtime.LEGACY_TRANSLATOR_VERSION
-
-
-def test_legacy_coupled_mapping_and_refresh_cadence(monkeypatch):
+def test_trace_one_passes_owned_problem_and_resolved_plan(monkeypatch) -> None:
     captured = {}
 
-    def execute(prompt, model, **kwargs):
-        captured.update(kwargs)
-        return {}
+    def execute(problem, plan):
+        captured.update(problem=problem, plan=plan)
+        return {"value": problem.prompt[0], "telemetry_summary": {"events": 2}}
 
-    monkeypatch.setattr("circuit_tracer.attribution.attribute_nnsight._attribute_impl", execute)
-    translated = runtime.request_from_legacy(
-        [1], FakeModel(), feature_batch_size=12, update_interval=3
-    )
-    result = runtime.trace_one(translated)
-
-    assert translated.logical.feature_group_size == 12
-    assert translated.logical.phase4_reference_frontier_batch == 12
-    assert translated.logical.phase4_refresh_stride == 3
-    assert translated.physical.phase4_microbatch_max_rows == 12
-    assert captured["phase4_compute_microbatch_max_rows"] == 12
-    mapping = result.compatibility_metadata["translated"]
-    assert mapping["logical"]["feature_batch_size"] == {
-        "feature_group_size": 12,
-        "phase4_reference_frontier_batch": 12,
-    }
-    assert mapping["logical"]["update_interval"] == 3
-
-
-def test_legacy_feature_group_can_use_explicit_legacy_physical_split(monkeypatch):
-    captured = {}
     monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight._attribute_impl",
-        lambda prompt, model, **kwargs: captured.update(kwargs) or {},
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
     )
-    trace_request = runtime.request_from_legacy(
-        [1],
-        FakeModel(),
-        feature_batch_size=12,
-        phase4_compute_microbatch_max_rows=4,
+    selected = request(
+        3,
+        semantics=TraceSemantics(source_batch_size=7, feature_batch_size=5),
+        execution=ExecutionConstraints(
+            session=SessionPlan(capacity=8),
+            storage=RowStoragePlan(full_retention_backend="column_tiled_v1"),
+            replay=ReplayPlan(feature_window=2),
+            frontier=FrontierExpansionPlan(scheduler="planner_v1"),
+            observability=ObservabilityPolicy(profile=True),
+        ),
+        evidence=TraceEvidence(name="gate", version="v1"),
     )
-    runtime.trace_one(trace_request)
-    assert captured["feature_batch_size"] == 12
-    assert captured["phase4_compute_microbatch_max_rows"] == 4
+
+    result = trace_one(selected)
+
+    assert result.output["value"] == 3
+    assert result.telemetry_summary == {"events": 2}
+    assert captured["problem"] is selected.problem
+    plan = captured["plan"]
+    assert plan.semantics is selected.semantics
+    assert plan.execution is selected.execution
+    assert plan.backend == "nnsight"
 
 
-def test_attribute_preserves_implementation_signature():
-    from circuit_tracer.attribution.attribute_nnsight import _attribute_impl, attribute
-
-    assert inspect.signature(attribute) == inspect.signature(_attribute_impl)
-    assert inspect.signature(attribute).parameters["exact_trace_internal_dtype"].default == "fp32"
-
-
-def test_exported_attribute_exposes_tiled_mechanism_controls():
-    from circuit_tracer import attribute
-
-    signature = inspect.signature(attribute)
-    expected_defaults = {
-        "full_retention_backend": "full_file",
-        "feature_row_column_tile_size": 2048,
-        "influence_row_tile_size": 4096,
-        "influence_column_tile_size": 2048,
-        "feature_row_retention": "full_file",
-        "replay_tile_cache_bytes": None,
-    }
-    assert {
-        name: signature.parameters[name].default for name in expected_defaults
-    } == expected_defaults
-
-
-def test_exported_attribute_forwards_tiled_mechanism_controls(monkeypatch):
-    import circuit_tracer.attribution.attribute_nnsight as nnsight_module
-    from circuit_tracer import attribute
-
-    captured = {}
-    monkeypatch.setattr(
-        nnsight_module,
-        "attribute",
-        lambda prompt, model, **kwargs: captured.update(kwargs) or "graph",
-    )
-    assert (
-        attribute(
-            [1],
-            FakeModel(),
-            full_retention_backend="column_tiled_v1",
-            feature_row_column_tile_size=32,
-            influence_row_tile_size=64,
-            influence_column_tile_size=16,
-            feature_row_retention="none_recompute",
-            replay_tile_cache_bytes=1024,
+def test_fingerprints_are_stable_and_split_semantics_from_execution() -> None:
+    first = resolve_trace_request(request(4))
+    same = resolve_trace_request(request(4))
+    physical = resolve_trace_request(
+        request(
+            4,
+            execution=ExecutionConstraints(session=SessionPlan(capacity=8)),
         )
-        == "graph"
     )
-    assert captured["full_retention_backend"] == "column_tiled_v1"
-    assert captured["feature_row_column_tile_size"] == 32
-    assert captured["influence_row_tile_size"] == 64
-    assert captured["influence_column_tile_size"] == 16
-    assert captured["feature_row_retention"] == "none_recompute"
-    assert captured["replay_tile_cache_bytes"] == 1024
-
-
-def test_fingerprints_are_stable_and_split_logical_from_physical():
-    first = request(4)
-    same = request(4)
-    physical = request(4, physical=runtime.TracePhysicalControls(session_capacity=8))
-    logical = request(4, logical=runtime.TraceLogicalSemantics(source_group_size=8))
+    semantic = resolve_trace_request(
+        request(4, semantics=TraceSemantics(source_batch_size=8))
+    )
 
     assert first.semantic_fingerprint == same.semantic_fingerprint
     assert first.execution_fingerprint == same.execution_fingerprint
     assert first.semantic_fingerprint == physical.semantic_fingerprint
     assert first.execution_fingerprint != physical.execution_fingerprint
-    assert first.semantic_fingerprint != logical.semantic_fingerprint
-    assert first.execution_fingerprint == logical.execution_fingerprint
+    assert first.semantic_fingerprint != semantic.semantic_fingerprint
+    assert first.execution_fingerprint == semantic.execution_fingerprint
 
 
 @pytest.mark.parametrize(
-    ("name", "first", "second"),
+    ("field", "first", "second"),
     [
         ("max_n_logits", 2, 3),
         ("desired_logit_prob", 0.8, 0.9),
-        ("attribution_targets", ["a"], ["b"]),
-        ("max_feature_nodes", 10, 11),
-        ("diagnostic_feature_cap", 4, 5),
-        ("sparsification", {"threshold": 0.1}, {"threshold": 0.2}),
-        ("phase3_frontier_buffer_max_extra", 1, 2),
-        ("phase4_frontier_buffer_max_extra_total", 1, 2),
+        ("targets", ["a"], ["b"]),
+        ("output_position", 1, 2),
     ],
 )
-def test_graph_controls_cannot_collide_in_semantic_fingerprint(name, first, second):
-    if name == "attribution_targets":
-        left = request(attribution_targets=first)
-        right = request(attribution_targets=second)
-    elif name in {"max_feature_nodes", "diagnostic_feature_cap"}:
-        left = request(logical=runtime.TraceLogicalSemantics(**{name: first}))
-        right = request(logical=runtime.TraceLogicalSemantics(**{name: second}))
-    else:
-        left = request(legacy_kwargs={name: first})
-        right = request(legacy_kwargs={name: second})
+def test_problem_controls_change_semantic_fingerprint(field, first, second) -> None:
+    left = resolve_trace_request(request(**{field: first}))
+    right = resolve_trace_request(request(**{field: second}))
     assert left.semantic_fingerprint != right.semantic_fingerprint
 
 
-def test_unknown_legacy_kwarg_is_rejected_preflight():
-    with pytest.raises(TypeError, match="unknown legacy attribution kwargs: obsolete_knob"):
-        request(legacy_kwargs={"obsolete_knob": True}).semantic_fingerprint
-
-
-def test_direct_feature_controls_map_or_reject_before_execution(monkeypatch):
-    captured = {}
+def test_invalid_requests_fail_before_backend_execution(monkeypatch) -> None:
     monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight._attribute_impl",
-        lambda prompt, model, **kwargs: captured.update(kwargs) or {},
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace",
+        lambda *_: pytest.fail("backend reached before validation"),
     )
-    runtime.trace_one(request(logical=runtime.TraceLogicalSemantics(
-        feature_group_size=7, phase4_reference_frontier_batch=7,
-    )))
-    assert captured["feature_batch_size"] == 7
-    with pytest.raises(ValueError, match="must be equal"):
-        runtime.trace_one(request(logical=runtime.TraceLogicalSemantics(
-            feature_group_size=7, phase4_reference_frontier_batch=8,
-        )))
-    with pytest.raises(ValueError, match="hooks are not representable"):
-        runtime.trace_one(request(logical=runtime.TraceLogicalSemantics(hooks=("x",))))
+    with pytest.raises(ValueError, match="microbatch"):
+        SessionPlan(capacity=2, phase3_microbatch_max_rows=3)
+    with pytest.raises(ValueError, match="evidence name and version"):
+        TraceEvidence(name="gate")
 
 
-def test_conflict_is_rejected_before_implementation(monkeypatch):
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight._attribute_impl",
-        lambda *args, **kwargs: pytest.fail("implementation reached before preflight"),
+def test_transformerlens_rejects_nondefault_execution_constraints() -> None:
+    model = FakeModel()
+    model.backend = "transformerlens"
+    selected = TraceRequest(
+        problem=AttributionProblem(model=model, prompt=[1]),
+        execution=ExecutionConstraints(session=SessionPlan(capacity=8)),
     )
-    conflicting = request(
-        logical=runtime.TraceLogicalSemantics(source_group_size=8),
-        legacy_kwargs={"batch_size": 16},
-    )
-    with pytest.raises(ValueError, match="conflicting logical value"):
-        runtime.trace_one(conflicting)
+    with pytest.raises(ValueError, match="only default execution constraints"):
+        resolve_trace_request(selected)
 
 
-def test_mixed_batch_order_isolation_failure_and_cancellation(monkeypatch):
-    def execute(prompt, model, **kwargs):
-        if prompt == [2]:
+def test_mixed_batch_order_isolation_failure_and_cancellation(monkeypatch) -> None:
+    def execute(problem, _plan):
+        if problem.prompt == [2]:
             raise LookupError("bad shape")
-        return list(prompt)
+        return list(problem.prompt)
 
-    monkeypatch.setattr("circuit_tracer.attribution.attribute_nnsight._attribute_impl", execute)
-    results = runtime.trace_batch([request(1), request(2), request(3)], failure="return")
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
+    )
+    results = trace_batch([request(1), request(2), request(3)], failure="return")
     assert [result.status for result in results] == [
-        runtime.TraceStatus.SUCCEEDED,
-        runtime.TraceStatus.FAILED,
-        runtime.TraceStatus.SUCCEEDED,
+        TraceStatus.SUCCEEDED,
+        TraceStatus.FAILED,
+        TraceStatus.SUCCEEDED,
     ]
     assert [result.output for result in results] == [[1], None, [3]]
     with pytest.raises(LookupError, match="bad shape"):
-        runtime.trace_batch([request(1), request(2), request(3)])
+        trace_batch([request(1), request(2), request(3)])
 
     cancelled = threading.Event()
     cancelled.set()
-    results = runtime.trace_batch([request(1), request(3)], failure="return", cancellation=cancelled)
-    assert [result.status for result in results] == [runtime.TraceStatus.CANCELLED] * 2
+    results = trace_batch(
+        [request(1), request(3)], failure="return", cancellation=cancelled
+    )
+    assert [result.status for result in results] == [TraceStatus.CANCELLED] * 2
 
 
-def test_batch_does_not_convert_base_exceptions(monkeypatch):
+def test_batch_does_not_convert_base_exceptions(monkeypatch) -> None:
+    def cancel(*_args):
+        raise asyncio.CancelledError
+
     monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight._attribute_impl",
-        lambda *args, **kwargs: (_ for _ in ()).throw(asyncio.CancelledError()),
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", cancel
     )
     with pytest.raises(asyncio.CancelledError):
-        runtime.trace_batch([request(1)], failure="return")
+        trace_batch([request(1)], failure="return")
 
 
-def test_graph_style_telemetry_summary_is_extracted(monkeypatch):
+def test_graph_style_telemetry_summary_is_extracted(monkeypatch) -> None:
     class Output:
         telemetry_summary = {"event_count": 9}
 
     monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight._attribute_impl",
-        lambda *args, **kwargs: Output(),
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace",
+        lambda *_: Output(),
     )
-    assert runtime.trace_one(request()).telemetry_summary == {"event_count": 9}
+    assert trace_one(request()).telemetry_summary == {"event_count": 9}
 
 
-def test_session_reuse_reset_close_and_failure_recovery(monkeypatch):
+def test_session_reuse_reset_close_and_failure_recovery(monkeypatch) -> None:
     delegates = []
 
     class Delegate:
-        def __init__(self, **kwargs):
-            self.cleaned = 0
+        def __init__(self, **_kwargs):
+            self.closed = 0
             self.fail = True
             delegates.append(self)
 
-        def attribute_target_position(self, position, **kwargs):
+        def trace_target_position(self, position, _request, _plan):
             if self.fail:
                 self.fail = False
                 raise RuntimeError("injected")
             return f"graph-{position}"
 
-        def cleanup(self):
-            self.cleaned += 1
+        def close(self):
+            self.closed += 1
 
     monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight.FullSequenceWindowAttributionSession",
+        "circuit_tracer.attribution.nnsight.forward_session.ForwardTraceSession",
         Delegate,
     )
-    session = runtime.open_session(request([1, 2, 3]), window_max_prefix_len=3)
+    session = open_session(request([1, 2, 3]), window=SessionWindow(max_prefix_len=3))
     with pytest.raises(RuntimeError, match="injected"):
         session.trace_window(2, reuse=True)
     assert session.trace_window(2, reuse=True).output == "graph-2"
     assert len(delegates) == 1
     session.reset()
-    assert delegates[0].cleaned == 1
+    assert delegates[0].closed == 1
     with pytest.raises(RuntimeError, match="injected"):
         session.trace_window(2, reuse=True)
     session.close()
-    assert delegates[1].cleaned == 1
+    assert delegates[1].closed == 1
     session.close()
     with pytest.raises(RuntimeError, match="closed"):
         session.trace()
 
 
-def test_session_window_applies_base_and_call_effective_config(monkeypatch):
+def test_session_window_resolves_effective_request(monkeypatch) -> None:
     calls = []
 
     class Delegate:
-        def __init__(self, **kwargs):
+        def __init__(self, **_kwargs):
             pass
 
-        def attribute_target_position(self, position, **kwargs):
-            calls.append((position, kwargs))
+        def trace_target_position(self, position, selected, plan):
+            calls.append((position, selected, plan))
             return "graph"
 
-        def cleanup(self):
+        def close(self):
             pass
 
     monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight.FullSequenceWindowAttributionSession",
+        "circuit_tracer.attribution.nnsight.forward_session.ForwardTraceSession",
         Delegate,
     )
     base = request(
         [1, 2, 3],
-        attribution_targets=["base"],
-        logical=runtime.TraceLogicalSemantics(source_group_size=6),
-        physical=runtime.TracePhysicalControls(influence_row_tile=2),
+        targets=["base"],
+        semantics=TraceSemantics(source_batch_size=6),
+        execution=ExecutionConstraints(
+            storage=RowStoragePlan(influence_row_tile_size=2)
+        ),
     )
-    session = runtime.open_session(base)
-    first = session.trace_window(2, reuse=True, max_n_logits=3)
-    second = session.trace_window(3, reuse=True, max_n_logits=3)
-    assert calls[0][1]["attribution_targets"] == ["base"]
-    assert calls[0][1]["batch_size"] == 6
-    assert calls[0][1]["influence_row_tile_size"] == 2
-    assert calls[0][1]["max_n_logits"] == 3
+    session = open_session(base)
+    first = session.trace_window(2, reuse=True)
+    override = replace(base, problem=replace(base.problem, max_n_logits=3))
+    second = session.trace_window(3, reuse=True, request=override)
+
+    assert calls[0][1].problem.targets == ["base"]
+    assert calls[0][2].semantics.source_batch_size == 6
+    assert calls[0][2].execution.storage.influence_row_tile_size == 2
+    assert calls[1][1].problem.max_n_logits == 3
+    assert calls[0][1].problem.output_position == 1
+    assert calls[1][1].problem.output_position == 2
     assert first.semantic_fingerprint != second.semantic_fingerprint
-    assert first.compatibility_metadata["target_position"] == 2
-    assert first.compatibility_metadata["semantic_effective_config"]["output_position"] == 1

@@ -2,7 +2,6 @@
 
 import os
 import warnings
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -14,7 +13,7 @@ from circuit_tracer.attribution.nnsight.replay import (
     _hash_index_tensor,
 )
 
-_ATTRIBUTE_NNSIGHT_FILE = str(Path(__file__).parents[1] / "attribute_nnsight.py")
+_NNSIGHT_BACKEND_FILE = __file__.replace("phase_support.py", "backend.py")
 
 def _resolve_internal_precision_requested(
     internal_precision: str | None,
@@ -1134,7 +1133,6 @@ def _build_phase4_environment_fingerprint() -> dict[str, object]:
         "lib_workspace_root": os.getenv("LIB_WORKSPACE_ROOT"),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
-        "attribute_nnsight_file": _ATTRIBUTE_NNSIGHT_FILE,
+        "nnsight_backend_file": _NNSIGHT_BACKEND_FILE,
     }
-
 

@@ -2,11 +2,10 @@
 
 This module owns policy/configuration, frontier planning, rank selection, scheduler
 telemetry summaries, exact-encoder residency setup, and feature-batch preflight.
-The Phase-4 execution body remains in :mod:`attribute_nnsight`.
+The Phase-4 execution body remains in :mod:`circuit_tracer.attribution.nnsight.backend`.
 """
 
 import math
-import sys
 import time
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -1816,15 +1815,7 @@ def _apply_phase4_planner_v2_refresh_plan(
     telemetry = _build_phase4_planner_v2_refresh_telemetry_disabled()
     selected_membership = reference_frontier.detach().to(device="cpu", dtype=torch.long)
     try:
-        candidate_builder = _build_phase4_planner_v2_candidate_window
-        compatibility_module = sys.modules.get("circuit_tracer.attribution.attribute_nnsight")
-        if compatibility_module is not None:
-            candidate_builder = getattr(
-                compatibility_module,
-                "_build_phase4_planner_v2_candidate_window",
-                candidate_builder,
-            )
-        candidate_window, telemetry = candidate_builder(
+        candidate_window, telemetry = _build_phase4_planner_v2_candidate_window(
             unvisited_feature_rank,
             reference_frontier=reference_frontier,
             reference_frontier_size=reference_size,
@@ -2410,8 +2401,10 @@ def _plan_phase4_feature_batch_size_preflight(
     telemetry_recorder: TelemetryRecorder | None = None,
     prefix_view_metadata: PrefixViewMetadata | None = None,
 ) -> int:
-    # Runtime import avoids a module cycle and preserves the legacy monkeypatch path.
-    from circuit_tracer.attribution.attribute_nnsight import _copy_rows_to_cpu_staging
+    # Runtime import avoids the phase_support -> phase4_policy module cycle.
+    from circuit_tracer.attribution.nnsight.phase_support import (
+        _copy_rows_to_cpu_staging,
+    )
 
     planner_start = time.perf_counter()
     exact_trace_internal_dtype_name = _exact_trace_internal_dtype_name(exact_trace_internal_dtype)
