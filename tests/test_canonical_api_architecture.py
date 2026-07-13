@@ -15,6 +15,10 @@ def test_production_has_no_legacy_tracing_entrypoints_or_references() -> None:
         "attribute_transformerlens",
         "circuit_tracer.runtime",
         "circuit_tracer.attribution.attribute import",
+        "_attribute_impl",
+        "_run_attribution",
+        "request_from_legacy",
+        "legacy_kwargs",
     )
     stale = {
         path.relative_to(PACKAGE_ROOT): token

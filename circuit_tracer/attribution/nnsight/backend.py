@@ -78,7 +78,7 @@ def run_nnsight_trace(
         raise RuntimeError("run_nnsight_trace must be invoked through the canonical trace runner")
     offload_handles: list[Any] = []
     try:
-        return _run_attribution(
+        return _execute_prepared_trace(
             problem=problem,
             plan=plan,
             logger=logger,
@@ -94,7 +94,7 @@ def run_nnsight_trace(
             logger.removeHandler(handler)
 
 
-def _run_attribution(
+def _execute_prepared_trace(
     *,
     problem: AttributionProblem,
     plan: ResolvedTracePlan,
