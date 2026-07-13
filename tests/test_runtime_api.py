@@ -8,8 +8,10 @@ import pytest
 
 from circuit_tracer.tracing import (
     AttributionProblem,
+    DecoderCachePolicy,
     ExecutionConstraints,
     FrontierExpansionPlan,
+    FrontierSemantics,
     ObservabilityPolicy,
     ReplayPlan,
     RowStoragePlan,
@@ -24,6 +26,7 @@ from circuit_tracer.tracing import (
     trace_batch,
     trace_one,
 )
+from circuit_tracer.transcoder.provider import TranscoderCapabilities
 
 
 class FakeModel:
@@ -71,12 +74,16 @@ def test_trace_one_passes_owned_problem_and_resolved_plan(monkeypatch) -> None:
     )
     selected = request(
         3,
-        semantics=TraceSemantics(source_batch_size=7, feature_batch_size=5),
+        semantics=TraceSemantics(
+            source_batch_size=7,
+            feature_batch_size=5,
+            frontier=FrontierSemantics(scheduler="planner_v1"),
+        ),
         execution=ExecutionConstraints(
             session=SessionPlan(capacity=8),
             storage=RowStoragePlan(full_retention_backend="column_tiled_v1"),
             replay=ReplayPlan(feature_window=2),
-            frontier=FrontierExpansionPlan(scheduler="planner_v1"),
+            frontier=FrontierExpansionPlan(row_executor="streaming_v1"),
             observability=ObservabilityPolicy(profile=True),
         ),
         evidence=TraceEvidence(name="gate", version="v1"),
@@ -112,6 +119,106 @@ def test_fingerprints_are_stable_and_split_semantics_from_execution() -> None:
     assert first.execution_fingerprint != physical.execution_fingerprint
     assert first.semantic_fingerprint != semantic.semantic_fingerprint
     assert first.execution_fingerprint == semantic.execution_fingerprint
+
+
+def test_frontier_membership_controls_are_semantic_not_physical() -> None:
+    base = resolve_trace_request(request(4))
+    membership = resolve_trace_request(
+        request(
+            4,
+            semantics=TraceSemantics(
+                frontier=FrontierSemantics(
+                    scheduler="planner_v1",
+                    refresh_policy="deferred_v1",
+                    refresh_interval_multiplier=2,
+                    ranker="topk_v1",
+                    phase3_buffer_relative_epsilon=0.01,
+                    phase3_buffer_max_extra=2,
+                    phase4_buffer_relative_epsilon=0.02,
+                    phase4_buffer_max_extra_per_refresh=3,
+                    phase4_buffer_max_extra_total=4,
+                )
+            ),
+        )
+    )
+    mechanism = resolve_trace_request(
+        request(
+            4,
+            execution=ExecutionConstraints(
+                frontier=FrontierExpansionPlan(
+                    row_executor="streaming_v1",
+                    refresh_optimization="off",
+                )
+            ),
+        )
+    )
+
+    assert membership.semantic_fingerprint != base.semantic_fingerprint
+    assert membership.execution_fingerprint == base.execution_fingerprint
+    assert mechanism.semantic_fingerprint == base.semantic_fingerprint
+    assert mechanism.execution_fingerprint != base.execution_fingerprint
+
+
+def test_evidence_provenance_does_not_change_fingerprints() -> None:
+    first = resolve_trace_request(
+        request(4, evidence=TraceEvidence(name="gate-a", version="1"))
+    )
+    second = resolve_trace_request(
+        request(4, evidence=TraceEvidence(name="gate-b", version="2"))
+    )
+    assert first.semantic_fingerprint == second.semantic_fingerprint
+    assert first.execution_fingerprint == second.execution_fingerprint
+
+
+def test_decoder_cache_policy_changes_only_execution_fingerprint() -> None:
+    base = resolve_trace_request(request(4))
+    cached = resolve_trace_request(
+        request(
+            4,
+            execution=ExecutionConstraints(
+                session=SessionPlan(
+                    decoder_cache=DecoderCachePolicy(enabled=True, max_bytes=4096)
+                )
+            ),
+        )
+    )
+    assert base.semantic_fingerprint == cached.semantic_fingerprint
+    assert base.execution_fingerprint != cached.execution_fingerprint
+
+
+def test_provider_semantic_identity_and_physical_capabilities_hash_separately() -> None:
+    class Provider:
+        def __init__(self, *, checkpoint: str, cache_bytes: int) -> None:
+            self.scan = checkpoint
+            self.capabilities = TranscoderCapabilities(
+                architecture="clt",
+                checkpoint_format="test",
+                supports_exact_chunked_provider=True,
+                supports_decoder_chunk_cache=True,
+                default_decoder_chunk_size=8192,
+                default_cross_batch_decoder_cache_bytes=cache_bytes,
+            )
+
+    class Model(FakeModel):
+        def __init__(self, *, checkpoint: str, cache_bytes: int) -> None:
+            self.transcoders = Provider(checkpoint=checkpoint, cache_bytes=cache_bytes)
+
+    def resolved(checkpoint: str, cache_bytes: int):
+        selected = TraceRequest(
+            problem=AttributionProblem(
+                prompt=[4],
+                model=Model(checkpoint=checkpoint, cache_bytes=cache_bytes),
+            )
+        )
+        return resolve_trace_request(selected)
+
+    base = resolved("checkpoint-a", 1024)
+    physical = resolved("checkpoint-a", 2048)
+    semantic = resolved("checkpoint-b", 1024)
+    assert base.semantic_fingerprint == physical.semantic_fingerprint
+    assert base.execution_fingerprint != physical.execution_fingerprint
+    assert base.semantic_fingerprint != semantic.semantic_fingerprint
+    assert base.execution_fingerprint == semantic.execution_fingerprint
 
 
 @pytest.mark.parametrize(
@@ -236,6 +343,77 @@ def test_session_reuse_reset_close_and_failure_recovery(monkeypatch) -> None:
     session.close()
     with pytest.raises(RuntimeError, match="closed"):
         session.trace()
+
+
+def test_session_owns_bounded_decoder_cache_across_traces_and_failures(monkeypatch) -> None:
+    class Provider:
+        capabilities = TranscoderCapabilities(
+            architecture="clt",
+            checkpoint_format="test",
+            supports_decoder_chunk_cache=True,
+        )
+
+        def __init__(self) -> None:
+            self.created: list[tuple[object, int | None, object]] = []
+            self.cleared: list[object] = []
+
+        def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None):
+            cache = object()
+            self.created.append((cache, max_bytes, fingerprint))
+            return cache
+
+        def clear_decoder_block_cache(self, cache) -> None:
+            self.cleared.append(cache)
+
+    class Model(FakeModel):
+        def __init__(self) -> None:
+            self.transcoders = Provider()
+
+    model = Model()
+    selected = TraceRequest(problem=AttributionProblem(prompt=[1], model=model))
+    seen: list[object] = []
+    fail = False
+
+    def execute(_problem, _plan, *, forward_overrides):
+        seen.append(forward_overrides.decoder_chunk_cache)
+        if fail:
+            raise RuntimeError("injected decoder-cache failure")
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
+    )
+    session = open_session(
+        replace(
+            selected,
+            execution=ExecutionConstraints(
+                session=SessionPlan(
+                    decoder_cache=DecoderCachePolicy(enabled=True, max_bytes=4096)
+                )
+            ),
+        ),
+    )
+
+    session.trace()
+    session.trace()
+    assert seen[0] is seen[1]
+    assert model.transcoders.created[0][1] == 4096
+    assert model.transcoders.created[0][2]["architecture"] == "clt"
+
+    session.reset()
+    assert model.transcoders.cleared == [seen[0]]
+    session.trace()
+    assert seen[2] is not seen[0]
+
+    fail = True
+    with pytest.raises(RuntimeError, match="decoder-cache failure"):
+        session.trace()
+    assert model.transcoders.cleared[-1] is seen[3]
+    fail = False
+    session.trace()
+    assert seen[4] is not seen[3]
+    session.close()
+    assert model.transcoders.cleared[-1] is seen[4]
 
 
 def test_session_window_resolves_effective_request(monkeypatch) -> None:

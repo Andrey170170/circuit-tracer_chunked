@@ -48,6 +48,34 @@ class AttributionProblem:
 
 
 @dataclass(frozen=True)
+class FrontierSemantics:
+    """Strict frontier checkpoints and membership choices."""
+
+    scheduler: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality"
+    refresh_policy: Literal["standard", "deferred_v1"] = "standard"
+    refresh_interval_multiplier: int = 1
+    ranker: Literal["argsort", "topk_v1"] = "argsort"
+    phase3_buffer_relative_epsilon: float | None = None
+    phase3_buffer_max_extra: int = 0
+    phase4_buffer_relative_epsilon: float | None = None
+    phase4_buffer_max_extra_per_refresh: int = 0
+    phase4_buffer_max_extra_total: int = 0
+
+    def __post_init__(self) -> None:
+        _positive("refresh_interval_multiplier", self.refresh_interval_multiplier)
+        for name in (
+            "phase3_buffer_max_extra",
+            "phase4_buffer_max_extra_per_refresh",
+            "phase4_buffer_max_extra_total",
+        ):
+            _nonnegative(name, getattr(self, name))
+        for name in ("phase3_buffer_relative_epsilon", "phase4_buffer_relative_epsilon"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be nonnegative when provided")
+
+
+@dataclass(frozen=True)
 class TraceSemantics:
     """Complete choices that are allowed to change the mathematical result."""
 
@@ -62,6 +90,7 @@ class TraceSemantics:
         "baseline", "bf16", "fp32", "fp64"
     ] = "baseline"
     sparsification: SparsificationConfig | None = field(default=None, repr=False)
+    frontier: FrontierSemantics = field(default_factory=FrontierSemantics)
 
     def __post_init__(self) -> None:
         for name in (
@@ -73,4 +102,3 @@ class TraceSemantics:
             "update_interval",
         ):
             _positive(name, getattr(self, name))
-

@@ -35,23 +35,41 @@ def _stable(value: Any) -> Any:
     return {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
 
 
-def _provider_identity(model: Any) -> dict[str, Any]:
-    identity = {
+def _provider_identity(model: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    semantic = {
         name: _stable(getattr(model, name))
         for name in ("backend", "scan", "model_name", "provider_id", "dtype")
         if hasattr(model, name)
     }
     config = getattr(model, "config", None)
     if config is not None:
-        identity["model_checkpoint"] = getattr(config, "_name_or_path", None)
-        identity["architectures"] = _stable(getattr(config, "architectures", None))
+        semantic["model_checkpoint"] = getattr(config, "_name_or_path", None)
+        semantic["architectures"] = _stable(getattr(config, "architectures", None))
+    physical: dict[str, Any] = {}
     provider = getattr(model, "transcoders", None)
     if provider is not None:
         provider = getattr(provider, "_module", provider)
         from circuit_tracer.transcoder.provider import provider_fingerprint
 
-        identity["transcoder_provider"] = provider_fingerprint(provider)
-    return identity
+        identity = provider_fingerprint(provider)
+        semantic_keys = {
+            "architecture",
+            "checkpoint_format",
+            "checkpoint_identity",
+            "dtype",
+            "n_layers",
+            "d_model",
+            "d_transcoder",
+            "decoder_output_topology",
+            "decoder_chunk_size",
+        }
+        semantic["transcoder_provider"] = {
+            key: value for key, value in identity.items() if key in semantic_keys
+        }
+        physical["transcoder_provider"] = {
+            key: value for key, value in identity.items() if key not in semantic_keys
+        }
+    return semantic, physical
 
 
 def _validate_backend_constraints(backend: str, execution: ExecutionConstraints) -> None:
@@ -71,7 +89,7 @@ def resolve_trace_request(request: TraceRequest) -> ResolvedTracePlan:
     if not isinstance(backend, str):
         raise ValueError("problem model must declare a tracing backend")
     _validate_backend_constraints(backend, request.execution)
-    provider = _provider_identity(request.problem.model)
+    semantic_provider, physical_provider = _provider_identity(request.problem.model)
     semantics = {
         "schema_version": RUNTIME_SCHEMA_VERSION,
         "problem": {
@@ -82,12 +100,12 @@ def resolve_trace_request(request: TraceRequest) -> ResolvedTracePlan:
             "output_position": request.problem.output_position,
         },
         "semantics": _stable(request.semantics),
-        "provider": provider,
-        "evidence": {"name": request.evidence.name, "version": request.evidence.version},
+        "provider": semantic_provider,
     }
     execution = {
         "schema_version": RUNTIME_SCHEMA_VERSION,
         "constraints": _stable(request.execution),
+        "provider": physical_provider,
     }
     return ResolvedTracePlan(
         semantics=request.semantics,

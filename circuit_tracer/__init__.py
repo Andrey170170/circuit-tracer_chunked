@@ -13,8 +13,10 @@ if TYPE_CHECKING:
     from circuit_tracer.replacement_model import ReplacementModel
     from circuit_tracer.tracing import (
         AttributionProblem,
+        DecoderCachePolicy,
         ExecutionConstraints,
         FrontierExpansionPlan,
+        FrontierSemantics,
         ObservabilityPolicy,
         ReplayPlan,
         ResolvedTracePlan,
@@ -35,9 +37,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AttributionProblem",
+    "DecoderCachePolicy",
     "attribute_phase0_stats",
     "ExecutionConstraints",
     "FrontierExpansionPlan",
+    "FrontierSemantics",
     "Graph",
     "ObservabilityPolicy",
     "ReplayPlan",

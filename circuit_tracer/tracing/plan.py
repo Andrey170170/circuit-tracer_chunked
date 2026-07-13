@@ -10,6 +10,20 @@ from .problem import TraceSemantics, _nonnegative, _positive
 
 
 @dataclass(frozen=True)
+class DecoderCachePolicy:
+    """Physical cross-trace decoder reuse owned by a tracing session."""
+
+    enabled: bool = False
+    max_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_bytes is not None and self.max_bytes <= 0:
+            raise ValueError("decoder cache max_bytes must be positive")
+        if not self.enabled and self.max_bytes is not None:
+            raise ValueError("decoder cache max_bytes requires enabled=True")
+
+
+@dataclass(frozen=True)
 class SessionPlan:
     """NNSight graph capacity and physical phase batching."""
 
@@ -18,6 +32,7 @@ class SessionPlan:
     phase4_microbatch_max_rows: int | None = None
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy"
     phase1_trace_batch_size_max: int | None = None
+    decoder_cache: DecoderCachePolicy = field(default_factory=DecoderCachePolicy)
 
     def __post_init__(self) -> None:
         for name in ("capacity", "phase3_microbatch_max_rows", "phase4_microbatch_max_rows"):
@@ -98,9 +113,8 @@ class ReplayPlan:
 
 @dataclass(frozen=True)
 class FrontierExpansionPlan:
-    """Phase-4 scheduling, refresh, ranking, and bounded-buffer mechanisms."""
+    """Physical Phase-4 execution, storage, and planner mechanisms."""
 
-    scheduler: Literal["locality", "planner_v1", "planner_v2", "legacy"] = "locality"
     scheduler_debug: bool = False
     scheduler_telemetry_detail: Literal["summary", "normal", "debug"] = "normal"
     refresh_optimization: Literal["off", "v1"] = "v1"
@@ -108,31 +122,16 @@ class FrontierExpansionPlan:
     refresh_active_row_accumulation: Literal["zero_fill", "direct_v1"] = "direct_v1"
     row_executor: Literal["batched", "streaming_v1"] = "batched"
     row_reduction: Literal["off", "gpu_v1"] = "gpu_v1"
-    refresh_policy: Literal["standard", "deferred_v1"] = "standard"
-    refresh_interval_multiplier: int = 1
-    ranker: Literal["argsort", "topk_v1"] = "argsort"
     feature_batch_planning: bool = False
     feature_batch_size_max: int | None = None
     feature_batch_target_reserved_fraction: float = 0.9
     feature_batch_min_free_fraction: float = 0.05
     feature_batch_probe_batches: int = 1
-    phase3_frontier_buffer_relative_epsilon: float | None = None
-    phase3_frontier_buffer_max_extra: int = 0
-    phase4_frontier_buffer_relative_epsilon: float | None = None
-    phase4_frontier_buffer_max_extra_per_refresh: int = 0
-    phase4_frontier_buffer_max_extra_total: int = 0
 
     def __post_init__(self) -> None:
         _nonnegative("refresh_prepared_chunk_cache_bytes", self.refresh_prepared_chunk_cache_bytes)
-        _positive("refresh_interval_multiplier", self.refresh_interval_multiplier)
         _positive("feature_batch_size_max", self.feature_batch_size_max)
         _positive("feature_batch_probe_batches", self.feature_batch_probe_batches)
-        for name in (
-            "phase3_frontier_buffer_max_extra",
-            "phase4_frontier_buffer_max_extra_per_refresh",
-            "phase4_frontier_buffer_max_extra_total",
-        ):
-            _nonnegative(name, getattr(self, name))
         for name in (
             "feature_batch_target_reserved_fraction",
             "feature_batch_min_free_fraction",

@@ -20,15 +20,17 @@ https://transformer-circuits.pub/2025/attribution-graphs/methods.html
    needed for interpretation.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
+if TYPE_CHECKING:
+    from .forward_session import ForwardOverrides
 
 if sys.version_info >= (3, 11):
     from builtins import BaseExceptionGroup, ExceptionGroup
@@ -201,22 +203,15 @@ def _resolve_phase4_anomaly_debug_enabled(phase4_anomaly_debug: bool) -> bool:
     return bool(phase4_anomaly_debug)
 
 
-@dataclass(frozen=True)
-class _ForwardOverrides:
-    phase0_context: object | None = None
-    target_logits: torch.Tensor | None = None
-    target_logit_source: str | None = None
-    decoder_chunk_cache: object | None = None
-    decoder_cache_fingerprint: object | None = None
-
-
 def run_nnsight_trace(
     problem: AttributionProblem,
     plan: ResolvedTracePlan,
     *,
-    forward_overrides: _ForwardOverrides | None = None,
+    forward_overrides: "ForwardOverrides | None" = None,
 ) -> Graph | dict[str, object]:
     """Execute one resolved plan while owning logging and offload cleanup."""
+
+    from .forward_session import ForwardOverrides
 
     observability = plan.execution.observability
     logger = logging.getLogger("attribution")
@@ -246,7 +241,7 @@ def run_nnsight_trace(
             plan=plan,
             logger=logger,
             offload_handles=offload_handles,
-            forward_overrides=forward_overrides or _ForwardOverrides(),
+            forward_overrides=forward_overrides or ForwardOverrides(),
             prefix_view_metadata=prefix_view_metadata,
             output_position=output_position,
         )
@@ -263,7 +258,7 @@ def _run_attribution(
     plan: ResolvedTracePlan,
     logger: logging.Logger,
     offload_handles: list[Any],
-    forward_overrides: _ForwardOverrides,
+    forward_overrides: "ForwardOverrides",
     prefix_view_metadata: PrefixViewMetadata | None,
     output_position: int | None,
 ):
@@ -280,6 +275,7 @@ def _run_attribution(
     storage = execution.storage
     replay = execution.replay
     frontier = execution.frontier
+    frontier_semantics = semantics.frontier
     observability = execution.observability
 
     batch_size = semantics.source_batch_size
@@ -324,7 +320,7 @@ def _run_attribution(
     phase3_row_replay_mode = replay.phase3_row_mode
     phase3_replay_validation_policy = replay.phase3_validation_policy
 
-    phase4_scheduler_mode = frontier.scheduler
+    phase4_scheduler_mode = frontier_semantics.scheduler
     phase4_scheduler_debug = frontier.scheduler_debug
     phase4_scheduler_telemetry_detail = frontier.scheduler_telemetry_detail
     phase4_refresh_optimization = frontier.refresh_optimization
@@ -332,19 +328,21 @@ def _run_attribution(
     phase4_refresh_active_row_accumulation = frontier.refresh_active_row_accumulation
     phase4_row_executor = frontier.row_executor
     phase4_row_reduction = frontier.row_reduction
-    phase4_refresh_policy = frontier.refresh_policy
-    phase4_refresh_interval_multiplier = frontier.refresh_interval_multiplier
-    phase4_ranker = frontier.ranker
+    phase4_refresh_policy = frontier_semantics.refresh_policy
+    phase4_refresh_interval_multiplier = frontier_semantics.refresh_interval_multiplier
+    phase4_ranker = frontier_semantics.ranker
     plan_feature_batch_size = frontier.feature_batch_planning
     feature_batch_size_max = frontier.feature_batch_size_max
     feature_batch_target_reserved_fraction = frontier.feature_batch_target_reserved_fraction
     feature_batch_min_free_fraction = frontier.feature_batch_min_free_fraction
     feature_batch_probe_batches = frontier.feature_batch_probe_batches
-    phase3_frontier_buffer_relative_epsilon = frontier.phase3_frontier_buffer_relative_epsilon
-    phase3_frontier_buffer_max_extra = frontier.phase3_frontier_buffer_max_extra
-    phase4_frontier_buffer_relative_epsilon = frontier.phase4_frontier_buffer_relative_epsilon
-    phase4_frontier_buffer_max_extra_per_refresh = frontier.phase4_frontier_buffer_max_extra_per_refresh
-    phase4_frontier_buffer_max_extra_total = frontier.phase4_frontier_buffer_max_extra_total
+    phase3_frontier_buffer_relative_epsilon = frontier_semantics.phase3_buffer_relative_epsilon
+    phase3_frontier_buffer_max_extra = frontier_semantics.phase3_buffer_max_extra
+    phase4_frontier_buffer_relative_epsilon = frontier_semantics.phase4_buffer_relative_epsilon
+    phase4_frontier_buffer_max_extra_per_refresh = (
+        frontier_semantics.phase4_buffer_max_extra_per_refresh
+    )
+    phase4_frontier_buffer_max_extra_total = frontier_semantics.phase4_buffer_max_extra_total
 
     offload = execution.offload
     compact_output = execution.compact_output
