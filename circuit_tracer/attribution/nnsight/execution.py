@@ -159,7 +159,9 @@ class AttributionExecution:
         model = p.problem.model
         execution = p.plan.execution
         if execution.offload and not model.skip_transcoder and not p.provider.exact_chunked:
-            p.offload_handles += offload_modules(model.transcoders, execution.offload)
+            p.offload_handles.extend(
+                offload_modules(model.transcoders, execution.offload)
+            )
         self.operations.run_phase1(
             logger=p.logger,
             model=model,
@@ -174,12 +176,16 @@ class AttributionExecution:
             telemetry_observer=p.diagnostics.observer,
         )
         if execution.offload:
-            p.offload_handles += offload_modules(
-                [layer.mlp for layer in getattr(model.pre_logit_location, "layers")],
-                execution.offload,
+            p.offload_handles.extend(
+                offload_modules(
+                    [layer.mlp for layer in getattr(model.pre_logit_location, "layers")],
+                    execution.offload,
+                )
             )
             if model.skip_transcoder and not p.provider.exact_chunked:
-                p.offload_handles += offload_modules(model.transcoders, execution.offload)
+                p.offload_handles.extend(
+                    offload_modules(model.transcoders, execution.offload)
+                )
 
     def setup_active_features_and_storage(self) -> None:
         p = self.prepared

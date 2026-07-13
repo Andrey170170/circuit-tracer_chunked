@@ -85,6 +85,20 @@ def test_backend_dependency_direction_is_one_way() -> None:
     assert _owned_imports("run_scope") == set()
 
 
+def test_execution_does_not_rebind_frozen_prepared_collections() -> None:
+    violations = [
+        node.lineno
+        for node in ast.walk(_module_tree("execution"))
+        if isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Attribute)
+        and node.target.attr == "offload_handles"
+    ]
+    assert not violations, (
+        "PreparedBackend is frozen; mutate offload_handles with extend rather than "
+        f"rebinding it via augmented assignment at lines {violations}"
+    )
+
+
 def test_backend_has_no_private_compatibility_exports() -> None:
     forbidden = {
         "_raise_cleanup_failures",
