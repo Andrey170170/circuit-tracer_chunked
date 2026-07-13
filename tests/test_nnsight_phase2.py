@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import circuit_tracer.attribution.nnsight.backend as backend
 from circuit_tracer.attribution.nnsight.phases.phase2 import _make_replay_lifecycle
+from circuit_tracer.attribution.nnsight.run_scope import raise_cleanup_failures
 
 
 def test_replay_lifecycle_restores_offloaded_modules_once_before_rebuild() -> None:
@@ -38,7 +38,8 @@ def test_cleanup_only_failures_raise_exception_group() -> None:
     first = RuntimeError("feature cleanup failed")
     second = OSError("sink close failed")
 
-    with pytest.raises(backend.ExceptionGroup, match="lifecycle cleanup failed") as raised:
-        backend._raise_cleanup_failures([first, second])
+    exception_group_type = getattr(__import__("builtins"), "ExceptionGroup")
+    with pytest.raises(exception_group_type, match="lifecycle cleanup failed") as raised:
+        raise_cleanup_failures([first, second])
 
     assert raised.value.exceptions == (first, second)

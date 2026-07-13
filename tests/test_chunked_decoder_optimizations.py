@@ -10,11 +10,11 @@ from safetensors.torch import save_file
 from circuit_tracer.attribution.context_transformerlens import (
     AttributionContext as TransformerLensAttributionContext,
 )
-from circuit_tracer.attribution.nnsight.backend import (
-    _resolve_phase0_activation_threshold_compare_mode,
-    _resolve_phase4_anomaly_debug_enabled,
-    _resolve_telemetry_max_events,
+from circuit_tracer.attribution.nnsight.preparation import (
+    resolve_phase0_activation_threshold_compare_mode,
+    resolve_telemetry_max_events,
 )
+from circuit_tracer.tracing.plan import ObservabilityPolicy
 from circuit_tracer.attribution.nnsight.phase1_policy import (
     _build_phase1_trace_batch_metadata,
     _build_phase1_trace_batch_sizing_metadata,
@@ -2451,14 +2451,16 @@ def test_phase4_planner_status_is_pending_when_growth_is_possible() -> None:
 
 
 def test_phase4_anomaly_debug_enabled_from_flag() -> None:
-    assert _resolve_phase4_anomaly_debug_enabled(True) is True
+    policy = ObservabilityPolicy(phase4_anomaly_debug=True)
+    assert policy.phase4_anomaly_debug is True
 
 
 def test_phase4_anomaly_debug_ignores_env_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PHASE4_ANOMALY_DEBUG", "1")
-    assert _resolve_phase4_anomaly_debug_enabled(False) is False
+    policy = ObservabilityPolicy(phase4_anomaly_debug=False)
+    assert policy.phase4_anomaly_debug is False
 
 
 def test_telemetry_max_events_ignores_env_override(
@@ -2466,7 +2468,7 @@ def test_telemetry_max_events_ignores_env_override(
 ) -> None:
     monkeypatch.setenv("CIRCUIT_TRACER_TELEMETRY_MAX_EVENTS", "17")
     assert (
-        _resolve_telemetry_max_events(
+        resolve_telemetry_max_events(
             telemetry_max_events=None,
             compact_output=False,
             exact_chunked_decoder=False,
@@ -3249,12 +3251,12 @@ def test_build_phase4_deterministic_shadow_pending_breaks_ties_stably() -> None:
 
 
 def test_phase0_activation_threshold_compare_mode_resolution() -> None:
-    assert _resolve_phase0_activation_threshold_compare_mode("DEFAULT") == "baseline"
-    assert _resolve_phase0_activation_threshold_compare_mode("bfloat16") == "bf16"
-    assert _resolve_phase0_activation_threshold_compare_mode("fp64") == "fp64"
+    assert resolve_phase0_activation_threshold_compare_mode("DEFAULT") == "baseline"
+    assert resolve_phase0_activation_threshold_compare_mode("bfloat16") == "bf16"
+    assert resolve_phase0_activation_threshold_compare_mode("fp64") == "fp64"
 
     with pytest.raises(ValueError, match="phase0_activation_threshold_compare_mode"):
-        _resolve_phase0_activation_threshold_compare_mode("float16")
+        resolve_phase0_activation_threshold_compare_mode("float16")
 
 
 def test_hash_sparse_membership_indices_canonicalizes_ordering() -> None:
