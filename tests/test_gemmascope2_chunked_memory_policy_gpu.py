@@ -4,9 +4,45 @@ import pytest
 import torch
 
 from circuit_tracer import ReplacementModel
-from circuit_tracer.attribution.attribute_nnsight import attribute as attribute_nnsight
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
+from circuit_tracer.tracing import (
+    AttributionProblem,
+    ExecutionConstraints,
+    ObservabilityPolicy,
+    TraceRequest,
+    TraceSemantics,
+    trace_one,
+)
 from tests.conftest import has_32gb
+
+
+def _trace_graph(
+    prompt,
+    model,
+    *,
+    max_n_logits: int,
+    source_batch_size: int,
+    max_feature_nodes: int,
+    offload: str | None,
+    feature_batch_size: int | None = None,
+    logit_batch_size: int | None = None,
+    profile: bool = False,
+):
+    return trace_one(
+        TraceRequest(
+            problem=AttributionProblem(prompt=prompt, model=model, max_n_logits=max_n_logits),
+            semantics=TraceSemantics(
+                source_batch_size=source_batch_size,
+                feature_batch_size=feature_batch_size,
+                logit_batch_size=logit_batch_size,
+                max_feature_nodes=max_feature_nodes,
+            ),
+            execution=ExecutionConstraints(
+                offload=offload,
+                observability=ObservabilityPolicy(profile=profile, profile_log_interval=1),
+            ),
+        )
+    ).graph
 
 
 def _load_gemmascope2_model() -> NNSightReplacementModel:
@@ -68,27 +104,26 @@ def test_gemmascope2_exact_chunked_setup_retains_last_token_logits_only_by_defau
 def test_gemmascope2_exact_chunked_split_batches_match_default_graph():
     prompt = "If Alice has 3 apples and buys 2 more, she has"
     default_model = _load_gemmascope2_model()
-    graph_default = attribute_nnsight(
+    graph_default = _trace_graph(
         prompt,
         default_model,
         max_n_logits=4,
-        batch_size=8,
+        source_batch_size=8,
         max_feature_nodes=64,
         offload="cpu",
     )
 
     split_model = _load_gemmascope2_model()
-    graph_split = attribute_nnsight(
+    graph_split = _trace_graph(
         prompt,
         split_model,
         max_n_logits=4,
-        batch_size=8,
+        source_batch_size=8,
         max_feature_nodes=64,
         offload="cpu",
         feature_batch_size=4,
         logit_batch_size=2,
         profile=True,
-        profile_log_interval=1,
     )
 
     _assert_graphs_close(graph_default, graph_split)
@@ -99,33 +134,32 @@ def test_gemmascope2_exact_chunked_sequential_reuse_matches_fresh_model():
     prompt = "If Alice has 3 apples and buys 2 more, she has"
 
     fresh_model = _load_gemmascope2_model()
-    fresh_graph = attribute_nnsight(
+    fresh_graph = _trace_graph(
         prompt,
         fresh_model,
         max_n_logits=4,
-        batch_size=8,
+        source_batch_size=8,
         max_feature_nodes=64,
         offload="cpu",
     )
 
     reused_model = _load_gemmascope2_model()
-    first_graph = attribute_nnsight(
+    first_graph = _trace_graph(
         prompt,
         reused_model,
         max_n_logits=4,
-        batch_size=8,
+        source_batch_size=8,
         max_feature_nodes=64,
         offload="cpu",
     )
-    second_graph = attribute_nnsight(
+    second_graph = _trace_graph(
         prompt,
         reused_model,
         max_n_logits=4,
-        batch_size=8,
+        source_batch_size=8,
         max_feature_nodes=64,
         offload="cpu",
         profile=True,
-        profile_log_interval=1,
     )
 
     _assert_graphs_close(fresh_graph, first_graph)

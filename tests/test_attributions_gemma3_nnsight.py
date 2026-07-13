@@ -9,12 +9,22 @@ from nnsight import save
 from tqdm import tqdm
 from transformers import AutoConfig, Gemma3TextConfig
 
-from circuit_tracer import attribute, Graph, ReplacementModel
+from circuit_tracer import Graph, ReplacementModel
+from circuit_tracer.tracing import AttributionProblem, TraceRequest, TraceSemantics, trace_one
 from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 from tests.conftest import has_32gb
+
+
+def _trace_graph(prompt, model, *, source_batch_size: int = 512):
+    return trace_one(
+        TraceRequest(
+            problem=AttributionProblem(prompt=prompt, model=model),
+            semantics=TraceSemantics(source_batch_size=source_batch_size),
+        )
+    ).graph
 
 gemma_3_config_dict = {
     "_sliding_window_pattern": 6,
@@ -440,7 +450,7 @@ def test_small_gemma_model():
     original_all_special_ids = tokenizer_class.all_special_ids  # type:ignore
     try:
         tokenizer_class.all_special_ids = property(lambda self: [0])  # type:ignore
-        graph = attribute(s, model)
+        graph = _trace_graph(s, model)
 
         assert isinstance(model, NNSightReplacementModel)
         verify_token_and_error_edges(model, graph)
@@ -469,7 +479,7 @@ def test_large_gemma_model():
     original_all_special_ids = tokenizer_class.all_special_ids  # type:ignore
     try:
         tokenizer_class.all_special_ids = property(lambda self: [0])  # type:ignore
-        graph = attribute(s, model)
+        graph = _trace_graph(s, model)
 
         assert isinstance(model, NNSightReplacementModel)
 
@@ -485,7 +495,7 @@ def test_gemma3_with_dummy_transcoders():
     s = "The National Digital Analytics Group (ND"
     model = load_gemma3_with_dummy_transcoders()
     model.to(torch.float32)  # type:ignore
-    graph = attribute(s, model, batch_size=256)
+    graph = _trace_graph(s, model, source_batch_size=256)
 
     assert isinstance(model, NNSightReplacementModel)
 
@@ -499,7 +509,7 @@ def test_gemma3_with_dummy_clt():
     s = "The National Digital Analytics Group (ND"
     model = load_gemma3_with_dummy_clt()
     model.to(torch.float32)  # type:ignore
-    graph = attribute(s, model, batch_size=256)
+    graph = _trace_graph(s, model, source_batch_size=256)
 
     assert isinstance(model, NNSightReplacementModel)
 
@@ -517,7 +527,7 @@ def test_gemma_3_1b():
         dtype=torch.float32,
         backend="nnsight",
     )
-    graph = attribute(s, model)
+    graph = _trace_graph(s, model)
     assert isinstance(model, NNSightReplacementModel)
 
     print("Changing logit softcap to 0, as the logits will otherwise be off.")
@@ -535,7 +545,7 @@ def test_gemma_3_1b_it():
         dtype=torch.float32,
         backend="nnsight",
     )
-    graph = attribute(s, model)
+    graph = _trace_graph(s, model)
     assert isinstance(model, NNSightReplacementModel)
 
     print("Changing logit softcap to 0, as the logits will otherwise be off.")
@@ -553,7 +563,7 @@ def test_gemma_3_1b_clt():
         dtype=torch.float32,
         backend="nnsight",
     )
-    graph = attribute(s, model)
+    graph = _trace_graph(s, model)
     assert isinstance(model, NNSightReplacementModel)
 
     print("Changing logit softcap to 0, as the logits will otherwise be off.")
@@ -572,7 +582,7 @@ def test_gemma_3_4b():
         backend="nnsight",
         lazy_encoder=True,
     )
-    graph = attribute(s, model)
+    graph = _trace_graph(s, model)
     assert isinstance(model, NNSightReplacementModel)
 
     print("Changing logit softcap to 0, as the logits will otherwise be off.")

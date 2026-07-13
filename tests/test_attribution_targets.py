@@ -8,8 +8,21 @@ import torch
 import pytest
 
 from circuit_tracer import Graph, ReplacementModel
-from circuit_tracer.attribution.attribute import attribute
 from circuit_tracer.attribution.targets import AttributionTargets, CustomTarget, LogitTarget
+from circuit_tracer.tracing import AttributionProblem, TraceRequest, TraceSemantics, trace_one
+
+
+def _trace_graph(
+    prompt, model, *, targets=None, max_n_logits: int = 10, source_batch_size: int = 512
+):
+    return trace_one(
+        TraceRequest(
+            problem=AttributionProblem(
+                prompt=prompt, model=model, targets=targets, max_n_logits=max_n_logits
+            ),
+            semantics=TraceSemantics(source_batch_size=source_batch_size),
+        )
+    ).graph
 
 
 class MockTokenizer:
@@ -663,13 +676,13 @@ def _run_attribution_format_consistency(backend: str):
     model, _, unembed_proj = _cfg_backend(backend)
 
     # Run with None (auto-select salient logits)
-    graph_none = attribute(prompt, model, attribution_targets=None, max_n_logits=5, batch_size=256)
+    graph_none = _trace_graph(prompt, model, max_n_logits=5, source_batch_size=256)
 
     # Extract the auto-selected token strings and their internal data
     auto_token_strs = [t.token_str for t in graph_none.logit_targets]
 
     # Run with Sequence[str] using the same token strings
-    graph_str = attribute(prompt, model, attribution_targets=auto_token_strs, batch_size=256)
+    graph_str = _trace_graph(prompt, model, targets=auto_token_strs, source_batch_size=256)
 
     # Run with Sequence[CustomTarget] using the same tokens, probs, and vectors
     # Reconstruct the unembed vectors for each auto-selected token
@@ -698,7 +711,7 @@ def _run_attribution_format_consistency(backend: str):
         )
     ]
 
-    graph_tuple = attribute(prompt, model, attribution_targets=custom_targets, batch_size=256)
+    graph_tuple = _trace_graph(prompt, model, targets=custom_targets, source_batch_size=256)
 
     # Verify consistency between None and Sequence[str]
     # Same number of targets
@@ -788,7 +801,7 @@ def _run_custom_target_correctness(
         model, prompt, token_x, token_y, backend
     )
 
-    graph = attribute(prompt, model, attribution_targets=[custom_target], batch_size=256)
+    graph = _trace_graph(prompt, model, targets=[custom_target], source_batch_size=256)
 
     device = next(model.parameters()).device
     adjacency_matrix = graph.adjacency_matrix.to(device)

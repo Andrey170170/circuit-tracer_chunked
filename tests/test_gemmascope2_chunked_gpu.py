@@ -4,9 +4,41 @@ import pytest
 import torch
 
 from circuit_tracer import ReplacementModel, SparsificationConfig
-from circuit_tracer.attribution.attribute_nnsight import attribute as attribute_nnsight
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
+from circuit_tracer.tracing import (
+    AttributionProblem,
+    ExecutionConstraints,
+    ObservabilityPolicy,
+    TraceRequest,
+    TraceSemantics,
+    trace_one,
+)
 from tests.conftest import has_32gb
+
+
+def _trace_graph(
+    prompt,
+    model,
+    *,
+    max_n_logits: int,
+    source_batch_size: int,
+    max_feature_nodes: int,
+    sparsification: SparsificationConfig | None = None,
+    offload: str | None = None,
+):
+    return trace_one(
+        TraceRequest(
+            problem=AttributionProblem(prompt=prompt, model=model, max_n_logits=max_n_logits),
+            semantics=TraceSemantics(
+                source_batch_size=source_batch_size,
+                max_feature_nodes=max_feature_nodes,
+                sparsification=sparsification,
+            ),
+            execution=ExecutionConstraints(
+                offload=offload, observability=ObservabilityPolicy(verbose=True)
+            ),
+        )
+    ).graph
 
 
 @pytest.fixture(autouse=True)
@@ -30,13 +62,12 @@ def test_gemmascope2_exact_chunked_nnsight_smoke():
     assert isinstance(model, NNSightReplacementModel)
     assert getattr(model.transcoders, "exact_chunked_decoder", False)
 
-    graph = attribute_nnsight(
+    graph = _trace_graph(
         "If Alice has 3 apples and buys 2 more, she has",
         model,
         max_n_logits=4,
-        batch_size=16,
+        source_batch_size=16,
         max_feature_nodes=128,
-        verbose=True,
         offload="cpu",
     )
 
@@ -62,17 +93,16 @@ def test_gemmascope2_exact_chunked_nnsight_sparsified_smoke():
     assert isinstance(model, NNSightReplacementModel)
     assert getattr(model.transcoders, "exact_chunked_decoder", False)
 
-    graph = attribute_nnsight(
+    graph = _trace_graph(
         "If Alice has 3 apples and buys 2 more, she has",
         model,
         max_n_logits=4,
-        batch_size=16,
+        source_batch_size=16,
         max_feature_nodes=128,
         sparsification=SparsificationConfig(
             per_layer_position_topk=8,
             global_cap=256,
         ),
-        verbose=True,
         offload="cpu",
     )
 

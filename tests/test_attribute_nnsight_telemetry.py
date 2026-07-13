@@ -1,22 +1,33 @@
 import os
-import inspect
-from typing import get_args
+from typing import get_args, get_type_hints
 
 import pytest
 import torch
 
-from circuit_tracer.attribution.attribute import attribute as attribute_entrypoint
-from circuit_tracer.attribution.attribute_nnsight import (
+from circuit_tracer.attribution.nnsight.phase_support import (
     _copy_rows_to_cpu_staging,
+    _resolve_phase3_effective_row_state,
+)
+from circuit_tracer.attribution.nnsight.numerics import (
+    _resolve_exact_trace_internal_dtype,
+    _row_abs_sums_to_scaled_l1,
+)
+from circuit_tracer.attribution.nnsight.replay import (
     _compute_row_abs_sums,
     _compute_row_denominator_scaled_l1,
+)
+from circuit_tracer.attribution.nnsight.row_store import (
     _FileBackedFeatureRowStore,
-    _attach_telemetry_export_to_exception,
-    _build_row_transfer_telemetry,
-    _resolve_phase3_effective_row_state,
-    _row_abs_sums_to_scaled_l1,
-    _resolve_exact_trace_internal_dtype,
-    attribute as nnsight_attribute,
+)
+from circuit_tracer.attribution.nnsight.telemetry import _build_row_transfer_telemetry
+from circuit_tracer.observability.exception_export import _attach_telemetry_export_to_exception
+from circuit_tracer.tracing import (
+    ExecutionConstraints,
+    FrontierExpansionPlan,
+    FrontierSemantics,
+    RowStoragePlan,
+    SessionPlan,
+    TraceSemantics,
 )
 from circuit_tracer.utils.telemetry import TelemetryRecorder
 
@@ -492,158 +503,42 @@ def test_exact_trace_internal_dtype_resolution_supports_fp32_and_fp64() -> None:
     assert _resolve_exact_trace_internal_dtype("FP64") == torch.float64
 
 
-def test_exact_trace_internal_dtype_default_is_fp32_on_public_entrypoints() -> None:
-    assert (
-        inspect.signature(attribute_entrypoint).parameters["exact_trace_internal_dtype"].default
-        == "fp32"
-    )
-    assert (
-        inspect.signature(nnsight_attribute).parameters["exact_trace_internal_dtype"].default
-        == "fp32"
-    )
-    assert inspect.signature(nnsight_attribute).parameters["internal_precision"].default is None
+def test_exact_trace_internal_dtype_default_is_fp32_on_canonical_semantics() -> None:
+    assert TraceSemantics().exact_trace_internal_dtype == "fp32"
 
 
-def test_phase4_scheduler_defaults_match_between_public_entrypoints() -> None:
-    entrypoint_sig = inspect.signature(attribute_entrypoint)
-    nnsight_sig = inspect.signature(nnsight_attribute)
-
-    assert (
-        entrypoint_sig.parameters["phase4_scheduler_mode"].default
-        == nnsight_sig.parameters["phase4_scheduler_mode"].default
-        == "locality"
-    )
-    assert (
-        entrypoint_sig.parameters["phase4_scheduler_debug"].default
-        == nnsight_sig.parameters["phase4_scheduler_debug"].default
-        is False
-    )
-    assert (
-        entrypoint_sig.parameters["phase4_scheduler_telemetry_detail"].default
-        == nnsight_sig.parameters["phase4_scheduler_telemetry_detail"].default
-        == "normal"
-    )
-    assert (
-        entrypoint_sig.parameters["phase4_refresh_optimization"].default
-        == nnsight_sig.parameters["phase4_refresh_optimization"].default
-        == "v1"
-    )
-    assert (
-        entrypoint_sig.parameters["phase4_row_executor"].default
-        == nnsight_sig.parameters["phase4_row_executor"].default
-        == "batched"
-    )
-    assert (
-        entrypoint_sig.parameters["phase1_trace_batch_policy"].default
-        == nnsight_sig.parameters["phase1_trace_batch_policy"].default
-        == "legacy"
-    )
-    assert (
-        entrypoint_sig.parameters["phase1_trace_batch_size_max"].default
-        == nnsight_sig.parameters["phase1_trace_batch_size_max"].default
-        is None
-    )
-    assert (
-        entrypoint_sig.parameters["phase4_refresh_policy"].default
-        == nnsight_sig.parameters["phase4_refresh_policy"].default
-        == "standard"
-    )
-    assert (
-        entrypoint_sig.parameters["phase4_refresh_interval_multiplier"].default
-        == nnsight_sig.parameters["phase4_refresh_interval_multiplier"].default
-        == 1
-    )
-    assert (
-        entrypoint_sig.parameters["phase4_ranker"].default
-        == nnsight_sig.parameters["phase4_ranker"].default
-        == "argsort"
-    )
-    assert (
-        entrypoint_sig.parameters["row_store_cache_control"].default
-        == nnsight_sig.parameters["row_store_cache_control"].default
-        == "off"
-    )
-    assert (
-        entrypoint_sig.parameters["exact_encoder_residency"].default
-        == nnsight_sig.parameters["exact_encoder_residency"].default
-        == "lazy"
-    )
+def test_execution_defaults_live_with_their_canonical_owners() -> None:
+    execution = ExecutionConstraints()
+    assert execution.frontier.scheduler_debug is False
+    assert execution.frontier.scheduler_telemetry_detail == "normal"
+    assert execution.frontier.refresh_optimization == "v1"
+    assert execution.frontier.row_executor == "batched"
+    assert execution.session.phase1_trace_batch_policy == "legacy"
+    assert execution.session.phase1_trace_batch_size_max is None
+    assert TraceSemantics().frontier.refresh_policy == "standard"
+    assert TraceSemantics().frontier.refresh_interval_multiplier == 1
+    assert TraceSemantics().frontier.ranker == "argsort"
+    assert execution.storage.cache_control == "off"
+    assert execution.storage.exact_encoder_residency == "lazy"
 
 
-def test_phase4_scheduler_mode_type_hints_include_planner_v2() -> None:
-    entrypoint_mode_annotation = (
-        inspect.signature(attribute_entrypoint).parameters["phase4_scheduler_mode"].annotation
-    )
-    nnsight_mode_annotation = (
-        inspect.signature(nnsight_attribute).parameters["phase4_scheduler_mode"].annotation
-    )
+def test_canonical_execution_policy_type_hints_include_supported_modes() -> None:
+    frontier_hints = get_type_hints(FrontierExpansionPlan)
+    session_hints = get_type_hints(SessionPlan)
+    semantics_hints = get_type_hints(FrontierSemantics)
+    storage_hints = get_type_hints(RowStoragePlan)
 
-    entrypoint_modes = set(get_args(entrypoint_mode_annotation))
-    nnsight_modes = set(get_args(nnsight_mode_annotation))
-    assert "planner_v2" in entrypoint_modes
-    assert "planner_v2" in nnsight_modes
-
-
-def test_phase4_execution_flag_type_hints_include_new_modes() -> None:
-    entrypoint_sig = inspect.signature(attribute_entrypoint)
-    nnsight_sig = inspect.signature(nnsight_attribute)
-
-    entry_refresh_modes = set(
-        get_args(entrypoint_sig.parameters["phase4_refresh_optimization"].annotation)
+    assert "planner_v2" in get_args(semantics_hints["scheduler"])
+    assert "v1" in get_args(frontier_hints["refresh_optimization"])
+    assert "streaming_v1" in get_args(frontier_hints["row_executor"])
+    assert "cap_effective_batches" in get_args(session_hints["phase1_trace_batch_policy"])
+    assert "deferred_v1" in get_args(semantics_hints["refresh_policy"])
+    assert "topk_v1" in get_args(semantics_hints["ranker"])
+    assert "fadvise_dontneed_after_append_v1" in get_args(storage_hints["cache_control"])
+    assert "fadvise_dontneed_after_append_and_read_v1" in get_args(
+        storage_hints["cache_control"]
     )
-    nnsight_refresh_modes = set(
-        get_args(nnsight_sig.parameters["phase4_refresh_optimization"].annotation)
-    )
-    assert "v1" in entry_refresh_modes
-    assert "v1" in nnsight_refresh_modes
-
-    entry_row_modes = set(get_args(entrypoint_sig.parameters["phase4_row_executor"].annotation))
-    nnsight_row_modes = set(get_args(nnsight_sig.parameters["phase4_row_executor"].annotation))
-    assert "streaming_v1" in entry_row_modes
-    assert "streaming_v1" in nnsight_row_modes
-
-    entry_phase1_batch_modes = set(
-        get_args(entrypoint_sig.parameters["phase1_trace_batch_policy"].annotation)
-    )
-    nnsight_phase1_batch_modes = set(
-        get_args(nnsight_sig.parameters["phase1_trace_batch_policy"].annotation)
-    )
-    assert "cap_effective_batches" in entry_phase1_batch_modes
-    assert "cap_effective_batches" in nnsight_phase1_batch_modes
-
-    entry_refresh_policy_modes = set(
-        get_args(entrypoint_sig.parameters["phase4_refresh_policy"].annotation)
-    )
-    nnsight_refresh_policy_modes = set(
-        get_args(nnsight_sig.parameters["phase4_refresh_policy"].annotation)
-    )
-    assert "deferred_v1" in entry_refresh_policy_modes
-    assert "deferred_v1" in nnsight_refresh_policy_modes
-
-    entry_ranker_modes = set(get_args(entrypoint_sig.parameters["phase4_ranker"].annotation))
-    nnsight_ranker_modes = set(get_args(nnsight_sig.parameters["phase4_ranker"].annotation))
-    assert "topk_v1" in entry_ranker_modes
-    assert "topk_v1" in nnsight_ranker_modes
-
-    entry_row_store_modes = set(
-        get_args(entrypoint_sig.parameters["row_store_cache_control"].annotation)
-    )
-    nnsight_row_store_modes = set(
-        get_args(nnsight_sig.parameters["row_store_cache_control"].annotation)
-    )
-    assert "fadvise_dontneed_after_append_v1" in entry_row_store_modes
-    assert "fadvise_dontneed_after_append_v1" in nnsight_row_store_modes
-    assert "fadvise_dontneed_after_append_and_read_v1" in entry_row_store_modes
-    assert "fadvise_dontneed_after_append_and_read_v1" in nnsight_row_store_modes
-
-    entry_encoder_residency_modes = set(
-        get_args(entrypoint_sig.parameters["exact_encoder_residency"].annotation)
-    )
-    nnsight_encoder_residency_modes = set(
-        get_args(nnsight_sig.parameters["exact_encoder_residency"].annotation)
-    )
-    assert "active_pinned_cpu" in entry_encoder_residency_modes
-    assert "active_pinned_cpu" in nnsight_encoder_residency_modes
+    assert "active_pinned_cpu" in get_args(storage_hints["exact_encoder_residency"])
 
 
 def test_exact_trace_internal_dtype_resolution_rejects_unknown_value() -> None:
