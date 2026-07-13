@@ -166,7 +166,9 @@ class TelemetryObserver:
             )
         if isinstance(observation, MemoryDelta):
             return build_memory_before_after_attrs(
-                observation.before, observation.after, keys=observation.keys
+                before=observation.before,
+                after=observation.after,
+                keys=observation.keys,
             )
         if isinstance(observation, NumericDelta):
             return diff_numeric_metrics(observation.before, observation.after)

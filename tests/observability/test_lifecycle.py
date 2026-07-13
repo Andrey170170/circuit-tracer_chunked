@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from circuit_tracer.observability.events import MemoryDelta
 from circuit_tracer.observability.lifecycle import TelemetryObserver
 from circuit_tracer.observability.recorder import TelemetryRecorder
 
@@ -32,6 +33,24 @@ def test_observer_records_paired_lifecycle_event_and_wall_clock() -> None:
     assert summary["event_count"] == 1
     assert summary["wall_clock_interval_count"] == 1
     assert summary["wall_clock_elapsed_ms_by_phase"] == {"phase3": 12.5}
+
+
+def test_observer_adapts_memory_delta_through_keyword_only_resource_contract() -> None:
+    observer = TelemetryObserver(TelemetryRecorder())
+
+    attrs = observer.observe(
+        MemoryDelta(
+            before={"rss_gib": 2.0},
+            after={"rss_gib": 3.5},
+            keys=("rss_gib",),
+        )
+    )
+
+    assert attrs == {
+        "memory_before_rss_gib": 2.0,
+        "memory_after_rss_gib": 3.5,
+        "memory_delta_rss_gib": 1.5,
+    }
 
 
 def test_observer_terminal_success_does_not_mutate_scientific_result(caplog) -> None:
