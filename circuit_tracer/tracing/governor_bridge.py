@@ -63,9 +63,13 @@ def _validate_provider(problem: Any, profile: ProviderProfile) -> None:
         "architecture": expected.architecture,
         "n_layers": profile.dimensions.n_layers,
         "d_model": profile.dimensions.d_model,
-        "d_transcoder": profile.dimensions.d_features,
         "decoder_output_topology": expected.decoder_topology.value,
     }
+    # CLT providers report features per source layer, while the governor profile
+    # stores the aggregate cross-layer feature universe. PLT widths are directly
+    # comparable because their topology is same-layer.
+    if expected.architecture != "clt":
+        comparisons["d_transcoder"] = profile.dimensions.d_features
     for name, expected_value in comparisons.items():
         actual_value = actual.get(name)
         if actual_value is not None and actual_value != expected_value:

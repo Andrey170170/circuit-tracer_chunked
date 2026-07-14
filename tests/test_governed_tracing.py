@@ -36,6 +36,8 @@ class Provider:
         self.n_layers = dimensions.n_layers
         self.d_model = dimensions.d_model
         self.d_transcoder = dimensions.d_features
+        if identity.architecture == "clt":
+            self.d_transcoder = 10_080
         self.capabilities = TranscoderCapabilities(
             architecture=identity.architecture,
             checkpoint_format="fixture",
@@ -141,6 +143,17 @@ def test_provider_mismatch_and_planning_refusal_fail_closed() -> None:
     assert names[:2] == ["attribute.start", "planning.pre_execution_admission"]
     assert "planning.refusal" in names
     assert names[-1] == "attribute.refused"
+
+
+def test_clt_profile_validates_aggregate_width_against_per_layer_provider() -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    selected = request(profile, batch=1000)
+
+    plan = resolve_trace_request(selected, resources=envelope(), provider_profile=profile)
+
+    assert selected.problem.model.transcoders.d_transcoder == 10_080
+    assert profile.dimensions.d_features == 262_144
+    assert plan.planning_trace_plan is not None
 
 
 def test_governed_storage_rejects_unmanaged_temp_root() -> None:
