@@ -27,6 +27,22 @@ class CachePolicy(str, Enum):
     STREAMING = "streaming"
 
 
+class EncoderResidency(str, Enum):
+    EAGER = "eager"
+    LAZY_PER_REQUEST = "lazy_per_request"
+
+
+class RowStorePolicy(str, Enum):
+    FULL = "file_backed_full"
+    TILED = "tiled"
+    RECOMPUTE = "recompute"
+
+
+class StorageTier(str, Enum):
+    LOCAL = "local"
+    SCRATCH = "scratch"
+
+
 class DemandTier(str, Enum):
     VRAM = "vram"
     HOST = "host"
@@ -258,7 +274,6 @@ class ResourceEnvelope:
     vram_budget_bytes: int | None = None
     cache_policy: CachePolicy = CachePolicy.AUTO
     spill_roots: tuple[str, ...] = ("local", "scratch")
-    physical_overrides: tuple[tuple[str, int | str], ...] = ()
 
     def __post_init__(self) -> None:
         _positive("total_vram_bytes", self.total_vram_bytes)
@@ -278,9 +293,6 @@ class ResourceEnvelope:
             raise ValueError("spill_roots must be unique")
         if any(root not in {"local", "scratch"} for root in self.spill_roots):
             raise ValueError("spill_roots may contain only 'local' and 'scratch'")
-        keys = [name for name, _ in self.physical_overrides]
-        if tuple(sorted(self.physical_overrides)) != self.physical_overrides or len(set(keys)) != len(keys):
-            raise ValueError("physical_overrides must be sorted with unique keys")
 
     @property
     def effective_vram_budget_bytes(self) -> int:
@@ -432,6 +444,8 @@ class ProviderProfile:
     max_replay_window: int
     default_prefetch_depth: int
     max_prefetch_depth: int
+    estimated_active_features_per_token: float = 1.0
+    default_encoder_residency: EncoderResidency = EncoderResidency.LAZY_PER_REQUEST
     row_store_tile_column_bound: int | None = None
     calibration_label: str = "resource_calibration_only"
 
@@ -444,6 +458,7 @@ class ProviderProfile:
             "max_physical_microbatch",
             "default_replay_window",
             "max_replay_window",
+            "estimated_active_features_per_token",
         ):
             _positive(name, getattr(self, name))
         for name in (
@@ -581,6 +596,50 @@ class PhysicalExecutionConfig:
             _nonnegative(name, getattr(self, name))
         if self.spill_target not in {None, "local", "scratch"}:
             raise ValueError("spill_target must be local, scratch, or None")
+
+
+@dataclass(frozen=True)
+class PhysicalExecutionRequirements:
+    """Typed caller requirements that the planner must honor exactly or refuse."""
+
+    decoder_fetch_chunk_size: int | None = None
+    decoder_cache_bytes: int | None = None
+    source_microbatch_size: int | None = None
+    feature_microbatch_size: int | None = None
+    logit_microbatch_size: int | None = None
+    replay_window: int | None = None
+    prefetch_depth: int | None = None
+    encoder_residency: EncoderResidency | None = None
+    row_store_policy: RowStorePolicy | None = None
+    spill_target: StorageTier | None = None
+    cache_policy: CachePolicy | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "decoder_fetch_chunk_size",
+            "source_microbatch_size",
+            "feature_microbatch_size",
+            "logit_microbatch_size",
+            "replay_window",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _positive(name, value)
+        for name in ("decoder_cache_bytes", "prefetch_depth"):
+            value = getattr(self, name)
+            if value is not None:
+                _nonnegative(name, value)
+        for name, enum_type in (
+            ("encoder_residency", EncoderResidency),
+            ("row_store_policy", RowStorePolicy),
+            ("spill_target", StorageTier),
+            ("cache_policy", CachePolicy),
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, enum_type):
+                raise ValueError(f"{name} must be a {enum_type.__name__}")
+        if self.row_store_policy is RowStorePolicy.RECOMPUTE and self.spill_target is not None:
+            raise ValueError("recompute row storage cannot require a spill target")
 
 
 @dataclass(frozen=True)

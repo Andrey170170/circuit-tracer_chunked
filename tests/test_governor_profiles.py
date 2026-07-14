@@ -71,9 +71,13 @@ def test_each_recorded_profile_admits_and_reproduces_calibrated_plan():
         amounts = _amounts(plan)
         assert plan.admission.admitted, plan.format()
         assert plan.physical.decoder_fetch_chunk_size == observation.fetch_chunk_size
-        assert plan.physical.source_microbatch_size == observation.batch_size
-        assert plan.physical.feature_microbatch_size == observation.batch_size
-        assert plan.physical.logit_microbatch_size == observation.batch_size
+        expected_physical_cap = observation.validated_physical_batch_cap
+        assert plan.physical.source_microbatch_size == expected_physical_cap
+        assert plan.physical.feature_microbatch_size == expected_physical_cap
+        assert plan.physical.logit_microbatch_size == expected_physical_cap
+        assert plan.physical.replay_window == 4
+        assert plan.physical.prefetch_depth == 2
+        assert plan.physical.encoder_residency == "lazy_per_request"
         assert plan.physical.decoder_cache_bytes == observation.decoder_cache_bytes
         assert profile.dimensions.d_features == 262_144
         assert amounts["predicted_walltime_low"] == pytest.approx(
@@ -89,8 +93,18 @@ def test_each_recorded_profile_admits_and_reproduces_calibrated_plan():
         assert amounts["encoder_residency_host"] == 0
         assert amounts["replay_host"] == 0
         assert profile.capabilities.supports_full_row_store
-        assert not profile.capabilities.supports_tiled_row_store
-        assert not profile.capabilities.supports_recompute_row_store
+        assert (
+            profile.capabilities.supports_tiled_row_store
+            is observation.validated_tiled_row_store
+        )
+        assert (
+            profile.capabilities.supports_recompute_row_store
+            is observation.validated_recompute_row_store
+        )
+        assert (
+            profile.row_store_tile_column_bound
+            == observation.row_store_tile_column_bound
+        )
         fixed_vram.append(amounts["model_vram"])
         fixed_host.append(amounts["baseline_total_host"])
         checkpoint_files.append(amounts["checkpoint_file_working_set"])

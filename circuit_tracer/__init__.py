@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from circuit_tracer.tracing import (
         AttributionProblem,
         DecoderCachePolicy,
+        DecoderPlan,
         EffectiveExecutionDescriptor,
         EffectiveExecutionIdentity,
         ExecutionConstraints,
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
         FrontierSemantics,
         ObservabilityPolicy,
         PrefixViewTarget,
+        PlanningRefusedError,
         ReplayPlan,
         ResolvedTracePlan,
         RowStoragePlan,
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AttributionProblem",
     "DecoderCachePolicy",
+    "DecoderPlan",
     "EffectiveExecutionDescriptor",
     "EffectiveExecutionIdentity",
     "attribute_phase0_stats",
@@ -50,6 +53,7 @@ __all__ = [
     "Graph",
     "ObservabilityPolicy",
     "PrefixViewTarget",
+    "PlanningRefusedError",
     "ReplayPlan",
     "ReplacementModel",
     "ResolvedTracePlan",

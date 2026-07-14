@@ -37,6 +37,10 @@ class ResourceCalibrationObservation:
     reference_active_features: int
     reference_max_feature_nodes: int
     reference_target_count: int
+    validated_physical_batch_cap: int
+    validated_tiled_row_store: bool = False
+    validated_recompute_row_store: bool = False
+    row_store_tile_column_bound: int | None = None
     evidence_class: str = "resource_calibration_only"
 
     def __post_init__(self) -> None:
@@ -48,6 +52,7 @@ class ResourceCalibrationObservation:
             "reference_active_features",
             "reference_max_feature_nodes",
             "reference_target_count",
+            "validated_physical_batch_cap",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -63,6 +68,14 @@ class ResourceCalibrationObservation:
             raise ValueError("MaxRSS range must be positive and ordered")
         if self.evidence_class != "resource_calibration_only":
             raise ValueError("calibration observations are not semantic evidence")
+        if self.validated_tiled_row_store != (
+            self.row_store_tile_column_bound is not None
+        ):
+            raise ValueError(
+                "validated tiled row storage requires a tile-column bound"
+            )
+        if self.validated_recompute_row_store and not self.validated_tiled_row_store:
+            raise ValueError("validated recompute requires validated tiled production")
 
     def reference_semantics(self) -> TraceSemantics:
         return TraceSemantics(
@@ -111,6 +124,10 @@ def _observation(
     chunk: int,
     cache_gib: int,
     active_features: int,
+    physical_batch_cap: int,
+    *,
+    tiled_columns: int | None = None,
+    recompute: bool = False,
 ) -> ResourceCalibrationObservation:
     return ResourceCalibrationObservation(
         profile_name=name,
@@ -126,6 +143,10 @@ def _observation(
         reference_active_features=active_features,
         reference_max_feature_nodes=8192,
         reference_target_count=1,
+        validated_physical_batch_cap=physical_batch_cap,
+        validated_tiled_row_store=tiled_columns is not None,
+        validated_recompute_row_store=recompute,
+        row_store_tile_column_bound=tiled_columns,
     )
 
 
@@ -141,6 +162,9 @@ GRANITE_H200_CALIBRATIONS = (
         4096,
         8,
         20_000,
+        128,
+        tiled_columns=2048,
+        recompute=True,
     ),
     _observation(
         "granite_h200_1b_plt_b128_c4096_cache0",
@@ -153,6 +177,9 @@ GRANITE_H200_CALIBRATIONS = (
         4096,
         0,
         80_000,
+        64,
+        tiled_columns=16384,
+        recompute=True,
     ),
     _observation(
         "granite_h200_4b_plt_b128_c4096_cache0",
@@ -165,6 +192,7 @@ GRANITE_H200_CALIBRATIONS = (
         4096,
         0,
         100_000,
+        128,
     ),
     _observation(
         "granite_h200_12b_plt_b64_c4096_cache0",
@@ -177,6 +205,7 @@ GRANITE_H200_CALIBRATIONS = (
         4096,
         0,
         120_000,
+        64,
     ),
 )
 
@@ -202,6 +231,7 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
         else DecoderTopology.SAME_LAYER
     )
     semantics = observation.reference_semantics()
+    physical_cap = observation.validated_physical_batch_cap
     reference_work = compute_work_units(
         prompt_token_count=semantics.prompt_token_count,
         estimated_active_features=semantics.estimated_nnz,
@@ -213,11 +243,11 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
         effective_source_batch_size=observation.batch_size,
         feature_batch_size=observation.batch_size,
         logit_batch_size=observation.batch_size,
-        source_microbatch_size=observation.batch_size,
-        feature_microbatch_size=observation.batch_size,
-        logit_microbatch_size=observation.batch_size,
-        replay_window=1,
-        prefetch_depth=0,
+        source_microbatch_size=min(observation.batch_size, physical_cap),
+        feature_microbatch_size=min(observation.batch_size, physical_cap),
+        logit_microbatch_size=min(observation.batch_size, physical_cap),
+        replay_window=4,
+        prefetch_depth=2,
     )
     return ProviderProfile(
         profile_name=observation.profile_name,
@@ -241,8 +271,8 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
             supports_prefetch=True,
             supports_replay=True,
             supports_full_row_store=True,
-            supports_tiled_row_store=False,
-            supports_recompute_row_store=False,
+            supports_tiled_row_store=observation.validated_tiled_row_store,
+            supports_recompute_row_store=observation.validated_recompute_row_store,
         ),
         costs=ProviderCostMetadata(
             cost_model_version="calibrated-v2",
@@ -256,7 +286,7 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
             known_rigid_host_bytes=0,
             baseline_total_host_bytes=observation.max_rss_bytes_range[1],
             file_cache_included_in_host_baseline=True,
-            reference_replay_window=1,
+            reference_replay_window=4,
             reference_encoder_residency="eager",
             active_host_coefficient=0.0,
             prompt_host_coefficient=0.0,
@@ -267,13 +297,18 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
         ),
         default_fetch_chunk_size=observation.fetch_chunk_size,
         max_fetch_chunk_size=observation.fetch_chunk_size,
-        max_physical_microbatch=observation.batch_size,
+        max_physical_microbatch=physical_cap,
         default_decoder_cache_bytes=observation.decoder_cache_bytes,
         max_decoder_cache_bytes=max(observation.decoder_cache_bytes, 8 * GIB),
-        default_replay_window=1,
+        default_replay_window=4,
         max_replay_window=8,
-        default_prefetch_depth=0,
+        default_prefetch_depth=2,
         max_prefetch_depth=4,
+        estimated_active_features_per_token=(
+            observation.reference_active_features
+            / observation.reference_prompt_token_count
+        ),
+        row_store_tile_column_bound=observation.row_store_tile_column_bound,
     )
 
 

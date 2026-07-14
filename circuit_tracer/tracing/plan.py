@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from os import PathLike
 from typing import Any, Literal, Mapping
 
+from circuit_tracer.governor.contracts import CachePolicy, StorageTier
+
 from .problem import TraceSemantics, _nonnegative, _positive
 
 
@@ -24,10 +26,22 @@ class DecoderCachePolicy:
 
 
 @dataclass(frozen=True)
+class DecoderPlan:
+    """Provider decoder fetch and file-cache execution policy."""
+
+    fetch_chunk_size: int | None = None
+    provider_file_cache: CachePolicy = CachePolicy.AUTO
+
+    def __post_init__(self) -> None:
+        _positive("decoder fetch_chunk_size", self.fetch_chunk_size)
+
+
+@dataclass(frozen=True)
 class SessionPlan:
     """NNSight graph capacity and physical phase batching."""
 
     capacity: int | None = None
+    source_microbatch_max_rows: int | None = None
     phase3_microbatch_max_rows: int | None = None
     phase4_microbatch_max_rows: int | None = None
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy"
@@ -35,10 +49,19 @@ class SessionPlan:
     decoder_cache: DecoderCachePolicy = field(default_factory=DecoderCachePolicy)
 
     def __post_init__(self) -> None:
-        for name in ("capacity", "phase3_microbatch_max_rows", "phase4_microbatch_max_rows"):
+        for name in (
+            "capacity",
+            "source_microbatch_max_rows",
+            "phase3_microbatch_max_rows",
+            "phase4_microbatch_max_rows",
+        ):
             _positive(name, getattr(self, name))
         if self.capacity is not None:
-            for name in ("phase3_microbatch_max_rows", "phase4_microbatch_max_rows"):
+            for name in (
+                "source_microbatch_max_rows",
+                "phase3_microbatch_max_rows",
+                "phase4_microbatch_max_rows",
+            ):
                 value = getattr(self, name)
                 if value is not None and value > self.capacity:
                     raise ValueError(f"{name} cannot exceed session capacity")
@@ -66,6 +89,7 @@ class RowStoragePlan:
     preallocate: bool = True
     replay_tile_cache_bytes: int | None = None
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy"
+    placement: StorageTier | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -173,6 +197,7 @@ class ExecutionConstraints:
     """Explicit physical restrictions, grouped by their mechanism owners."""
 
     session: SessionPlan = field(default_factory=SessionPlan)
+    decoder: DecoderPlan = field(default_factory=DecoderPlan)
     storage: RowStoragePlan = field(default_factory=RowStoragePlan)
     replay: ReplayPlan = field(default_factory=ReplayPlan)
     frontier: FrontierExpansionPlan = field(default_factory=FrontierExpansionPlan)
@@ -188,7 +213,6 @@ class TraceEvidence:
     name: str | None = None
     version: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
-    advisory_governor_plan: Any = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if (self.name is None) != (self.version is None):

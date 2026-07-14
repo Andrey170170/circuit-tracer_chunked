@@ -9,12 +9,14 @@ import circuit_tracer.governor.resolver as resolver_module
 
 from circuit_tracer.governor import DecoderTopology
 from circuit_tracer.governor import FidelityMode
+from circuit_tracer.governor import PhysicalExecutionRequirements
 from circuit_tracer.governor import ProviderCapabilities
 from circuit_tracer.governor import ProviderCostMetadata
 from circuit_tracer.governor import ProviderDimensions
 from circuit_tracer.governor import ProviderIdentity
 from circuit_tracer.governor import ProviderProfile
 from circuit_tracer.governor import ResourceEnvelope
+from circuit_tracer.governor import RowStorePolicy
 from circuit_tracer.governor import TraceSemantics
 from circuit_tracer.governor import ValidationEvidence
 from circuit_tracer.governor import dtype_byte_width
@@ -190,12 +192,11 @@ def test_complete_semantic_inputs_and_physical_values_drive_demand_arithmetic():
     physical = resolve_trace_plan(
         base_semantics,
         profile,
-        _envelope(
-            physical_overrides=(
-                ("decoder_cache_bytes", 2 * GIB),
-                ("decoder_fetch_chunk_size", 2048),
-                ("prefetch_depth", 2),
-            )
+        _envelope(),
+        PhysicalExecutionRequirements(
+            decoder_cache_bytes=2 * GIB,
+            decoder_fetch_chunk_size=2048,
+            prefetch_depth=2,
         ),
     )
     changed = _estimates(physical)
@@ -238,7 +239,8 @@ def test_each_physical_microbatch_is_independently_bounded(name, value):
         resolve_trace_plan(
             _semantics(),
             _profile(),
-            _envelope(physical_overrides=((name, value),)),
+            _envelope(),
+            PhysicalExecutionRequirements(**{name: value}),
         )
 
 
@@ -246,10 +248,8 @@ def test_decoder_cache_is_vram_and_huge_override_refuses():
     plan = resolve_trace_plan(
         _semantics(),
         _profile(),
-        _envelope(
-            total_vram_bytes=10 * GIB,
-            physical_overrides=(("decoder_cache_bytes", 9 * GIB),),
-        ),
+        _envelope(total_vram_bytes=10 * GIB),
+        PhysicalExecutionRequirements(decoder_cache_bytes=9 * GIB),
     )
     assert not plan.admission.admitted
     assert _estimates(plan)["decoder_cache_vram"] == 9 * GIB
@@ -261,12 +261,14 @@ def test_microbatch_and_replay_workspaces_change_vram_and_can_refuse():
     smaller_source = resolve_trace_plan(
         _semantics(),
         _profile(),
-        _envelope(physical_overrides=(("source_microbatch_size", 16),)),
+        _envelope(),
+        PhysicalExecutionRequirements(source_microbatch_size=16),
     )
     larger_replay = resolve_trace_plan(
         _semantics(),
         _profile(),
-        _envelope(physical_overrides=(("replay_window", 4),)),
+        _envelope(),
+        PhysicalExecutionRequirements(replay_window=4),
     )
     assert _estimates(smaller_source)["source_microbatch_vram"] < _estimates(base)[
         "source_microbatch_vram"
@@ -279,16 +281,14 @@ def test_microbatch_and_replay_workspaces_change_vram_and_can_refuse():
     refused = resolve_trace_plan(
         _semantics(),
         expensive,
-        _envelope(
-            total_vram_bytes=2 * GIB,
-            physical_overrides=(("replay_window", 8),),
-        ),
+        _envelope(total_vram_bytes=2 * GIB),
+        PhysicalExecutionRequirements(replay_window=8),
     )
     assert not refused.admission.admitted
     assert any("VRAM allocations require" in reason for reason in refused.admission.refusals)
 
 
-def test_unsupported_or_unknown_physical_overrides_fail_clearly():
+def test_unsupported_or_invalid_physical_requirements_fail_clearly():
     profile = _profile(
         capabilities=replace(_profile().capabilities, supports_replay=False, supports_prefetch=False),
         default_replay_window=1,
@@ -298,21 +298,26 @@ def test_unsupported_or_unknown_physical_overrides_fail_clearly():
     )
     with pytest.raises(ValueError, match="replay_window"):
         resolve_trace_plan(
-            _semantics(), profile, _envelope(physical_overrides=(("replay_window", 2),))
+            _semantics(),
+            profile,
+            _envelope(),
+            PhysicalExecutionRequirements(replay_window=2),
         )
     with pytest.raises(ValueError, match="prefetch_depth"):
         resolve_trace_plan(
-            _semantics(), profile, _envelope(physical_overrides=(("prefetch_depth", 1),))
+            _semantics(),
+            profile,
+            _envelope(),
+            PhysicalExecutionRequirements(prefetch_depth=1),
         )
-    with pytest.raises(ValueError, match="unknown physical override"):
-        resolve_trace_plan(
-            _semantics(), _profile(), _envelope(physical_overrides=(("mystery", 1),))
-        )
-    with pytest.raises(ValueError, match="encoder_residency override"):
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        PhysicalExecutionRequirements(mystery=1)
+    with pytest.raises(ValueError, match="encoder_residency"):
         resolve_trace_plan(
             _semantics(),
             _profile(),
-            _envelope(physical_overrides=(("encoder_residency", "unavailable"),)),
+            _envelope(),
+            PhysicalExecutionRequirements(encoder_residency="unavailable"),
         )
 
 
@@ -372,16 +377,14 @@ def test_row_store_overrides_validate_capability_and_capacity():
         resolve_trace_plan(
             _semantics(),
             full_only,
-            _envelope(physical_overrides=(("row_store_policy", "tiled"),)),
+            _envelope(),
+            PhysicalExecutionRequirements(row_store_policy=RowStorePolicy.TILED),
         )
     refused = resolve_trace_plan(
         _semantics(),
         _profile(),
-        _envelope(
-            local_disk_bytes=1,
-            scratch_disk_bytes=1,
-            physical_overrides=(("row_store_policy", "file_backed_full"),),
-        ),
+        _envelope(local_disk_bytes=1, scratch_disk_bytes=1),
+        PhysicalExecutionRequirements(row_store_policy=RowStorePolicy.FULL),
     )
     assert not refused.admission.admitted
     assert any("no configured spill tier fits" in reason for reason in refused.admission.refusals)

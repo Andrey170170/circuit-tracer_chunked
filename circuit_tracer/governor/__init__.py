@@ -11,8 +11,10 @@ if TYPE_CHECKING:
     from .contracts import DemandEstimate
     from .contracts import DemandLifetime
     from .contracts import DemandTier
+    from .contracts import EncoderResidency
     from .contracts import FidelityMode
     from .contracts import PhysicalExecutionConfig
+    from .contracts import PhysicalExecutionRequirements
     from .contracts import PlanStatus
     from .contracts import ProviderCapabilities
     from .contracts import ProviderCostMetadata
@@ -20,6 +22,8 @@ if TYPE_CHECKING:
     from .contracts import ProviderIdentity
     from .contracts import ProviderProfile
     from .contracts import ResourceEnvelope
+    from .contracts import RowStorePolicy
+    from .contracts import StorageTier
     from .contracts import TracePlan
     from .contracts import TraceSemantics
     from .contracts import TRUSTED_VALIDATION_EVIDENCE_REGISTRY
@@ -51,8 +55,10 @@ _CONTRACT_EXPORTS = {
     "DemandEstimate",
     "DemandLifetime",
     "DemandTier",
+    "EncoderResidency",
     "FidelityMode",
     "PhysicalExecutionConfig",
+    "PhysicalExecutionRequirements",
     "PlanStatus",
     "ProviderCapabilities",
     "ProviderCostMetadata",
@@ -60,6 +66,8 @@ _CONTRACT_EXPORTS = {
     "ProviderIdentity",
     "ProviderProfile",
     "ResourceEnvelope",
+    "RowStorePolicy",
+    "StorageTier",
     "TracePlan",
     "TraceSemantics",
     "TRUSTED_VALIDATION_EVIDENCE_REGISTRY",
@@ -90,6 +98,7 @@ __all__ = [
     "DemandEstimate",
     "DemandLifetime",
     "DemandTier",
+    "EncoderResidency",
     "FidelityMode",
     "GRANITE_H200_CALIBRATIONS",
     "HISTORICAL_STRESS_FIXTURES",
@@ -97,6 +106,7 @@ __all__ = [
     "HostBudgetCandidate",
     "HostBudgetDiscovery",
     "PhysicalExecutionConfig",
+    "PhysicalExecutionRequirements",
     "PlanStatus",
     "ProviderCapabilities",
     "ProviderCostMetadata",
@@ -106,8 +116,10 @@ __all__ = [
     "RECORDED_PROVIDER_PROFILES",
     "ResourceCalibrationObservation",
     "ResourceEnvelope",
+    "RowStorePolicy",
     "StressArithmeticFixture",
     "StressRecommendation",
+    "StorageTier",
     "TracePlan",
     "TraceSemantics",
     "TRUSTED_VALIDATION_EVIDENCE_REGISTRY",

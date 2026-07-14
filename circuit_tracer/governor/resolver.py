@@ -12,6 +12,7 @@ from .contracts import (
     DemandTier,
     FidelityMode,
     PhysicalExecutionConfig,
+    PhysicalExecutionRequirements,
     PlanStatus,
     ProviderDimensions,
     ProviderCostMetadata,
@@ -134,18 +135,6 @@ def _cache_policy(file_bytes: int, allowance: int, requested: CachePolicy) -> Ca
     return CachePolicy.STREAMING
 
 
-def _int_override(name: str, value: int | str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f"physical override {name} must be an integer")
-    return value
-
-
-def _string_override(name: str, value: int | str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"physical override {name} must be a string")
-    return value
-
-
 def _disk_available(envelope: ResourceEnvelope, root: str) -> int:
     return envelope.local_disk_bytes if root == "local" else envelope.scratch_disk_bytes
 
@@ -231,34 +220,16 @@ def _resolve_physical(
     profile: ProviderProfile,
     envelope: ResourceEnvelope,
     effective_source: int,
+    requirements: PhysicalExecutionRequirements,
 ) -> tuple[PhysicalExecutionConfig, tuple[str, ...], tuple[str, ...]]:
     capabilities = profile.capabilities
-    overrides = dict(envelope.physical_overrides)
-    known = {
-        "decoder_fetch_chunk_size",
-        "decoder_cache_bytes",
-        "source_microbatch_size",
-        "feature_microbatch_size",
-        "logit_microbatch_size",
-        "replay_window",
-        "prefetch_depth",
-        "encoder_residency",
-        "row_store_policy",
-        "spill_target",
-    }
-    unknown = sorted(set(overrides) - known)
-    if unknown:
-        raise ValueError("unknown physical override(s): " + ", ".join(unknown))
-
-    fetch = _int_override(
-        "decoder_fetch_chunk_size",
-        overrides.get("decoder_fetch_chunk_size", profile.default_fetch_chunk_size),
-    )
+    fetch = requirements.decoder_fetch_chunk_size or profile.default_fetch_chunk_size
     if not 0 < fetch <= profile.max_fetch_chunk_size:
         raise ValueError("decoder_fetch_chunk_size must be positive and within profile maximum")
-    cache = _int_override(
-        "decoder_cache_bytes",
-        overrides.get("decoder_cache_bytes", profile.default_decoder_cache_bytes),
+    cache = (
+        profile.default_decoder_cache_bytes
+        if requirements.decoder_cache_bytes is None
+        else requirements.decoder_cache_bytes
     )
     if cache < 0 or cache > profile.max_decoder_cache_bytes:
         raise ValueError("decoder_cache_bytes must be nonnegative and within profile maximum")
@@ -266,29 +237,26 @@ def _resolve_physical(
         raise ValueError("provider does not support decoder_cache_bytes > 0")
 
     batch_specs = (
-        ("source_microbatch_size", effective_source),
-        ("feature_microbatch_size", semantics.feature_batch_size),
-        ("logit_microbatch_size", semantics.logit_batch_size),
+        ("source_microbatch_size", effective_source, requirements.source_microbatch_size),
+        ("feature_microbatch_size", semantics.feature_batch_size, requirements.feature_microbatch_size),
+        ("logit_microbatch_size", semantics.logit_batch_size, requirements.logit_microbatch_size),
     )
     microbatches: dict[str, int] = {}
-    for name, logical_bound in batch_specs:
-        value = _int_override(
-            name,
-            overrides.get(name, min(logical_bound, profile.max_physical_microbatch)),
-        )
+    for name, logical_bound, required in batch_specs:
+        value = min(logical_bound, profile.max_physical_microbatch) if required is None else required
         if not 0 < value <= logical_bound:
             raise ValueError(f"{name} must be positive and <= its logical/effective capacity")
         microbatches[name] = value
 
-    replay = _int_override(
-        "replay_window", overrides.get("replay_window", profile.default_replay_window)
-    )
+    replay = requirements.replay_window or profile.default_replay_window
     if not 0 < replay <= profile.max_replay_window:
         raise ValueError("replay_window must be positive and within profile maximum")
     if replay > 1 and not capabilities.supports_replay:
         raise ValueError("provider does not support replay_window > 1")
-    prefetch = _int_override(
-        "prefetch_depth", overrides.get("prefetch_depth", profile.default_prefetch_depth)
+    prefetch = (
+        profile.default_prefetch_depth
+        if requirements.prefetch_depth is None
+        else requirements.prefetch_depth
     )
     if not 0 <= prefetch <= profile.max_prefetch_depth:
         raise ValueError("prefetch_depth must be nonnegative and within profile maximum")
@@ -297,12 +265,8 @@ def _resolve_physical(
 
     warnings: list[str] = []
     refusals: list[str] = []
-    if "encoder_residency" in overrides:
-        residency = _string_override("encoder_residency", overrides["encoder_residency"])
-        if residency not in {"eager", "lazy_per_request"}:
-            raise ValueError(
-                "encoder_residency override must be eager or lazy_per_request"
-            )
+    if requirements.encoder_residency is not None:
+        residency = requirements.encoder_residency.value
     else:
         eager_bytes = semantics.estimated_nnz * profile.dimensions.d_model * semantics.dtype_bytes
         costs = profile.costs
@@ -317,10 +281,13 @@ def _resolve_physical(
                 costs.known_rigid_host_bytes + eager_increment,
             )
         eager_fits = eager_reservation <= envelope.host_budget_bytes
-        if capabilities.supports_encoder_row_materialization and eager_fits:
-            residency = "eager"
+        preferred = profile.default_encoder_residency.value
+        if preferred == "eager" and capabilities.supports_encoder_row_materialization and eager_fits:
+            residency = preferred
         elif capabilities.supports_lazy_encoder_rows:
             residency = "lazy_per_request"
+        elif capabilities.supports_encoder_row_materialization and eager_fits:
+            residency = "eager"
         else:
             residency = "unavailable"
             refusals.append("provider exposes neither fitting eager nor lazy encoder rows")
@@ -332,13 +299,13 @@ def _resolve_physical(
         raise ValueError(f"unknown encoder_residency override: {residency}")
 
     policy_override = (
-        _string_override("row_store_policy", overrides["row_store_policy"])
-        if "row_store_policy" in overrides
+        requirements.row_store_policy.value
+        if requirements.row_store_policy is not None
         else None
     )
     spill_override = (
-        _string_override("spill_target", overrides["spill_target"])
-        if "spill_target" in overrides
+        requirements.spill_target.value
+        if requirements.spill_target is not None
         else None
     )
     row_policy, row_bytes, spill_target, row_refusal = _select_row_store(
@@ -536,6 +503,7 @@ def resolve_trace_plan(
     semantics: TraceSemantics,
     profile: ProviderProfile,
     envelope: ResourceEnvelope,
+    requirements: PhysicalExecutionRequirements | None = None,
 ) -> TracePlan:
     """Resolve a pure, provider-agnostic, advisory Phase B execution plan."""
 
@@ -543,8 +511,9 @@ def resolve_trace_plan(
         raise ValueError("provider profile has incomplete cost metadata")
     evidence_hash = _validate_evidence(semantics, profile)
     effective_source, capacity, bindings = _effective_batches(semantics)
+    requirements = requirements or PhysicalExecutionRequirements()
     physical, physical_warnings, physical_refusals = _resolve_physical(
-        semantics, profile, envelope, effective_source
+        semantics, profile, envelope, effective_source, requirements
     )
     estimates = _estimate_demands(
         semantics, profile, physical, effective_source, capacity
@@ -593,7 +562,16 @@ def resolve_trace_plan(
                 f"{effective_file_allowance} B so rigid host plus allowance stays within total host budget"
             )
     checkpoint_bytes = int(_amount(estimates, "checkpoint_file_working_set"))
-    cache_policy = _cache_policy(checkpoint_bytes, effective_file_allowance, envelope.cache_policy)
+    if (
+        requirements.cache_policy is not None
+        and envelope.cache_policy is not CachePolicy.AUTO
+        and requirements.cache_policy is not envelope.cache_policy
+    ):
+        refusals.append(
+            "explicit provider file-cache policy conflicts with the resource envelope"
+        )
+    requested_cache_policy = requirements.cache_policy or envelope.cache_policy
+    cache_policy = _cache_policy(checkpoint_bytes, effective_file_allowance, requested_cache_policy)
     physical = replace(physical, cache_policy=cache_policy)
     if checkpoint_bytes > effective_file_allowance:
         warnings.append(

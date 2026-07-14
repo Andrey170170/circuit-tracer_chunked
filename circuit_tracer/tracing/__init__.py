@@ -7,6 +7,7 @@ from circuit_tracer.execution_identity import (
 )
 from .plan import (
     DecoderCachePolicy,
+    DecoderPlan,
     ExecutionConstraints,
     FrontierExpansionPlan,
     ObservabilityPolicy,
@@ -17,6 +18,7 @@ from .plan import (
     TraceEvidence,
 )
 from .planning import resolve_trace_request
+from .governor_bridge import PlanningRefusedError
 from .problem import AttributionProblem, FrontierSemantics, PrefixViewTarget, TraceSemantics
 from .request import TraceRequest
 from .result import TraceResult, TraceStatus
@@ -25,6 +27,7 @@ from .session import SessionWindow, TraceSession
 __all__ = [
     "AttributionProblem",
     "DecoderCachePolicy",
+    "DecoderPlan",
     "ExecutionConstraints",
     "EffectiveExecutionDescriptor",
     "EffectiveExecutionIdentity",
@@ -32,6 +35,7 @@ __all__ = [
     "FrontierSemantics",
     "ObservabilityPolicy",
     "PrefixViewTarget",
+    "PlanningRefusedError",
     "ReplayPlan",
     "ResolvedTracePlan",
     "RowStoragePlan",

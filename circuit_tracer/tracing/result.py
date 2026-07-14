@@ -11,6 +11,7 @@ class TraceStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    REFUSED = "refused"
 
 
 @dataclass(frozen=True)

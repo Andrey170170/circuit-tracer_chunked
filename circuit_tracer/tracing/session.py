@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence
 
+from circuit_tracer.governor.contracts import ProviderProfile, ResourceEnvelope
 from circuit_tracer.transcoder.provider import (
     get_transcoder_capabilities,
     provider_fingerprint,
@@ -116,15 +117,32 @@ def _attempt_cleanup(
 
 
 class TraceSession:
-    def __init__(self, request: TraceRequest, window: SessionWindow | None = None) -> None:
+    def __init__(
+        self,
+        request: TraceRequest,
+        window: SessionWindow | None = None,
+        *,
+        resources: ResourceEnvelope | None = None,
+        provider_profile: ProviderProfile | None = None,
+    ) -> None:
+        if (resources is None) != (provider_profile is None):
+            raise ValueError("resources and provider_profile must be supplied together")
         self.request = request
         self.window = window or SessionWindow()
+        self.resources = resources
+        self.provider_profile = provider_profile
+        initial_plan = resolve_trace_request(
+            request,
+            resources=resources,
+            provider_profile=provider_profile,
+        )
         self._delegate: Any = None
         self._reuse: bool | None = None
         self._closed = False
+        self._decoder_cache_enabled = initial_plan.execution.session.decoder_cache.enabled
         self._decoder_cache = _SessionDecoderCache(
             request.problem.model,
-            request.execution.session.decoder_cache,
+            initial_plan.execution.session.decoder_cache,
         )
 
     def _ensure_open(self) -> None:
@@ -136,11 +154,22 @@ class TraceSession:
         selected = request or self.request
         if selected.problem.model is not self.request.problem.model:
             raise ValueError("a session cannot change models")
-        if not self.request.execution.session.decoder_cache.enabled:
-            return run_trace(selected.problem, resolve_trace_request(selected))
+        if not self._decoder_cache_enabled:
+            return run_trace(
+                selected.problem,
+                resolve_trace_request(
+                    selected,
+                    resources=self.resources,
+                    provider_profile=self.provider_profile,
+                ),
+            )
         from circuit_tracer.attribution.nnsight.forward_session import ForwardOverrides
 
-        plan = resolve_trace_request(selected)
+        plan = resolve_trace_request(
+            selected,
+            resources=self.resources,
+            provider_profile=self.provider_profile,
+        )
         cache, fingerprint = self._decoder_cache.acquire()
         try:
             return run_trace(
@@ -195,7 +224,11 @@ class TraceSession:
             target_position,
             window_request,
         )
-        plan = resolve_trace_request(replace(window_request, problem=problem))
+        plan = resolve_trace_request(
+            replace(window_request, problem=problem),
+            resources=self.resources,
+            provider_profile=self.provider_profile,
+        )
         try:
             return run_trace(problem, plan, forward_overrides=overrides)
         except BaseException as primary_error:

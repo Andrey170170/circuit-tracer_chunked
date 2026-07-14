@@ -7,7 +7,7 @@ from enum import Enum
 from os import PathLike
 from typing import Any, Mapping
 
-from circuit_tracer.governor.contracts import fingerprint
+from circuit_tracer.governor.contracts import ProviderProfile, ResourceEnvelope, fingerprint
 
 from .plan import ExecutionConstraints, ResolvedTracePlan
 from .request import TraceRequest
@@ -82,7 +82,7 @@ def _validate_backend_constraints(backend: str, execution: ExecutionConstraints)
         raise ValueError("TransformerLens tracing accepts only default execution constraints")
 
 
-def resolve_trace_request(request: TraceRequest) -> ResolvedTracePlan:
+def _resolve_explicit_trace_request(request: TraceRequest) -> ResolvedTracePlan:
     """Validate every cross-domain choice before execution resources are created."""
 
     backend = getattr(request.problem.model, "backend", None)
@@ -120,5 +120,28 @@ def resolve_trace_request(request: TraceRequest) -> ResolvedTracePlan:
         requested_execution_fingerprint=fingerprint(execution),
         backend=backend,
         evidence_metadata=request.evidence.metadata,
-        admission_report=request.evidence.advisory_governor_plan,
+    )
+
+
+def resolve_trace_request(
+    request: TraceRequest,
+    *,
+    resources: ResourceEnvelope | None = None,
+    provider_profile: ProviderProfile | None = None,
+) -> ResolvedTracePlan:
+    """Resolve an explicit request or compile one governed pre-load plan."""
+
+    if (resources is None) != (provider_profile is None):
+        raise ValueError("resources and provider_profile must be supplied together")
+    explicit = _resolve_explicit_trace_request(request)
+    if resources is None:
+        return explicit
+    from .governor_bridge import resolve_governed_trace_request
+
+    return resolve_governed_trace_request(
+        request,
+        resources,
+        provider_profile,
+        explicit_plan=explicit,
+        resolve_explicit=_resolve_explicit_trace_request,
     )
