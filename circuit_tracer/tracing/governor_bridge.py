@@ -74,6 +74,18 @@ def _validate_provider(problem: Any, profile: ProviderProfile) -> None:
         raise ValueError("provider profile mismatch: " + ", ".join(mismatches))
 
 
+def _validate_load_time_mechanisms(problem: Any, planning: Any) -> None:
+    provider = getattr(problem.model, "transcoders", None)
+    actual = provider_fingerprint(getattr(provider, "_module", provider))
+    actual_chunk = actual.get("decoder_chunk_size")
+    planned_chunk = planning.physical.decoder_fetch_chunk_size
+    if actual_chunk is not None and int(actual_chunk) != int(planned_chunk):
+        raise ValueError(
+            "loaded decoder chunk size does not match governed plan: "
+            f"loaded {actual_chunk}, planned {planned_chunk}"
+        )
+
+
 def _workload(
     request: TraceRequest,
     profile: ProviderProfile,
@@ -230,13 +242,14 @@ def resolve_governed_trace_request(
 
     _validate_provider(request.problem, provider_profile)
     workload = _workload(request, provider_profile, explicit_plan.semantic_fingerprint)
-    requirements = _requirements(request)
+    requirements = request.physical_requirements or _requirements(request)
     planning = resolve_trace_plan(
         workload,
         provider_profile,
         resources,
         requirements,
     )
+    _validate_load_time_mechanisms(request.problem, planning)
     compiled_request = replace(request, execution=_compile_execution(request, planning))
     compiled = resolve_explicit(compiled_request)
     resolved = replace(
@@ -290,6 +303,7 @@ def recompile_governed_plan(
         semantics=current.semantics,
         execution=current.execution,
         evidence=TraceEvidence(metadata=current.evidence_metadata),
+        physical_requirements=current.planning_requirements,
     )
     return compile_governed_revision(
         request,

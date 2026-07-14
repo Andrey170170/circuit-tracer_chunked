@@ -142,9 +142,18 @@ class AttributionExecution:
     def _run_with_grant(self, phase: PhaseId, callback: Callable[[], Any]) -> Any:
         grant = self._grant(phase)
         try:
-            return callback()
-        finally:
+            result = callback()
+        except BaseException as primary_error:
+            try:
+                self._release(grant)
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"governor {phase.value} release also failed: {cleanup_error!r}"
+                )
+            raise
+        else:
             self._release(grant)
+            return result
 
     def run_phase0_preparation(self) -> None:
         p = self.prepared

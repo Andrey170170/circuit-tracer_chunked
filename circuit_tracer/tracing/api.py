@@ -11,7 +11,7 @@ from .planning import resolve_trace_request
 from .request import TraceRequest
 from .result import TraceResult, TraceStatus
 from .runner import run_trace
-from .session import SessionWindow, TraceSession
+from .session import SessionWindow, TraceSession, _SessionDecoderCache
 
 
 def trace_one(
@@ -21,7 +21,31 @@ def trace_one(
     provider_profile: ProviderProfile | None = None,
 ) -> TraceResult:
     plan = resolve_trace_request(request, resources=resources, provider_profile=provider_profile)
-    return run_trace(request.problem, plan)
+    cache_policy = plan.execution.session.decoder_cache
+    if not cache_policy.enabled:
+        return run_trace(request.problem, plan)
+
+    from circuit_tracer.attribution.nnsight.forward_session import ForwardOverrides
+
+    owner = _SessionDecoderCache(request.problem.model, cache_policy)
+    cache, fingerprint = owner.acquire()
+    try:
+        result = run_trace(
+            request.problem,
+            plan,
+            forward_overrides=ForwardOverrides(
+                decoder_chunk_cache=cache,
+                decoder_cache_fingerprint=fingerprint,
+            ),
+        )
+    except BaseException as primary_error:
+        try:
+            owner.close()
+        except BaseException as cleanup_error:
+            primary_error.add_note(f"one-shot decoder cache cleanup also failed: {cleanup_error!r}")
+        raise
+    owner.close()
+    return result
 
 
 def trace_batch(

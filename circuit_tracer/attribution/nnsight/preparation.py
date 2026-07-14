@@ -646,10 +646,11 @@ def _effective_execution_identity(
     replay: ReplayMechanisms,
     batches: BatchMechanisms,
     frontier: FrontierMechanisms,
+    plan: ResolvedTracePlan,
 ) -> EffectiveExecutionIdentity:
     """Describe only mechanisms fixed by successful NNSight preparation."""
     descriptor = EffectiveExecutionDescriptor(
-        schema_version=1,
+        schema_version=2,
         backend="nnsight",
         provider={
             "capabilities": _capability_descriptor(provider.capabilities),
@@ -710,6 +711,28 @@ def _effective_execution_identity(
             "active_row_accumulation": frontier.active_row_accumulation_effective,
             "refresh_aux_fallback_reason": frontier.refresh_aux_fallback_reason,
         },
+        decoder={
+            "fetch_chunk_size": plan.execution.decoder.fetch_chunk_size,
+            "cache_enabled": plan.execution.session.decoder_cache.enabled,
+            "cache_max_bytes": plan.execution.session.decoder_cache.max_bytes,
+        },
+        storage={
+            "retention": plan.execution.storage.retention,
+            "backend": plan.execution.storage.full_retention_backend,
+            "feature_column_tile_size": plan.execution.storage.feature_column_tile_size,
+            "influence_row_tile_size": plan.execution.storage.influence_row_tile_size,
+            "influence_column_tile_size": plan.execution.storage.influence_column_tile_size,
+            "cache_control": plan.execution.storage.cache_control,
+            "temp_root_policy": plan.execution.storage.temp_root_policy,
+            "preallocate": plan.execution.storage.preallocate,
+            "replay_tile_cache_bytes": plan.execution.storage.replay_tile_cache_bytes,
+            "exact_encoder_residency": plan.execution.storage.exact_encoder_residency,
+            "placement": (
+                None
+                if plan.execution.storage.placement is None
+                else plan.execution.storage.placement.value
+            ),
+        },
     )
     return EffectiveExecutionIdentity(descriptor=descriptor, fingerprint=fingerprint(descriptor))
 
@@ -748,7 +771,7 @@ def prepare_backend(
         "phase4_execution": frontier.execution_metadata,
     }
     effective_execution = _effective_execution_identity(
-        provider, numerics, replay, batches, frontier
+        provider, numerics, replay, batches, frontier, plan
     )
     return PreparedBackend(
         problem=problem,
@@ -804,7 +827,7 @@ def reprepare_after_active_universe(
             + ", ".join(frozen_mismatches)
         )
     effective = _effective_execution_identity(
-        prepared.provider, prepared.numerics, prepared.replay, batches, frontier
+        prepared.provider, prepared.numerics, prepared.replay, batches, frontier, plan
     )
     return replace(
         prepared,

@@ -111,9 +111,21 @@ def run_trace(
             output = run_transformerlens_trace(problem, plan, observer=observer)
         else:  # resolved plans are closed over the supported backend set
             raise AssertionError(f"unreachable backend: {plan.backend}")
-    except RuntimePlanningRefusedError:
+    except RuntimePlanningRefusedError as refusal:
         if governor_runtime is None:
             raise AssertionError("runtime planning refusal requires a governor runtime")
+        from .governor_bridge import recompile_governed_plan
+
+        plan = recompile_governed_plan(problem, plan, refusal.revision.plan)
+        plan = replace(
+            plan,
+            planning_profile=governor_runtime.profile,
+            planning_envelope=governor_runtime.envelope,
+            planning_workload=governor_runtime.workload,
+            planning_requirements=governor_runtime.requirements,
+            planning_parent_fingerprint=refusal.revision.parent_execution_fingerprint,
+            planning_epoch_fingerprint=refusal.revision.execution_fingerprint,
+        )
         return _refused_result(plan, scope, governor_runtime, "active_universe_replan")
     except BaseException as primary_error:
         if governor_runtime is not None:
@@ -168,7 +180,7 @@ def _refused_result(
         )
     )
     runtime.close()
-    evidence = scope.close(None)
+    evidence = scope.close(None, terminal_status="refused")
     return TraceResult(
         output=None,
         semantic_fingerprint=plan.semantic_fingerprint,

@@ -30,17 +30,33 @@ class TraceRunScope:
     started_at: float = field(default_factory=time.perf_counter)
     _closed: bool = False
 
-    def close(self, primary_error: BaseException | None) -> ObservabilityEvidence:
+    def close(
+        self,
+        primary_error: BaseException | None,
+        *,
+        terminal_status: str | None = None,
+    ) -> ObservabilityEvidence:
         if self._closed:
             raise RuntimeError("trace run scope is already closed")
         self._closed = True
         elapsed_ms = (time.perf_counter() - self.started_at) * 1000.0
-        name = "attribute.done" if primary_error is None else "attribute.failed"
+        if terminal_status is None:
+            terminal_status = "succeeded" if primary_error is None else "failed"
+        if terminal_status not in {"succeeded", "failed", "refused"}:
+            raise ValueError(f"unsupported terminal status: {terminal_status!r}")
+        if primary_error is not None and terminal_status != "failed":
+            raise ValueError("a primary error requires terminal_status='failed'")
+        name = {
+            "succeeded": "attribute.done",
+            "failed": "attribute.failed",
+            "refused": "attribute.refused",
+        }[terminal_status]
         attrs: dict[str, object] = {
             "compact_output": self.compact_output,
             "requested_execution_fingerprint": self.execution_identity.requested_fingerprint,
             "effective_execution_fingerprint": self.execution_identity.effective_fingerprint,
             "execution_fingerprint": self.execution_identity.execution_fingerprint,
+            "status": terminal_status,
         }
         if primary_error is not None:
             attrs.update(

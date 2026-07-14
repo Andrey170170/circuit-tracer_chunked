@@ -14,6 +14,12 @@ from circuit_tracer.attribution.nnsight.preparation import (
     _effective_execution_identity,
 )
 from circuit_tracer.attribution.nnsight.session_controls import NNSightSessionControls
+from circuit_tracer.tracing.plan import (
+    DecoderCachePolicy,
+    ExecutionConstraints,
+    RowStoragePlan,
+    SessionPlan,
+)
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
 
 
@@ -22,6 +28,8 @@ def _identity(
     feature_batch_size: int = 8,
     planner_status: str = "disabled",
     compact_row_store: bool = True,
+    row_backend: str = "full_file",
+    decoder_cache_bytes: int = 0,
 ):
     provider = ProviderMechanisms(
         capabilities=TranscoderCapabilities(
@@ -126,7 +134,18 @@ def _identity(
         active_row_accumulation_effective="direct_v1" if compact_row_store else "zero_fill",
         refresh_aux_fallback_reason=None if compact_row_store else "not_applicable",
     )
-    return _effective_execution_identity(provider, numerics, replay, batches, frontier)
+    plan = SimpleNamespace(
+        execution=ExecutionConstraints(
+            session=SessionPlan(
+                decoder_cache=DecoderCachePolicy(
+                    enabled=decoder_cache_bytes > 0,
+                    max_bytes=decoder_cache_bytes or None,
+                )
+            ),
+            storage=RowStoragePlan(full_retention_backend=row_backend),
+        )
+    )
+    return _effective_execution_identity(provider, numerics, replay, batches, frontier, plan)
 
 
 def test_effective_execution_descriptor_is_stable_and_json_serializable() -> None:
@@ -155,3 +174,15 @@ def test_effective_identity_changes_with_provider_dependent_fallbacks() -> None:
     assert supported.fingerprint != fallback.fingerprint
     assert fallback.descriptor is not None
     assert fallback.descriptor.frontier["refresh_aux_fallback_reason"] == "not_applicable"
+
+
+def test_effective_identity_covers_storage_and_decoder_mechanisms() -> None:
+    full = _identity(row_backend="full_file")
+    tiled = _identity(row_backend="column_tiled_v1")
+    cached = _identity(row_backend="full_file", decoder_cache_bytes=4096)
+
+    assert len({full.fingerprint, tiled.fingerprint, cached.fingerprint}) == 3
+    assert tiled.descriptor is not None
+    assert tiled.descriptor.storage["backend"] == "column_tiled_v1"
+    assert cached.descriptor is not None
+    assert cached.descriptor.decoder["cache_max_bytes"] == 4096

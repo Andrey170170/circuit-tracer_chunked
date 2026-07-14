@@ -9,6 +9,8 @@ from circuit_tracer.governor import (
     ActiveUniverseObservation,
     PlanStatus,
     ResourceEnvelope,
+    PhysicalExecutionRequirements,
+    RowStorePolicy,
 )
 from circuit_tracer.governor.host_budget import HostBudgetCandidate, HostBudgetDiscovery
 from circuit_tracer.governor.runtime import LoadedStateObservation, ProviderUnitProbe
@@ -138,7 +140,7 @@ def test_provider_mismatch_and_planning_refusal_fail_closed() -> None:
     names = [event["name"] for event in refused.telemetry_events]
     assert names[:2] == ["attribute.start", "planning.pre_execution_admission"]
     assert "planning.refusal" in names
-    assert names[-1] == "attribute.done"
+    assert names[-1] == "attribute.refused"
 
 
 def test_governed_storage_rejects_unmanaged_temp_root() -> None:
@@ -286,7 +288,16 @@ def test_active_universe_refusal_returns_terminal_refused_result(monkeypatch) ->
     assert "planning.active_universe_replan" in names
     assert "planning.refusal" in names
     assert "planning.terminal_cleanup" in names
-    assert names[-1] == "attribute.done"
+    assert names[-1] == "attribute.refused"
+    active_revision = next(
+        event
+        for event in result.telemetry_events
+        if event["name"] == "planning.active_universe_replan"
+    )
+    assert active_revision["attrs"]["execution_fingerprint"]
+    assert result.telemetry_summary["requested_execution_fingerprint"] == (
+        result.requested_execution_fingerprint
+    )
 
 
 @pytest.mark.parametrize("api", [resolve_trace_request, trace_batch, open_session])
@@ -296,3 +307,21 @@ def test_public_governed_inputs_must_be_paired(api) -> None:
     value = [selected] if api is trace_batch else selected
     with pytest.raises(ValueError, match="must be supplied together"):
         api(value, resources=envelope())
+
+
+def test_explicit_zero_and_full_requirements_override_profile_defaults() -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    selected = replace(
+        request(profile, batch=1000),
+        physical_requirements=PhysicalExecutionRequirements(
+            decoder_cache_bytes=0,
+            row_store_policy=RowStorePolicy.FULL,
+        ),
+    )
+
+    plan = resolve_trace_request(selected, resources=envelope(), provider_profile=profile)
+
+    assert plan.execution.session.decoder_cache.enabled is False
+    assert plan.execution.storage.full_retention_backend == "full_file"
+    assert plan.planning_requirements.decoder_cache_bytes == 0
+    assert plan.planning_requirements.row_store_policy is RowStorePolicy.FULL

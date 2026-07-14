@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 
+from circuit_tracer.governor.contracts import PhysicalExecutionRequirements
+
 from .plan import ExecutionConstraints, TraceEvidence
 from .problem import AttributionProblem, TraceSemantics
 
@@ -14,4 +16,4 @@ class TraceRequest:
     semantics: TraceSemantics = field(default_factory=TraceSemantics)
     execution: ExecutionConstraints = field(default_factory=ExecutionConstraints)
     evidence: TraceEvidence = field(default_factory=TraceEvidence)
-
+    physical_requirements: PhysicalExecutionRequirements | None = None

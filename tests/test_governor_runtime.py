@@ -168,6 +168,20 @@ def test_all_planning_epochs_are_ordered_and_semantics_stay_stable() -> None:
         "admission_decisions",
     ):
         assert key in admission_event.attrs
+    observation_events = [
+        event for event in governed.observer.events if event.name == "planning.observation"
+    ]
+    assert observation_events[-1].attrs["total_nnz"] == 100
+    assert all(
+        not isinstance(value, (tuple, list, dict))
+        for event in observation_events
+        for value in event.attrs.values()
+    )
+    assert any(
+        event.name == "planning.active_universe_layer"
+        and event.attrs == {"layer_index": 0, "active_count": 100}
+        for event in governed.observer.events
+    )
 
 
 def test_actual_nnz_revises_storage_rung_before_claim() -> None:

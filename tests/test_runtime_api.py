@@ -531,6 +531,66 @@ def test_session_owns_bounded_decoder_cache_across_traces_and_failures(monkeypat
     assert model.transcoders.cleared[-1] is seen[4]
 
 
+def test_trace_one_owns_and_clears_its_planned_decoder_cache(monkeypatch) -> None:
+    class Provider:
+        capabilities = TranscoderCapabilities(
+            architecture="clt",
+            checkpoint_format="test",
+            supports_decoder_chunk_cache=True,
+        )
+
+        def __init__(self) -> None:
+            self.created = []
+            self.cleared = []
+
+        def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None):
+            cache = object()
+            self.created.append((cache, max_bytes, fingerprint))
+            return cache
+
+        def clear_decoder_block_cache(self, cache) -> None:
+            self.cleared.append(cache)
+
+    class Model(FakeModel):
+        def __init__(self) -> None:
+            self.transcoders = Provider()
+
+    model = Model()
+    selected = TraceRequest(
+        problem=AttributionProblem(prompt=[1], model=model),
+        execution=ExecutionConstraints(
+            session=SessionPlan(
+                decoder_cache=DecoderCachePolicy(enabled=True, max_bytes=4096)
+            )
+        ),
+    )
+    seen = []
+
+    def execute(
+        _problem,
+        _plan,
+        *,
+        observer,
+        forward_overrides,
+        execution_identity,
+        governor_runtime,
+    ):
+        del observer
+        assert governor_runtime is None
+        execution_identity.mark_requested_as_effective()
+        seen.append(forward_overrides.decoder_chunk_cache)
+        return {"ok": True}
+
+    monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute)
+
+    result = trace_one(selected)
+
+    assert result.status is TraceStatus.SUCCEEDED
+    assert seen == [model.transcoders.created[0][0]]
+    assert model.transcoders.created[0][1] == 4096
+    assert model.transcoders.cleared == seen
+
+
 def test_session_window_resolves_effective_request(monkeypatch) -> None:
     calls = []
 

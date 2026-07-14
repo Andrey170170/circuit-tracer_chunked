@@ -539,17 +539,70 @@ class TraceGovernorRuntime:
             )
 
     def _emit_observation(self, epoch: PlanningEpoch, observation: object) -> None:
-        attrs = {name: value for name, value in vars(observation).items()}
+        if isinstance(observation, LoadedStateObservation):
+            attrs = {
+                "epoch": epoch.value,
+                "cuda_available": observation.cuda_available,
+                "cuda_allocated_bytes": observation.cuda_allocated_bytes,
+                "cuda_reserved_bytes": observation.cuda_reserved_bytes,
+                "cuda_total_bytes": observation.cuda_total_bytes,
+                "host_rss_bytes": observation.host_rss_bytes,
+                "host_available_bytes": observation.host_available_bytes,
+            }
+            probes = (observation.decoder_probe, observation.encoder_probe)
+        elif isinstance(observation, ActiveUniverseObservation):
+            attrs = {
+                "epoch": epoch.value,
+                "total_nnz": observation.total_nnz,
+                "rank": len(observation.shape),
+                "shape": "x".join(str(value) for value in observation.shape),
+                "layer_count": len(observation.per_layer_counts),
+                "position_count": len(observation.per_position_counts),
+                "membership_fingerprint": observation.membership_fingerprint,
+                "membership_sample_count": len(observation.membership_sample),
+            }
+            probes = ()
+        else:
+            raise TypeError(f"unsupported planning observation: {type(observation).__name__}")
         self.observer.observe(
             TraceEvent(
                 scope="run",
                 name="planning.observation",
-                attrs={
-                    "epoch": epoch.value,
-                    **attrs,
-                },
+                attrs=attrs,
             )
         )
+        for probe in probes:
+            self.observer.observe(
+                TraceEvent(
+                    scope="run",
+                    name="planning.provider_probe",
+                    attrs={
+                        "epoch": epoch.value,
+                        "probe": probe.name,
+                        "available": probe.available,
+                        "elapsed_ms": probe.elapsed_ms,
+                        "materialized_bytes": probe.materialized_bytes,
+                        "reason": probe.reason,
+                    },
+                )
+            )
+        if isinstance(observation, ActiveUniverseObservation):
+            for index, count in enumerate(observation.per_layer_counts):
+                self.observer.observe(
+                    TraceEvent(
+                        scope="run",
+                        name="planning.active_universe_layer",
+                        attrs={"layer_index": index, "active_count": count},
+                    )
+                )
+            for index, count in enumerate(observation.per_position_counts):
+                self.observer.observe(
+                    TraceEvent(
+                        scope="run",
+                        name="planning.active_universe_position",
+                        attrs={"position_index": index, "active_count": count},
+                    )
+                )
 
     def _ledger_event(self, event: LedgerEvent) -> None:
         planned = tuple(

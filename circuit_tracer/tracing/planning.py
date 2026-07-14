@@ -136,6 +136,8 @@ def resolve_trace_request(
 
     if (resources is None) != (provider_profile is None):
         raise ValueError("resources and provider_profile must be supplied together")
+    if resources is None and request.physical_requirements is not None:
+        raise ValueError("physical_requirements require governed resources and provider_profile")
     explicit = _resolve_explicit_trace_request(request)
     if resources is None:
         return explicit

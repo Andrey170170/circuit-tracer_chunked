@@ -20,6 +20,8 @@ class EffectiveExecutionDescriptor:
     replay: Mapping[str, Any] = field(default_factory=dict)
     batches: Mapping[str, Any] = field(default_factory=dict)
     frontier: Mapping[str, Any] = field(default_factory=dict)
+    decoder: Mapping[str, Any] = field(default_factory=dict)
+    storage: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the same canonical primitive tree used for fingerprinting."""
