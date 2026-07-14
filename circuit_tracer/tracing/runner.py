@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
+from circuit_tracer.governor.runtime import (
+    RuntimePlanningRefusedError,
+    TorchLoadedStateSampler,
+    TraceGovernorRuntime,
+)
 from circuit_tracer.observability.events import TraceEvent
 from circuit_tracer.observability.lifecycle import TelemetryObserver
 from circuit_tracer.observability.run_scope import TraceRunScope
@@ -30,6 +36,7 @@ def run_trace(
         profile=plan.execution.observability.profile,
         execution_identity=execution_identity,
     )
+    governor_runtime = None
     observer.observe(
         TraceEvent(
             scope="run",
@@ -46,6 +53,42 @@ def run_trace(
         )
     )
     try:
+        if plan.planning_trace_plan is not None:
+            if any(
+                value is None
+                for value in (
+                    plan.planning_workload,
+                    plan.planning_profile,
+                    plan.planning_envelope,
+                    plan.planning_requirements,
+                )
+            ):
+                raise RuntimeError("governed plan is missing immutable planning inputs")
+            governor_runtime = TraceGovernorRuntime(
+                plan=plan.planning_trace_plan,
+                workload=plan.planning_workload,
+                profile=plan.planning_profile,
+                envelope=plan.planning_envelope,
+                requirements=plan.planning_requirements,
+                observer=observer,
+            )
+            governor_runtime.pre_execution_admission()
+            if not governor_runtime.current_plan.admission.admitted:
+                return _refused_result(plan, scope, governor_runtime, "pre_execution_admission")
+            provider = getattr(problem.model, "transcoders", None)
+            observation = TorchLoadedStateSampler().sample(getattr(provider, "_module", provider))
+            revision = governor_runtime.loaded_state_calibration(observation)
+            from .governor_bridge import recompile_governed_plan
+
+            plan = recompile_governed_plan(problem, plan, revision.plan)
+            plan = replace(
+                plan,
+                planning_profile=governor_runtime.profile,
+                planning_envelope=governor_runtime.envelope,
+                planning_workload=governor_runtime.workload,
+            )
+            if not revision.plan.admission.admitted:
+                return _refused_result(plan, scope, governor_runtime, "loaded_state_calibration")
         if plan.backend == "nnsight":
             from circuit_tracer.attribution.nnsight.backend import run_nnsight_trace
 
@@ -55,6 +98,7 @@ def run_trace(
                 observer=observer,
                 forward_overrides=forward_overrides,
                 execution_identity=execution_identity,
+                governor_runtime=governor_runtime,
             )
         elif plan.backend == "transformerlens":
             if forward_overrides is not None:
@@ -67,9 +111,27 @@ def run_trace(
             output = run_transformerlens_trace(problem, plan, observer=observer)
         else:  # resolved plans are closed over the supported backend set
             raise AssertionError(f"unreachable backend: {plan.backend}")
+    except RuntimePlanningRefusedError:
+        if governor_runtime is None:
+            raise AssertionError("runtime planning refusal requires a governor runtime")
+        return _refused_result(plan, scope, governor_runtime, "active_universe_replan")
     except BaseException as primary_error:
+        if governor_runtime is not None:
+            governor_runtime.observer.observe(
+                TraceEvent(
+                    scope="run",
+                    name="planning.failure",
+                    attrs={
+                        "error_type": type(primary_error).__name__,
+                        "error_message": str(primary_error),
+                    },
+                )
+            )
+            governor_runtime.close()
         scope.close(primary_error)
         raise
+    if governor_runtime is not None:
+        governor_runtime.close()
     evidence = scope.close(None)
     return TraceResult(
         output=output,
@@ -85,6 +147,36 @@ def run_trace(
         telemetry_summary=evidence.summary,
         telemetry_events=evidence.events,
         admission_report=plan.admission_report,
+    )
+
+
+def _refused_result(
+    plan: ResolvedTracePlan,
+    scope: TraceRunScope,
+    runtime: TraceGovernorRuntime,
+    epoch: str,
+) -> TraceResult:
+    report = runtime.current_plan.admission
+    runtime.observer.observe(
+        TraceEvent(
+            scope="run",
+            name="planning.refusal",
+            attrs={
+                "epoch": epoch,
+                "refusals": report.refusals,
+            },
+        )
+    )
+    runtime.close()
+    evidence = scope.close(None)
+    return TraceResult(
+        output=None,
+        semantic_fingerprint=plan.semantic_fingerprint,
+        requested_execution_fingerprint=plan.requested_execution_fingerprint,
+        status=TraceStatus.REFUSED,
+        telemetry_summary=evidence.summary,
+        telemetry_events=evidence.events,
+        admission_report=report,
     )
 
 
@@ -109,6 +201,7 @@ def _open_observability(plan: ResolvedTracePlan) -> tuple[TelemetryObserver, log
                 policy.profile
                 or plan.execution.compact_output
                 or policy.phase4_anomaly_debug
+                or plan.planning_trace_plan is not None
             ),
             max_events=max_events,
             jsonl_path=policy.telemetry_jsonl_path,

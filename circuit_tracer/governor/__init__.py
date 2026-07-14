@@ -45,6 +45,19 @@ if TYPE_CHECKING:
     from .profiles import StressRecommendation
     from .resolver import compute_work_units
     from .resolver import resolve_trace_plan
+    from .runtime import ActiveUniverseObservation
+    from .runtime import FrozenMechanismRevisionError
+    from .runtime import LoadedStateObservation
+    from .runtime import PlanningEpochOrderError
+    from .runtime import PlanningEpoch
+    from .runtime import PlanRevision
+    from .runtime import ProviderUnitProbe
+    from .runtime import ResourceUsageExceededError
+    from .runtime import ResourceUsageObservation
+    from .runtime import TorchResourceUsageSampler
+    from .runtime import RuntimePlanningRefusedError
+    from .runtime import TorchLoadedStateSampler
+    from .runtime import TraceGovernorRuntime
 
 
 _CONTRACT_EXPORTS = {
@@ -89,9 +102,25 @@ _PROFILE_EXPORTS = {
     "StressRecommendation",
 }
 _RESOLVER_EXPORTS = {"compute_work_units", "resolve_trace_plan"}
+_RUNTIME_EXPORTS = {
+    "ActiveUniverseObservation",
+    "FrozenMechanismRevisionError",
+    "LoadedStateObservation",
+    "PlanningEpoch",
+    "PlanningEpochOrderError",
+    "PlanRevision",
+    "ProviderUnitProbe",
+    "ResourceUsageExceededError",
+    "ResourceUsageObservation",
+    "TorchResourceUsageSampler",
+    "RuntimePlanningRefusedError",
+    "TorchLoadedStateSampler",
+    "TraceGovernorRuntime",
+}
 
 __all__ = [
     "AdmissionReport",
+    "ActiveUniverseObservation",
     "CachePolicy",
     "DecoderTopology",
     "DemandClass",
@@ -100,19 +129,28 @@ __all__ = [
     "DemandTier",
     "EncoderResidency",
     "FidelityMode",
+    "FrozenMechanismRevisionError",
     "GRANITE_H200_CALIBRATIONS",
     "HISTORICAL_STRESS_FIXTURES",
     "HISTORICAL_STRESS_RECOMMENDATIONS",
     "HostBudgetCandidate",
     "HostBudgetDiscovery",
+    "LoadedStateObservation",
     "PhysicalExecutionConfig",
     "PhysicalExecutionRequirements",
     "PlanStatus",
+    "PlanningEpoch",
+    "PlanningEpochOrderError",
+    "PlanRevision",
     "ProviderCapabilities",
     "ProviderCostMetadata",
     "ProviderDimensions",
     "ProviderIdentity",
     "ProviderProfile",
+    "ProviderUnitProbe",
+    "ResourceUsageExceededError",
+    "ResourceUsageObservation",
+    "RuntimePlanningRefusedError",
     "RECORDED_PROVIDER_PROFILES",
     "ResourceCalibrationObservation",
     "ResourceEnvelope",
@@ -121,7 +159,9 @@ __all__ = [
     "StressRecommendation",
     "StorageTier",
     "TracePlan",
+    "TraceGovernorRuntime",
     "TraceSemantics",
+    "TorchResourceUsageSampler",
     "TRUSTED_VALIDATION_EVIDENCE_REGISTRY",
     "ValidationEvidence",
     "canonical_json",
@@ -132,6 +172,7 @@ __all__ = [
     "fingerprint",
     "resolve_trace_plan",
     "semantic_fingerprint",
+    "TorchLoadedStateSampler",
 ]
 
 
@@ -144,6 +185,8 @@ def __getattr__(name: str):
         module_name = "circuit_tracer.governor.profiles"
     elif name in _RESOLVER_EXPORTS:
         module_name = "circuit_tracer.governor.resolver"
+    elif name in _RUNTIME_EXPORTS:
+        module_name = "circuit_tracer.governor.runtime"
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module = __import__(module_name, fromlist=[name])

@@ -1,4 +1,4 @@
-"""Pre-load bridge from canonical trace requests to governed execution plans."""
+"""Pre-execution bridge from canonical trace requests to governed execution plans."""
 
 from __future__ import annotations
 
@@ -21,17 +21,8 @@ from circuit_tracer.governor.resolver import resolve_trace_plan
 from circuit_tracer.transcoder.provider import provider_fingerprint
 
 from .plan import DecoderCachePolicy, DecoderPlan, ResolvedTracePlan
+from .plan import TraceEvidence
 from .request import TraceRequest
-
-
-class PlanningRefusedError(RuntimeError):
-    """Raised before backend execution when governed admission refuses."""
-
-    def __init__(self, plan: ResolvedTracePlan) -> None:
-        self.plan = plan
-        report = plan.admission_report
-        detail = "; ".join(report.refusals) if report is not None else "unknown refusal"
-        super().__init__(f"trace planning refused: {detail}")
 
 
 def _prompt_token_count(problem: Any) -> int:
@@ -40,7 +31,7 @@ def _prompt_token_count(problem: Any) -> int:
         tokenizer = getattr(problem.model, "tokenizer", None)
         if tokenizer is None:
             raise ValueError(
-                "governed pre-load planning requires token ids or an already available tokenizer"
+                "governed pre-execution planning requires token ids or an available tokenizer"
             )
         encoded = tokenizer.encode(prompt, add_special_tokens=True)
         return len(encoded)
@@ -125,6 +116,11 @@ def _requirements(request: TraceRequest) -> PhysicalExecutionRequirements:
     session = execution.session
     storage = execution.storage
     defaults = type(execution)()
+    if storage.temp_root is not None:
+        raise ValueError(
+            "governed storage does not accept an unmanaged temp_root; "
+            "declare a storage placement through the resource envelope"
+        )
     row_policy = None
     if storage.retention == "none_recompute":
         row_policy = RowStorePolicy.RECOMPUTE
@@ -152,9 +148,7 @@ def _requirements(request: TraceRequest) -> PhysicalExecutionRequirements:
             else None
         ),
         encoder_residency=(
-            EncoderResidency.EAGER
-            if storage.exact_encoder_residency != "lazy"
-            else None
+            EncoderResidency.EAGER if storage.exact_encoder_residency != "lazy" else None
         ),
         row_store_policy=row_policy,
         spill_target=storage.placement,
@@ -170,25 +164,25 @@ def _compile_execution(request: TraceRequest, planning: Any) -> Any:
     physical = planning.physical
     execution = request.execution
     row_policy = physical.row_store_policy
+    placement = (
+        StorageTier(physical.spill_target)
+        if physical.spill_target is not None
+        else None
+    )
     storage = replace(
         execution.storage,
         retention="none_recompute" if row_policy == "recompute" else "full_file",
-        full_retention_backend=(
-            "column_tiled_v1" if row_policy == "tiled" else "full_file"
-        ),
+        full_retention_backend=("column_tiled_v1" if row_policy == "tiled" else "full_file"),
         feature_column_tile_size=(
             planning.profile.row_store_tile_column_bound
             if row_policy == "tiled"
             else execution.storage.feature_column_tile_size
         ),
-        exact_encoder_residency=(
-            "active_cpu" if physical.encoder_residency == "eager" else "lazy"
+        exact_encoder_residency=("active_cpu" if physical.encoder_residency == "eager" else "lazy"),
+        temp_root_policy=(
+            "env_node_local" if placement is StorageTier.LOCAL else "default"
         ),
-        placement=(
-            StorageTier(physical.spill_target)
-            if physical.spill_target is not None
-            else None
-        ),
+        placement=placement,
     )
     capacity = max(
         physical.source_microbatch_size,
@@ -232,14 +226,16 @@ def resolve_governed_trace_request(
     explicit_plan: ResolvedTracePlan,
     resolve_explicit: Any,
 ) -> ResolvedTracePlan:
-    """Resolve and compile the deterministic pre-load Phase E planning epoch."""
+    """Resolve and compile the deterministic pre-execution Phase E planning epoch."""
 
     _validate_provider(request.problem, provider_profile)
+    workload = _workload(request, provider_profile, explicit_plan.semantic_fingerprint)
+    requirements = _requirements(request)
     planning = resolve_trace_plan(
-        _workload(request, provider_profile, explicit_plan.semantic_fingerprint),
+        workload,
         provider_profile,
         resources,
-        _requirements(request),
+        requirements,
     )
     compiled_request = replace(request, execution=_compile_execution(request, planning))
     compiled = resolve_explicit(compiled_request)
@@ -247,7 +243,57 @@ def resolve_governed_trace_request(
         compiled,
         semantic_fingerprint=explicit_plan.semantic_fingerprint,
         admission_report=planning.admission,
+        planning_profile=provider_profile,
+        planning_envelope=resources,
+        planning_workload=workload,
+        planning_requirements=requirements,
+        planning_trace_plan=planning,
+        planning_parent_fingerprint=explicit_plan.requested_execution_fingerprint,
+        planning_epoch_fingerprint=planning.execution_fingerprint,
     )
-    if not planning.admission.admitted:
-        raise PlanningRefusedError(resolved)
     return resolved
+
+
+def compile_governed_revision(
+    request: TraceRequest,
+    current: ResolvedTracePlan,
+    planning: Any,
+    *,
+    resolve_explicit: Any,
+) -> ResolvedTracePlan:
+    """Compile a later Phase E plan without creating another tracing path."""
+    compiled = resolve_explicit(replace(request, execution=_compile_execution(request, planning)))
+    return replace(
+        compiled,
+        semantic_fingerprint=current.semantic_fingerprint,
+        admission_report=planning.admission,
+        planning_profile=current.planning_profile,
+        planning_envelope=current.planning_envelope,
+        planning_workload=current.planning_workload,
+        planning_requirements=current.planning_requirements,
+        planning_trace_plan=planning,
+        planning_parent_fingerprint=current.planning_epoch_fingerprint,
+        planning_epoch_fingerprint=planning.execution_fingerprint,
+    )
+
+
+def recompile_governed_plan(
+    problem: Any,
+    current: ResolvedTracePlan,
+    planning: Any,
+) -> ResolvedTracePlan:
+    """Recompile the canonical request after a live governor revision."""
+    from .planning import _resolve_explicit_trace_request
+
+    request = TraceRequest(
+        problem=problem,
+        semantics=current.semantics,
+        execution=current.execution,
+        evidence=TraceEvidence(metadata=current.evidence_metadata),
+    )
+    return compile_governed_revision(
+        request,
+        current,
+        planning,
+        resolve_explicit=_resolve_explicit_trace_request,
+    )

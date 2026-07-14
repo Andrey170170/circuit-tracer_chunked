@@ -6,7 +6,16 @@ from dataclasses import dataclass, field
 from os import PathLike
 from typing import Any, Literal, Mapping
 
-from circuit_tracer.governor.contracts import CachePolicy, StorageTier
+from circuit_tracer.governor.contracts import (
+    AdmissionReport,
+    CachePolicy,
+    PhysicalExecutionRequirements,
+    ProviderProfile,
+    ResourceEnvelope,
+    StorageTier,
+    TracePlan,
+    TraceSemantics as PlanningWorkload,
+)
 
 from .problem import TraceSemantics, _nonnegative, _positive
 
@@ -66,7 +75,10 @@ class SessionPlan:
                 if value is not None and value > self.capacity:
                     raise ValueError(f"{name} cannot exceed session capacity")
         _positive("phase1_trace_batch_size_max", self.phase1_trace_batch_size_max)
-        if self.phase1_trace_batch_policy == "cap_effective_batches" and self.phase1_trace_batch_size_max is None:
+        if (
+            self.phase1_trace_batch_policy == "cap_effective_batches"
+            and self.phase1_trace_batch_size_max is None
+        ):
             raise ValueError("capped Phase-1 batching requires phase1_trace_batch_size_max")
 
 
@@ -229,7 +241,14 @@ class ResolvedTracePlan:
     requested_execution_fingerprint: str
     backend: Literal["nnsight", "transformerlens"]
     evidence_metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
-    admission_report: Any = None
+    admission_report: AdmissionReport | None = None
+    planning_profile: ProviderProfile | None = field(default=None, repr=False)
+    planning_envelope: ResourceEnvelope | None = field(default=None, repr=False)
+    planning_workload: PlanningWorkload | None = field(default=None, repr=False)
+    planning_requirements: PhysicalExecutionRequirements | None = field(default=None, repr=False)
+    planning_trace_plan: TracePlan | None = field(default=None, repr=False)
+    planning_parent_fingerprint: str | None = None
+    planning_epoch_fingerprint: str | None = None
 
     @property
     def execution_fingerprint(self) -> str:

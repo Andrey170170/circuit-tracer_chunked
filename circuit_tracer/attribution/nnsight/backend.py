@@ -38,6 +38,7 @@ from circuit_tracer.transcoder.provider import (
 )
 
 if TYPE_CHECKING:
+    from circuit_tracer.governor.runtime import TraceGovernorRuntime
     from circuit_tracer.attribution.nnsight.forward_session import ForwardOverrides
 
 
@@ -48,6 +49,7 @@ def run_nnsight_trace(
     observer: TraceObserver | None = None,
     forward_overrides: ForwardOverrides | None = None,
     execution_identity: ExecutionIdentityState,
+    governor_runtime: TraceGovernorRuntime | None = None,
 ) -> Graph | dict[str, object]:
     """Execute one resolved plan while owning logging and module offload cleanup."""
     from circuit_tracer.attribution.nnsight.forward_session import ForwardOverrides
@@ -88,6 +90,7 @@ def run_nnsight_trace(
             output_position=output_position,
             observer=observer,
             execution_identity=execution_identity,
+            governor_runtime=governor_runtime,
         )
     finally:
         if handler is not None:
@@ -105,6 +108,7 @@ def _execute_prepared_trace(
     output_position: int | None,
     observer: TraceObserver,
     execution_identity: ExecutionIdentityState,
+    governor_runtime: TraceGovernorRuntime | None,
 ) -> Graph | dict[str, object]:
     """Prepare mechanisms, execute Phase 0-5 operations, then close the lifecycle."""
     scope = AttributionRunScope(offload_handles=offload_handles)
@@ -123,7 +127,8 @@ def _execute_prepared_trace(
                 require_exact_provider=require_exact_chunked_provider,
             ),
         )
-        execution_identity.mark_effective(prepared.effective_execution)
+        if governor_runtime is None:
+            execution_identity.mark_effective(prepared.effective_execution)
         execution = AttributionExecution(
             prepared=prepared,
             scope=scope,
@@ -135,6 +140,8 @@ def _execute_prepared_trace(
                 run_phase4=run_phase4,
                 run_phase5=run_phase5,
             ),
+            governor_runtime=governor_runtime,
+            execution_identity=execution_identity,
         )
         return execution.run()
     finally:

@@ -7,7 +7,6 @@ from threading import Event
 
 from circuit_tracer.governor.contracts import ProviderProfile, ResourceEnvelope
 
-from .governor_bridge import PlanningRefusedError
 from .planning import resolve_trace_request
 from .request import TraceRequest
 from .result import TraceResult, TraceStatus
@@ -21,9 +20,7 @@ def trace_one(
     resources: ResourceEnvelope | None = None,
     provider_profile: ProviderProfile | None = None,
 ) -> TraceResult:
-    plan = resolve_trace_request(
-        request, resources=resources, provider_profile=provider_profile
-    )
+    plan = resolve_trace_request(request, resources=resources, provider_profile=provider_profile)
     return run_trace(request.problem, plan)
 
 
@@ -62,10 +59,6 @@ def trace_batch(
                     provider_profile=provider_profile,
                 )
             )
-        except PlanningRefusedError as error:
-            if failure == "raise":
-                raise
-            results.append(_terminal_result_from_plan(error.plan, TraceStatus.REFUSED, error))
         except Exception as error:
             if failure == "raise":
                 raise
@@ -89,9 +82,7 @@ def _terminal_result(
     resources: ResourceEnvelope | None = None,
     provider_profile: ProviderProfile | None = None,
 ) -> TraceResult:
-    plan = resolve_trace_request(
-        request, resources=resources, provider_profile=provider_profile
-    )
+    plan = resolve_trace_request(request, resources=resources, provider_profile=provider_profile)
     return _terminal_result_from_plan(plan, status, error)
 
 

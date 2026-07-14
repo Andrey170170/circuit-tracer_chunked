@@ -4,15 +4,22 @@ from dataclasses import replace
 
 import pytest
 
-from circuit_tracer.governor import RECORDED_PROVIDER_PROFILES, ResourceEnvelope
+from circuit_tracer.governor import (
+    RECORDED_PROVIDER_PROFILES,
+    ActiveUniverseObservation,
+    PlanStatus,
+    ResourceEnvelope,
+)
+from circuit_tracer.governor.host_budget import HostBudgetCandidate, HostBudgetDiscovery
+from circuit_tracer.governor.runtime import LoadedStateObservation, ProviderUnitProbe
 from circuit_tracer.tracing import (
     AttributionProblem,
-    PlanningRefusedError,
     TraceRequest,
     TraceSemantics,
     open_session,
     resolve_trace_request,
     trace_batch,
+    trace_one,
 )
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
 
@@ -74,9 +81,7 @@ def request(profile, *, batch: int, prompt_tokens: int = 16) -> TraceRequest:
 def test_governed_clt_compiles_to_equivalent_explicit_c2_plan() -> None:
     profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
     selected = request(profile, batch=1000)
-    governed = resolve_trace_request(
-        selected, resources=envelope(), provider_profile=profile
-    )
+    governed = resolve_trace_request(selected, resources=envelope(), provider_profile=profile)
     explicit = resolve_trace_request(replace(selected, execution=governed.execution))
 
     assert governed.semantic_fingerprint == explicit.semantic_fingerprint
@@ -91,6 +96,8 @@ def test_governed_clt_compiles_to_equivalent_explicit_c2_plan() -> None:
     assert governed.execution.replay.feature_window == 4
     assert governed.execution.replay.error_vector_prefetch_lookahead == 2
     assert governed.execution.storage.exact_encoder_residency == "lazy"
+    assert governed.execution.storage.placement.value == "local"
+    assert governed.execution.storage.temp_root_policy == "env_node_local"
 
 
 @pytest.mark.parametrize(
@@ -124,9 +131,32 @@ def test_provider_mismatch_and_planning_refusal_fail_closed() -> None:
         resolve_trace_request(selected, resources=envelope(), provider_profile=profile)
 
     admitted = request(profile, batch=1000)
-    with pytest.raises(PlanningRefusedError, match="planning refused"):
+    refused = trace_batch([admitted], resources=envelope(vram=GIB), provider_profile=profile)[0]
+    assert refused.status.value == "refused"
+    assert refused.output is None
+    assert refused.admission_report is not None
+    names = [event["name"] for event in refused.telemetry_events]
+    assert names[:2] == ["attribute.start", "planning.pre_execution_admission"]
+    assert "planning.refusal" in names
+    assert names[-1] == "attribute.done"
+
+
+def test_governed_storage_rejects_unmanaged_temp_root() -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    selected = request(profile, batch=1000)
+    selected = replace(
+        selected,
+        execution=replace(
+            selected.execution,
+            storage=replace(selected.execution.storage, temp_root="/tmp/unmanaged"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unmanaged temp_root"):
         resolve_trace_request(
-            admitted, resources=envelope(vram=GIB), provider_profile=profile
+            selected,
+            resources=envelope(),
+            provider_profile=profile,
         )
 
 
@@ -134,27 +164,129 @@ def test_batch_and_session_pin_and_propagate_governed_inputs(monkeypatch) -> Non
     profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_plt_b128_c4096_cache0"]
     resources = envelope()
     selected = request(profile, batch=128)
+    unavailable = ProviderUnitProbe("cpu_test", False, reason="injected")
+    monkeypatch.setattr(
+        "circuit_tracer.governor.runtime.discover_host_budget",
+        lambda requested: HostBudgetDiscovery(
+            requested,
+            "test_allocation",
+            (HostBudgetCandidate("test_allocation", requested),),
+        ),
+    )
+    monkeypatch.setattr(
+        "circuit_tracer.tracing.runner.TorchLoadedStateSampler.sample",
+        lambda self, provider: LoadedStateObservation(
+            cuda_available=False,
+            cuda_allocated_bytes=None,
+            cuda_reserved_bytes=None,
+            cuda_total_bytes=None,
+            host_rss_bytes=None,
+            host_available_bytes=None,
+            decoder_probe=unavailable,
+            encoder_probe=unavailable,
+        ),
+    )
 
-    def execute(problem, plan, *, observer, forward_overrides, execution_identity):
-        del observer, forward_overrides
+    def execute(
+        problem, plan, *, observer, forward_overrides, execution_identity, governor_runtime
+    ):
+        del observer, forward_overrides, governor_runtime
         execution_identity.mark_requested_as_effective()
         return (problem.prompt[0], plan.execution.session.capacity)
 
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
-    )
-    results = trace_batch(
-        [selected], resources=resources, provider_profile=profile
-    )
+    monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute)
+    results = trace_batch([selected], resources=resources, provider_profile=profile)
     assert results[0].output == (0, 64)
 
-    session = open_session(
-        selected, resources=resources, provider_profile=profile
-    )
+    session = open_session(selected, resources=resources, provider_profile=profile)
     assert session.resources is resources
     assert session.provider_profile is profile
     assert session.trace().output == (0, 64)
     session.close()
+
+
+def test_active_universe_refusal_returns_terminal_refused_result(monkeypatch) -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_plt_b128_c4096_cache0"]
+    resources = envelope()
+    selected = request(profile, batch=128)
+    unavailable = ProviderUnitProbe("cpu_test", False, reason="injected")
+    monkeypatch.setattr(
+        "circuit_tracer.governor.runtime.discover_host_budget",
+        lambda requested: HostBudgetDiscovery(
+            requested,
+            "test_allocation",
+            (HostBudgetCandidate("test_allocation", requested),),
+        ),
+    )
+    monkeypatch.setattr(
+        "circuit_tracer.tracing.runner.TorchLoadedStateSampler.sample",
+        lambda self, provider: LoadedStateObservation(
+            cuda_available=False,
+            cuda_allocated_bytes=None,
+            cuda_reserved_bytes=None,
+            cuda_total_bytes=None,
+            host_rss_bytes=None,
+            host_available_bytes=None,
+            decoder_probe=unavailable,
+            encoder_probe=unavailable,
+        ),
+    )
+    from circuit_tracer.governor.resolver import resolve_trace_plan as pure_resolve
+
+    calls = 0
+
+    def resolve_with_late_refusal(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        plan = pure_resolve(*args, **kwargs)
+        if calls == 2:
+            plan = replace(
+                plan,
+                admission=replace(
+                    plan.admission,
+                    admitted=False,
+                    refusals=("late capacity refusal",),
+                ),
+                status=PlanStatus.ADVISORY_REFUSED,
+            )
+        return plan
+
+    monkeypatch.setattr(
+        "circuit_tracer.governor.runtime.resolve_trace_plan", resolve_with_late_refusal
+    )
+
+    def execute(
+        problem, plan, *, observer, forward_overrides, execution_identity, governor_runtime
+    ):
+        del problem, plan, observer, forward_overrides, execution_identity
+        nnz = governor_runtime.workload.estimated_active_features
+        governor_runtime.active_universe_replan(
+            ActiveUniverseObservation(
+                total_nnz=nnz,
+                shape=(1, 1, nnz),
+                per_layer_counts=(nnz,),
+                per_position_counts=(nnz,),
+                membership_fingerprint="late-refusal",
+                membership_sample=((0, 0, 0),),
+            )
+        )
+        raise AssertionError("refused active plan must not execute")
+
+    monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute)
+
+    result = trace_one(selected, resources=resources, provider_profile=profile)
+
+    assert result.status.value == "refused"
+    assert [event["name"] for event in result.telemetry_events].count(
+        "planning.refusal"
+    ) == 1
+    assert result.output is None
+    assert result.admission_report.refusals == ("late capacity refusal",)
+    names = [event["name"] for event in result.telemetry_events]
+    assert "planning.active_universe_replan" in names
+    assert "planning.refusal" in names
+    assert "planning.terminal_cleanup" in names
+    assert names[-1] == "attribute.done"
 
 
 @pytest.mark.parametrize("api", [resolve_trace_request, trace_batch, open_session])

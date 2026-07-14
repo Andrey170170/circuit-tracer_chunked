@@ -24,7 +24,10 @@ def _stable(value: Any) -> Any:
     if isinstance(value, PathLike):
         return str(value)
     if isinstance(value, Mapping):
-        return {str(key): _stable(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+        return {
+            str(key): _stable(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
     if isinstance(value, (tuple, list)):
         return [_stable(item) for item in value]
     if is_dataclass(value) and not isinstance(value, type):
@@ -129,7 +132,7 @@ def resolve_trace_request(
     resources: ResourceEnvelope | None = None,
     provider_profile: ProviderProfile | None = None,
 ) -> ResolvedTracePlan:
-    """Resolve an explicit request or compile one governed pre-load plan."""
+    """Resolve an explicit request or compile one governed pre-execution plan."""
 
     if (resources is None) != (provider_profile is None):
         raise ValueError("resources and provider_profile must be supplied together")

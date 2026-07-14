@@ -67,7 +67,16 @@ def test_every_top_level_export_is_reachable() -> None:
 def test_trace_one_passes_owned_problem_and_resolved_plan(monkeypatch) -> None:
     captured = {}
 
-    def execute(problem, plan, *, observer, forward_overrides, execution_identity):
+    def execute(
+        problem,
+        plan,
+        *,
+        observer,
+        forward_overrides,
+        execution_identity,
+        governor_runtime,
+    ):
+        assert governor_runtime is None
         execution_identity.mark_requested_as_effective()
         captured.update(
             problem=problem,
@@ -77,9 +86,7 @@ def test_trace_one_passes_owned_problem_and_resolved_plan(monkeypatch) -> None:
         )
         return {"value": problem.prompt[0]}
 
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
-    )
+    monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute)
     selected = request(
         3,
         semantics=TraceSemantics(
@@ -129,9 +136,7 @@ def test_fingerprints_are_stable_and_split_semantics_from_execution() -> None:
             execution=ExecutionConstraints(session=SessionPlan(capacity=8)),
         )
     )
-    semantic = resolve_trace_request(
-        request(4, semantics=TraceSemantics(source_batch_size=8))
-    )
+    semantic = resolve_trace_request(request(4, semantics=TraceSemantics(source_batch_size=8)))
 
     assert first.semantic_fingerprint == same.semantic_fingerprint
     assert first.execution_fingerprint == same.execution_fingerprint
@@ -180,12 +185,8 @@ def test_frontier_membership_controls_are_semantic_not_physical() -> None:
 
 
 def test_evidence_provenance_does_not_change_fingerprints() -> None:
-    first = resolve_trace_request(
-        request(4, evidence=TraceEvidence(name="gate-a", version="1"))
-    )
-    second = resolve_trace_request(
-        request(4, evidence=TraceEvidence(name="gate-b", version="2"))
-    )
+    first = resolve_trace_request(request(4, evidence=TraceEvidence(name="gate-a", version="1")))
+    second = resolve_trace_request(request(4, evidence=TraceEvidence(name="gate-b", version="2")))
     assert first.semantic_fingerprint == second.semantic_fingerprint
     assert first.execution_fingerprint == second.execution_fingerprint
 
@@ -209,7 +210,16 @@ def test_prefix_view_target_and_mode_change_semantic_fingerprint() -> None:
             ),
         )
     )
-    assert len({base.semantic_fingerprint, independent.semantic_fingerprint, reused.semantic_fingerprint}) == 3
+    assert (
+        len(
+            {
+                base.semantic_fingerprint,
+                independent.semantic_fingerprint,
+                reused.semantic_fingerprint,
+            }
+        )
+        == 3
+    )
     assert base.execution_fingerprint == independent.execution_fingerprint
     assert independent.execution_fingerprint == reused.execution_fingerprint
 
@@ -245,9 +255,7 @@ def test_decoder_cache_policy_changes_only_execution_fingerprint() -> None:
         request(
             4,
             execution=ExecutionConstraints(
-                session=SessionPlan(
-                    decoder_cache=DecoderCachePolicy(enabled=True, max_bytes=4096)
-                )
+                session=SessionPlan(decoder_cache=DecoderCachePolicy(enabled=True, max_bytes=4096))
             ),
         )
     )
@@ -328,17 +336,23 @@ def test_transformerlens_rejects_nondefault_execution_constraints() -> None:
 
 
 def test_mixed_batch_order_isolation_failure_and_cancellation(monkeypatch) -> None:
-    def execute(problem, _plan, *, observer, forward_overrides, execution_identity):
-        del observer
+    def execute(
+        problem,
+        _plan,
+        *,
+        observer,
+        forward_overrides,
+        execution_identity,
+        governor_runtime,
+    ):
+        del observer, governor_runtime
         assert forward_overrides is None
         if problem.prompt == [2]:
             raise LookupError("bad shape")
         execution_identity.mark_requested_as_effective()
         return list(problem.prompt)
 
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
-    )
+    monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute)
     results = trace_batch([request(1), request(2), request(3)], failure="return")
     assert [result.status for result in results] == [
         TraceStatus.SUCCEEDED,
@@ -353,9 +367,7 @@ def test_mixed_batch_order_isolation_failure_and_cancellation(monkeypatch) -> No
 
     cancelled = threading.Event()
     cancelled.set()
-    results = trace_batch(
-        [request(1), request(3)], failure="return", cancellation=cancelled
-    )
+    results = trace_batch([request(1), request(3)], failure="return", cancellation=cancelled)
     assert [result.status for result in results] == [TraceStatus.CANCELLED] * 2
 
 
@@ -363,9 +375,7 @@ def test_batch_does_not_convert_base_exceptions(monkeypatch) -> None:
     def cancel(*_args, **_kwargs):
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", cancel
-    )
+    monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", cancel)
     with pytest.raises(asyncio.CancelledError):
         trace_batch([request(1)], failure="return")
 
@@ -384,9 +394,7 @@ def test_canonical_observer_owns_telemetry_summary(monkeypatch) -> None:
         execute,
     )
     selected = request(
-        execution=ExecutionConstraints(
-            observability=ObservabilityPolicy(profile=True)
-        )
+        execution=ExecutionConstraints(observability=ObservabilityPolicy(profile=True))
     )
     assert trace_one(selected).telemetry_summary["event_count"] == 3
 
@@ -417,11 +425,14 @@ def test_session_reuse_reset_close_and_failure_recovery(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace",
-        lambda _problem, _plan, *, observer, forward_overrides, execution_identity: (
-            execution_identity.mark_requested_as_effective(),
-            observer.observe(TraceEvent(scope="phase", name="window.test", phase="test")),
-            f"graph-{forward_overrides.target_logit_source.removeprefix('position-')}",
-        )[2],
+        lambda _problem, _plan, *, observer, forward_overrides, execution_identity, governor_runtime: (
+            (
+                execution_identity.mark_requested_as_effective(),
+                governor_runtime is None,
+                observer.observe(TraceEvent(scope="phase", name="window.test", phase="test")),
+                f"graph-{forward_overrides.target_logit_source.removeprefix('position-')}",
+            )[3]
+        ),
     )
     session = open_session(request([1, 2, 3]), window=SessionWindow(max_prefix_len=3))
     with pytest.raises(RuntimeError, match="injected"):
@@ -471,8 +482,15 @@ def test_session_owns_bounded_decoder_cache_across_traces_and_failures(monkeypat
     observers = []
 
     def execute(
-        _problem, _plan, *, observer, forward_overrides, execution_identity
+        _problem,
+        _plan,
+        *,
+        observer,
+        forward_overrides,
+        execution_identity,
+        governor_runtime,
     ):
+        assert governor_runtime is None
         execution_identity.mark_requested_as_effective()
         observers.append(observer)
         seen.append(forward_overrides.decoder_chunk_cache)
@@ -480,16 +498,12 @@ def test_session_owns_bounded_decoder_cache_across_traces_and_failures(monkeypat
             raise RuntimeError("injected decoder-cache failure")
         return {"ok": True}
 
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
-    )
+    monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute)
     session = open_session(
         replace(
             selected,
             execution=ExecutionConstraints(
-                session=SessionPlan(
-                    decoder_cache=DecoderCachePolicy(enabled=True, max_bytes=4096)
-                )
+                session=SessionPlan(decoder_cache=DecoderCachePolicy(enabled=True, max_bytes=4096))
             ),
         ),
     )
@@ -539,7 +553,16 @@ def test_session_window_resolves_effective_request(monkeypatch) -> None:
     )
     backend_calls = []
 
-    def execute(problem, plan, *, observer, forward_overrides, execution_identity):
+    def execute(
+        problem,
+        plan,
+        *,
+        observer,
+        forward_overrides,
+        execution_identity,
+        governor_runtime,
+    ):
+        assert governor_runtime is None
         execution_identity.mark_requested_as_effective()
         backend_calls.append((problem, plan, observer, forward_overrides))
         return "graph"
@@ -552,9 +575,7 @@ def test_session_window_resolves_effective_request(monkeypatch) -> None:
         [1, 2, 3],
         targets=["base"],
         semantics=TraceSemantics(source_batch_size=6),
-        execution=ExecutionConstraints(
-            storage=RowStoragePlan(influence_row_tile_size=2)
-        ),
+        execution=ExecutionConstraints(storage=RowStoragePlan(influence_row_tile_size=2)),
     )
     session = open_session(base)
     first = session.trace_window(2, reuse=True)

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
+
+from circuit_tracer.execution_identity import ExecutionIdentityState
+from circuit_tracer.governor.ledger import PhaseId, ResourceGrant
+from circuit_tracer.governor.runtime import ActiveUniverseObservation, TraceGovernorRuntime
 
 from circuit_tracer.attribution.nnsight.phases.phase0 import (
     Phase0CleanupOwner,
@@ -53,7 +57,10 @@ from circuit_tracer.attribution.nnsight.phases.phase5 import (
     ReplayArtifacts,
     RunProvenance,
 )
-from circuit_tracer.attribution.nnsight.preparation import PreparedBackend
+from circuit_tracer.attribution.nnsight.preparation import (
+    PreparedBackend,
+    reprepare_after_active_universe,
+)
 from circuit_tracer.attribution.nnsight.run_scope import AttributionRunScope
 from circuit_tracer.utils.disk_offload import offload_modules
 
@@ -81,15 +88,63 @@ class AttributionExecution:
     phase2: Phase2Result | None = None
     phase3: Phase3Result | None = None
     phase4: Phase4Result | None = None
+    governor_runtime: TraceGovernorRuntime | None = None
+    execution_identity: ExecutionIdentityState | None = None
+    row_store_grant: ResourceGrant | None = None
 
     def run(self) -> Any:
         """Execute the canonical attribution lifecycle in readable domain order."""
-        self.run_phase0_preparation()
-        self.run_forward_pass()
-        self.setup_active_features_and_storage()
-        self.attribute_seed_nodes()
-        self.expand_feature_frontier()
-        return self.assemble_graph()
+        session_grant = self._grant(PhaseId.SESSION)
+        try:
+            self._run_with_grant(PhaseId.PHASE0, self.run_phase0_preparation)
+            self.apply_active_universe_replan()
+            self._run_with_grant(PhaseId.PHASE1, self.run_forward_pass)
+            self.row_store_grant = self._grant(PhaseId.PHASE2)
+            self.setup_active_features_and_storage()
+            self._run_with_grant(PhaseId.PHASE3, self.attribute_seed_nodes)
+            self._run_with_grant(PhaseId.PHASE4, self.expand_feature_frontier)
+            return self._run_with_grant(PhaseId.PHASE5, self.assemble_graph)
+        finally:
+            self._release(self.row_store_grant)
+            self._release(session_grant)
+
+    def apply_active_universe_replan(self) -> None:
+        if self.governor_runtime is None:
+            return
+        observation = ActiveUniverseObservation.from_sparse_tensor(self._phase0().activation_matrix)
+        revision = self.governor_runtime.active_universe_replan(observation)
+        from circuit_tracer.tracing.governor_bridge import recompile_governed_plan
+
+        plan = recompile_governed_plan(self.prepared.problem, self.prepared.plan, revision.plan)
+        plan = replace(
+            plan,
+            planning_profile=self.governor_runtime.profile,
+            planning_envelope=self.governor_runtime.envelope,
+            planning_workload=self.governor_runtime.workload,
+            planning_requirements=self.governor_runtime.requirements,
+            planning_parent_fingerprint=revision.parent_execution_fingerprint,
+            planning_epoch_fingerprint=revision.execution_fingerprint,
+        )
+        self.prepared = reprepare_after_active_universe(self.prepared, plan)
+        if self.execution_identity is None:
+            raise RuntimeError("governed execution requires execution identity state")
+        self.execution_identity.mark_effective(self.prepared.effective_execution)
+
+    def _grant(self, phase: PhaseId) -> ResourceGrant | None:
+        if self.governor_runtime is None:
+            return None
+        return self.governor_runtime.grant(phase)
+
+    def _release(self, grant: ResourceGrant | None) -> None:
+        if self.governor_runtime is not None:
+            self.governor_runtime.release(grant)
+
+    def _run_with_grant(self, phase: PhaseId, callback: Callable[[], Any]) -> Any:
+        grant = self._grant(phase)
+        try:
+            return callback()
+        finally:
+            self._release(grant)
 
     def run_phase0_preparation(self) -> None:
         p = self.prepared
@@ -106,9 +161,7 @@ class AttributionExecution:
                     telemetry_observer=p.diagnostics.observer,
                     phase0_context_override=p.forward_overrides.phase0_context,
                     prefix_view_metadata=p.prefix_view_metadata,
-                    exact_encoder_residency_metadata=(
-                        p.frontier.exact_encoder_residency_metadata
-                    ),
+                    exact_encoder_residency_metadata=(p.frontier.exact_encoder_residency_metadata),
                     phase4_execution_metadata=p.frontier.execution_metadata,
                     cross_cluster_debug_summary=p.diagnostics.cross_cluster_summary,
                     cross_cluster_debug_checkpoints=p.diagnostics.cross_cluster_checkpoints,
@@ -142,9 +195,7 @@ class AttributionExecution:
                     resolved_dtype_map=p.numerics.dtype_map,
                     decoder_chunk_cache=p.forward_overrides.decoder_chunk_cache,
                     decoder_cache_fingerprint=p.forward_overrides.decoder_cache_fingerprint,
-                    capture_phase3_gradient_bundle_enabled=(
-                        policy.capture_phase3_gradient_bundle
-                    ),
+                    capture_phase3_gradient_bundle_enabled=(policy.capture_phase3_gradient_bundle),
                     diagnostic_feature_cap=plan.semantics.diagnostic_feature_cap,
                 ),
             )
@@ -159,9 +210,7 @@ class AttributionExecution:
         model = p.problem.model
         execution = p.plan.execution
         if execution.offload and not model.skip_transcoder and not p.provider.exact_chunked:
-            p.offload_handles.extend(
-                offload_modules(model.transcoders, execution.offload)
-            )
+            p.offload_handles.extend(offload_modules(model.transcoders, execution.offload))
         self.operations.run_phase1(
             logger=p.logger,
             model=model,
@@ -183,9 +232,7 @@ class AttributionExecution:
                 )
             )
             if model.skip_transcoder and not p.provider.exact_chunked:
-                p.offload_handles.extend(
-                    offload_modules(model.transcoders, execution.offload)
-                )
+                p.offload_handles.extend(offload_modules(model.transcoders, execution.offload))
 
     def setup_active_features_and_storage(self) -> None:
         p = self.prepared
@@ -221,9 +268,7 @@ class AttributionExecution:
                     mode=p.replay.phase0_mode,
                     donor_bundle_path=p.replay.phase0_bundle_path,
                     context_policy=p.replay.phase0_context_policy,
-                    capture_bundle=(
-                        plan.execution.observability.capture_phase0_donor_bundle
-                    ),
+                    capture_bundle=(plan.execution.observability.capture_phase0_donor_bundle),
                 ),
                 phase3_replay=Phase3ReplayPolicy(
                     gradient_mode=p.replay.phase3_gradient_mode,
@@ -253,9 +298,7 @@ class AttributionExecution:
                     temp_root_policy=_resolve_storage_temp_policy(storage),
                     temp_root=storage.temp_root,
                     preallocate=storage.preallocate,
-                    prepared_chunk_cache_bytes=(
-                        p.frontier.prepared_chunk_cache_bytes_effective
-                    ),
+                    prepared_chunk_cache_bytes=(p.frontier.prepared_chunk_cache_bytes_effective),
                     replay_tile_cache_bytes=int(storage.replay_tile_cache_bytes or 0),
                 ),
                 execution=Phase2ExecutionPolicy(
@@ -307,9 +350,7 @@ class AttributionExecution:
             ),
             config=Phase3Config(
                 effective_logit_batch_size=p.batches.logit_batch_size,
-                compute_microbatch_max_rows=(
-                    p.batches.session_controls.phase3_microbatch_max_rows
-                ),
+                compute_microbatch_max_rows=(p.batches.session_controls.phase3_microbatch_max_rows),
                 effective_feature_batch_size=p.batches.feature_batch_size,
                 output_position=self._phase0().output_position,
                 n_layers=phase2.n_layers,
@@ -331,9 +372,7 @@ class AttributionExecution:
                 phase3_frontier_buffer_relative_epsilon=(
                     plan.semantics.frontier.phase3_buffer_relative_epsilon
                 ),
-                phase3_frontier_buffer_max_extra=(
-                    plan.semantics.frontier.phase3_buffer_max_extra
-                ),
+                phase3_frontier_buffer_max_extra=(plan.semantics.frontier.phase3_buffer_max_extra),
                 update_interval=plan.semantics.update_interval,
                 planner_compute_dtype=p.numerics.planner_compute_dtype,
                 influence_compute_dtype=p.numerics.influence_compute_dtype,
@@ -389,9 +428,7 @@ class AttributionExecution:
                 n_logits=phase2.n_logits,
                 logit_offset=phase2.logit_offset,
                 effective_feature_batch_size=p.batches.feature_batch_size,
-                compute_microbatch_max_rows=(
-                    p.batches.session_controls.phase4_microbatch_max_rows
-                ),
+                compute_microbatch_max_rows=(p.batches.session_controls.phase4_microbatch_max_rows),
                 max_phase4_feature_batch_size=p.batches.max_phase4_feature_batch_size,
                 update_interval=plan.semantics.update_interval,
                 row_store_capacity_feature_nodes=phase2.row_store_capacity_feature_nodes,
@@ -559,9 +596,7 @@ class AttributionExecution:
                     executor_reference_batch_size=phase4.phase4_executor_reference_batch_size,
                     executor_microbatch_size=phase4.phase4_executor_microbatch_size,
                     refresh_count=phase4.phase4_refresh_count,
-                    scheduler_reference_batch_count=(
-                        phase4.phase4_scheduler_reference_batch_count
-                    ),
+                    scheduler_reference_batch_count=(phase4.phase4_scheduler_reference_batch_count),
                     executor_microbatch_count=phase4.phase4_executor_microbatch_count,
                 ),
                 phase4_timings=Phase4TimingSummary(
@@ -572,9 +607,7 @@ class AttributionExecution:
                         phase4.phase4_refresh_partial_influence_elapsed_ms_total
                     ),
                     rank_topk_elapsed_ms=phase4.phase4_refresh_rank_topk_elapsed_ms_total,
-                    frontier_plan_elapsed_ms=(
-                        phase4.phase4_refresh_frontier_plan_elapsed_ms_total
-                    ),
+                    frontier_plan_elapsed_ms=(phase4.phase4_refresh_frontier_plan_elapsed_ms_total),
                     row_store_read_elapsed_ms=(
                         phase4.phase4_refresh_row_store_read_elapsed_ms_total
                     ),

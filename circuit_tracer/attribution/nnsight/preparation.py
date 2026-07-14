@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from typing import Any, Callable
 
 import torch
@@ -248,9 +248,7 @@ def _resolve_provider_and_numerics(
         exact_encoder_residency=bool(
             exact_chunked and capabilities.supports_exact_encoder_residency
         ),
-        use_compact_feature_row_store=bool(
-            plan.execution.compact_output and compact_row_store
-        ),
+        use_compact_feature_row_store=bool(plan.execution.compact_output and compact_row_store),
     )
     numerics = NumericMechanisms(
         exact_dtype=exact_dtype,
@@ -302,8 +300,7 @@ def _resolve_replay(problem: AttributionProblem, plan: ResolvedTracePlan) -> Rep
     if storage.retention == "none_recompute":
         require_exact_row_replay_provider(problem.model.transcoders)
     if (
-        storage.full_retention_backend == "column_tiled_v1"
-        or storage.retention == "none_recompute"
+        storage.full_retention_backend == "column_tiled_v1" or storage.retention == "none_recompute"
     ) and (
         resolved.phase3_gradient_mode != "disabled"
         or resolved.phase3_row_mode != "disabled"
@@ -335,8 +332,7 @@ def _resolve_frontier(
         exact_chunked_provider_enabled=provider.compact_row_store,
     )
     refresh_aux_applicable = bool(
-        provider.use_compact_feature_row_store
-        and refresh_optimization.effective_mode == "v1"
+        provider.use_compact_feature_row_store and refresh_optimization.effective_mode == "v1"
     )
     prepared_cache_bytes = (
         int(frontier.refresh_prepared_chunk_cache_bytes)
@@ -588,6 +584,14 @@ def _validate_provider_requirements(
     provider: ProviderMechanisms,
     replay: ReplayMechanisms,
 ) -> None:
+    if plan.planning_trace_plan is not None:
+        requested_fetch = plan.execution.decoder.fetch_chunk_size
+        loaded_fetch = getattr(provider.capabilities, "default_decoder_chunk_size", None)
+        if loaded_fetch is None or int(loaded_fetch) != int(requested_fetch or 0):
+            raise ValueError(
+                "governed decoder fetch size was not applied while loading the provider: "
+                f"loaded={loaded_fetch!r}, requested={requested_fetch!r}"
+            )
     policy = plan.execution.observability
     compact_exact = plan.execution.compact_output and provider.exact_chunked
     compact_rows = plan.execution.compact_output and provider.compact_row_store
@@ -727,9 +731,7 @@ def prepare_backend(
     replay = _resolve_replay(problem, plan)
     _validate_provider_requirements(plan, provider, replay)
     frontier = _resolve_frontier(plan, provider)
-    diagnostics = _prepare_diagnostics(
-        plan, provider, numerics, replay, observer
-    )
+    diagnostics = _prepare_diagnostics(plan, provider, numerics, replay, observer)
     batches = _resolve_batches(
         problem,
         plan,
@@ -764,4 +766,50 @@ def prepare_backend(
         diagnostics=diagnostics,
         effective_execution=effective_execution,
         start_time=time.time(),
+    )
+
+
+def reprepare_after_active_universe(
+    prepared: PreparedBackend,
+    plan: ResolvedTracePlan,
+) -> PreparedBackend:
+    """Rebuild only mechanisms still mutable after Phase 0.
+
+    Provider, numerics, replay, diagnostics, source/session capacity, and Phase-0
+    state are preserved.  Storage/frontier residency and Phase-3/4 microbatch
+    controls are rebuilt from the final governed plan.
+    """
+    frontier = _resolve_frontier(plan, prepared.provider)
+    batches = _resolve_batches(
+        prepared.problem,
+        plan,
+        prepared.logger,
+        prepared.prefix_view_metadata,
+        prepared.provider,
+        prepared.numerics,
+        frontier,
+        prepared.diagnostics,
+    )
+    frozen_mismatches = []
+    for name in ("source_batch_size", "feature_batch_size", "logit_batch_size", "trace_batch_size"):
+        if getattr(batches, name) != getattr(prepared.batches, name):
+            frozen_mismatches.append(name)
+    old_controls = prepared.batches.session_controls
+    new_controls = batches.session_controls
+    if new_controls.session_capacity != old_controls.session_capacity:
+        frozen_mismatches.append("session_capacity")
+    if frozen_mismatches:
+        raise RuntimeError(
+            "active-universe reprepare changed frozen prepared mechanisms: "
+            + ", ".join(frozen_mismatches)
+        )
+    effective = _effective_execution_identity(
+        prepared.provider, prepared.numerics, prepared.replay, batches, frontier
+    )
+    return replace(
+        prepared,
+        plan=plan,
+        batches=batches,
+        frontier=frontier,
+        effective_execution=effective,
     )
