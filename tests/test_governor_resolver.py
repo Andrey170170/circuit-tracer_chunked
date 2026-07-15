@@ -245,6 +245,27 @@ def test_source_cap_uses_effective_source_and_reports_all_bindings():
     assert any("does not lower trace capacity" in item for item in still_bound.admission.warnings)
 
 
+def test_phase1_source_batch_size_changes_predicted_walltime():
+    profile = _profile()
+    semantics = _semantics(source_batch_size=64)
+    full = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(),
+        PhysicalExecutionRequirements(phase1_source_batch_size=64),
+    )
+    partitioned = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(),
+        PhysicalExecutionRequirements(phase1_source_batch_size=16),
+    )
+
+    assert _estimates(partitioned)["predicted_walltime_high"] > _estimates(full)[
+        "predicted_walltime_high"
+    ]
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

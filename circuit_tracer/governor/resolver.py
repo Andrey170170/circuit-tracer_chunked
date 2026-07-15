@@ -47,10 +47,12 @@ def compute_work_units(
     prefetch_depth: int,
 ) -> float:
     fetch_blocks = math.ceil(dimensions.d_features / decoder_fetch_chunk_size)
-    # Phase 1 is a small admission/survival stage in the calibration runs. Its
-    # session width is not a sequenced source microbatch, so only the physical
-    # Phase 3/4 partitions contribute to this throughput model.
+    # Count the independently scheduled Phase 1 source batches alongside the
+    # Phase 3/4 partitions. The calibration reference uses one Phase 1 step, so
+    # this keeps recorded plans anchored while pricing stricter source limits.
     microbatch_steps = math.ceil(
+        effective_source_batch_size / source_microbatch_size
+    ) + math.ceil(
         feature_batch_size / feature_microbatch_size
     ) + math.ceil(logit_batch_size / logit_microbatch_size)
     logical_work = (
