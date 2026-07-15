@@ -14,6 +14,7 @@ from circuit_tracer.attribution.nnsight.preparation import (
     _effective_execution_identity,
 )
 from circuit_tracer.attribution.nnsight.session_controls import NNSightSessionControls
+from circuit_tracer.execution_identity import ExecutionIdentityState
 from circuit_tracer.tracing.plan import (
     DecoderCachePolicy,
     ExecutionConstraints,
@@ -186,3 +187,16 @@ def test_effective_identity_covers_storage_and_decoder_mechanisms() -> None:
     assert tiled.descriptor.storage["backend"] == "column_tiled_v1"
     assert cached.descriptor is not None
     assert cached.descriptor.decoder["cache_max_bytes"] == 4096
+
+
+def test_effective_identity_state_records_allowed_runtime_revisions() -> None:
+    initial = _identity(feature_batch_size=8)
+    revised = _identity(feature_batch_size=16)
+    state = ExecutionIdentityState("requested")
+
+    state.mark_effective(initial)
+    state.revise_effective(revised)
+    state.revise_effective(revised)
+
+    assert state.effective == revised
+    assert state.effective_revisions == [initial, revised]

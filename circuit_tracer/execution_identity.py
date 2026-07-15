@@ -42,11 +42,24 @@ class ExecutionIdentityState:
 
     requested_fingerprint: str
     effective: EffectiveExecutionIdentity | None = None
+    effective_revisions: list[EffectiveExecutionIdentity] = field(default_factory=list)
 
     def mark_effective(self, identity: EffectiveExecutionIdentity) -> None:
         if self.effective is not None and self.effective != identity:
             raise RuntimeError("effective execution identity is already set")
         self.effective = identity
+        if not self.effective_revisions:
+            self.effective_revisions.append(identity)
+
+    def revise_effective(self, identity: EffectiveExecutionIdentity) -> None:
+        """Record an effective identity produced by an allowed planning epoch."""
+        if self.effective is None:
+            self.mark_effective(identity)
+            return
+        if self.effective == identity:
+            return
+        self.effective = identity
+        self.effective_revisions.append(identity)
 
     def mark_requested_as_effective(self) -> None:
         self.mark_effective(

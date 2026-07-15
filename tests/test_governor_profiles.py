@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import subprocess
 import sys
 from types import MappingProxyType
@@ -71,7 +73,12 @@ def test_each_recorded_profile_admits_and_reproduces_calibrated_plan():
         amounts = _amounts(plan)
         assert plan.admission.admitted, plan.format()
         assert plan.physical.decoder_fetch_chunk_size == observation.fetch_chunk_size
-        expected_physical_cap = observation.validated_physical_batch_cap
+        calibrated_cap = observation.validated_physical_batch_cap
+        expected_physical_cap = math.ceil(
+            observation.batch_size / math.ceil(observation.batch_size / calibrated_cap)
+        )
+        assert plan.physical.session_capacity == expected_physical_cap
+        assert plan.physical.phase1_source_batch_size == observation.batch_size
         assert plan.physical.source_microbatch_size == expected_physical_cap
         assert plan.physical.feature_microbatch_size == expected_physical_cap
         assert plan.physical.logit_microbatch_size == expected_physical_cap

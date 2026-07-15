@@ -7,7 +7,11 @@ from typing import Any, Callable
 
 from circuit_tracer.execution_identity import ExecutionIdentityState
 from circuit_tracer.governor.ledger import PhaseId, ResourceGrant
-from circuit_tracer.governor.runtime import ActiveUniverseObservation, TraceGovernorRuntime
+from circuit_tracer.governor.runtime import (
+    ActiveUniverseObservation,
+    PlanRevision,
+    TraceGovernorRuntime,
+)
 
 from circuit_tracer.attribution.nnsight.phases.phase0 import (
     Phase0CleanupOwner,
@@ -101,7 +105,9 @@ class AttributionExecution:
             self._run_with_grant(PhaseId.PHASE1, self.run_forward_pass)
             self.row_store_grant = self._grant(PhaseId.PHASE2)
             self.setup_active_features_and_storage()
+            self.apply_phase3_entry_replan()
             self._run_with_grant(PhaseId.PHASE3, self.attribute_seed_nodes)
+            self.apply_phase4_entry_replan()
             self._run_with_grant(PhaseId.PHASE4, self.expand_feature_frontier)
             return self._run_with_grant(PhaseId.PHASE5, self.assemble_graph)
         finally:
@@ -113,6 +119,17 @@ class AttributionExecution:
             return
         observation = ActiveUniverseObservation.from_sparse_tensor(self._phase0().activation_matrix)
         revision = self.governor_runtime.active_universe_replan(observation)
+        self._apply_governor_revision(revision)
+
+    def apply_phase3_entry_replan(self) -> None:
+        if self.governor_runtime is not None:
+            self._apply_governor_revision(self.governor_runtime.phase3_entry_replan())
+
+    def apply_phase4_entry_replan(self) -> None:
+        if self.governor_runtime is not None:
+            self._apply_governor_revision(self.governor_runtime.phase4_entry_replan())
+
+    def _apply_governor_revision(self, revision: PlanRevision) -> None:
         from circuit_tracer.tracing.governor_bridge import recompile_governed_plan
 
         plan = recompile_governed_plan(self.prepared.problem, self.prepared.plan, revision.plan)
@@ -128,7 +145,7 @@ class AttributionExecution:
         self.prepared = reprepare_after_active_universe(self.prepared, plan)
         if self.execution_identity is None:
             raise RuntimeError("governed execution requires execution identity state")
-        self.execution_identity.mark_effective(self.prepared.effective_execution)
+        self.execution_identity.revise_effective(self.prepared.effective_execution)
 
     def _grant(self, phase: PhaseId) -> ResourceGrant | None:
         if self.governor_runtime is None:

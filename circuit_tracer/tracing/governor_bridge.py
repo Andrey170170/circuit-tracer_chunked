@@ -149,6 +149,12 @@ def _requirements(request: TraceRequest) -> PhysicalExecutionRequirements:
             if session.decoder_cache.enabled and session.decoder_cache.max_bytes is not None
             else None
         ),
+        session_capacity=session.capacity,
+        phase1_source_batch_size=(
+            session.phase1_trace_batch_size_max
+            if session.phase1_trace_batch_policy == "cap_effective_batches"
+            else None
+        ),
         source_microbatch_size=session.source_microbatch_max_rows,
         feature_microbatch_size=session.phase4_microbatch_max_rows,
         logit_microbatch_size=session.phase3_microbatch_max_rows,
@@ -200,19 +206,19 @@ def _compile_execution(request: TraceRequest, planning: Any) -> Any:
         ),
         placement=placement,
     )
-    capacity = max(
-        physical.source_microbatch_size,
-        physical.feature_microbatch_size,
-        physical.logit_microbatch_size,
+    phase1_is_capped = (
+        physical.phase1_source_batch_size < planning.semantics.source_batch_size
     )
     session = replace(
         execution.session,
-        capacity=capacity,
+        capacity=physical.session_capacity,
         source_microbatch_max_rows=physical.source_microbatch_size,
         phase3_microbatch_max_rows=physical.logit_microbatch_size,
         phase4_microbatch_max_rows=physical.feature_microbatch_size,
-        phase1_trace_batch_policy="cap_effective_batches",
-        phase1_trace_batch_size_max=physical.source_microbatch_size,
+        phase1_trace_batch_policy=("cap_effective_batches" if phase1_is_capped else "legacy"),
+        phase1_trace_batch_size_max=(
+            physical.phase1_source_batch_size if phase1_is_capped else None
+        ),
         decoder_cache=DecoderCachePolicy(
             enabled=physical.decoder_cache_bytes > 0,
             max_bytes=(physical.decoder_cache_bytes or None),

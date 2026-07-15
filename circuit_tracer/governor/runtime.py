@@ -22,10 +22,13 @@ from .contracts import (
     DemandEstimate,
     DemandLifetime,
     DemandTier,
+    EncoderResidency,
     PhysicalExecutionConfig,
     PhysicalExecutionRequirements,
     ProviderProfile,
     ResourceEnvelope,
+    RowStorePolicy,
+    StorageTier,
     TracePlan,
     TraceSemantics,
 )
@@ -38,6 +41,8 @@ class PlanningEpoch(str, Enum):
     PRE_EXECUTION_ADMISSION = "pre_execution_admission"
     LOADED_STATE_CALIBRATION = "loaded_state_calibration"
     ACTIVE_UNIVERSE_REPLAN = "active_universe_replan"
+    PHASE3_ENTRY_REPLAN = "phase3_entry_replan"
+    PHASE4_ENTRY_REPLAN = "phase4_entry_replan"
 
 
 class PlanningEpochOrderError(RuntimeError):
@@ -135,6 +140,22 @@ class ResourceUsageObservation:
     host_rss_bytes: int | None
     host_available_bytes: int | None
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class PhaseEntryObservation:
+    target_phase: PhaseId
+    prior_phase: PhaseId | None
+    prior_boundary: str | None
+    cuda_allocated_bytes: int | None
+    cuda_reserved_bytes: int | None
+    cuda_total_bytes: int | None
+    host_rss_bytes: int | None
+    host_available_bytes: int | None
+    elapsed_seconds: float | None
+    predicted_persistent_vram_bytes: int
+    vram_prediction_error_bytes: int | None
+    effective_phase_vram_budget_bytes: int
 
 
 class ResourceUsageSampler(Protocol):
@@ -245,10 +266,14 @@ class TorchLoadedStateSampler:
 _FROZEN_FIELDS = (
     "decoder_fetch_chunk_size",
     "decoder_cache_bytes",
+    "session_capacity",
+    "phase1_source_batch_size",
     "source_microbatch_size",
     "replay_window",
     "prefetch_depth",
 )
+
+_PHASE_ENTRY_PHYSICAL_FIELDS = tuple(PhysicalExecutionConfig.__dataclass_fields__)
 
 
 class FrozenMechanismRevisionError(RuntimeError):
@@ -283,6 +308,7 @@ class TraceGovernorRuntime:
         self._host_budget_discoverer = host_budget_discoverer or discover_host_budget
         self._resource_usage_sampler = resource_usage_sampler or TorchResourceUsageSampler()
         self._started_at = time.perf_counter()
+        self._last_resource_usage: tuple[PhaseId, str, ResourceUsageObservation] | None = None
         self.revisions: list[PlanRevision] = []
         self._next_epoch: PlanningEpoch | None = PlanningEpoch.PRE_EXECUTION_ADMISSION
         self.ledger = ResourceLedger(envelope, event_sink=self._ledger_event)
@@ -359,8 +385,24 @@ class TraceGovernorRuntime:
         if observation.total_nnz <= 0:
             raise ValueError("active universe must contain at least one member")
         self.workload = replace(self.workload, estimated_active_features=observation.total_nnz)
+        current = self.current_plan.physical
+        late_requirements = replace(
+            self.requirements,
+            decoder_fetch_chunk_size=current.decoder_fetch_chunk_size,
+            decoder_cache_bytes=current.decoder_cache_bytes,
+            session_capacity=current.session_capacity,
+            phase1_source_batch_size=current.phase1_source_batch_size,
+            source_microbatch_size=current.source_microbatch_size,
+            replay_window=current.replay_window,
+            prefetch_depth=current.prefetch_depth,
+        )
         candidate = resolve_trace_plan(
-            self.workload, self.profile, self.envelope, self.requirements
+            self.workload,
+            self.profile,
+            self.envelope,
+            late_requirements,
+            frozen_fields=_FROZEN_FIELDS,
+            reported_hard_constraints=self.requirements,
         )
         candidate = replace(candidate, semantic_fingerprint=self.current_plan.semantic_fingerprint)
         changed = _changed_physical(self.current_plan.physical, candidate.physical)
@@ -382,10 +424,158 @@ class TraceGovernorRuntime:
             )
         self._emit_observation(epoch, observation)
         revision = self._record_revision(epoch, candidate)
-        self._next_epoch = None
+        self._next_epoch = PlanningEpoch.PHASE3_ENTRY_REPLAN
         if not candidate.admission.admitted:
             raise RuntimePlanningRefusedError(revision)
         return revision
+
+    def phase3_entry_replan(self) -> PlanRevision:
+        revision = self._phase_entry_replan(
+            epoch=PlanningEpoch.PHASE3_ENTRY_REPLAN,
+            target_phase=PhaseId.PHASE3,
+            target_field="logit_microbatch_size",
+        )
+        self._next_epoch = PlanningEpoch.PHASE4_ENTRY_REPLAN
+        return revision
+
+    def phase4_entry_replan(self) -> PlanRevision:
+        revision = self._phase_entry_replan(
+            epoch=PlanningEpoch.PHASE4_ENTRY_REPLAN,
+            target_phase=PhaseId.PHASE4,
+            target_field="feature_microbatch_size",
+        )
+        self._next_epoch = None
+        return revision
+
+    def _phase_entry_replan(
+        self,
+        *,
+        epoch: PlanningEpoch,
+        target_phase: PhaseId,
+        target_field: str,
+    ) -> PlanRevision:
+        self._require_epoch(epoch)
+        prior_phase = PhaseId.PHASE2 if target_phase is PhaseId.PHASE3 else PhaseId.PHASE3
+        self._observe_resource_usage(phase=prior_phase, boundary=f"{target_phase.value}_entry")
+        observation = self._phase_entry_observation(target_phase)
+        phase_envelope = replace(
+            self.envelope,
+            vram_budget_bytes=observation.effective_phase_vram_budget_bytes,
+        )
+        current = self.current_plan.physical
+        requirements = replace(
+            self.requirements,
+            decoder_fetch_chunk_size=current.decoder_fetch_chunk_size,
+            decoder_cache_bytes=current.decoder_cache_bytes,
+            session_capacity=current.session_capacity,
+            phase1_source_batch_size=current.phase1_source_batch_size,
+            source_microbatch_size=current.source_microbatch_size,
+            feature_microbatch_size=current.feature_microbatch_size,
+            logit_microbatch_size=current.logit_microbatch_size,
+            replay_window=current.replay_window,
+            prefetch_depth=current.prefetch_depth,
+            encoder_residency=EncoderResidency(current.encoder_residency),
+            row_store_policy=RowStorePolicy(current.row_store_policy),
+            spill_target=(
+                StorageTier(current.spill_target) if current.spill_target is not None else None
+            ),
+            cache_policy=current.cache_policy,
+        )
+        original_target = getattr(self.requirements, target_field)
+        requirements = replace(requirements, **{target_field: original_target})
+        frozen_fields = tuple(
+            name for name in _PHASE_ENTRY_PHYSICAL_FIELDS if name != target_field
+        )
+        candidate = resolve_trace_plan(
+            self.workload,
+            self.profile,
+            phase_envelope,
+            requirements,
+            frozen_fields=frozen_fields,
+            reported_hard_constraints=self.requirements,
+        )
+        candidate = replace(candidate, semantic_fingerprint=self.current_plan.semantic_fingerprint)
+        changed = _changed_physical(current, candidate.physical)
+        forbidden = tuple(name for name in changed if name != target_field)
+        if forbidden:
+            self.observer.observe(
+                TraceEvent(
+                    scope="run",
+                    name="planning.refusal",
+                    attrs={
+                        "epoch": epoch.value,
+                        "reason": "phase-entry frozen mechanism revision",
+                        "mechanisms": forbidden,
+                    },
+                )
+            )
+            raise FrozenMechanismRevisionError(
+                f"{epoch.value} attempted to revise frozen mechanisms: "
+                + ", ".join(forbidden)
+            )
+        self._emit_observation(epoch, observation)
+        revision = self._record_revision(epoch, candidate)
+        if not candidate.admission.admitted:
+            raise RuntimePlanningRefusedError(revision)
+        return revision
+
+    def _phase_entry_observation(self, target_phase: PhaseId) -> PhaseEntryObservation:
+        persistent_names = {
+            "model_vram",
+            "trace_vram",
+            "decoder_cache_vram",
+            "source_microbatch_vram",
+        }
+        predicted_persistent = int(
+            sum(
+                estimate.amount
+                for estimate in self.current_plan.admission.estimates
+                if estimate.name in persistent_names
+            )
+        )
+        prior = self._last_resource_usage
+        if prior is None:
+            return PhaseEntryObservation(
+                target_phase=target_phase,
+                prior_phase=None,
+                prior_boundary=None,
+                cuda_allocated_bytes=None,
+                cuda_reserved_bytes=None,
+                cuda_total_bytes=None,
+                host_rss_bytes=None,
+                host_available_bytes=None,
+                elapsed_seconds=None,
+                predicted_persistent_vram_bytes=predicted_persistent,
+                vram_prediction_error_bytes=None,
+                effective_phase_vram_budget_bytes=(
+                    self.envelope.effective_vram_budget_bytes
+                ),
+            )
+        prior_phase, prior_boundary, usage = prior
+        prediction_error = (
+            None
+            if usage.cuda_allocated_bytes is None
+            else usage.cuda_allocated_bytes - predicted_persistent
+        )
+        effective_budget = max(
+            0,
+            self.envelope.effective_vram_budget_bytes
+            - max(0, prediction_error or 0),
+        )
+        return PhaseEntryObservation(
+            target_phase=target_phase,
+            prior_phase=prior_phase,
+            prior_boundary=prior_boundary,
+            cuda_allocated_bytes=usage.cuda_allocated_bytes,
+            cuda_reserved_bytes=usage.cuda_reserved_bytes,
+            cuda_total_bytes=usage.cuda_total_bytes,
+            host_rss_bytes=usage.host_rss_bytes,
+            host_available_bytes=usage.host_available_bytes,
+            elapsed_seconds=usage.elapsed_seconds,
+            predicted_persistent_vram_bytes=predicted_persistent,
+            vram_prediction_error_bytes=prediction_error,
+            effective_phase_vram_budget_bytes=effective_budget,
+        )
 
     def grant(self, phase: PhaseId) -> ResourceGrant | None:
         claims = _claims_for_phase(self.current_plan.admission.estimates, phase)
@@ -443,6 +633,7 @@ class TraceGovernorRuntime:
 
     def _observe_resource_usage(self, *, phase: PhaseId, boundary: str) -> None:
         usage = self._resource_usage_sampler.sample(started_at=self._started_at)
+        self._last_resource_usage = (phase, boundary, usage)
         reserved = self.ledger.actual
         self.observer.observe(
             TraceEvent(
@@ -514,9 +705,23 @@ class TraceGovernorRuntime:
                     "refusals": candidate.admission.refusals,
                     "admission_decisions": candidate.admission.decisions,
                     "admission_warnings": candidate.admission.warnings,
+                    "candidate_count": candidate.admission.candidate_count,
+                    "admissible_candidate_count": (
+                        candidate.admission.admissible_candidate_count
+                    ),
+                    "hard_constraints": candidate.admission.hard_constraints,
+                    "frozen_fields": candidate.admission.frozen_fields,
+                    "free_fields": candidate.admission.free_fields,
+                    "binding_constraints": candidate.admission.binding_constraints,
+                    "selected_objective": candidate.admission.selected_objective,
+                    "rejected_candidates": candidate.admission.rejected_candidates,
                     "row_store_policy": candidate.physical.row_store_policy,
                     "row_store_bytes": candidate.physical.row_store_bytes,
                     "spill_target": candidate.physical.spill_target,
+                    "session_capacity": candidate.physical.session_capacity,
+                    "phase1_source_batch_size": (
+                        candidate.physical.phase1_source_batch_size
+                    ),
                     "source_microbatch_size": candidate.physical.source_microbatch_size,
                     "feature_microbatch_size": candidate.physical.feature_microbatch_size,
                     "logit_microbatch_size": candidate.physical.logit_microbatch_size,
@@ -560,6 +765,31 @@ class TraceGovernorRuntime:
                 "position_count": len(observation.per_position_counts),
                 "membership_fingerprint": observation.membership_fingerprint,
                 "membership_sample_count": len(observation.membership_sample),
+            }
+            probes = ()
+        elif isinstance(observation, PhaseEntryObservation):
+            attrs = {
+                "epoch": epoch.value,
+                "target_phase": observation.target_phase.value,
+                "prior_phase": (
+                    observation.prior_phase.value
+                    if observation.prior_phase is not None
+                    else None
+                ),
+                "prior_boundary": observation.prior_boundary,
+                "cuda_allocated_bytes": observation.cuda_allocated_bytes,
+                "cuda_reserved_bytes": observation.cuda_reserved_bytes,
+                "cuda_total_bytes": observation.cuda_total_bytes,
+                "host_rss_bytes": observation.host_rss_bytes,
+                "host_available_bytes": observation.host_available_bytes,
+                "elapsed_seconds": observation.elapsed_seconds,
+                "predicted_persistent_vram_bytes": (
+                    observation.predicted_persistent_vram_bytes
+                ),
+                "vram_prediction_error_bytes": observation.vram_prediction_error_bytes,
+                "effective_phase_vram_budget_bytes": (
+                    observation.effective_phase_vram_budget_bytes
+                ),
             }
             probes = ()
         else:

@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from circuit_tracer.attribution.nnsight.execution import AttributionExecution
 from circuit_tracer.governor.contracts import (
     PhysicalExecutionRequirements,
     ResourceEnvelope,
@@ -66,11 +67,16 @@ def envelope(*, disk: int = 100 * GIB) -> ResourceEnvelope:
     )
 
 
-def runtime(*, nnz: int = 1000, disk: int = 100 * GIB):
+def runtime(
+    *,
+    nnz: int = 1000,
+    disk: int = 100 * GIB,
+    requirements: PhysicalExecutionRequirements | None = None,
+):
     profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
     inputs = workload(nnz=nnz)
     resources = envelope(disk=disk)
-    requirements = PhysicalExecutionRequirements()
+    requirements = requirements or PhysicalExecutionRequirements()
     plan = resolve_trace_plan(inputs, profile, resources, requirements)
     observer = Observer()
     return TraceGovernorRuntime(
@@ -126,11 +132,15 @@ def test_all_planning_epochs_are_ordered_and_semantics_stay_stable() -> None:
     governed.pre_execution_admission()
     governed.loaded_state_calibration(unavailable_loaded_state(allocated=1234))
     governed.active_universe_replan(active_observation(100))
+    governed.phase3_entry_replan()
+    governed.phase4_entry_replan()
 
     assert [revision.epoch for revision in governed.revisions] == [
         PlanningEpoch.PRE_EXECUTION_ADMISSION,
         PlanningEpoch.LOADED_STATE_CALIBRATION,
         PlanningEpoch.ACTIVE_UNIVERSE_REPLAN,
+        PlanningEpoch.PHASE3_ENTRY_REPLAN,
+        PlanningEpoch.PHASE4_ENTRY_REPLAN,
     ]
     assert all(revision.semantic_fingerprint == semantic for revision in governed.revisions)
     model_vram = next(
@@ -171,7 +181,12 @@ def test_all_planning_epochs_are_ordered_and_semantics_stay_stable() -> None:
     observation_events = [
         event for event in governed.observer.events if event.name == "planning.observation"
     ]
-    assert observation_events[-1].attrs["total_nnz"] == 100
+    active_event = next(
+        event
+        for event in observation_events
+        if event.attrs["epoch"] == PlanningEpoch.ACTIVE_UNIVERSE_REPLAN.value
+    )
+    assert active_event.attrs["total_nnz"] == 100
     assert all(
         not isinstance(value, (tuple, list, dict))
         for event in observation_events
@@ -218,6 +233,169 @@ def test_late_revision_rejects_frozen_mechanism(monkeypatch) -> None:
     with pytest.raises(FrozenMechanismRevisionError, match="decoder_fetch_chunk_size"):
         governed.active_universe_replan(active_observation(100))
     assert observer.events[-1].name == "planning.refusal"
+
+
+def test_phase_entry_replans_only_free_the_target_control() -> None:
+    governed, observer = runtime()
+    advance_to_active(governed)
+    governed.active_universe_replan(active_observation(100))
+    before_phase3 = governed.current_plan.physical
+
+    phase3 = governed.phase3_entry_replan()
+
+    assert set(phase3.changed_mechanisms) <= {"logit_microbatch_size"}
+    assert phase3.plan.admission.free_fields == ("logit_microbatch_size",)
+    assert set(phase3.plan.admission.frozen_fields) == (
+        set(before_phase3.__dataclass_fields__) - {"logit_microbatch_size"}
+    )
+    before_phase4 = governed.current_plan.physical
+
+    phase4 = governed.phase4_entry_replan()
+
+    assert set(phase4.changed_mechanisms) <= {"feature_microbatch_size"}
+    assert phase4.plan.admission.free_fields == ("feature_microbatch_size",)
+    assert set(phase4.plan.admission.frozen_fields) == (
+        set(before_phase4.__dataclass_fields__) - {"feature_microbatch_size"}
+    )
+    for epoch in (PlanningEpoch.PHASE3_ENTRY_REPLAN, PlanningEpoch.PHASE4_ENTRY_REPLAN):
+        event = next(
+            event for event in observer.events if event.name == f"planning.{epoch.value}"
+        )
+        assert event.attrs["candidate_count"] >= 1
+        assert "selected_objective" in event.attrs
+        assert "frozen_fields" in event.attrs
+
+
+def test_phase_entry_original_hard_target_requirements_remain_fixed() -> None:
+    requirements = PhysicalExecutionRequirements(
+        logit_microbatch_size=8,
+        feature_microbatch_size=16,
+    )
+    governed, _ = runtime(requirements=requirements)
+    advance_to_active(governed)
+    governed.active_universe_replan(active_observation(100))
+
+    phase3 = governed.phase3_entry_replan()
+    phase4 = governed.phase4_entry_replan()
+
+    assert phase3.plan.physical.logit_microbatch_size == 8
+    assert phase4.plan.physical.feature_microbatch_size == 16
+    assert "logit_microbatch_size=8" in phase3.plan.admission.hard_constraints
+    assert "feature_microbatch_size=16" in phase4.plan.admission.hard_constraints
+    assert "logit_microbatch_size" not in phase3.plan.admission.free_fields
+    assert "feature_microbatch_size" not in phase4.plan.admission.free_fields
+
+
+def test_phase_entry_rejects_change_outside_target(monkeypatch) -> None:
+    governed, observer = runtime()
+    advance_to_active(governed)
+    governed.active_universe_replan(active_observation(100))
+    original = governed.current_plan
+
+    def changed(*args, **kwargs):
+        del args, kwargs
+        return replace(
+            original,
+            physical=replace(
+                original.physical,
+                feature_microbatch_size=original.physical.feature_microbatch_size // 2,
+            ),
+        )
+
+    monkeypatch.setattr("circuit_tracer.governor.runtime.resolve_trace_plan", changed)
+    with pytest.raises(FrozenMechanismRevisionError, match="feature_microbatch_size"):
+        governed.phase3_entry_replan()
+    assert observer.events[-1].name == "planning.refusal"
+
+
+def test_phase_entry_observation_reuses_prior_actual_measurement() -> None:
+    governed, observer = runtime()
+    governed._resource_usage_sampler = type(
+        "Sampler",
+        (),
+        {
+            "sample": lambda self, *, started_at: ResourceUsageObservation(
+                cuda_allocated_bytes=10,
+                cuda_reserved_bytes=20,
+                cuda_total_bytes=30,
+                host_rss_bytes=40,
+                host_available_bytes=50,
+                elapsed_seconds=1.5,
+            )
+        },
+    )()
+    advance_to_active(governed)
+    governed.active_universe_replan(active_observation(100))
+    grant = governed.grant(PhaseId.PHASE2)
+
+    governed.phase3_entry_replan()
+
+    observation = next(
+        event
+        for event in observer.events
+        if event.name == "planning.observation"
+        and event.attrs["epoch"] == PlanningEpoch.PHASE3_ENTRY_REPLAN.value
+    )
+    assert observation.attrs["prior_phase"] == PhaseId.PHASE2.value
+    assert observation.attrs["prior_boundary"] == "phase3_entry"
+    assert observation.attrs["cuda_reserved_bytes"] == 20
+    assert observation.attrs["host_rss_bytes"] == 40
+    assert "vram_prediction_error_bytes" in observation.attrs
+    assert "effective_phase_vram_budget_bytes" in observation.attrs
+    governed.release(grant)
+
+
+def test_phase_entry_actual_vram_tightens_the_optimizer_envelope(monkeypatch) -> None:
+    governed, observer = runtime()
+    advance_to_active(governed)
+    governed.active_universe_replan(active_observation(100))
+    persistent_names = {
+        "model_vram",
+        "trace_vram",
+        "decoder_cache_vram",
+        "source_microbatch_vram",
+    }
+    predicted = int(
+        sum(
+            estimate.amount
+            for estimate in governed.current_plan.admission.estimates
+            if estimate.name in persistent_names
+        )
+    )
+    governed._resource_usage_sampler = type(
+        "Sampler",
+        (),
+        {
+            "sample": lambda self, *, started_at: ResourceUsageObservation(
+                cuda_allocated_bytes=predicted + 1024,
+                cuda_reserved_bytes=predicted + 2048,
+                cuda_total_bytes=governed.envelope.total_vram_bytes,
+                host_rss_bytes=1,
+                host_available_bytes=1,
+                elapsed_seconds=2.0,
+            )
+        },
+    )()
+    captured_envelopes = []
+    original_resolve = resolve_trace_plan
+
+    def capture(*args, **kwargs):
+        captured_envelopes.append(args[2])
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr("circuit_tracer.governor.runtime.resolve_trace_plan", capture)
+    governed.phase3_entry_replan()
+
+    assert captured_envelopes[-1].effective_vram_budget_bytes == (
+        governed.envelope.effective_vram_budget_bytes - 1024
+    )
+    observation = next(
+        event
+        for event in observer.events
+        if event.name == "planning.observation"
+        and event.attrs["epoch"] == PlanningEpoch.PHASE3_ENTRY_REPLAN.value
+    )
+    assert observation.attrs["vram_prediction_error_bytes"] == 1024
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -441,5 +619,44 @@ def test_planning_epoch_state_machine_rejects_skips_and_duplicates() -> None:
     with pytest.raises(PlanningEpochOrderError, match="expected active_universe_replan"):
         governed.loaded_state_calibration(unavailable_loaded_state())
     governed.active_universe_replan(active_observation(100))
-    with pytest.raises(PlanningEpochOrderError, match="expected complete"):
+    with pytest.raises(PlanningEpochOrderError, match="expected phase3_entry_replan"):
         governed.active_universe_replan(active_observation(100))
+    with pytest.raises(PlanningEpochOrderError, match="expected phase3_entry_replan"):
+        governed.phase4_entry_replan()
+    governed.phase3_entry_replan()
+    with pytest.raises(PlanningEpochOrderError, match="expected phase4_entry_replan"):
+        governed.phase3_entry_replan()
+    governed.phase4_entry_replan()
+    with pytest.raises(PlanningEpochOrderError, match="expected complete"):
+        governed.phase4_entry_replan()
+
+
+def test_execution_replans_immediately_before_phase3_and_phase4_grants() -> None:
+    execution = object.__new__(AttributionExecution)
+    events: list[str] = []
+    execution.governor_runtime = object()
+    execution.row_store_grant = None
+    execution._grant = lambda phase: events.append(f"grant:{phase.value}")
+    execution._release = lambda grant: None
+
+    def run_with_grant(phase, callback):
+        events.append(f"grant:{phase.value}")
+        return callback()
+
+    execution._run_with_grant = run_with_grant
+    execution.run_phase0_preparation = lambda: events.append("run:phase0")
+    execution.apply_active_universe_replan = lambda: events.append("replan:active")
+    execution.run_forward_pass = lambda: events.append("run:phase1")
+    execution.setup_active_features_and_storage = lambda: events.append("run:phase2")
+    execution.apply_phase3_entry_replan = lambda: events.append("replan:phase3")
+    execution.attribute_seed_nodes = lambda: events.append("run:phase3")
+    execution.apply_phase4_entry_replan = lambda: events.append("replan:phase4")
+    execution.expand_feature_frontier = lambda: events.append("run:phase4")
+    execution.assemble_graph = lambda: events.append("run:phase5")
+
+    execution.run()
+
+    phase3_replan = events.index("replan:phase3")
+    phase4_replan = events.index("replan:phase4")
+    assert events[phase3_replan + 1] == "grant:phase3"
+    assert events[phase4_replan + 1] == "grant:phase4"

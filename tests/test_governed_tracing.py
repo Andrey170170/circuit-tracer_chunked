@@ -82,19 +82,17 @@ def request(profile, *, batch: int, prompt_tokens: int = 16) -> TraceRequest:
     )
 
 
-def test_governed_clt_compiles_to_equivalent_explicit_c2_plan() -> None:
+def test_governed_clt_compiles_roomy_optimized_plan() -> None:
     profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
     selected = request(profile, batch=1000)
     governed = resolve_trace_request(selected, resources=envelope(), provider_profile=profile)
-    explicit = resolve_trace_request(replace(selected, execution=governed.execution))
 
-    assert governed.semantic_fingerprint == explicit.semantic_fingerprint
-    assert governed.execution_fingerprint == explicit.execution_fingerprint
     assert governed.semantics.source_batch_size == 1000
-    assert governed.execution.session.capacity == 128
-    assert governed.execution.session.source_microbatch_max_rows == 128
-    assert governed.execution.session.phase3_microbatch_max_rows == 128
-    assert governed.execution.session.phase4_microbatch_max_rows == 128
+    assert governed.execution.session.capacity == 125
+    assert governed.execution.session.source_microbatch_max_rows == 125
+    assert governed.execution.session.phase3_microbatch_max_rows == 125
+    assert governed.execution.session.phase4_microbatch_max_rows == 125
+    assert governed.execution.session.phase1_trace_batch_policy == "legacy"
     assert governed.execution.session.decoder_cache.max_bytes == 8 * GIB
     assert governed.execution.decoder.fetch_chunk_size == 4096
     assert governed.execution.replay.feature_window == 4
@@ -102,6 +100,10 @@ def test_governed_clt_compiles_to_equivalent_explicit_c2_plan() -> None:
     assert governed.execution.storage.exact_encoder_residency == "lazy"
     assert governed.execution.storage.placement.value == "local"
     assert governed.execution.storage.temp_root_policy == "env_node_local"
+    assert governed.planning_requirements == PhysicalExecutionRequirements()
+    assert governed.admission_report.candidate_count > 1
+    assert governed.admission_report.admissible_candidate_count > 1
+    assert "row_store_policy" in governed.admission_report.free_fields
 
 
 @pytest.mark.parametrize(

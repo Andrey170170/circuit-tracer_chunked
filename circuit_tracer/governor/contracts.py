@@ -385,6 +385,11 @@ class ProviderCostMetadata:
     calibrated_walltime_low_seconds: float
     calibrated_walltime_high_seconds: float
     walltime_reference_work_units: float
+    row_store_walltime_multipliers: tuple[tuple[str, float], ...] = (
+        ("file_backed_full", 1.0),
+        ("tiled", 2.0),
+        ("recompute", 6.0),
+    )
 
     def __post_init__(self) -> None:
         _nonempty("cost_model_version", self.cost_model_version)
@@ -424,6 +429,17 @@ class ProviderCostMetadata:
             _positive(name, getattr(self, name))
         if self.calibrated_walltime_high_seconds < self.calibrated_walltime_low_seconds:
             raise ValueError("calibrated walltime range must be ordered")
+        multipliers = dict(self.row_store_walltime_multipliers)
+        if set(multipliers) != {"file_backed_full", "tiled", "recompute"}:
+            raise ValueError("row_store_walltime_multipliers must define every row-store policy")
+        for name, multiplier in multipliers.items():
+            _positive(f"row_store_walltime_multipliers[{name}]", multiplier)
+
+    def row_store_walltime_multiplier(self, policy: str) -> float:
+        try:
+            return dict(self.row_store_walltime_multipliers)[policy]
+        except KeyError as error:
+            raise ValueError(f"unknown row-store policy {policy!r}") from error
 
 
 @dataclass(frozen=True)
@@ -437,7 +453,11 @@ class ProviderProfile:
     costs: ProviderCostMetadata
     default_fetch_chunk_size: int
     max_fetch_chunk_size: int
-    max_physical_microbatch: int
+    max_session_capacity: int
+    max_phase1_source_batch_size: int
+    max_source_microbatch_size: int
+    max_phase3_microbatch_size: int
+    max_phase4_microbatch_size: int
     default_decoder_cache_bytes: int
     max_decoder_cache_bytes: int
     default_replay_window: int
@@ -455,7 +475,11 @@ class ProviderProfile:
         for name in (
             "default_fetch_chunk_size",
             "max_fetch_chunk_size",
-            "max_physical_microbatch",
+            "max_session_capacity",
+            "max_phase1_source_batch_size",
+            "max_source_microbatch_size",
+            "max_phase3_microbatch_size",
+            "max_phase4_microbatch_size",
             "default_replay_window",
             "max_replay_window",
             "estimated_active_features_per_token",
@@ -572,6 +596,8 @@ class DemandEstimate:
 class PhysicalExecutionConfig:
     decoder_fetch_chunk_size: int
     decoder_cache_bytes: int
+    session_capacity: int
+    phase1_source_batch_size: int
     source_microbatch_size: int
     feature_microbatch_size: int
     logit_microbatch_size: int
@@ -586,6 +612,8 @@ class PhysicalExecutionConfig:
     def __post_init__(self) -> None:
         for name in (
             "decoder_fetch_chunk_size",
+            "session_capacity",
+            "phase1_source_batch_size",
             "source_microbatch_size",
             "feature_microbatch_size",
             "logit_microbatch_size",
@@ -604,6 +632,8 @@ class PhysicalExecutionRequirements:
 
     decoder_fetch_chunk_size: int | None = None
     decoder_cache_bytes: int | None = None
+    session_capacity: int | None = None
+    phase1_source_batch_size: int | None = None
     source_microbatch_size: int | None = None
     feature_microbatch_size: int | None = None
     logit_microbatch_size: int | None = None
@@ -617,6 +647,8 @@ class PhysicalExecutionRequirements:
     def __post_init__(self) -> None:
         for name in (
             "decoder_fetch_chunk_size",
+            "session_capacity",
+            "phase1_source_batch_size",
             "source_microbatch_size",
             "feature_microbatch_size",
             "logit_microbatch_size",
@@ -652,12 +684,24 @@ class AdmissionReport:
     decisions: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     refusals: tuple[str, ...] = ()
+    candidate_count: int = 1
+    admissible_candidate_count: int = 0
+    hard_constraints: tuple[str, ...] = ()
+    frozen_fields: tuple[str, ...] = ()
+    free_fields: tuple[str, ...] = ()
+    binding_constraints: tuple[str, ...] = ()
+    selected_objective: tuple[tuple[str, float], ...] = ()
+    rejected_candidates: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _positive("trace_capacity", self.trace_capacity)
         _nonnegative(
             "effective_file_cache_allowance_bytes", self.effective_file_cache_allowance_bytes
         )
+        _positive("candidate_count", self.candidate_count)
+        _nonnegative("admissible_candidate_count", self.admissible_candidate_count)
+        if self.admissible_candidate_count > self.candidate_count:
+            raise ValueError("admissible_candidate_count cannot exceed candidate_count")
         if not self.binding_reasons:
             raise ValueError("binding_reasons must not be empty")
         if self.admitted == bool(self.refusals):

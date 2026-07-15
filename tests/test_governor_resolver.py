@@ -17,6 +17,7 @@ from circuit_tracer.governor import ProviderIdentity
 from circuit_tracer.governor import ProviderProfile
 from circuit_tracer.governor import ResourceEnvelope
 from circuit_tracer.governor import RowStorePolicy
+from circuit_tracer.governor import StorageTier
 from circuit_tracer.governor import TraceSemantics
 from circuit_tracer.governor import ValidationEvidence
 from circuit_tracer.governor import dtype_byte_width
@@ -103,7 +104,11 @@ def _profile(
         ),
         default_fetch_chunk_size=1024,
         max_fetch_chunk_size=4096,
-        max_physical_microbatch=32,
+        max_session_capacity=64,
+        max_phase1_source_batch_size=64,
+        max_source_microbatch_size=32,
+        max_phase3_microbatch_size=32,
+        max_phase4_microbatch_size=32,
         default_decoder_cache_bytes=GIB,
         max_decoder_cache_bytes=128 * GIB,
         default_replay_window=2,
@@ -176,7 +181,21 @@ def test_complete_semantic_inputs_and_physical_values_drive_demand_arithmetic():
     assert _estimates(resolve_trace_plan(replace(base_semantics, max_feature_nodes=19), profile, _envelope()))["row_store_disk"] > amounts["row_store_disk"]
     assert _estimates(resolve_trace_plan(replace(base_semantics, target_count=4), profile, _envelope()))["target_vram"] > amounts["target_vram"]
     assert _estimates(resolve_trace_plan(replace(base_semantics, dtype="bf16"), profile, _envelope()))["trace_vram"] < amounts["trace_vram"]
-    assert _estimates(resolve_trace_plan(replace(base_semantics, source_batch_size=128), profile, _envelope()))["trace_vram"] > amounts["trace_vram"]
+    larger_session = resolve_trace_plan(
+        replace(base_semantics, source_batch_size=128),
+        profile,
+        _envelope(),
+        PhysicalExecutionRequirements(session_capacity=64),
+    )
+    smaller_session = resolve_trace_plan(
+        replace(base_semantics, source_batch_size=128),
+        profile,
+        _envelope(),
+        PhysicalExecutionRequirements(session_capacity=32),
+    )
+    assert _estimates(larger_session)["trace_vram"] > _estimates(smaller_session)[
+        "trace_vram"
+    ]
 
     wider = replace(profile, dimensions=replace(profile.dimensions, d_model=256))
     wider_amounts = _estimates(resolve_trace_plan(base_semantics, wider, _envelope()))
@@ -270,9 +289,8 @@ def test_microbatch_and_replay_workspaces_change_vram_and_can_refuse():
         _envelope(),
         PhysicalExecutionRequirements(replay_window=4),
     )
-    assert _estimates(smaller_source)["source_microbatch_vram"] < _estimates(base)[
-        "source_microbatch_vram"
-    ]
+    assert _estimates(smaller_source)["source_microbatch_vram"] == 0
+    assert _estimates(base)["source_microbatch_vram"] == 0
     assert _estimates(larger_replay)["replay_vram"] > _estimates(base)["replay_vram"]
 
     expensive = _profile(
@@ -327,11 +345,9 @@ def test_file_cache_allowance_is_clamped_under_total_host_budget():
         _profile(),
         _envelope(host_budget_bytes=2 * GIB, file_cache_allowance_bytes=2 * GIB),
     )
-    host_total = sum(
-        item.amount for item in plan.admission.estimates if item.tier.value == "host"
-    )
+    peak_host = dict(plan.admission.selected_objective)["predicted_host_bytes"]
     assert plan.admission.effective_file_cache_allowance_bytes == max(
-        0, 2 * GIB - int(host_total)
+        0, 2 * GIB - int(peak_host)
     )
     assert any("clamped file-cache allowance" in item for item in plan.admission.warnings)
 
@@ -362,6 +378,192 @@ def test_row_store_selects_full_then_tiled_then_recompute_by_capacity():
         0,
     )
     assert recompute.physical.spill_target is None
+
+
+def test_roomy_optimizer_selects_fastest_policy_then_lower_pressure():
+    plan = resolve_trace_plan(_semantics(), _profile(), _envelope(local_disk_bytes=GIB))
+
+    assert plan.admission.admitted
+    assert plan.physical.row_store_policy == RowStorePolicy.FULL.value
+    assert plan.physical.session_capacity == 32
+    assert plan.physical.phase1_source_batch_size == 64
+    assert plan.physical.source_microbatch_size == 32
+    assert plan.physical.logit_microbatch_size == 16
+    assert plan.physical.feature_microbatch_size == 32
+    assert plan.admission.candidate_count > 1
+    assert plan.admission.admissible_candidate_count > 1
+    assert "row_store_policy" in plan.admission.free_fields
+    assert dict(plan.admission.selected_objective)["predicted_walltime_high_seconds"] == (
+        _estimates(plan)["predicted_walltime_high"]
+    )
+
+
+def test_hard_row_policy_only_fixes_row_policy():
+    plan = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(local_disk_bytes=GIB),
+        PhysicalExecutionRequirements(row_store_policy=RowStorePolicy.RECOMPUTE),
+    )
+
+    assert plan.admission.admitted
+    assert plan.physical.row_store_policy == RowStorePolicy.RECOMPUTE.value
+    assert plan.physical.session_capacity == 32
+    assert plan.physical.phase1_source_batch_size == 64
+    assert plan.physical.source_microbatch_size == 32
+    assert plan.physical.logit_microbatch_size == 16
+    assert plan.physical.feature_microbatch_size == 32
+    assert "row_store_policy=recompute" in plan.admission.hard_constraints
+    assert "row_store_policy" not in plan.admission.free_fields
+    assert "feature_microbatch_size" in plan.admission.free_fields
+
+
+def test_independent_hard_batch_constraints_leave_other_batches_free():
+    plan = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(local_disk_bytes=GIB),
+        PhysicalExecutionRequirements(
+            session_capacity=32,
+            feature_microbatch_size=8,
+        ),
+    )
+
+    assert plan.physical.session_capacity == 32
+    assert plan.physical.feature_microbatch_size == 8
+    assert plan.physical.phase1_source_batch_size == 64
+    assert plan.physical.source_microbatch_size == 32
+    assert plan.physical.logit_microbatch_size == 16
+    assert "session_capacity=32" in plan.admission.hard_constraints
+    assert "feature_microbatch_size=8" in plan.admission.hard_constraints
+    assert "source_microbatch_size" not in plan.admission.free_fields
+
+    inferred_session = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(local_disk_bytes=GIB),
+        PhysicalExecutionRequirements(feature_microbatch_size=32),
+    )
+    assert inferred_session.admission.admitted
+    assert inferred_session.physical.feature_microbatch_size == 32
+    assert inferred_session.physical.session_capacity >= 32
+
+
+def test_row_policy_cost_model_changes_predicted_walltime():
+    requirements = PhysicalExecutionRequirements(
+        session_capacity=64,
+        phase1_source_batch_size=64,
+        source_microbatch_size=32,
+        feature_microbatch_size=32,
+        logit_microbatch_size=16,
+    )
+    full = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(local_disk_bytes=GIB),
+        replace(requirements, row_store_policy=RowStorePolicy.FULL),
+    )
+    recompute = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(local_disk_bytes=GIB),
+        replace(requirements, row_store_policy=RowStorePolicy.RECOMPUTE),
+    )
+
+    assert _estimates(recompute)["predicted_walltime_high"] == pytest.approx(
+        6 * _estimates(full)["predicted_walltime_high"]
+    )
+
+
+def test_resource_infeasibility_reports_nearest_candidates():
+    plan = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(total_vram_bytes=1, local_disk_bytes=GIB),
+    )
+
+    assert not plan.admission.admitted
+    assert plan.admission.candidate_count > 1
+    assert plan.admission.admissible_candidate_count == 0
+    assert plan.admission.rejected_candidates
+    assert any("VRAM allocations require" in item for item in plan.admission.refusals)
+
+
+def test_optimizer_searches_small_breakpoints_needed_for_admission():
+    constrained_profile = _profile(
+        costs=replace(
+            _profile().costs,
+            feature_microbatch_vram_coefficient=100_000.0,
+            logit_microbatch_vram_coefficient=100_000.0,
+        )
+    )
+    explicit = resolve_trace_plan(
+        _semantics(feature_batch_size=64, logit_batch_size=64),
+        constrained_profile,
+        _envelope(vram_fraction=1.0),
+        PhysicalExecutionRequirements(
+            session_capacity=8,
+            feature_microbatch_size=8,
+            logit_microbatch_size=8,
+        ),
+    )
+    budget = int(
+        dict(explicit.admission.selected_objective)["predicted_peak_vram_bytes"]
+    )
+    automatic = resolve_trace_plan(
+        _semantics(feature_batch_size=64, logit_batch_size=64),
+        constrained_profile,
+        _envelope(
+            total_vram_bytes=budget,
+            vram_budget_bytes=budget,
+            vram_fraction=1.0,
+        ),
+    )
+
+    assert explicit.admission.admitted
+    assert automatic.admission.admitted
+    assert 8 in resolver_module._batch_breakpoint_sizes(
+        logical_size=64, maximum=32, required=None
+    )
+    assert automatic.admission.candidate_count > 100
+
+
+@pytest.mark.parametrize("spill_target", ["local", "scratch"])
+def test_hard_spill_target_prunes_incompatible_recompute_candidates(spill_target):
+    plan = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(local_disk_bytes=GIB, scratch_disk_bytes=GIB),
+        PhysicalExecutionRequirements(spill_target=StorageTier(spill_target)),
+    )
+
+    assert plan.admission.admitted
+    assert plan.physical.spill_target == spill_target
+    assert plan.physical.row_store_policy != RowStorePolicy.RECOMPUTE.value
+
+
+def test_admission_uses_peak_concurrent_vram_not_sum_of_disjoint_phases():
+    roomy = resolve_trace_plan(
+        _semantics(), _profile(), _envelope(local_disk_bytes=GIB, vram_fraction=1.0)
+    )
+    all_vram = sum(
+        item.amount for item in roomy.admission.estimates if item.tier.value == "vram"
+    )
+    peak_vram = int(
+        dict(roomy.admission.selected_objective)["predicted_peak_vram_bytes"]
+    )
+
+    assert peak_vram < all_vram
+    fitting = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(
+            total_vram_bytes=peak_vram,
+            local_disk_bytes=GIB,
+            vram_fraction=1.0,
+        ),
+    )
+    assert fitting.admission.admitted
 
 
 def test_row_store_overrides_validate_capability_and_capacity():

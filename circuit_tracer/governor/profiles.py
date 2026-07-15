@@ -222,6 +222,31 @@ _CHECKPOINT_BYTES_BY_PROFILE = {
     "granite_h200_4b_plt_b128_c4096_cache0": 32 * GIB,
     "granite_h200_12b_plt_b64_c4096_cache0": 64 * GIB,
 }
+# C2 Granite 361_base wall-clock ratios relative to each provider's full-file
+# arm (A). CLT: A=111.23s, D=361.73s, E=710.21s. PLT: A=2494.32s,
+# D=5918.07s, E=20581.41s. These calibrate mechanism cost only, not fidelity.
+_ROW_STORE_WALLTIME_MULTIPLIERS_BY_PROFILE = {
+    "granite_h200_1b_clt_b1000_c4096_cache8": (
+        ("file_backed_full", 1.0),
+        ("tiled", 3.25),
+        ("recompute", 6.4),
+    ),
+    "granite_h200_1b_plt_b128_c4096_cache0": (
+        ("file_backed_full", 1.0),
+        ("tiled", 2.4),
+        ("recompute", 8.3),
+    ),
+    "granite_h200_4b_plt_b128_c4096_cache0": (
+        ("file_backed_full", 1.0),
+        ("tiled", 2.4),
+        ("recompute", 8.3),
+    ),
+    "granite_h200_12b_plt_b64_c4096_cache0": (
+        ("file_backed_full", 1.0),
+        ("tiled", 2.4),
+        ("recompute", 8.3),
+    ),
+}
 
 
 def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
@@ -243,7 +268,7 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
         effective_source_batch_size=observation.batch_size,
         feature_batch_size=observation.batch_size,
         logit_batch_size=observation.batch_size,
-        source_microbatch_size=min(observation.batch_size, physical_cap),
+        source_microbatch_size=observation.batch_size,
         feature_microbatch_size=min(observation.batch_size, physical_cap),
         logit_microbatch_size=min(observation.batch_size, physical_cap),
         replay_window=4,
@@ -294,10 +319,17 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
             calibrated_walltime_low_seconds=observation.walltime_seconds_range[0],
             calibrated_walltime_high_seconds=observation.walltime_seconds_range[1],
             walltime_reference_work_units=reference_work,
+            row_store_walltime_multipliers=(
+                _ROW_STORE_WALLTIME_MULTIPLIERS_BY_PROFILE[observation.profile_name]
+            ),
         ),
         default_fetch_chunk_size=observation.fetch_chunk_size,
         max_fetch_chunk_size=observation.fetch_chunk_size,
-        max_physical_microbatch=physical_cap,
+        max_session_capacity=observation.batch_size,
+        max_phase1_source_batch_size=observation.batch_size,
+        max_source_microbatch_size=physical_cap,
+        max_phase3_microbatch_size=physical_cap,
+        max_phase4_microbatch_size=physical_cap,
         default_decoder_cache_bytes=observation.decoder_cache_bytes,
         max_decoder_cache_bytes=max(observation.decoder_cache_bytes, 8 * GIB),
         default_replay_window=4,
@@ -373,7 +405,11 @@ def _stress_fixture(
         ),
         default_fetch_chunk_size=recommendation.fetch_chunk_size,
         max_fetch_chunk_size=recommendation.fetch_chunk_size,
-        max_physical_microbatch=recommendation.batch_size,
+        max_session_capacity=recommendation.batch_size,
+        max_phase1_source_batch_size=recommendation.batch_size,
+        max_source_microbatch_size=recommendation.batch_size,
+        max_phase3_microbatch_size=recommendation.batch_size,
+        max_phase4_microbatch_size=recommendation.batch_size,
         default_decoder_cache_bytes=recommendation.decoder_cache_bytes,
         max_decoder_cache_bytes=recommendation.decoder_cache_bytes,
     )

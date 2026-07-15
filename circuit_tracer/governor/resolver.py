@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from itertools import product
 
 from .contracts import (
     AdmissionReport,
@@ -18,6 +19,7 @@ from .contracts import (
     ProviderCostMetadata,
     ProviderProfile,
     ResourceEnvelope,
+    RowStorePolicy,
     TracePlan,
     TraceSemantics,
     TRUSTED_VALIDATION_EVIDENCE_REGISTRY,
@@ -45,11 +47,12 @@ def compute_work_units(
     prefetch_depth: int,
 ) -> float:
     fetch_blocks = math.ceil(dimensions.d_features / decoder_fetch_chunk_size)
-    microbatch_steps = (
-        math.ceil(effective_source_batch_size / source_microbatch_size)
-        + math.ceil(feature_batch_size / feature_microbatch_size)
-        + math.ceil(logit_batch_size / logit_microbatch_size)
-    )
+    # Phase 1 is a small admission/survival stage in the calibration runs. Its
+    # session width is not a sequenced source microbatch, so only the physical
+    # Phase 3/4 partitions contribute to this throughput model.
+    microbatch_steps = math.ceil(
+        feature_batch_size / feature_microbatch_size
+    ) + math.ceil(logit_batch_size / logit_microbatch_size)
     logical_work = (
         prompt_token_count
         * estimated_active_features
@@ -236,16 +239,60 @@ def _resolve_physical(
     if cache and not capabilities.supports_decoder_chunk_cache:
         raise ValueError("provider does not support decoder_cache_bytes > 0")
 
+    logical_capacity = max(
+        effective_source, semantics.feature_batch_size, semantics.logit_batch_size
+    )
+    session_capacity = (
+        min(logical_capacity, profile.max_session_capacity)
+        if requirements.session_capacity is None
+        else requirements.session_capacity
+    )
+    if not 0 < session_capacity <= logical_capacity:
+        raise ValueError("session_capacity must be positive and <= logical trace capacity")
+    if session_capacity > profile.max_session_capacity:
+        raise ValueError("session_capacity exceeds the provider profile maximum")
+
+    phase1_source_batch_size = (
+        min(effective_source, profile.max_phase1_source_batch_size)
+        if requirements.phase1_source_batch_size is None
+        else requirements.phase1_source_batch_size
+    )
+    if not 0 < phase1_source_batch_size <= effective_source:
+        raise ValueError(
+            "phase1_source_batch_size must be positive and <= effective source batch"
+        )
+    if phase1_source_batch_size > profile.max_phase1_source_batch_size:
+        raise ValueError("phase1_source_batch_size exceeds the provider profile maximum")
+
     batch_specs = (
-        ("source_microbatch_size", effective_source, requirements.source_microbatch_size),
-        ("feature_microbatch_size", semantics.feature_batch_size, requirements.feature_microbatch_size),
-        ("logit_microbatch_size", semantics.logit_batch_size, requirements.logit_microbatch_size),
+        (
+            "source_microbatch_size",
+            effective_source,
+            profile.max_source_microbatch_size,
+            requirements.source_microbatch_size,
+        ),
+        (
+            "feature_microbatch_size",
+            semantics.feature_batch_size,
+            profile.max_phase4_microbatch_size,
+            requirements.feature_microbatch_size,
+        ),
+        (
+            "logit_microbatch_size",
+            semantics.logit_batch_size,
+            profile.max_phase3_microbatch_size,
+            requirements.logit_microbatch_size,
+        ),
     )
     microbatches: dict[str, int] = {}
-    for name, logical_bound, required in batch_specs:
-        value = min(logical_bound, profile.max_physical_microbatch) if required is None else required
+    for name, logical_bound, profile_bound, required in batch_specs:
+        value = min(logical_bound, profile_bound, session_capacity) if required is None else required
         if not 0 < value <= logical_bound:
             raise ValueError(f"{name} must be positive and <= its logical/effective capacity")
+        if value > profile_bound:
+            raise ValueError(f"{name} exceeds the provider profile maximum")
+        if value > session_capacity:
+            raise ValueError(f"{name} cannot exceed session_capacity")
         microbatches[name] = value
 
     replay = requirements.replay_window or profile.default_replay_window
@@ -323,6 +370,8 @@ def _resolve_physical(
     physical = PhysicalExecutionConfig(
         decoder_fetch_chunk_size=fetch,
         decoder_cache_bytes=cache,
+        session_capacity=session_capacity,
+        phase1_source_batch_size=phase1_source_batch_size,
         source_microbatch_size=microbatches["source_microbatch_size"],
         feature_microbatch_size=microbatches["feature_microbatch_size"],
         logit_microbatch_size=microbatches["logit_microbatch_size"],
@@ -348,7 +397,7 @@ def _estimate_demands(
     dims = profile.dimensions
     dtype_bytes = semantics.dtype_bytes
     trace_elements = (
-        capacity
+        physical.session_capacity
         * semantics.prompt_token_count
         * dims.n_layers
         * dims.decoder_output_span
@@ -367,13 +416,10 @@ def _estimate_demands(
         * dtype_bytes
     )
     prefetch_vram = fetch_vram * physical.prefetch_depth
-    source_microbatch_vram = math.ceil(
-        physical.source_microbatch_size
-        * semantics.prompt_token_count
-        * dims.d_model
-        * dtype_bytes
-        * costs.source_microbatch_vram_coefficient
-    )
+    # No runtime path currently executes source_microbatch_size as a physical
+    # partition. Keep the named estimate for schema stability, but do not charge
+    # fictitious residency until a sequenced source executor consumes it.
+    source_microbatch_vram = 0
     feature_microbatch_vram = math.ceil(
         physical.feature_microbatch_size
         * semantics.prompt_token_count
@@ -437,13 +483,17 @@ def _estimate_demands(
         effective_source_batch_size=effective_source,
         feature_batch_size=semantics.feature_batch_size,
         logit_batch_size=semantics.logit_batch_size,
-        source_microbatch_size=physical.source_microbatch_size,
+        source_microbatch_size=physical.phase1_source_batch_size,
         feature_microbatch_size=physical.feature_microbatch_size,
         logit_microbatch_size=physical.logit_microbatch_size,
         replay_window=physical.replay_window,
         prefetch_depth=physical.prefetch_depth,
     )
-    walltime_scale = work_units / costs.walltime_reference_work_units
+    walltime_scale = (
+        work_units
+        / costs.walltime_reference_work_units
+        * costs.row_store_walltime_multiplier(physical.row_store_policy)
+    )
     disk_tier = (
         DemandTier.LOCAL_DISK
         if physical.spill_target == "local"
@@ -473,33 +523,47 @@ def _estimate_demands(
     )
 
 
-def _tier_total(estimates: tuple[DemandEstimate, ...], tier: DemandTier) -> int:
-    return int(sum(estimate.amount for estimate in estimates if estimate.tier is tier))
+def _sum_estimates(estimates: tuple[DemandEstimate, ...], names: set[str]) -> int:
+    return int(sum(item.amount for item in estimates if item.name in names))
 
 
-def _host_reservation_total(
+def _peak_vram_total(estimates: tuple[DemandEstimate, ...]) -> int:
+    permanent = _sum_estimates(estimates, {"model_vram"})
+    session = _sum_estimates(
+        estimates,
+        {"trace_vram", "decoder_cache_vram", "source_microbatch_vram"},
+    )
+    phase_working_sets = (
+        _sum_estimates(
+            estimates,
+            {"decoder_fetch_vram", "prefetch_vram", "replay_vram"},
+        ),
+        _sum_estimates(estimates, {"target_vram", "logit_microbatch_vram"}),
+        _sum_estimates(estimates, {"feature_microbatch_vram"}),
+    )
+    return permanent + session + max(phase_working_sets)
+
+
+def _peak_host_reservation_total(
     estimates: tuple[DemandEstimate, ...], profile: ProviderProfile
 ) -> int:
-    incremental_components = (
-        "active_host",
-        "prompt_host",
-        "encoder_residency_host",
-        "replay_host",
+    phase_working_sets = (
+        _sum_estimates(estimates, {"replay_host"}),
+        _sum_estimates(estimates, {"prompt_host"}),
+        _sum_estimates(estimates, {"active_host", "encoder_residency_host"}),
     )
-    incremental_total = int(
-        sum(_amount(estimates, name) for name in incremental_components)
-    )
+    incremental_peak = max(phase_working_sets)
     baseline = profile.costs.baseline_total_host_bytes
     if baseline is None:
-        return int(_amount(estimates, "known_rigid_host")) + incremental_total
-    return baseline + incremental_total
+        return int(_amount(estimates, "known_rigid_host")) + incremental_peak
+    return baseline + incremental_peak
 
 
 def _amount(estimates: tuple[DemandEstimate, ...], name: str) -> float:
     return next(estimate.amount for estimate in estimates if estimate.name == name)
 
 
-def resolve_trace_plan(
+def _resolve_single_trace_plan(
     semantics: TraceSemantics,
     profile: ProviderProfile,
     envelope: ResourceEnvelope,
@@ -540,8 +604,8 @@ def resolve_trace_plan(
                 f"{capacity}; binding={','.join(bindings)}"
             )
 
-    vram_total = _tier_total(estimates, DemandTier.VRAM)
-    host_total = _host_reservation_total(estimates, profile)
+    vram_total = _peak_vram_total(estimates)
+    host_total = _peak_host_reservation_total(estimates, profile)
     if profile.costs.file_cache_included_in_host_baseline:
         baseline = profile.costs.baseline_total_host_bytes or 0
         incremental_host = max(0, host_total - baseline)
@@ -613,6 +677,8 @@ def resolve_trace_plan(
     decisions.extend(
         (
             f"effective_source_batch={effective_source}",
+            f"session_capacity={physical.session_capacity}",
+            f"phase1_source_batch={physical.phase1_source_batch_size}",
             f"microbatches=source:{physical.source_microbatch_size},"
             f"feature:{physical.feature_microbatch_size},logit:{physical.logit_microbatch_size}",
             f"decoder_cache_vram={physical.decoder_cache_bytes}",
@@ -654,4 +720,255 @@ def resolve_trace_plan(
             if report.admitted
             else PlanStatus.ADVISORY_REFUSED
         ),
+    )
+
+
+_OPTIMIZED_REQUIREMENT_FIELDS = (
+    "session_capacity",
+    "feature_microbatch_size",
+    "logit_microbatch_size",
+    "row_store_policy",
+)
+
+
+def _batch_breakpoint_sizes(
+    *, logical_size: int, maximum: int, required: int | None
+) -> tuple[int, ...]:
+    if required is not None:
+        return (required,)
+    values = {1, maximum}
+    physical_steps = 1
+    numerator = logical_size - 1
+    while physical_steps <= logical_size:
+        quotient = numerator // physical_steps
+        value = quotient + 1
+        if value <= maximum:
+            values.add(value)
+        if quotient == 0:
+            break
+        physical_steps = numerator // quotient + 1
+    return tuple(sorted(values, reverse=True))
+
+
+def _requirement_descriptions(
+    requirements: PhysicalExecutionRequirements,
+) -> tuple[str, ...]:
+    return tuple(
+        f"{name}={getattr(requirements, name).value if hasattr(getattr(requirements, name), 'value') else getattr(requirements, name)}"
+        for name in requirements.__dataclass_fields__
+        if getattr(requirements, name) is not None
+    )
+
+
+def _candidate_summary(plan: TracePlan) -> str:
+    physical = plan.physical
+    refusal = plan.admission.refusals[0] if plan.admission.refusals else "not selected"
+    return (
+        f"session={physical.session_capacity},phase1={physical.phase1_source_batch_size},"
+        f"source={physical.source_microbatch_size},phase3={physical.logit_microbatch_size},"
+        f"phase4={physical.feature_microbatch_size},row_store={physical.row_store_policy}: "
+        f"{refusal}"
+    )
+
+
+def _objective(plan: TracePlan) -> tuple[float, ...]:
+    estimates = plan.admission.estimates
+    walltime = _amount(estimates, "predicted_walltime_high")
+    vram = _peak_vram_total(estimates)
+    host = _peak_host_reservation_total(estimates, plan.profile)
+    disk = _amount(estimates, "row_store_disk")
+    return (
+        walltime,
+        float(vram),
+        float(host),
+        disk,
+    )
+
+
+def _with_optimization_report(
+    plan: TracePlan,
+    *,
+    requirements: PhysicalExecutionRequirements,
+    reported_hard_constraints: PhysicalExecutionRequirements,
+    frozen_fields: tuple[str, ...],
+    candidates: tuple[TracePlan, ...],
+) -> TracePlan:
+    admitted = tuple(candidate for candidate in candidates if candidate.admission.admitted)
+    hard_constraints = _requirement_descriptions(reported_hard_constraints)
+    free_fields = tuple(
+        name
+        for name in _OPTIMIZED_REQUIREMENT_FIELDS
+        if getattr(requirements, name) is None and name not in frozen_fields
+    )
+    objective = _objective(plan)
+    rejected = tuple(
+        _candidate_summary(candidate)
+        for candidate in sorted(
+            (candidate for candidate in candidates if candidate is not plan),
+            key=lambda candidate: (
+                0 if candidate.admission.admitted else 1,
+                _objective(candidate),
+                candidate.execution_fingerprint,
+            ),
+        )[:12]
+    )
+    binding = tuple(
+        dict.fromkeys(
+            (*plan.admission.binding_reasons, *hard_constraints, *frozen_fields)
+        )
+    )
+    report = replace(
+        plan.admission,
+        candidate_count=len(candidates),
+        admissible_candidate_count=len(admitted),
+        hard_constraints=hard_constraints,
+        frozen_fields=frozen_fields,
+        free_fields=free_fields,
+        binding_constraints=binding,
+        selected_objective=(
+            ("predicted_walltime_high_seconds", objective[0]),
+            ("predicted_peak_vram_bytes", objective[1]),
+            ("predicted_host_bytes", objective[2]),
+            ("predicted_row_store_bytes", objective[3]),
+        ),
+        rejected_candidates=rejected,
+    )
+    execution_hash = execution_fingerprint(
+        profile=plan.profile,
+        envelope=plan.envelope,
+        physical=plan.physical,
+        admission=report,
+        evidence_fingerprint=plan.evidence_fingerprint,
+    )
+    return replace(plan, admission=report, execution_fingerprint=execution_hash)
+
+
+def resolve_trace_plan(
+    semantics: TraceSemantics,
+    profile: ProviderProfile,
+    envelope: ResourceEnvelope,
+    requirements: PhysicalExecutionRequirements | None = None,
+    *,
+    frozen_fields: tuple[str, ...] = (),
+    reported_hard_constraints: PhysicalExecutionRequirements | None = None,
+) -> TracePlan:
+    """Select the fastest fitting physical plan under hard caller constraints."""
+
+    requirements = requirements or PhysicalExecutionRequirements()
+    reported_hard_constraints = reported_hard_constraints or requirements
+    effective_source, _, _ = _effective_batches(semantics)
+    required_batch_bounds = (
+        (
+            "source_microbatch_size",
+            requirements.source_microbatch_size,
+            min(effective_source, profile.max_source_microbatch_size),
+        ),
+        (
+            "feature_microbatch_size",
+            requirements.feature_microbatch_size,
+            min(semantics.feature_batch_size, profile.max_phase4_microbatch_size),
+        ),
+        (
+            "logit_microbatch_size",
+            requirements.logit_microbatch_size,
+            min(semantics.logit_batch_size, profile.max_phase3_microbatch_size),
+        ),
+    )
+    for name, value, maximum in required_batch_bounds:
+        if value is not None and value > maximum:
+            raise ValueError(f"{name} exceeds its logical or provider maximum")
+    required_microbatch_capacity = max(
+        requirements.source_microbatch_size or 0,
+        requirements.feature_microbatch_size or 0,
+        requirements.logit_microbatch_size or 0,
+    )
+    if (
+        requirements.session_capacity is not None
+        and required_microbatch_capacity > requirements.session_capacity
+    ):
+        raise ValueError("required microbatch cannot exceed required session_capacity")
+    phase1_source_batch_size = (
+        min(effective_source, profile.max_phase1_source_batch_size)
+        if requirements.phase1_source_batch_size is None
+        else requirements.phase1_source_batch_size
+    )
+    policies = (
+        (requirements.row_store_policy,)
+        if requirements.row_store_policy is not None
+        else tuple(
+            policy
+            for policy in RowStorePolicy
+            if _row_store_supported(policy.value, profile)
+            and not (
+                policy is RowStorePolicy.RECOMPUTE
+                and requirements.spill_target is not None
+            )
+        )
+    )
+    phase3_values = _batch_breakpoint_sizes(
+        logical_size=semantics.logit_batch_size,
+        maximum=min(
+            semantics.logit_batch_size,
+            profile.max_phase3_microbatch_size,
+            profile.max_session_capacity,
+            requirements.session_capacity or profile.max_session_capacity,
+        ),
+        required=requirements.logit_microbatch_size,
+    )
+    phase4_values = _batch_breakpoint_sizes(
+        logical_size=semantics.feature_batch_size,
+        maximum=min(
+            semantics.feature_batch_size,
+            profile.max_phase4_microbatch_size,
+            profile.max_session_capacity,
+            requirements.session_capacity or profile.max_session_capacity,
+        ),
+        required=requirements.feature_microbatch_size,
+    )
+    candidates: list[TracePlan] = []
+    for phase3, phase4, policy in product(phase3_values, phase4_values, policies):
+        minimum_session = max(
+            phase3,
+            phase4,
+            requirements.source_microbatch_size or 1,
+        )
+        session_capacity = requirements.session_capacity or minimum_session
+        if session_capacity < minimum_session:
+            continue
+        source = requirements.source_microbatch_size or min(
+            effective_source,
+            session_capacity,
+            profile.max_source_microbatch_size,
+        )
+        candidate_requirements = replace(
+            requirements,
+            session_capacity=session_capacity,
+            phase1_source_batch_size=phase1_source_batch_size,
+            source_microbatch_size=source,
+            logit_microbatch_size=phase3,
+            feature_microbatch_size=phase4,
+            row_store_policy=policy,
+        )
+        candidates.append(
+            _resolve_single_trace_plan(
+                semantics, profile, envelope, candidate_requirements
+            )
+        )
+    if not candidates:
+        raise ValueError("optimizer produced no candidates")
+    admitted = tuple(candidate for candidate in candidates if candidate.admission.admitted)
+    selected = min(
+        admitted or tuple(candidates),
+        key=lambda candidate: (
+            0 if candidate.admission.admitted else len(candidate.admission.refusals),
+            _objective(candidate),
+            candidate.execution_fingerprint,
+        ),
+    )
+    return _with_optimization_report(
+        selected,
+        requirements=requirements,
+        reported_hard_constraints=reported_hard_constraints,
+        frozen_fields=frozen_fields,
+        candidates=tuple(candidates),
     )
