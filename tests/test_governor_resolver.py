@@ -8,8 +8,11 @@ import pytest
 import circuit_tracer.governor.resolver as resolver_module
 
 from circuit_tracer.governor import DecoderTopology
+from circuit_tracer.governor import CachePolicy
+from circuit_tracer.governor import EncoderResidency
 from circuit_tracer.governor import FidelityMode
 from circuit_tracer.governor import PhysicalExecutionRequirements
+from circuit_tracer.governor import PlanningProgress
 from circuit_tracer.governor import ProviderCapabilities
 from circuit_tracer.governor import ProviderCostMetadata
 from circuit_tracer.governor import ProviderDimensions
@@ -22,6 +25,7 @@ from circuit_tracer.governor import TraceSemantics
 from circuit_tracer.governor import ValidationEvidence
 from circuit_tracer.governor import dtype_byte_width
 from circuit_tracer.governor import resolve_trace_plan
+from circuit_tracer.governor.profiles import RECORDED_PROVIDER_PROFILES
 
 
 GIB = 1024**3
@@ -221,7 +225,7 @@ def test_complete_semantic_inputs_and_physical_values_drive_demand_arithmetic():
     changed = _estimates(physical)
     assert changed["decoder_cache_vram"] == 2 * GIB
     assert changed["decoder_fetch_vram"] > amounts["decoder_fetch_vram"]
-    assert changed["prefetch_vram"] > amounts["prefetch_vram"]
+    assert changed["prefetch_vram"] == amounts["prefetch_vram"]
     assert changed["predicted_walltime_high"] != amounts["predicted_walltime_high"]
 
 
@@ -406,7 +410,7 @@ def test_roomy_optimizer_selects_fastest_policy_then_lower_pressure():
 
     assert plan.admission.admitted
     assert plan.physical.row_store_policy == RowStorePolicy.FULL.value
-    assert plan.physical.session_capacity == 32
+    assert plan.physical.session_capacity == 64
     assert plan.physical.phase1_source_batch_size == 64
     assert plan.physical.source_microbatch_size == 32
     assert plan.physical.logit_microbatch_size == 16
@@ -429,7 +433,7 @@ def test_hard_row_policy_only_fixes_row_policy():
 
     assert plan.admission.admitted
     assert plan.physical.row_store_policy == RowStorePolicy.RECOMPUTE.value
-    assert plan.physical.session_capacity == 32
+    assert plan.physical.session_capacity == 64
     assert plan.physical.phase1_source_batch_size == 64
     assert plan.physical.source_microbatch_size == 32
     assert plan.physical.logit_microbatch_size == 16
@@ -771,3 +775,216 @@ def test_report_is_deterministic_and_actionable():
     assert "rigid host allocations require" in report
     assert "predicted walltime upper bound" in report
     assert "trace_capacity:" in report and "decisions:" in report
+
+
+def test_v03_support_extrapolation_and_safety_refusal_are_distinct() -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    support = profile.calibration_support
+    semantics = TraceSemantics(
+        prompt_token_count=support.prompt_token_count + 1,
+        estimated_active_features=support.active_features,
+        max_feature_nodes=support.max_feature_nodes,
+        target_count=support.target_count,
+        scenario_id="v03-extrapolation",
+        environment_label="cpu-test",
+        source_batch_size=64,
+        feature_batch_size=64,
+        logit_batch_size=64,
+    )
+    extrapolated = resolve_trace_plan(semantics, profile, _envelope(walltime_seconds=10**30))
+    assert extrapolated.admission.admitted
+    assert extrapolated.admission.confidence == "extrapolated"
+    assert "prompt_token_count" in extrapolated.admission.extrapolated_dimensions
+    assert extrapolated.admission.calibration_evidence
+
+    invalid = resolve_trace_plan(
+        replace(semantics, prompt_token_count=profile.safety_limits.max_prompt_token_count + 1),
+        profile,
+        _envelope(walltime_seconds=10**30),
+    )
+    assert not invalid.admission.admitted
+    assert any("provider safety limit" in reason for reason in invalid.admission.refusals)
+
+    cache_extrapolation = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(host_budget_bytes=800 * GIB, walltime_seconds=10**30),
+        PhysicalExecutionRequirements(
+            row_store_policy=RowStorePolicy.RECOMPUTE,
+            replay_tile_cache_bytes=support.replay_tile_cache_bytes + 1,
+        ),
+    )
+    assert cache_extrapolation.admission.admitted
+    assert "replay_tile_cache_bytes" in (
+        cache_extrapolation.admission.extrapolated_dimensions
+    )
+
+    cache_invalid = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(host_budget_bytes=800 * GIB, walltime_seconds=10**30),
+        PhysicalExecutionRequirements(
+            row_store_policy=RowStorePolicy.RECOMPUTE,
+            replay_tile_cache_bytes=(
+                profile.safety_limits.max_replay_tile_cache_bytes + 1
+            ),
+        ),
+    )
+    assert not cache_invalid.admission.admitted
+    assert any(
+        "replay_tile_cache_bytes" in reason and "safety limit" in reason
+        for reason in cache_invalid.admission.refusals
+    )
+
+
+def test_v03_replay_tile_cache_is_exact_and_recompute_only() -> None:
+    profile = replace(_profile(), reference_replay_tile_cache_bytes=GIB)
+    recompute = resolve_trace_plan(
+        _semantics(), profile, _envelope(),
+        PhysicalExecutionRequirements(
+            row_store_policy=RowStorePolicy.RECOMPUTE,
+            replay_tile_cache_bytes=GIB,
+        ),
+    )
+    full = resolve_trace_plan(
+        _semantics(), profile, _envelope(local_disk_bytes=GIB),
+        PhysicalExecutionRequirements(row_store_policy=RowStorePolicy.FULL),
+    )
+    assert recompute.physical.replay_tile_cache_bytes == GIB
+    assert _estimates(recompute)["replay_tile_cache_host"] == GIB
+    assert full.physical.replay_tile_cache_bytes == 0
+    with pytest.raises(ValueError, match="requires recompute"):
+        PhysicalExecutionRequirements(
+            row_store_policy=RowStorePolicy.FULL, replay_tile_cache_bytes=1
+        )
+
+
+def test_v03_fully_explicit_requirements_form_a_singleton_domain() -> None:
+    requirements = PhysicalExecutionRequirements(
+        decoder_fetch_chunk_size=1024,
+        decoder_cache_bytes=0,
+        session_capacity=32,
+        phase1_source_batch_size=32,
+        source_microbatch_size=16,
+        feature_microbatch_size=8,
+        logit_microbatch_size=8,
+        replay_window=1,
+        prefetch_depth=0,
+        replay_tile_cache_bytes=0,
+        encoder_residency=EncoderResidency.LAZY_PER_REQUEST,
+        row_store_policy=RowStorePolicy.FULL,
+        spill_target=StorageTier.LOCAL,
+        cache_policy=CachePolicy.WARM,
+    )
+    plan = resolve_trace_plan(
+        _semantics(), _profile(), _envelope(local_disk_bytes=GIB), requirements
+    )
+    assert plan.admission.candidate_count == 1
+    assert "source_microbatch_size" not in plan.admission.free_fields
+    assert all(len(values) == 1 for _, values in plan.admission.domain_summary)
+
+
+def test_v03_row_policy_changes_only_phase4_projection() -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    support = profile.calibration_support
+    semantics = TraceSemantics(
+        prompt_token_count=support.prompt_token_count,
+        estimated_active_features=support.active_features,
+        max_feature_nodes=support.max_feature_nodes,
+        target_count=support.target_count,
+        scenario_id="phase-local-policy",
+        environment_label="cpu-test",
+        source_batch_size=support.logical_batch_size,
+        feature_batch_size=support.logical_batch_size,
+        logit_batch_size=support.logical_batch_size,
+    )
+    common = PhysicalExecutionRequirements(
+        session_capacity=support.session_capacity,
+        phase1_source_batch_size=support.phase1_source_batch_size,
+        source_microbatch_size=support.phase1_source_batch_size,
+        feature_microbatch_size=support.phase4_microbatch_size,
+        logit_microbatch_size=support.phase3_microbatch_size,
+        decoder_cache_bytes=support.decoder_cache_bytes,
+        replay_window=support.replay_window,
+        prefetch_depth=support.prefetch_depth,
+        encoder_residency=EncoderResidency.LAZY_PER_REQUEST,
+        spill_target=StorageTier.LOCAL,
+    )
+    roomy = _envelope(local_disk_bytes=GIB, walltime_seconds=10**30)
+    full = resolve_trace_plan(
+        semantics, profile, roomy, replace(common, row_store_policy=RowStorePolicy.FULL)
+    )
+    tiled = resolve_trace_plan(
+        semantics, profile, roomy, replace(common, row_store_policy=RowStorePolicy.TILED)
+    )
+    full_phases = {phase: (low, high) for phase, low, high in full.admission.phase_predictions}
+    tiled_phases = {phase: (low, high) for phase, low, high in tiled.admission.phase_predictions}
+    assert {
+        phase for phase in full_phases if full_phases[phase] != tiled_phases[phase]
+    } == {"phase4"}
+
+
+def test_v03_staged_projection_uses_elapsed_plus_remaining_phases() -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    support = profile.calibration_support
+    semantics = TraceSemantics(
+        prompt_token_count=support.prompt_token_count,
+        estimated_active_features=support.active_features,
+        max_feature_nodes=support.max_feature_nodes,
+        target_count=support.target_count,
+        scenario_id="staged-projection",
+        environment_label="cpu-test",
+        source_batch_size=support.logical_batch_size,
+        feature_batch_size=support.logical_batch_size,
+        logit_batch_size=support.logical_batch_size,
+    )
+    elapsed = 17.0
+    plan = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(host_budget_bytes=800 * GIB, walltime_seconds=10**30),
+        progress=PlanningProgress(
+            completed_phases=("phase0", "phase1", "phase2"),
+            observed_elapsed_seconds=elapsed,
+        ),
+    )
+    assert tuple(item[0] for item in plan.admission.remaining_projection) == (
+        "phase3",
+        "phase4",
+        "phase5",
+    )
+    expected_high = elapsed + sum(
+        high for _phase, _low, high in plan.admission.remaining_projection
+    )
+    assert _estimates(plan)["predicted_walltime_high"] == pytest.approx(expected_high)
+
+
+def test_v03_constrained_search_retains_intermediate_batch_rungs() -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    support = profile.calibration_support
+    semantics = TraceSemantics(
+        prompt_token_count=support.prompt_token_count,
+        estimated_active_features=support.active_features,
+        max_feature_nodes=support.max_feature_nodes,
+        target_count=support.target_count,
+        scenario_id="intermediate-rung",
+        environment_label="cpu-test",
+        source_batch_size=support.logical_batch_size,
+        feature_batch_size=support.logical_batch_size,
+        logit_batch_size=support.logical_batch_size,
+    )
+    plan = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(
+            total_vram_bytes=120 * GIB,
+            host_budget_bytes=800 * GIB,
+            file_cache_allowance_bytes=64 * GIB,
+            local_disk_bytes=100 * GIB,
+            scratch_disk_bytes=100 * GIB,
+        ),
+    )
+    assert plan.admission.admitted
+    assert plan.physical.session_capacity == 500
+    assert plan.physical.feature_microbatch_size == 500
+    assert plan.physical.logit_microbatch_size == 500

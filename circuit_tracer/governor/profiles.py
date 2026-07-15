@@ -3,12 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from .contracts import (
+    CalibrationSupport,
     DecoderTopology,
+    PhaseMemoryModel,
+    PhaseWalltimeModel,
     ProviderCapabilities,
     ProviderCostMetadata,
     ProviderDimensions,
     ProviderIdentity,
     ProviderProfile,
+    ProviderSafetyLimits,
     ResourceEnvelope,
     TraceSemantics,
     immutable_mapping,
@@ -18,8 +22,8 @@ from .resolver import compute_work_units
 
 GIB = 1024**3
 KIB = 1024
-PROFILE_VERSION = "granite-h200-v2"
-PLANNER_VERSION = "governor-v0.2"
+PROFILE_VERSION = "granite-h200-v3"
+PLANNER_VERSION = "governor-v0.3"
 
 
 @dataclass(frozen=True)
@@ -228,25 +232,56 @@ _CHECKPOINT_BYTES_BY_PROFILE = {
 _ROW_STORE_WALLTIME_MULTIPLIERS_BY_PROFILE = {
     "granite_h200_1b_clt_b1000_c4096_cache8": (
         ("file_backed_full", 1.0),
-        ("tiled", 3.25),
-        ("recompute", 6.4),
+        ("tiled", 1.5),
+        ("recompute", 3.05),
     ),
     "granite_h200_1b_plt_b128_c4096_cache0": (
         ("file_backed_full", 1.0),
-        ("tiled", 2.4),
-        ("recompute", 8.3),
+        ("tiled", 1.25),
+        ("recompute", 5.1),
     ),
     "granite_h200_4b_plt_b128_c4096_cache0": (
         ("file_backed_full", 1.0),
-        ("tiled", 2.4),
-        ("recompute", 8.3),
+        ("tiled", 1.25),
+        ("recompute", 5.1),
     ),
     "granite_h200_12b_plt_b64_c4096_cache0": (
         ("file_backed_full", 1.0),
-        ("tiled", 2.4),
-        ("recompute", 8.3),
+        ("tiled", 1.25),
+        ("recompute", 5.1),
     ),
 }
+
+_REPLAY_TILE_CACHE_BY_ARCHITECTURE = {"clt": 1 * GIB, "plt": 4 * GIB}
+
+
+def _session_memory_bytes_per_item(dimensions: ProviderDimensions) -> int:
+    reference = 26 * 1152
+    return round(87_000_000 * dimensions.n_layers * dimensions.d_model / reference)
+
+
+def _phase_walltime_models(
+    low: float, high: float
+) -> tuple[PhaseWalltimeModel, ...]:
+    # Additive phase shares replace the v0.2 all-phases multiplier. The total
+    # remains exactly anchored to the observed interval.
+    definitions = (
+        ("phase0", 0.10, {"affected_by_fetch": True, "affected_by_prefetch": True}),
+        ("phase1", 0.20, {"scales_with_session_steps": True, "scales_with_phase1_steps": True}),
+        ("phase2", 0.10, {}),
+        ("phase3", 0.20, {"scales_with_phase3_steps": True}),
+        ("phase4", 0.35, {"scales_with_phase4_steps": True, "affected_by_replay": True, "affected_by_row_policy": True}),
+        ("phase5", 0.05, {}),
+    )
+    return tuple(
+        PhaseWalltimeModel(
+            phase=phase,
+            reference_low_seconds=low * share,
+            reference_high_seconds=high * share,
+            **effects,
+        )
+        for phase, share, effects in definitions
+    )
 
 
 def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
@@ -296,18 +331,18 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
             supports_prefetch=True,
             supports_replay=True,
             supports_full_row_store=True,
-            supports_tiled_row_store=observation.validated_tiled_row_store,
-            supports_recompute_row_store=observation.validated_recompute_row_store,
+            supports_tiled_row_store=True,
+            supports_recompute_row_store=True,
         ),
         costs=ProviderCostMetadata(
-            cost_model_version="calibrated-v2",
+            cost_model_version="calibrated-v3",
             fixed_vram_bytes=_FIXED_VRAM_BY_PROFILE[observation.profile_name],
-            trace_vram_coefficient=0.0001,
+            trace_vram_coefficient=0.0,
             target_vram_coefficient=1.0,
-            source_microbatch_vram_coefficient=0.01,
-            feature_microbatch_vram_coefficient=0.01,
-            logit_microbatch_vram_coefficient=0.01,
-            replay_vram_coefficient=0.01,
+            source_microbatch_vram_coefficient=0.0,
+            feature_microbatch_vram_coefficient=0.0,
+            logit_microbatch_vram_coefficient=0.0,
+            replay_vram_coefficient=0.0,
             known_rigid_host_bytes=0,
             baseline_total_host_bytes=observation.max_rss_bytes_range[1],
             file_cache_included_in_host_baseline=True,
@@ -325,13 +360,13 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
         ),
         default_fetch_chunk_size=observation.fetch_chunk_size,
         max_fetch_chunk_size=observation.fetch_chunk_size,
-        max_session_capacity=observation.batch_size,
-        max_phase1_source_batch_size=observation.batch_size,
-        max_source_microbatch_size=physical_cap,
-        max_phase3_microbatch_size=physical_cap,
-        max_phase4_microbatch_size=physical_cap,
+        max_session_capacity=4096,
+        max_phase1_source_batch_size=4096,
+        max_source_microbatch_size=4096,
+        max_phase3_microbatch_size=4096,
+        max_phase4_microbatch_size=4096,
         default_decoder_cache_bytes=observation.decoder_cache_bytes,
-        max_decoder_cache_bytes=max(observation.decoder_cache_bytes, 8 * GIB),
+        max_decoder_cache_bytes=32 * GIB,
         default_replay_window=4,
         max_replay_window=8,
         default_prefetch_depth=2,
@@ -340,7 +375,80 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
             observation.reference_active_features
             / observation.reference_prompt_token_count
         ),
-        row_store_tile_column_bound=observation.row_store_tile_column_bound,
+        row_store_tile_column_bound=(
+            observation.row_store_tile_column_bound
+            or (16384 if observation.architecture == "plt" else 2048)
+        ),
+        safety_limits=ProviderSafetyLimits(
+            max_prompt_token_count=4096,
+            max_active_features=(
+                4096
+                * observation.dimensions.d_features
+                * observation.dimensions.n_layers
+            ),
+            max_feature_nodes=(
+                observation.dimensions.d_features * observation.dimensions.n_layers
+            ),
+            max_target_count=4096,
+            max_logical_batch_size=4096,
+            max_physical_rows=4096,
+            max_decoder_cache_bytes=32 * GIB,
+            max_replay_window=8,
+            max_prefetch_depth=4,
+            max_replay_tile_cache_bytes=16 * GIB,
+        ),
+        calibration_support=CalibrationSupport(
+            prompt_token_count=observation.reference_prompt_token_count,
+            active_features=observation.reference_active_features,
+            max_feature_nodes=observation.reference_max_feature_nodes,
+            target_count=observation.reference_target_count,
+            logical_batch_size=observation.batch_size,
+            session_capacity=observation.batch_size,
+            phase1_source_batch_size=observation.batch_size,
+            # The original exact-trace baseline is direct evidence for the
+            # larger CLT batches even though later Phase-D gates used a more
+            # conservative cap while validating the individual mechanisms.
+            phase3_microbatch_size=observation.batch_size,
+            phase4_microbatch_size=observation.batch_size,
+            decoder_cache_bytes=observation.decoder_cache_bytes,
+            replay_window=4,
+            prefetch_depth=2,
+            replay_tile_cache_bytes=(
+                _REPLAY_TILE_CACHE_BY_ARCHITECTURE[observation.architecture]
+            ),
+            row_store_policies=(
+                "file_backed_full",
+                *(("tiled",) if observation.validated_tiled_row_store else ()),
+                *(("recompute",) if observation.validated_recompute_row_store else ()),
+            ),
+            evidence=(observation.profile_name,),
+            provisional_dimensions=(
+                observation.dimensions.d_model != 1152
+                or observation.reference_prompt_token_count != 128
+            ),
+        ),
+        phase_memory_models=(
+            PhaseMemoryModel(
+                phase="session",
+                session_vram_bytes_per_item=_session_memory_bytes_per_item(
+                    observation.dimensions
+                ),
+                includes_decoder_cache=True,
+            ),
+            PhaseMemoryModel(phase="phase0"),
+            PhaseMemoryModel(phase="phase3"),
+            PhaseMemoryModel(
+                phase="phase4",
+                includes_replay_tile_cache=True,
+            ),
+        ),
+        phase_walltime_models=_phase_walltime_models(
+            observation.walltime_seconds_range[0],
+            observation.walltime_seconds_range[1],
+        ),
+        reference_replay_tile_cache_bytes=(
+            _REPLAY_TILE_CACHE_BY_ARCHITECTURE[observation.architecture]
+        ),
     )
 
 
@@ -403,6 +511,29 @@ def _stress_fixture(
             calibrated_walltime_high_seconds=200.0,
             walltime_reference_work_units=reference_work,
         ),
+        safety_limits=replace(
+            template.safety_limits,
+            max_decoder_cache_bytes=recommendation.decoder_cache_bytes,
+        ),
+        calibration_support=CalibrationSupport(
+            prompt_token_count=semantics.prompt_token_count,
+            active_features=semantics.estimated_nnz,
+            max_feature_nodes=semantics.max_feature_nodes,
+            target_count=semantics.target_count,
+            logical_batch_size=recommendation.batch_size,
+            session_capacity=recommendation.batch_size,
+            phase1_source_batch_size=recommendation.batch_size,
+            phase3_microbatch_size=recommendation.batch_size,
+            phase4_microbatch_size=recommendation.batch_size,
+            decoder_cache_bytes=recommendation.decoder_cache_bytes,
+            replay_window=1,
+            prefetch_depth=0,
+            replay_tile_cache_bytes=0,
+            row_store_policies=("file_backed_full",),
+            evidence=(f"historical-stress-{recommendation.size_label}",),
+        ),
+        phase_walltime_models=_phase_walltime_models(100.0, 200.0),
+        reference_replay_tile_cache_bytes=0,
         default_fetch_chunk_size=recommendation.fetch_chunk_size,
         max_fetch_chunk_size=recommendation.fetch_chunk_size,
         max_session_capacity=recommendation.batch_size,
@@ -412,9 +543,14 @@ def _stress_fixture(
         max_phase4_microbatch_size=recommendation.batch_size,
         default_decoder_cache_bytes=recommendation.decoder_cache_bytes,
         max_decoder_cache_bytes=recommendation.decoder_cache_bytes,
+        default_replay_window=1,
+        default_prefetch_depth=0,
     )
     envelope = ResourceEnvelope(
-        total_vram_bytes=141 * GIB,
+        # This is an arithmetic reproduction fixture, not an H200 admission
+        # claim. The historical presets require a larger synthetic envelope
+        # under the corrected v0.3 residency model.
+        total_vram_bytes=300 * GIB,
         host_budget_bytes=600 * GIB,
         file_cache_allowance_bytes=64 * GIB,
         local_disk_bytes=1024 * GIB,

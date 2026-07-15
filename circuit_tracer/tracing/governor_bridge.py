@@ -169,6 +169,7 @@ def _requirements(request: TraceRequest) -> PhysicalExecutionRequirements:
             != defaults.replay.error_vector_prefetch_lookahead
             else None
         ),
+        replay_tile_cache_bytes=storage.replay_tile_cache_bytes,
         encoder_residency=(
             EncoderResidency.EAGER if storage.exact_encoder_residency != "lazy" else None
         ),
@@ -205,6 +206,7 @@ def _compile_execution(request: TraceRequest, planning: Any) -> Any:
             "env_node_local" if placement is StorageTier.LOCAL else "default"
         ),
         placement=placement,
+        replay_tile_cache_bytes=physical.replay_tile_cache_bytes,
     )
     phase1_is_capped = (
         physical.phase1_source_batch_size < planning.semantics.source_batch_size

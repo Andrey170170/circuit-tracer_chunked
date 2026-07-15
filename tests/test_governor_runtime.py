@@ -199,7 +199,30 @@ def test_all_planning_epochs_are_ordered_and_semantics_stay_stable() -> None:
     )
 
 
-def test_actual_nnz_revises_storage_rung_before_claim() -> None:
+def test_loaded_probe_bytes_replace_matching_memory_estimates() -> None:
+    governed, _ = runtime()
+    governed.pre_execution_admission()
+    observation = replace(
+        unavailable_loaded_state(),
+        decoder_probe=ProviderUnitProbe(
+            "decoder_chunk", True, elapsed_ms=1.0, materialized_bytes=1234
+        ),
+        encoder_probe=ProviderUnitProbe(
+            "encoder_row", True, elapsed_ms=1.0, materialized_bytes=5678
+        ),
+    )
+
+    revision = governed.loaded_state_calibration(observation)
+
+    estimates = {
+        estimate.name: estimate.amount for estimate in revision.plan.admission.estimates
+    }
+    assert estimates["decoder_fetch_vram"] == 1234
+    models = {model.phase: model for model in governed.profile.phase_memory_models}
+    assert models["phase4"].host_bytes_per_item == 5678
+
+
+def test_replay_cache_and_storage_cooptimize_after_actual_nnz() -> None:
     governed, _ = runtime(nnz=1000, disk=100_000)
     assert governed.current_plan.physical.row_store_policy == "recompute"
     advance_to_active(governed)
@@ -207,7 +230,10 @@ def test_actual_nnz_revises_storage_rung_before_claim() -> None:
     revision = governed.active_universe_replan(active_observation(100))
 
     assert revision.plan.physical.row_store_policy == "file_backed_full"
-    assert revision.plan.physical.row_store_bytes == 40_400
+    assert revision.plan.physical.replay_tile_cache_bytes == 0
+    assert {"row_store_policy", "replay_tile_cache_bytes"} <= set(
+        revision.changed_mechanisms
+    )
     grant = governed.grant(PhaseId.PHASE2)
     assert grant is not None
     assert next(claim.amount for claim in grant.claims if claim.name == "row_store_disk") == 40_400
@@ -342,6 +368,19 @@ def test_phase_entry_observation_reuses_prior_actual_measurement() -> None:
     assert observation.attrs["host_rss_bytes"] == 40
     assert "vram_prediction_error_bytes" in observation.attrs
     assert "effective_phase_vram_budget_bytes" in observation.attrs
+    phase3_plan_event = next(
+        event
+        for event in observer.events
+        if event.name == "planning.phase3_entry_replan"
+    )
+    remaining = phase3_plan_event.attrs["remaining_projection"]
+    assert tuple(item[0] for item in remaining) == ("phase3", "phase4", "phase5")
+    projected_high = next(
+        value
+        for name, value in phase3_plan_event.attrs["selected_objective"]
+        if name == "predicted_walltime_high_seconds"
+    )
+    assert projected_high == pytest.approx(1.5 + sum(item[2] for item in remaining))
     governed.release(grant)
 
 
@@ -387,7 +426,7 @@ def test_phase_entry_actual_vram_tightens_the_optimizer_envelope(monkeypatch) ->
     governed.phase3_entry_replan()
 
     assert captured_envelopes[-1].effective_vram_budget_bytes == (
-        governed.envelope.effective_vram_budget_bytes - 1024
+        governed.envelope.effective_vram_budget_bytes - 2048
     )
     observation = next(
         event
@@ -395,7 +434,7 @@ def test_phase_entry_actual_vram_tightens_the_optimizer_envelope(monkeypatch) ->
         if event.name == "planning.observation"
         and event.attrs["epoch"] == PlanningEpoch.PHASE3_ENTRY_REPLAN.value
     )
-    assert observation.attrs["vram_prediction_error_bytes"] == 1024
+    assert observation.attrs["vram_prediction_error_bytes"] == 2048
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -577,6 +616,62 @@ def test_phase_boundaries_record_measured_and_planned_usage() -> None:
     assert [event.attrs["boundary"] for event in events] == ["grant", "release"]
     assert events[0].attrs["cuda_reserved_bytes"] == 20
     assert events[0].attrs["planned_vram_bytes"] > 0
+
+
+def test_v03_grant_resets_cuda_peak_and_release_reports_phase_peak() -> None:
+    class Sampler:
+        def __init__(self) -> None:
+            self.resets = 0
+
+        def reset_cuda_peak(self) -> None:
+            self.resets += 1
+
+        def sample(self, *, started_at):
+            del started_at
+            return ResourceUsageObservation(
+                cuda_allocated_bytes=10,
+                cuda_reserved_bytes=20,
+                cuda_total_bytes=141 * GIB,
+                host_rss_bytes=30,
+                host_available_bytes=40,
+                elapsed_seconds=1.5,
+                cuda_peak_allocated_bytes=111,
+                cuda_peak_reserved_bytes=222,
+            )
+
+    governed, observer = runtime()
+    sampler = Sampler()
+    governed._resource_usage_sampler = sampler
+    advance_to_active(governed)
+    governed.active_universe_replan(active_observation(100))
+    grant = governed.grant(PhaseId.PHASE3)
+    governed.release(grant)
+
+    events = [
+        event for event in observer.events if event.name == "planning.resource_actual"
+    ]
+    assert sampler.resets == 1
+    assert events[-1].attrs["boundary"] == "release"
+    assert events[-1].attrs["cuda_peak_allocated_bytes"] == 111
+    assert events[-1].attrs["cuda_peak_reserved_bytes"] == 222
+
+
+def test_v03_loaded_residency_uses_max_observed_not_allocated_plus_reserved() -> None:
+    governed, _ = runtime()
+    governed.pre_execution_admission()
+    governed.loaded_state_calibration(
+        replace(
+            unavailable_loaded_state(),
+            cuda_allocated_bytes=100,
+            cuda_reserved_bytes=150,
+        )
+    )
+    model_vram = next(
+        estimate.amount
+        for estimate in governed.current_plan.admission.estimates
+        if estimate.name == "model_vram"
+    )
+    assert model_vram == 150
 
 
 def test_measured_usage_over_budget_fails_and_releases_grant() -> None:

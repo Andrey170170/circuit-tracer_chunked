@@ -15,8 +15,13 @@ if TYPE_CHECKING:
     from .contracts import FidelityMode
     from .contracts import PhysicalExecutionConfig
     from .contracts import PhysicalExecutionRequirements
+    from .contracts import PlanningProgress
+    from .contracts import PhaseMemoryModel
+    from .contracts import PhaseWalltimeModel
     from .contracts import PlanStatus
     from .contracts import ProviderCapabilities
+    from .contracts import ProviderSafetyLimits
+    from .contracts import CalibrationSupport
     from .contracts import ProviderCostMetadata
     from .contracts import ProviderDimensions
     from .contracts import ProviderIdentity
@@ -72,8 +77,13 @@ _CONTRACT_EXPORTS = {
     "FidelityMode",
     "PhysicalExecutionConfig",
     "PhysicalExecutionRequirements",
+    "PlanningProgress",
+    "PhaseMemoryModel",
+    "PhaseWalltimeModel",
     "PlanStatus",
     "ProviderCapabilities",
+    "ProviderSafetyLimits",
+    "CalibrationSupport",
     "ProviderCostMetadata",
     "ProviderDimensions",
     "ProviderIdentity",
@@ -138,11 +148,16 @@ __all__ = [
     "LoadedStateObservation",
     "PhysicalExecutionConfig",
     "PhysicalExecutionRequirements",
+    "PlanningProgress",
+    "PhaseMemoryModel",
+    "PhaseWalltimeModel",
     "PlanStatus",
     "PlanningEpoch",
     "PlanningEpochOrderError",
     "PlanRevision",
     "ProviderCapabilities",
+    "ProviderSafetyLimits",
+    "CalibrationSupport",
     "ProviderCostMetadata",
     "ProviderDimensions",
     "ProviderIdentity",

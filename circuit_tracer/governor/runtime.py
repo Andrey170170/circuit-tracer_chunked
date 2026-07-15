@@ -25,6 +25,7 @@ from .contracts import (
     EncoderResidency,
     PhysicalExecutionConfig,
     PhysicalExecutionRequirements,
+    PlanningProgress,
     ProviderProfile,
     ResourceEnvelope,
     RowStorePolicy,
@@ -140,6 +141,8 @@ class ResourceUsageObservation:
     host_rss_bytes: int | None
     host_available_bytes: int | None
     elapsed_seconds: float
+    cuda_peak_allocated_bytes: int | None = None
+    cuda_peak_reserved_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -161,15 +164,19 @@ class PhaseEntryObservation:
 class ResourceUsageSampler(Protocol):
     def sample(self, *, started_at: float) -> ResourceUsageObservation: ...
 
+    def reset_cuda_peak(self) -> None: ...
+
 
 class TorchResourceUsageSampler:
     """Low-overhead process/CUDA measurements at governor phase boundaries."""
 
     def sample(self, *, started_at: float) -> ResourceUsageObservation:
-        allocated = reserved = total = None
+        allocated = reserved = total = peak_allocated = peak_reserved = None
         if torch.cuda.is_available():
             allocated = int(torch.cuda.memory_allocated())
             reserved = int(torch.cuda.memory_reserved())
+            peak_allocated = int(torch.cuda.max_memory_allocated())
+            peak_reserved = int(torch.cuda.max_memory_reserved())
             total = int(
                 torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
             )
@@ -188,7 +195,13 @@ class TorchResourceUsageSampler:
             host_rss_bytes=rss,
             host_available_bytes=available,
             elapsed_seconds=time.perf_counter() - started_at,
+            cuda_peak_allocated_bytes=peak_allocated,
+            cuda_peak_reserved_bytes=peak_reserved,
         )
+
+    def reset_cuda_peak(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
 
 def _tensor_bytes(value: object) -> int | None:
@@ -325,9 +338,37 @@ class TraceGovernorRuntime:
         epoch = PlanningEpoch.LOADED_STATE_CALIBRATION
         self._require_epoch(epoch)
         costs = self.profile.costs
-        measured = observation.cuda_allocated_bytes
+        measured_values = tuple(
+            value
+            for value in (
+                observation.cuda_allocated_bytes,
+                observation.cuda_reserved_bytes,
+            )
+            if value is not None
+        )
+        measured = max(measured_values) if measured_values else None
         if measured is not None:
             self.profile = replace(self.profile, costs=replace(costs, fixed_vram_bytes=measured))
+        measured_models = tuple(
+            replace(
+                model,
+                fixed_vram_bytes=(
+                    observation.decoder_probe.materialized_bytes
+                    if model.phase == "phase0"
+                    and observation.decoder_probe.materialized_bytes is not None
+                    else model.fixed_vram_bytes
+                ),
+                host_bytes_per_item=(
+                    observation.encoder_probe.materialized_bytes
+                    if model.phase == "phase4"
+                    and observation.encoder_probe.materialized_bytes is not None
+                    else model.host_bytes_per_item
+                ),
+            )
+            for model in self.profile.phase_memory_models
+        )
+        if measured_models:
+            self.profile = replace(self.profile, phase_memory_models=measured_models)
         if observation.cuda_total_bytes is not None:
             self.envelope = replace(self.envelope, total_vram_bytes=observation.cuda_total_bytes)
         discovery = self._host_budget_discoverer(self.envelope.host_budget_bytes)
@@ -395,6 +436,7 @@ class TraceGovernorRuntime:
             source_microbatch_size=current.source_microbatch_size,
             replay_window=current.replay_window,
             prefetch_depth=current.prefetch_depth,
+            replay_tile_cache_bytes=self.requirements.replay_tile_cache_bytes,
         )
         candidate = resolve_trace_plan(
             self.workload,
@@ -403,6 +445,7 @@ class TraceGovernorRuntime:
             late_requirements,
             frozen_fields=_FROZEN_FIELDS,
             reported_hard_constraints=self.requirements,
+            progress=self._planning_progress(("phase0",)),
         )
         candidate = replace(candidate, semantic_fingerprint=self.current_plan.semantic_fingerprint)
         changed = _changed_physical(self.current_plan.physical, candidate.physical)
@@ -474,6 +517,7 @@ class TraceGovernorRuntime:
             logit_microbatch_size=current.logit_microbatch_size,
             replay_window=current.replay_window,
             prefetch_depth=current.prefetch_depth,
+            replay_tile_cache_bytes=current.replay_tile_cache_bytes,
             encoder_residency=EncoderResidency(current.encoder_residency),
             row_store_policy=RowStorePolicy(current.row_store_policy),
             spill_target=(
@@ -493,6 +537,11 @@ class TraceGovernorRuntime:
             requirements,
             frozen_fields=frozen_fields,
             reported_hard_constraints=self.requirements,
+            progress=self._planning_progress(
+                ("phase0", "phase1", "phase2")
+                if target_phase is PhaseId.PHASE3
+                else ("phase0", "phase1", "phase2", "phase3")
+            ),
         )
         candidate = replace(candidate, semantic_fingerprint=self.current_plan.semantic_fingerprint)
         changed = _changed_physical(current, candidate.physical)
@@ -518,6 +567,22 @@ class TraceGovernorRuntime:
         if not candidate.admission.admitted:
             raise RuntimePlanningRefusedError(revision)
         return revision
+
+    def _planning_progress(
+        self, completed_phases: tuple[str, ...]
+    ) -> PlanningProgress:
+        if self._last_resource_usage is not None:
+            elapsed = self._last_resource_usage[2].elapsed_seconds
+        else:
+            elapsed = sum(
+                high
+                for phase, _low, high in self.current_plan.admission.phase_predictions
+                if phase in completed_phases
+            )
+        return PlanningProgress(
+            completed_phases=completed_phases,
+            observed_elapsed_seconds=elapsed,
+        )
 
     def _phase_entry_observation(self, target_phase: PhaseId) -> PhaseEntryObservation:
         persistent_names = {
@@ -552,10 +617,17 @@ class TraceGovernorRuntime:
                 ),
             )
         prior_phase, prior_boundary, usage = prior
+        observed_residencies = tuple(
+            value
+            for value in (
+                usage.cuda_allocated_bytes,
+                usage.cuda_reserved_bytes,
+            )
+            if value is not None
+        )
+        observed_residency = max(observed_residencies) if observed_residencies else None
         prediction_error = (
-            None
-            if usage.cuda_allocated_bytes is None
-            else usage.cuda_allocated_bytes - predicted_persistent
+            None if observed_residency is None else observed_residency - predicted_persistent
         )
         effective_budget = max(
             0,
@@ -581,6 +653,9 @@ class TraceGovernorRuntime:
         claims = _claims_for_phase(self.current_plan.admission.estimates, phase)
         if not claims:
             return None
+        reset = getattr(self._resource_usage_sampler, "reset_cuda_peak", None)
+        if callable(reset):
+            reset()
         grant = self.ledger.grant(phase, claims)
         self._grants.append(grant)
         try:
@@ -645,6 +720,8 @@ class TraceGovernorRuntime:
                     "cuda_allocated_bytes": usage.cuda_allocated_bytes,
                     "cuda_reserved_bytes": usage.cuda_reserved_bytes,
                     "cuda_total_bytes": usage.cuda_total_bytes,
+                    "cuda_peak_allocated_bytes": usage.cuda_peak_allocated_bytes,
+                    "cuda_peak_reserved_bytes": usage.cuda_peak_reserved_bytes,
                     "host_rss_bytes": usage.host_rss_bytes,
                     "host_available_bytes": usage.host_available_bytes,
                     "elapsed_seconds": usage.elapsed_seconds,
@@ -729,8 +806,19 @@ class TraceGovernorRuntime:
                     "decoder_fetch_chunk_size": candidate.physical.decoder_fetch_chunk_size,
                     "replay_window": candidate.physical.replay_window,
                     "prefetch_depth": candidate.physical.prefetch_depth,
+                    "replay_tile_cache_bytes": (
+                        candidate.physical.replay_tile_cache_bytes
+                    ),
                     "encoder_residency": candidate.physical.encoder_residency,
                     "cache_policy": candidate.physical.cache_policy.value,
+                    "confidence": candidate.admission.confidence,
+                    "extrapolated_dimensions": (
+                        candidate.admission.extrapolated_dimensions
+                    ),
+                    "calibration_evidence": candidate.admission.calibration_evidence,
+                    "phase_predictions": candidate.admission.phase_predictions,
+                    "remaining_projection": candidate.admission.remaining_projection,
+                    "domain_summary": candidate.admission.domain_summary,
                 },
             )
         )
@@ -875,12 +963,22 @@ _PHASE_CLAIMS = {
     PhaseId.PHASE1: {"prompt_host"},
     PhaseId.PHASE2: {"active_host", "row_store_disk"},
     PhaseId.PHASE3: {"target_vram", "logit_microbatch_vram"},
-    PhaseId.PHASE4: {"feature_microbatch_vram", "encoder_residency_host"},
+    PhaseId.PHASE4: {
+        "feature_microbatch_vram", "encoder_residency_host",
+        "replay_tile_cache_host",
+    },
     PhaseId.PHASE5: {"predicted_walltime_high"},
 }
 
 _EXCLUDED_ESTIMATES = {
     "predicted_walltime_low": "upper-bound walltime claim supersedes lower-bound estimate",
+    **{
+        f"predicted_walltime_phase{phase}_{bound}": (
+            "additive phase projection is metadata; total upper-bound claim owns admission"
+        )
+        for phase in range(6)
+        for bound in ("low", "high")
+    },
 }
 
 

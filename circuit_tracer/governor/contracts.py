@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
 
 
-FINGERPRINT_SCHEMA_VERSION = 2
+FINGERPRINT_SCHEMA_VERSION = 3
 _DTYPE_BYTE_WIDTHS = MappingProxyType({"fp16": 2, "bf16": 2, "fp32": 4, "fp64": 8})
 _K = TypeVar("_K")
 _V = TypeVar("_V")
@@ -365,6 +365,117 @@ class ProviderCapabilities:
 
 
 @dataclass(frozen=True)
+class ProviderSafetyLimits:
+    """Hard provider bounds. Requests beyond these limits are invalid."""
+
+    max_prompt_token_count: int
+    max_active_features: int
+    max_feature_nodes: int
+    max_target_count: int
+    max_logical_batch_size: int
+    max_physical_rows: int
+    max_decoder_cache_bytes: int
+    max_replay_window: int
+    max_prefetch_depth: int
+    max_replay_tile_cache_bytes: int
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            if field.name in {
+                "max_decoder_cache_bytes",
+                "max_prefetch_depth",
+                "max_replay_tile_cache_bytes",
+            }:
+                _nonnegative(field.name, getattr(self, field.name))
+            else:
+                _positive(field.name, getattr(self, field.name))
+
+
+@dataclass(frozen=True)
+class CalibrationSupport:
+    """Region directly supported by named calibration evidence."""
+
+    prompt_token_count: int
+    active_features: int
+    max_feature_nodes: int
+    target_count: int
+    logical_batch_size: int
+    session_capacity: int
+    phase1_source_batch_size: int
+    phase3_microbatch_size: int
+    phase4_microbatch_size: int
+    decoder_cache_bytes: int
+    replay_window: int
+    prefetch_depth: int
+    replay_tile_cache_bytes: int
+    row_store_policies: tuple[str, ...]
+    evidence: tuple[str, ...]
+    provisional_dimensions: bool = False
+
+    def __post_init__(self) -> None:
+        for name in (
+            "prompt_token_count", "active_features", "max_feature_nodes",
+            "target_count", "logical_batch_size", "session_capacity",
+            "phase1_source_batch_size", "phase3_microbatch_size",
+            "phase4_microbatch_size", "replay_window",
+        ):
+            _positive(name, getattr(self, name))
+        for name in (
+            "decoder_cache_bytes", "prefetch_depth", "replay_tile_cache_bytes"
+        ):
+            _nonnegative(name, getattr(self, name))
+        if not self.row_store_policies or not self.evidence:
+            raise ValueError("calibration support requires row policies and evidence")
+        if len(set(self.row_store_policies)) != len(self.row_store_policies):
+            raise ValueError("row_store_policies must be unique")
+        if any(not item for item in self.evidence):
+            raise ValueError("calibration evidence names must be nonempty")
+
+
+@dataclass(frozen=True)
+class PhaseMemoryModel:
+    """Concurrent memory terms used by one execution phase."""
+
+    phase: str
+    fixed_vram_bytes: int = 0
+    session_vram_bytes_per_item: int = 0
+    microbatch_vram_bytes_per_item: int = 0
+    host_bytes_per_item: int = 0
+    includes_decoder_cache: bool = False
+    includes_replay_tile_cache: bool = False
+
+    def __post_init__(self) -> None:
+        _nonempty("phase", self.phase)
+        for field in fields(self):
+            if field.name != "phase" and not isinstance(getattr(self, field.name), bool):
+                _nonnegative(field.name, getattr(self, field.name))
+
+
+@dataclass(frozen=True)
+class PhaseWalltimeModel:
+    """Additive calibrated phase interval and the dimensions that scale it."""
+
+    phase: str
+    reference_low_seconds: float
+    reference_high_seconds: float
+    scales_with_session_steps: bool = False
+    scales_with_phase1_steps: bool = False
+    scales_with_phase3_steps: bool = False
+    scales_with_phase4_steps: bool = False
+    affected_by_fetch: bool = False
+    affected_by_replay: bool = False
+    affected_by_prefetch: bool = False
+    affected_by_row_policy: bool = False
+
+    def __post_init__(self) -> None:
+        _nonempty("phase", self.phase)
+        _nonnegative("reference_low_seconds", self.reference_low_seconds)
+        _nonnegative("reference_high_seconds", self.reference_high_seconds)
+        if self.reference_high_seconds < self.reference_low_seconds:
+            raise ValueError("phase walltime interval must be ordered")
+
+
+@dataclass(frozen=True)
 class ProviderCostMetadata:
     cost_model_version: str
     fixed_vram_bytes: int
@@ -468,6 +579,11 @@ class ProviderProfile:
     default_encoder_residency: EncoderResidency = EncoderResidency.LAZY_PER_REQUEST
     row_store_tile_column_bound: int | None = None
     calibration_label: str = "resource_calibration_only"
+    safety_limits: ProviderSafetyLimits | None = None
+    calibration_support: CalibrationSupport | None = None
+    phase_memory_models: tuple[PhaseMemoryModel, ...] = ()
+    phase_walltime_models: tuple[PhaseWalltimeModel, ...] = ()
+    reference_replay_tile_cache_bytes: int = 0
 
     def __post_init__(self) -> None:
         for name in ("profile_name", "profile_version", "planner_version"):
@@ -506,6 +622,17 @@ class ProviderProfile:
             raise ValueError("tiled row-store capability requires a tile column bound")
         if self.calibration_label != "resource_calibration_only":
             raise ValueError("provider profiles are resource calibration only")
+        _nonnegative(
+            "reference_replay_tile_cache_bytes",
+            self.reference_replay_tile_cache_bytes,
+        )
+        for name, models in (
+            ("phase_memory_models", self.phase_memory_models),
+            ("phase_walltime_models", self.phase_walltime_models),
+        ):
+            phases = tuple(model.phase for model in models)
+            if len(set(phases)) != len(phases):
+                raise ValueError(f"{name} phases must be unique")
 
     @property
     def profile_fingerprint(self) -> str:
@@ -593,6 +720,20 @@ class DemandEstimate:
 
 
 @dataclass(frozen=True)
+class PlanningProgress:
+    """Observed prefix and completed phase set for a staged replan."""
+
+    completed_phases: tuple[str, ...] = ()
+    observed_elapsed_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        phase_order = tuple(f"phase{index}" for index in range(6))
+        if self.completed_phases != phase_order[: len(self.completed_phases)]:
+            raise ValueError("completed_phases must be an ordered phase0..phase5 prefix")
+        _nonnegative("observed_elapsed_seconds", self.observed_elapsed_seconds)
+
+
+@dataclass(frozen=True)
 class PhysicalExecutionConfig:
     decoder_fetch_chunk_size: int
     decoder_cache_bytes: int
@@ -603,6 +744,7 @@ class PhysicalExecutionConfig:
     logit_microbatch_size: int
     replay_window: int
     prefetch_depth: int
+    replay_tile_cache_bytes: int
     encoder_residency: str
     row_store_policy: str
     row_store_bytes: int
@@ -620,8 +762,13 @@ class PhysicalExecutionConfig:
             "replay_window",
         ):
             _positive(name, getattr(self, name))
-        for name in ("decoder_cache_bytes", "prefetch_depth", "row_store_bytes"):
+        for name in (
+            "decoder_cache_bytes", "prefetch_depth", "replay_tile_cache_bytes",
+            "row_store_bytes",
+        ):
             _nonnegative(name, getattr(self, name))
+        if self.row_store_policy != "recompute" and self.replay_tile_cache_bytes:
+            raise ValueError("replay_tile_cache_bytes must be zero unless recomputing")
         if self.spill_target not in {None, "local", "scratch"}:
             raise ValueError("spill_target must be local, scratch, or None")
 
@@ -639,6 +786,7 @@ class PhysicalExecutionRequirements:
     logit_microbatch_size: int | None = None
     replay_window: int | None = None
     prefetch_depth: int | None = None
+    replay_tile_cache_bytes: int | None = None
     encoder_residency: EncoderResidency | None = None
     row_store_policy: RowStorePolicy | None = None
     spill_target: StorageTier | None = None
@@ -657,7 +805,7 @@ class PhysicalExecutionRequirements:
             value = getattr(self, name)
             if value is not None:
                 _positive(name, value)
-        for name in ("decoder_cache_bytes", "prefetch_depth"):
+        for name in ("decoder_cache_bytes", "prefetch_depth", "replay_tile_cache_bytes"):
             value = getattr(self, name)
             if value is not None:
                 _nonnegative(name, value)
@@ -672,6 +820,12 @@ class PhysicalExecutionRequirements:
                 raise ValueError(f"{name} must be a {enum_type.__name__}")
         if self.row_store_policy is RowStorePolicy.RECOMPUTE and self.spill_target is not None:
             raise ValueError("recompute row storage cannot require a spill target")
+        if (
+            self.row_store_policy is not None
+            and self.row_store_policy is not RowStorePolicy.RECOMPUTE
+            and self.replay_tile_cache_bytes not in (None, 0)
+        ):
+            raise ValueError("replay_tile_cache_bytes requires recompute row storage")
 
 
 @dataclass(frozen=True)
@@ -692,6 +846,12 @@ class AdmissionReport:
     binding_constraints: tuple[str, ...] = ()
     selected_objective: tuple[tuple[str, float], ...] = ()
     rejected_candidates: tuple[str, ...] = ()
+    confidence: str = "unknown"
+    extrapolated_dimensions: tuple[str, ...] = ()
+    calibration_evidence: tuple[str, ...] = ()
+    phase_predictions: tuple[tuple[str, float, float], ...] = ()
+    remaining_projection: tuple[tuple[str, float, float], ...] = ()
+    domain_summary: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         _positive("trace_capacity", self.trace_capacity)
@@ -706,6 +866,8 @@ class AdmissionReport:
             raise ValueError("binding_reasons must not be empty")
         if self.admitted == bool(self.refusals):
             raise ValueError("admitted must be false exactly when refusals are present")
+        if self.confidence not in {"calibrated", "provisional", "extrapolated", "unknown"}:
+            raise ValueError("invalid admission confidence")
 
     def format(self) -> str:
         lines = [

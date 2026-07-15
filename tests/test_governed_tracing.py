@@ -88,10 +88,10 @@ def test_governed_clt_compiles_roomy_optimized_plan() -> None:
     governed = resolve_trace_request(selected, resources=envelope(), provider_profile=profile)
 
     assert governed.semantics.source_batch_size == 1000
-    assert governed.execution.session.capacity == 125
-    assert governed.execution.session.source_microbatch_max_rows == 125
-    assert governed.execution.session.phase3_microbatch_max_rows == 125
-    assert governed.execution.session.phase4_microbatch_max_rows == 125
+    assert governed.execution.session.capacity == governed.planning_trace_plan.physical.session_capacity
+    assert governed.execution.session.source_microbatch_max_rows == governed.planning_trace_plan.physical.source_microbatch_size
+    assert governed.execution.session.phase3_microbatch_max_rows == governed.planning_trace_plan.physical.logit_microbatch_size
+    assert governed.execution.session.phase4_microbatch_max_rows == governed.planning_trace_plan.physical.feature_microbatch_size
     assert governed.execution.session.phase1_trace_batch_policy == "legacy"
     assert governed.execution.session.decoder_cache.max_bytes == 8 * GIB
     assert governed.execution.decoder.fetch_chunk_size == 4096
@@ -125,6 +125,10 @@ def test_constrained_envelopes_select_validated_storage_rungs(disk, expected) ->
     assert actual == expected
     if expected == "column_tiled_v1":
         assert plan.execution.storage.feature_column_tile_size == 2048
+    if expected == "none_recompute":
+        assert plan.execution.storage.replay_tile_cache_bytes == 1 * GIB
+    else:
+        assert plan.execution.storage.replay_tile_cache_bytes == 0
 
 
 def test_provider_mismatch_and_planning_refusal_fail_closed() -> None:
@@ -213,12 +217,12 @@ def test_batch_and_session_pin_and_propagate_governed_inputs(monkeypatch) -> Non
 
     monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute)
     results = trace_batch([selected], resources=resources, provider_profile=profile)
-    assert results[0].output == (0, 64)
+    assert results[0].output == (0, 128)
 
     session = open_session(selected, resources=resources, provider_profile=profile)
     assert session.resources is resources
     assert session.provider_profile is profile
-    assert session.trace().output == (0, 64)
+    assert session.trace().output == (0, 128)
     session.close()
 
 

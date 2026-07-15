@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import subprocess
 import sys
 from types import MappingProxyType
@@ -73,15 +71,11 @@ def test_each_recorded_profile_admits_and_reproduces_calibrated_plan():
         amounts = _amounts(plan)
         assert plan.admission.admitted, plan.format()
         assert plan.physical.decoder_fetch_chunk_size == observation.fetch_chunk_size
-        calibrated_cap = observation.validated_physical_batch_cap
-        expected_physical_cap = math.ceil(
-            observation.batch_size / math.ceil(observation.batch_size / calibrated_cap)
-        )
-        assert plan.physical.session_capacity == expected_physical_cap
+        assert plan.physical.session_capacity == observation.batch_size
         assert plan.physical.phase1_source_batch_size == observation.batch_size
-        assert plan.physical.source_microbatch_size == expected_physical_cap
-        assert plan.physical.feature_microbatch_size == expected_physical_cap
-        assert plan.physical.logit_microbatch_size == expected_physical_cap
+        assert plan.physical.source_microbatch_size == observation.batch_size
+        assert plan.physical.feature_microbatch_size == observation.batch_size
+        assert plan.physical.logit_microbatch_size == observation.batch_size
         assert plan.physical.replay_window == 4
         assert plan.physical.prefetch_depth == 2
         assert plan.physical.encoder_residency == "lazy_per_request"
@@ -100,17 +94,14 @@ def test_each_recorded_profile_admits_and_reproduces_calibrated_plan():
         assert amounts["encoder_residency_host"] == 0
         assert amounts["replay_host"] == 0
         assert profile.capabilities.supports_full_row_store
-        assert (
-            profile.capabilities.supports_tiled_row_store
-            is observation.validated_tiled_row_store
-        )
-        assert (
-            profile.capabilities.supports_recompute_row_store
-            is observation.validated_recompute_row_store
-        )
+        assert profile.capabilities.supports_tiled_row_store
+        assert profile.capabilities.supports_recompute_row_store
+        supported_policies = profile.calibration_support.row_store_policies
+        assert ("tiled" in supported_policies) is observation.validated_tiled_row_store
+        assert ("recompute" in supported_policies) is observation.validated_recompute_row_store
         assert (
             profile.row_store_tile_column_bound
-            == observation.row_store_tile_column_bound
+            == (observation.row_store_tile_column_bound or 16384)
         )
         fixed_vram.append(amounts["model_vram"])
         fixed_host.append(amounts["baseline_total_host"])
@@ -130,6 +121,34 @@ def test_each_recorded_profile_admits_and_reproduces_calibrated_plan():
     assert len(set(fixed_vram)) == 4
     assert len(set(fixed_host)) == 4
     assert len(set(checkpoint_files)) == 4
+
+
+def test_v03_profiles_separate_safety_support_and_session_memory() -> None:
+    clt = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    plt = RECORDED_PROVIDER_PROFILES["granite_h200_1b_plt_b128_c4096_cache0"]
+    larger = (
+        RECORDED_PROVIDER_PROFILES["granite_h200_4b_plt_b128_c4096_cache0"],
+        RECORDED_PROVIDER_PROFILES["granite_h200_12b_plt_b64_c4096_cache0"],
+    )
+
+    assert clt.safety_limits.max_physical_rows == 4096
+    assert plt.safety_limits.max_physical_rows == 4096
+    assert clt.phase_memory_models[0].session_vram_bytes_per_item == 87_000_000
+    assert plt.phase_memory_models[0].session_vram_bytes_per_item == 87_000_000
+    assert all(
+        profile.phase_memory_models[0].session_vram_bytes_per_item > 87_000_000
+        and profile.calibration_support.provisional_dimensions
+        for profile in larger
+    )
+    assert clt.reference_replay_tile_cache_bytes == 1 * GIB
+    assert plt.reference_replay_tile_cache_bytes == 4 * GIB
+    assert clt.calibration_support.replay_tile_cache_bytes == 1 * GIB
+    assert plt.calibration_support.replay_tile_cache_bytes == 4 * GIB
+    assert all(
+        model.microbatch_vram_bytes_per_item == 0
+        for profile in (clt, plt, *larger)
+        for model in profile.phase_memory_models
+    )
 
 
 def test_historical_stress_fixtures_resolve_to_recommendations():

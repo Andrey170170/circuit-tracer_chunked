@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from itertools import product
 
 from .contracts import (
     AdmissionReport,
@@ -11,15 +10,18 @@ from .contracts import (
     DemandEstimate,
     DemandLifetime,
     DemandTier,
+    EncoderResidency,
     FidelityMode,
     PhysicalExecutionConfig,
     PhysicalExecutionRequirements,
+    PlanningProgress,
     PlanStatus,
     ProviderDimensions,
     ProviderCostMetadata,
     ProviderProfile,
     ResourceEnvelope,
     RowStorePolicy,
+    StorageTier,
     TracePlan,
     TraceSemantics,
     TRUSTED_VALIDATION_EVIDENCE_REGISTRY,
@@ -368,6 +370,16 @@ def _resolve_physical(
         refusals.append(row_refusal)
     if row_policy != "file_backed_full":
         warnings.append(f"selected row-store degradation rung {row_policy}")
+    if row_policy == "recompute":
+        replay_tile_cache_bytes = (
+            profile.reference_replay_tile_cache_bytes
+            if requirements.replay_tile_cache_bytes is None
+            else requirements.replay_tile_cache_bytes
+        )
+    else:
+        replay_tile_cache_bytes = 0
+        if requirements.replay_tile_cache_bytes not in (None, 0):
+            raise ValueError("replay_tile_cache_bytes requires recompute row storage")
 
     physical = PhysicalExecutionConfig(
         decoder_fetch_chunk_size=fetch,
@@ -379,6 +391,7 @@ def _resolve_physical(
         logit_microbatch_size=microbatches["logit_microbatch_size"],
         replay_window=replay,
         prefetch_depth=prefetch,
+        replay_tile_cache_bytes=replay_tile_cache_bytes,
         encoder_residency=residency,
         row_store_policy=row_policy,
         row_store_bytes=row_bytes,
@@ -409,34 +422,64 @@ def _estimate_demands(
     target_elements = (
         semantics.target_count * semantics.prompt_token_count * dims.d_model * dtype_bytes
     )
-    trace_vram = math.ceil(trace_elements * costs.trace_vram_coefficient)
+    memory_models = {model.phase: model for model in profile.phase_memory_models}
+    session_model = memory_models.get("session")
+    if session_model is None:
+        trace_vram = math.ceil(trace_elements * costs.trace_vram_coefficient)
+    else:
+        trace_vram = math.ceil(
+            physical.session_capacity
+            * session_model.session_vram_bytes_per_item
+            * semantics.prompt_token_count
+            / max(1, (profile.calibration_support.prompt_token_count if profile.calibration_support else semantics.prompt_token_count))
+        )
     target_vram = math.ceil(target_elements * costs.target_vram_coefficient)
+    phase0_model = memory_models.get("phase0")
     fetch_vram = (
-        physical.decoder_fetch_chunk_size
-        * dims.d_model
-        * dims.decoder_output_span
-        * dtype_bytes
+        phase0_model.fixed_vram_bytes
+        if phase0_model is not None and phase0_model.fixed_vram_bytes
+        else (
+            physical.decoder_fetch_chunk_size
+            * dims.d_model
+            * dims.decoder_output_span
+            * dtype_bytes
+        )
     )
     prefetch_vram = fetch_vram * physical.prefetch_depth
     # No runtime path currently executes source_microbatch_size as a physical
     # partition. Keep the named estimate for schema stability, but do not charge
     # fictitious residency until a sequenced source executor consumes it.
     source_microbatch_vram = 0
-    feature_microbatch_vram = math.ceil(
-        physical.feature_microbatch_size
-        * semantics.prompt_token_count
-        * min(semantics.estimated_nnz, dims.d_features)
-        * dtype_bytes
-        * costs.feature_microbatch_vram_coefficient
-    )
-    logit_microbatch_vram = math.ceil(
-        physical.logit_microbatch_size
-        * semantics.prompt_token_count
-        * semantics.target_count
-        * dims.d_model
-        * dtype_bytes
-        * costs.logit_microbatch_vram_coefficient
-    )
+    if profile.phase_memory_models:
+        feature_microbatch_vram = (
+            physical.feature_microbatch_size
+            * semantics.prompt_token_count
+            * min(semantics.estimated_nnz, dims.d_features)
+            * dtype_bytes
+        )
+        logit_microbatch_vram = (
+            physical.logit_microbatch_size
+            * semantics.prompt_token_count
+            * semantics.target_count
+            * dims.d_model
+            * dtype_bytes
+        )
+    else:
+        feature_microbatch_vram = math.ceil(
+            physical.feature_microbatch_size
+            * semantics.prompt_token_count
+            * min(semantics.estimated_nnz, dims.d_features)
+            * dtype_bytes
+            * costs.feature_microbatch_vram_coefficient
+        )
+        logit_microbatch_vram = math.ceil(
+            physical.logit_microbatch_size
+            * semantics.prompt_token_count
+            * semantics.target_count
+            * dims.d_model
+            * dtype_bytes
+            * costs.logit_microbatch_vram_coefficient
+        )
     replay_vram = math.ceil(
         physical.replay_window
         * semantics.prompt_token_count
@@ -455,9 +498,15 @@ def _estimate_demands(
         * dtype_bytes
         * costs.prompt_host_coefficient
     )
+    phase4_model = memory_models.get("phase4")
+    encoder_row_bytes = (
+        phase4_model.host_bytes_per_item
+        if phase4_model is not None and phase4_model.host_bytes_per_item
+        else dims.d_model * dtype_bytes
+    )
     if costs.baseline_total_host_bytes is not None:
         encoder_host = (
-            semantics.estimated_nnz * dims.d_model * dtype_bytes
+            semantics.estimated_nnz * encoder_row_bytes
             if physical.encoder_residency == "eager"
             and costs.reference_encoder_residency != "eager"
             else 0
@@ -469,7 +518,7 @@ def _estimate_demands(
         )
     else:
         encoder_host = (
-            semantics.estimated_nnz * dims.d_model * dtype_bytes
+            semantics.estimated_nnz * encoder_row_bytes
             if physical.encoder_residency == "eager"
             else 0
         )
@@ -485,23 +534,106 @@ def _estimate_demands(
         effective_source_batch_size=effective_source,
         feature_batch_size=semantics.feature_batch_size,
         logit_batch_size=semantics.logit_batch_size,
-        source_microbatch_size=physical.phase1_source_batch_size,
+        source_microbatch_size=min(
+            physical.session_capacity, physical.phase1_source_batch_size
+        ),
         feature_microbatch_size=physical.feature_microbatch_size,
         logit_microbatch_size=physical.logit_microbatch_size,
         replay_window=physical.replay_window,
         prefetch_depth=physical.prefetch_depth,
     )
-    walltime_scale = (
-        work_units
-        / costs.walltime_reference_work_units
-        * costs.row_store_walltime_multiplier(physical.row_store_policy)
-    )
+    phase_walltimes: list[tuple[str, float, float]] = []
+    if profile.phase_walltime_models and profile.calibration_support is not None:
+        support = profile.calibration_support
+        logical_scale = (
+            semantics.prompt_token_count / support.prompt_token_count
+            * semantics.estimated_nnz / support.active_features
+            * semantics.target_count / support.target_count
+        )
+        session_steps = math.ceil(capacity / physical.session_capacity)
+        phase1_steps = math.ceil(
+            effective_source
+            / min(physical.session_capacity, physical.phase1_source_batch_size)
+        )
+        phase3_steps = math.ceil(
+            semantics.logit_batch_size / physical.logit_microbatch_size
+        )
+        phase4_steps = math.ceil(
+            semantics.feature_batch_size / physical.feature_microbatch_size
+        )
+        reference_session_steps = math.ceil(
+            support.logical_batch_size / support.session_capacity
+        )
+        reference_phase1_steps = math.ceil(
+            support.logical_batch_size
+            / min(support.session_capacity, support.phase1_source_batch_size)
+        )
+        reference_phase3_steps = math.ceil(
+            support.logical_batch_size / support.phase3_microbatch_size
+        )
+        reference_phase4_steps = math.ceil(
+            support.logical_batch_size / support.phase4_microbatch_size
+        )
+        for model in profile.phase_walltime_models:
+            scale = logical_scale
+            if model.scales_with_session_steps:
+                scale *= session_steps / reference_session_steps
+            if model.scales_with_phase1_steps:
+                scale *= phase1_steps / reference_phase1_steps
+            if model.scales_with_phase3_steps:
+                scale *= phase3_steps / reference_phase3_steps
+            if model.scales_with_phase4_steps:
+                scale *= phase4_steps / reference_phase4_steps
+            if model.affected_by_fetch:
+                if support.decoder_cache_bytes:
+                    cache_ratio = min(
+                        1.0,
+                        physical.decoder_cache_bytes / support.decoder_cache_bytes,
+                    )
+                    # The reference point proves the selected cache fits, but
+                    # not an unbounded inverse-byte speed curve. Keep the
+                    # provisional miss penalty bounded until the causal sweep.
+                    scale *= 1.25 - 0.25 * cache_ratio
+            if model.affected_by_replay:
+                scale *= 1 + 0.02 * (physical.replay_window - support.replay_window)
+            if model.affected_by_prefetch:
+                scale *= (1 + 0.05 * support.prefetch_depth) / (
+                    1 + 0.05 * physical.prefetch_depth
+                )
+            if model.affected_by_row_policy:
+                scale *= costs.row_store_walltime_multiplier(
+                    physical.row_store_policy
+                )
+                if physical.row_store_policy == "recompute":
+                    reference_cache = max(1, profile.reference_replay_tile_cache_bytes)
+                    cache_ratio = min(
+                        1.0, physical.replay_tile_cache_bytes / reference_cache
+                    )
+                    scale *= 1.25 - 0.25 * cache_ratio
+            phase_walltimes.append(
+                (
+                    model.phase,
+                    model.reference_low_seconds * scale,
+                    model.reference_high_seconds * scale,
+                )
+            )
+        walltime_low = sum(item[1] for item in phase_walltimes)
+        walltime_high = sum(item[2] for item in phase_walltimes)
+    else:
+        walltime_scale = (
+            work_units
+            / costs.walltime_reference_work_units
+            * math.ceil(capacity / physical.session_capacity)
+            * costs.row_store_walltime_multiplier(physical.row_store_policy)
+        )
+        walltime_low = costs.calibrated_walltime_low_seconds * walltime_scale
+        walltime_high = costs.calibrated_walltime_high_seconds * walltime_scale
     disk_tier = (
         DemandTier.LOCAL_DISK
         if physical.spill_target == "local"
         else DemandTier.SCRATCH_DISK if physical.spill_target == "scratch" else DemandTier.LOCAL_DISK
     )
-    return (
+    estimates = (
         DemandEstimate("model_vram", DemandTier.VRAM, DemandClass.RIGID, DemandLifetime.PERMANENT, costs.fixed_vram_bytes),
         DemandEstimate("trace_vram", DemandTier.VRAM, DemandClass.RIGID, DemandLifetime.PHASE, trace_vram),
         DemandEstimate("target_vram", DemandTier.VRAM, DemandClass.RIGID, DemandLifetime.PHASE, target_vram),
@@ -518,10 +650,19 @@ def _estimate_demands(
         DemandEstimate("prompt_host", DemandTier.HOST, DemandClass.RIGID, DemandLifetime.PHASE, prompt_host),
         DemandEstimate("encoder_residency_host", DemandTier.HOST, DemandClass.RIGID, DemandLifetime.PHASE, encoder_host),
         DemandEstimate("replay_host", DemandTier.HOST, DemandClass.RIGID, DemandLifetime.PHASE, replay_host),
+        DemandEstimate("replay_tile_cache_host", DemandTier.HOST, DemandClass.RIGID, DemandLifetime.PHASE, physical.replay_tile_cache_bytes),
         DemandEstimate("checkpoint_file_working_set", DemandTier.FILE_BACKED, DemandClass.ELASTIC, DemandLifetime.PERMANENT, costs.checkpoint_file_bytes),
         DemandEstimate("row_store_disk", disk_tier, DemandClass.RIGID, DemandLifetime.PHASE, physical.row_store_bytes),
-        DemandEstimate("predicted_walltime_low", DemandTier.WALLTIME, DemandClass.RIGID, DemandLifetime.PHASE, costs.calibrated_walltime_low_seconds * walltime_scale, "seconds"),
-        DemandEstimate("predicted_walltime_high", DemandTier.WALLTIME, DemandClass.RIGID, DemandLifetime.PHASE, costs.calibrated_walltime_high_seconds * walltime_scale, "seconds"),
+        DemandEstimate("predicted_walltime_low", DemandTier.WALLTIME, DemandClass.RIGID, DemandLifetime.PHASE, walltime_low, "seconds"),
+        DemandEstimate("predicted_walltime_high", DemandTier.WALLTIME, DemandClass.RIGID, DemandLifetime.PHASE, walltime_high, "seconds"),
+    )
+    return estimates + tuple(
+        DemandEstimate(
+            f"predicted_walltime_{phase}_{bound}", DemandTier.WALLTIME,
+            DemandClass.RIGID, DemandLifetime.PHASE, amount, "seconds"
+        )
+        for phase, low, high in phase_walltimes
+        for bound, amount in (("low", low), ("high", high))
     )
 
 
@@ -553,6 +694,7 @@ def _peak_host_reservation_total(
         _sum_estimates(estimates, {"replay_host"}),
         _sum_estimates(estimates, {"prompt_host"}),
         _sum_estimates(estimates, {"active_host", "encoder_residency_host"}),
+        _sum_estimates(estimates, {"replay_tile_cache_host", "encoder_residency_host"}),
     )
     incremental_peak = max(phase_working_sets)
     baseline = profile.costs.baseline_total_host_bytes
@@ -565,11 +707,159 @@ def _amount(estimates: tuple[DemandEstimate, ...], name: str) -> float:
     return next(estimate.amount for estimate in estimates if estimate.name == name)
 
 
+def _support_metadata(
+    semantics: TraceSemantics,
+    profile: ProviderProfile,
+    physical: PhysicalExecutionConfig,
+) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Return confidence, extrapolated dimensions, evidence, and invalid reasons."""
+
+    safety = profile.safety_limits
+    support = profile.calibration_support
+    invalid: list[str] = []
+    if safety is not None:
+        safety_values = {
+            "prompt_token_count": (semantics.prompt_token_count, safety.max_prompt_token_count),
+            "estimated_active_features": (semantics.estimated_nnz, safety.max_active_features),
+            "max_feature_nodes": (semantics.max_feature_nodes, safety.max_feature_nodes),
+            "target_count": (semantics.target_count, safety.max_target_count),
+            "source_batch_size": (semantics.source_batch_size, safety.max_logical_batch_size),
+            "feature_batch_size": (semantics.feature_batch_size, safety.max_logical_batch_size),
+            "logit_batch_size": (semantics.logit_batch_size, safety.max_logical_batch_size),
+            "session_capacity": (physical.session_capacity, safety.max_physical_rows),
+            "phase1_source_batch_size": (physical.phase1_source_batch_size, safety.max_physical_rows),
+            "source_microbatch_size": (physical.source_microbatch_size, safety.max_physical_rows),
+            "feature_microbatch_size": (physical.feature_microbatch_size, safety.max_physical_rows),
+            "logit_microbatch_size": (physical.logit_microbatch_size, safety.max_physical_rows),
+            "decoder_cache_bytes": (
+                physical.decoder_cache_bytes, safety.max_decoder_cache_bytes
+            ),
+            "replay_window": (physical.replay_window, safety.max_replay_window),
+            "prefetch_depth": (physical.prefetch_depth, safety.max_prefetch_depth),
+            "replay_tile_cache_bytes": (
+                physical.replay_tile_cache_bytes,
+                safety.max_replay_tile_cache_bytes,
+            ),
+        }
+        invalid.extend(
+            f"{name}={value} exceeds provider safety limit {limit}"
+            for name, (value, limit) in safety_values.items()
+            if value > limit
+        )
+    if support is None:
+        return "unknown", (), (), tuple(invalid)
+    support_values = {
+        "prompt_token_count": (semantics.prompt_token_count, support.prompt_token_count),
+        "estimated_active_features": (semantics.estimated_nnz, support.active_features),
+        "max_feature_nodes": (semantics.max_feature_nodes, support.max_feature_nodes),
+        "target_count": (semantics.target_count, support.target_count),
+        "logical_batch_size": (
+            max(semantics.source_batch_size, semantics.feature_batch_size, semantics.logit_batch_size),
+            support.logical_batch_size,
+        ),
+        "session_capacity": (physical.session_capacity, support.session_capacity),
+        "phase1_source_batch_size": (
+            physical.phase1_source_batch_size, support.phase1_source_batch_size
+        ),
+        "phase3_microbatch_size": (
+            physical.logit_microbatch_size, support.phase3_microbatch_size
+        ),
+        "phase4_microbatch_size": (
+            physical.feature_microbatch_size, support.phase4_microbatch_size
+        ),
+        "decoder_cache_bytes": (
+            physical.decoder_cache_bytes, support.decoder_cache_bytes
+        ),
+        "replay_window": (physical.replay_window, support.replay_window),
+        "prefetch_depth": (physical.prefetch_depth, support.prefetch_depth),
+        "replay_tile_cache_bytes": (
+            physical.replay_tile_cache_bytes, support.replay_tile_cache_bytes
+        ),
+    }
+    extrapolated = [
+        name for name, (value, bound) in support_values.items() if value > bound
+    ]
+    if physical.row_store_policy not in support.row_store_policies:
+        extrapolated.append("row_store_policy")
+    if support.provisional_dimensions:
+        extrapolated.append("provider_dimensions")
+    extrapolated = list(dict.fromkeys(extrapolated))
+    confidence = (
+        "extrapolated" if extrapolated else "provisional" if support.provisional_dimensions else "calibrated"
+    )
+    return confidence, tuple(extrapolated), support.evidence, tuple(invalid)
+
+
+def _phase_predictions(
+    estimates: tuple[DemandEstimate, ...]
+) -> tuple[tuple[str, float, float], ...]:
+    values = {estimate.name: float(estimate.amount) for estimate in estimates}
+    phases = sorted(
+        {
+            name.removeprefix("predicted_walltime_").removesuffix("_low")
+            for name in values
+            if name.startswith("predicted_walltime_")
+            and name.endswith("_low")
+            and name != "predicted_walltime_low"
+        }
+    )
+    return tuple(
+        (
+            phase,
+            values[f"predicted_walltime_{phase}_low"],
+            values[f"predicted_walltime_{phase}_high"],
+        )
+        for phase in phases
+    )
+
+
+def _apply_planning_progress(
+    estimates: tuple[DemandEstimate, ...],
+    progress: PlanningProgress,
+) -> tuple[DemandEstimate, ...]:
+    if not progress.completed_phases and progress.observed_elapsed_seconds == 0:
+        return estimates
+    predictions = _phase_predictions(estimates)
+    remaining = tuple(
+        prediction
+        for prediction in predictions
+        if prediction[0] not in progress.completed_phases
+    )
+    if predictions:
+        projected_low = progress.observed_elapsed_seconds + sum(
+            prediction[1] for prediction in remaining
+        )
+        projected_high = progress.observed_elapsed_seconds + sum(
+            prediction[2] for prediction in remaining
+        )
+    else:
+        # Profiles without additive phase models cannot subtract completed
+        # work safely. Retain their full estimate and add observed elapsed.
+        projected_low = progress.observed_elapsed_seconds + _amount(
+            estimates, "predicted_walltime_low"
+        )
+        projected_high = progress.observed_elapsed_seconds + _amount(
+            estimates, "predicted_walltime_high"
+        )
+    return tuple(
+        replace(
+            estimate,
+            amount=(
+                projected_low
+                if estimate.name == "predicted_walltime_low"
+                else projected_high
+            ),
+        )
+        if estimate.name in {"predicted_walltime_low", "predicted_walltime_high"}
+        else estimate
+        for estimate in estimates
+    )
 def _resolve_single_trace_plan(
     semantics: TraceSemantics,
     profile: ProviderProfile,
     envelope: ResourceEnvelope,
     requirements: PhysicalExecutionRequirements | None = None,
+    progress: PlanningProgress = PlanningProgress(),
 ) -> TracePlan:
     """Resolve a pure, provider-agnostic, advisory Phase B execution plan."""
 
@@ -584,9 +874,19 @@ def _resolve_single_trace_plan(
     estimates = _estimate_demands(
         semantics, profile, physical, effective_source, capacity
     )
+    estimates = _apply_planning_progress(estimates, progress)
 
     warnings = list(physical_warnings)
     refusals = list(physical_refusals)
+    confidence, extrapolated, calibration_evidence, invalid = _support_metadata(
+        semantics, profile, physical
+    )
+    refusals.extend(invalid)
+    if extrapolated:
+        warnings.append(
+            "valid provider-safety extrapolation outside calibration support: "
+            + ", ".join(extrapolated)
+        )
     decisions: list[str] = []
     if semantics.provider_approximation != profile.identity.approximation:
         refusals.append(
@@ -684,12 +984,14 @@ def _resolve_single_trace_plan(
             f"microbatches=source:{physical.source_microbatch_size},"
             f"feature:{physical.feature_microbatch_size},logit:{physical.logit_microbatch_size}",
             f"decoder_cache_vram={physical.decoder_cache_bytes}",
+            f"replay_tile_cache={physical.replay_tile_cache_bytes}",
             f"cache_policy={physical.cache_policy.value}",
             f"encoder_residency={physical.encoder_residency}",
             f"row_store={physical.row_store_policy}:{physical.row_store_bytes}",
             f"spill_target={physical.spill_target or 'none'}",
         )
     )
+    phase_predictions = _phase_predictions(estimates)
     report = AdmissionReport(
         admitted=not refusals,
         estimates=estimates,
@@ -699,6 +1001,15 @@ def _resolve_single_trace_plan(
         decisions=tuple(decisions),
         warnings=tuple(warnings),
         refusals=tuple(refusals),
+        confidence=confidence,
+        extrapolated_dimensions=extrapolated,
+        calibration_evidence=calibration_evidence,
+        phase_predictions=phase_predictions,
+        remaining_projection=tuple(
+            prediction
+            for prediction in phase_predictions
+            if prediction[0] not in progress.completed_phases
+        ),
     )
     semantic_hash = semantic_fingerprint(semantics, profile.identity)
     execution_hash = execution_fingerprint(
@@ -727,9 +1038,16 @@ def _resolve_single_trace_plan(
 
 _OPTIMIZED_REQUIREMENT_FIELDS = (
     "session_capacity",
+    "phase1_source_batch_size",
     "feature_microbatch_size",
     "logit_microbatch_size",
+    "decoder_cache_bytes",
+    "replay_window",
+    "prefetch_depth",
+    "replay_tile_cache_bytes",
     "row_store_policy",
+    "encoder_residency",
+    "spill_target",
 )
 
 
@@ -749,7 +1067,50 @@ def _batch_breakpoint_sizes(
         if quotient == 0:
             break
         physical_steps = numerator // quotient + 1
-    return tuple(sorted(values, reverse=True))
+    ordered = tuple(sorted(values, reverse=True))
+    if len(ordered) <= 16:
+        return ordered
+    # Preserve the one-through-eight-step rungs exactly; those are where a
+    # roomy accelerator normally lands. Use the remaining slots to retain a
+    # geometric spread toward the minimum instead of replacing 500 with 100
+    # merely because the full divisor-breakpoint set is dense near zero.
+    indexes = set(range(8))
+    tail_start = 8
+    indexes.update(
+        round(tail_start + index * (len(ordered) - 1 - tail_start) / 7)
+        for index in range(8)
+    )
+    return tuple(ordered[index] for index in sorted(indexes))
+
+
+def _domain_values(required, *values):
+    if required is not None:
+        return (required,)
+    return tuple(dict.fromkeys(value for value in values if value is not None))
+
+
+def _display_domain(values: tuple[object, ...]) -> tuple[str, ...]:
+    return tuple(str(value.value if hasattr(value, "value") else value) for value in values)
+
+
+def _state_numeric(value: object) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, RowStorePolicy):
+        return {RowStorePolicy.FULL: 3.0, RowStorePolicy.TILED: 2.0, RowStorePolicy.RECOMPUTE: 1.0}[value]
+    if isinstance(value, EncoderResidency):
+        return 1.0 if value is EncoderResidency.LAZY_PER_REQUEST else 0.0
+    return 0.0
+
+
+def _state_speed_key(state: tuple[object, ...]) -> tuple[float, ...]:
+    # Larger batches/caches/prefetch and less-degraded row policies form the
+    # fast frontier. Replay window is workload semantics, not a speed knob.
+    return tuple(-_state_numeric(value) for value in state)
+
+
+def _state_pressure_key(state: tuple[object, ...]) -> tuple[float, ...]:
+    return tuple(_state_numeric(value) for value in state)
 
 
 def _requirement_descriptions(
@@ -794,6 +1155,7 @@ def _with_optimization_report(
     reported_hard_constraints: PhysicalExecutionRequirements,
     frozen_fields: tuple[str, ...],
     candidates: tuple[TracePlan, ...],
+    domain_summary: tuple[tuple[str, tuple[str, ...]], ...],
 ) -> TracePlan:
     admitted = tuple(candidate for candidate in candidates if candidate.admission.admitted)
     hard_constraints = _requirement_descriptions(reported_hard_constraints)
@@ -834,6 +1196,7 @@ def _with_optimization_report(
             ("predicted_row_store_bytes", objective[3]),
         ),
         rejected_candidates=rejected,
+        domain_summary=domain_summary,
     )
     execution_hash = execution_fingerprint(
         profile=plan.profile,
@@ -853,10 +1216,12 @@ def resolve_trace_plan(
     *,
     frozen_fields: tuple[str, ...] = (),
     reported_hard_constraints: PhysicalExecutionRequirements | None = None,
+    progress: PlanningProgress | None = None,
 ) -> TracePlan:
     """Select the fastest fitting physical plan under hard caller constraints."""
 
     requirements = requirements or PhysicalExecutionRequirements()
+    progress = progress or PlanningProgress()
     reported_hard_constraints = reported_hard_constraints or requirements
     effective_source, _, _ = _effective_batches(semantics)
     required_batch_bounds = (
@@ -889,10 +1254,13 @@ def resolve_trace_plan(
         and required_microbatch_capacity > requirements.session_capacity
     ):
         raise ValueError("required microbatch cannot exceed required session_capacity")
-    phase1_source_batch_size = (
-        min(effective_source, profile.max_phase1_source_batch_size)
-        if requirements.phase1_source_batch_size is None
-        else requirements.phase1_source_batch_size
+    logical_capacity = max(
+        effective_source, semantics.feature_batch_size, semantics.logit_batch_size
+    )
+    row_limit = (
+        profile.safety_limits.max_physical_rows
+        if profile.safety_limits is not None
+        else profile.max_session_capacity
     )
     policies = (
         (requirements.row_store_policy,)
@@ -906,6 +1274,16 @@ def resolve_trace_plan(
                 and requirements.spill_target is not None
             )
         )
+    )
+    session_values = _batch_breakpoint_sizes(
+        logical_size=logical_capacity,
+        maximum=min(logical_capacity, profile.max_session_capacity, row_limit),
+        required=requirements.session_capacity,
+    )
+    phase1_values = _batch_breakpoint_sizes(
+        logical_size=effective_source,
+        maximum=min(effective_source, profile.max_phase1_source_batch_size, row_limit),
+        required=requirements.phase1_source_batch_size,
     )
     phase3_values = _batch_breakpoint_sizes(
         logical_size=semantics.logit_batch_size,
@@ -927,43 +1305,297 @@ def resolve_trace_plan(
         ),
         required=requirements.feature_microbatch_size,
     )
+    cache_values = _domain_values(
+        requirements.decoder_cache_bytes,
+        profile.default_decoder_cache_bytes,
+        0,
+        min(profile.max_decoder_cache_bytes, envelope.effective_vram_budget_bytes // 4),
+    )
+    replay_values = _domain_values(
+        requirements.replay_window,
+        profile.default_replay_window,
+        1,
+        profile.max_replay_window,
+    )
+    prefetch_values = _domain_values(
+        requirements.prefetch_depth,
+        profile.default_prefetch_depth,
+        0,
+        profile.max_prefetch_depth,
+    )
+    encoder_values = _domain_values(
+        requirements.encoder_residency,
+        profile.default_encoder_residency,
+        EncoderResidency.LAZY_PER_REQUEST if profile.capabilities.supports_lazy_encoder_rows else None,
+        EncoderResidency.EAGER if profile.capabilities.supports_encoder_row_materialization else None,
+    )
+    spill_values = (
+        (requirements.spill_target,)
+        if requirements.spill_target is not None
+        else tuple(StorageTier(root) for root in envelope.spill_roots)
+        + ((None,) if RowStorePolicy.RECOMPUTE in policies else ())
+    )
+    replay_cache_values = _domain_values(
+        requirements.replay_tile_cache_bytes,
+        profile.reference_replay_tile_cache_bytes,
+        0,
+        min(
+            (
+                profile.safety_limits.max_replay_tile_cache_bytes
+                if profile.safety_limits is not None
+                else profile.reference_replay_tile_cache_bytes
+            ),
+            envelope.host_budget_bytes // 8,
+        ),
+    )
+    domain_summary = (
+        ("session_capacity", _display_domain(session_values)),
+        ("phase1_source_batch_size", _display_domain(phase1_values)),
+        ("feature_microbatch_size", _display_domain(phase4_values)),
+        ("logit_microbatch_size", _display_domain(phase3_values)),
+        ("decoder_cache_bytes", _display_domain(cache_values)),
+        ("replay_window", _display_domain(replay_values)),
+        ("prefetch_depth", _display_domain(prefetch_values)),
+        ("replay_tile_cache_bytes", _display_domain(replay_cache_values)),
+        ("row_store_policy", _display_domain(policies)),
+        ("encoder_residency", _display_domain(encoder_values)),
+        ("spill_target", _display_domain(spill_values)),
+    )
+
+    # Build bounded independent domains, then deterministically prune on both
+    # speed and pressure fronts before invoking the full admission arithmetic.
+    states = [()]
+    domains = (
+        session_values, phase1_values, phase3_values, phase4_values,
+        cache_values, replay_values, prefetch_values, policies,
+        encoder_values, spill_values, replay_cache_values,
+    )
+    for domain in domains:
+        expanded = list(dict.fromkeys((*state, value) for state in states for value in domain))
+        if len(expanded) > 1024:
+            speed = sorted(expanded, key=_state_speed_key)[:512]
+            pressure = sorted(expanded, key=_state_pressure_key)[:512]
+            expanded = list(dict.fromkeys((*speed, *pressure)))
+        states = expanded
+
     candidates: list[TracePlan] = []
-    for phase3, phase4, policy in product(phase3_values, phase4_values, policies):
-        minimum_session = max(
-            phase3,
-            phase4,
-            requirements.source_microbatch_size or 1,
+    seen: set[PhysicalExecutionRequirements] = set()
+
+    def append_candidate(candidate_requirements: PhysicalExecutionRequirements) -> None:
+        if candidate_requirements in seen:
+            return
+        seen.add(candidate_requirements)
+        try:
+            candidates.append(
+                _resolve_single_trace_plan(
+                    semantics,
+                    profile,
+                    envelope,
+                    candidate_requirements,
+                    progress,
+                )
+            )
+        except ValueError:
+            pass
+
+    # Always retain the legacy deterministic defaults as one frontier point;
+    # this also fail-closes malformed explicit requirements with their precise
+    # validation error instead of an opaque empty-domain error.
+    candidates.append(
+        _resolve_single_trace_plan(semantics, profile, envelope, requirements, progress)
+    )
+    seen.add(requirements)
+    support = profile.calibration_support
+    support_seed: PhysicalExecutionRequirements | None = None
+    if support is not None:
+        seed_policy = requirements.row_store_policy or RowStorePolicy.FULL
+        seed_session = requirements.session_capacity or min(
+            logical_capacity, support.session_capacity
         )
-        session_capacity = requirements.session_capacity or minimum_session
+        seed_phase1 = requirements.phase1_source_batch_size or min(
+            effective_source, support.phase1_source_batch_size
+        )
+        seed_source = requirements.source_microbatch_size or min(
+            effective_source, seed_phase1, seed_session,
+            profile.max_source_microbatch_size,
+        )
+        seed = replace(
+            requirements,
+            session_capacity=seed_session,
+            phase1_source_batch_size=seed_phase1,
+            source_microbatch_size=seed_source,
+            feature_microbatch_size=(
+                requirements.feature_microbatch_size
+                or min(semantics.feature_batch_size, support.phase4_microbatch_size, seed_session)
+            ),
+            logit_microbatch_size=(
+                requirements.logit_microbatch_size
+                or min(semantics.logit_batch_size, support.phase3_microbatch_size, seed_session)
+            ),
+            decoder_cache_bytes=(
+                requirements.decoder_cache_bytes
+                if requirements.decoder_cache_bytes is not None
+                else support.decoder_cache_bytes
+            ),
+            replay_window=requirements.replay_window or support.replay_window,
+            prefetch_depth=(
+                requirements.prefetch_depth
+                if requirements.prefetch_depth is not None
+                else support.prefetch_depth
+            ),
+            row_store_policy=seed_policy,
+            encoder_residency=(
+                requirements.encoder_residency or profile.default_encoder_residency
+            ),
+            spill_target=(
+                None
+                if seed_policy is RowStorePolicy.RECOMPUTE
+                else requirements.spill_target
+                or (StorageTier(envelope.spill_roots[0]) if envelope.spill_roots else None)
+            ),
+            replay_tile_cache_bytes=(
+                requirements.replay_tile_cache_bytes
+                if requirements.replay_tile_cache_bytes is not None
+                else profile.reference_replay_tile_cache_bytes
+                if seed_policy is RowStorePolicy.RECOMPUTE
+                else 0
+            ),
+        )
+        support_seed = seed
+        append_candidate(seed)
+
+    # The generic Cartesian beam preserves broad policy/cache coverage, while
+    # these neighborhoods guarantee that physical batch rungs between the two
+    # corners survive pruning. Each anchor varies one owning phase at a time,
+    # plus the paired Phase-3/4 width needed when both phase peaks are binding.
+    if support_seed is not None:
+        for session_capacity in session_values:
+            compatible_phase1 = tuple(
+                value for value in phase1_values if value <= session_capacity
+            )
+            compatible_phase3 = tuple(
+                value for value in phase3_values if value <= session_capacity
+            )
+            compatible_phase4 = tuple(
+                value for value in phase4_values if value <= session_capacity
+            )
+            if not compatible_phase1 or not compatible_phase3 or not compatible_phase4:
+                continue
+            anchor = replace(
+                support_seed,
+                session_capacity=session_capacity,
+                phase1_source_batch_size=compatible_phase1[0],
+                source_microbatch_size=(
+                    requirements.source_microbatch_size
+                    or min(
+                        effective_source,
+                        compatible_phase1[0],
+                        session_capacity,
+                        profile.max_source_microbatch_size,
+                    )
+                ),
+                logit_microbatch_size=compatible_phase3[0],
+                feature_microbatch_size=compatible_phase4[0],
+            )
+            append_candidate(anchor)
+            for value in compatible_phase1:
+                append_candidate(
+                    replace(
+                        anchor,
+                        phase1_source_batch_size=value,
+                        source_microbatch_size=(
+                            requirements.source_microbatch_size
+                            or min(
+                                effective_source,
+                                value,
+                                session_capacity,
+                                profile.max_source_microbatch_size,
+                            )
+                        ),
+                    )
+                )
+            for value in compatible_phase3:
+                append_candidate(replace(anchor, logit_microbatch_size=value))
+            for value in compatible_phase4:
+                append_candidate(replace(anchor, feature_microbatch_size=value))
+            for phase3, phase4 in zip(compatible_phase3, compatible_phase4):
+                append_candidate(
+                    replace(
+                        anchor,
+                        logit_microbatch_size=phase3,
+                        feature_microbatch_size=phase4,
+                    )
+                )
+            for value in cache_values:
+                append_candidate(replace(anchor, decoder_cache_bytes=value))
+    for (
+        session_capacity, phase1, phase3, phase4, decoder_cache, replay,
+        prefetch, policy, encoder, spill, replay_cache,
+    ) in states:
+        minimum_session = max(phase3, phase4, requirements.source_microbatch_size or 1)
         if session_capacity < minimum_session:
             continue
+        if policy is RowStorePolicy.RECOMPUTE:
+            if spill is not None:
+                continue
+            spill_value = None
+            replay_cache_value = replay_cache
+        else:
+            if spill is None:
+                continue
+            spill_value = spill
+            replay_cache_value = 0
+            if requirements.replay_tile_cache_bytes not in (None, 0):
+                continue
         source = requirements.source_microbatch_size or min(
             effective_source,
+            phase1,
             session_capacity,
             profile.max_source_microbatch_size,
         )
         candidate_requirements = replace(
             requirements,
             session_capacity=session_capacity,
-            phase1_source_batch_size=phase1_source_batch_size,
+            phase1_source_batch_size=phase1,
             source_microbatch_size=source,
             logit_microbatch_size=phase3,
             feature_microbatch_size=phase4,
+            decoder_cache_bytes=decoder_cache,
+            replay_window=replay,
+            prefetch_depth=prefetch,
             row_store_policy=policy,
+            encoder_residency=encoder,
+            spill_target=spill_value,
+            replay_tile_cache_bytes=replay_cache_value,
         )
-        candidates.append(
-            _resolve_single_trace_plan(
-                semantics, profile, envelope, candidate_requirements
-            )
-        )
+        append_candidate(candidate_requirements)
     if not candidates:
         raise ValueError("optimizer produced no candidates")
+    candidates = list(
+        {
+            candidate.physical: candidate
+            for candidate in candidates
+        }.values()
+    )
     admitted = tuple(candidate for candidate in candidates if candidate.admission.admitted)
     selected = min(
         admitted or tuple(candidates),
         key=lambda candidate: (
             0 if candidate.admission.admitted else len(candidate.admission.refusals),
+            {"calibrated": 0, "provisional": 1, "extrapolated": 2, "unknown": 3}[
+                candidate.admission.confidence
+            ],
+            len(candidate.admission.extrapolated_dimensions),
             _objective(candidate),
+            0
+            if candidate.physical.encoder_residency
+            == profile.default_encoder_residency.value
+            else 1,
+            (
+                envelope.spill_roots.index(candidate.physical.spill_target)
+                if candidate.physical.spill_target in envelope.spill_roots
+                else len(envelope.spill_roots)
+            ),
             candidate.execution_fingerprint,
         ),
     )
@@ -973,4 +1605,5 @@ def resolve_trace_plan(
         reported_hard_constraints=reported_hard_constraints,
         frozen_fields=frozen_fields,
         candidates=tuple(candidates),
+        domain_summary=domain_summary,
     )
