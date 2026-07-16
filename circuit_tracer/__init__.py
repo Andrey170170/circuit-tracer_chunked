@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from circuit_tracer.replacement_model import ReplacementModel
     from circuit_tracer.tracing import (
         AttributionProblem,
+        AdmissionMode,
         DecoderCachePolicy,
         DecoderPlan,
         EffectiveExecutionDescriptor,
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AttributionProblem",
+    "AdmissionMode",
     "DecoderCachePolicy",
     "DecoderPlan",
     "EffectiveExecutionDescriptor",

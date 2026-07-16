@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
+from circuit_tracer.governor.contracts import AdmissionMode
 from circuit_tracer.governor.runtime import (
     RuntimePlanningRefusedError,
     TorchLoadedStateSampler,
@@ -35,6 +36,7 @@ def run_trace(
         compact_output=plan.execution.compact_output,
         profile=plan.execution.observability.profile,
         execution_identity=execution_identity,
+        governor_admission_mode=plan.governor_admission_mode.value,
     )
     governor_runtime = None
     observer.observe(
@@ -49,6 +51,7 @@ def run_trace(
                 "requested_execution_fingerprint": plan.requested_execution_fingerprint,
                 "effective_execution_fingerprint": None,
                 "execution_fingerprint": plan.requested_execution_fingerprint,
+                "governor_admission_mode": plan.governor_admission_mode.value,
             },
         )
     )
@@ -71,9 +74,13 @@ def run_trace(
                 envelope=plan.planning_envelope,
                 requirements=plan.planning_requirements,
                 observer=observer,
+                admission_mode=plan.governor_admission_mode,
             )
             governor_runtime.pre_execution_admission()
-            if not governor_runtime.current_plan.admission.admitted:
+            if (
+                not governor_runtime.current_plan.admission.admitted
+                and plan.governor_admission_mode is AdmissionMode.ENFORCE
+            ):
                 return _refused_result(plan, scope, governor_runtime, "pre_execution_admission")
             provider = getattr(problem.model, "transcoders", None)
             observation = TorchLoadedStateSampler().sample(getattr(provider, "_module", provider))
@@ -87,7 +94,10 @@ def run_trace(
                 planning_envelope=governor_runtime.envelope,
                 planning_workload=governor_runtime.workload,
             )
-            if not revision.plan.admission.admitted:
+            if (
+                not revision.plan.admission.admitted
+                and plan.governor_admission_mode is AdmissionMode.ENFORCE
+            ):
                 return _refused_result(plan, scope, governor_runtime, "loaded_state_calibration")
         if plan.backend == "nnsight":
             from circuit_tracer.attribution.nnsight.backend import run_nnsight_trace
@@ -158,7 +168,11 @@ def run_trace(
         status=TraceStatus.SUCCEEDED,
         telemetry_summary=evidence.summary,
         telemetry_events=evidence.events,
-        admission_report=plan.admission_report,
+        admission_report=(
+            plan.admission_report
+            if governor_runtime is None
+            else governor_runtime.current_plan.admission
+        ),
     )
 
 
@@ -201,6 +215,7 @@ def _open_observability(plan: ResolvedTracePlan) -> tuple[TelemetryObserver, log
         "semantic_fingerprint": plan.semantic_fingerprint,
         "requested_execution_fingerprint": plan.requested_execution_fingerprint,
         "execution_fingerprint": plan.requested_execution_fingerprint,
+        "governor_admission_mode": plan.governor_admission_mode.value,
     }
     max_events = (
         int(policy.telemetry_max_events)

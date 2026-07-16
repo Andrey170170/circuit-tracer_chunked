@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    from .contracts import AdmissionMode
     from .contracts import AdmissionReport
     from .contracts import CachePolicy
     from .contracts import DecoderTopology
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
 
 
 _CONTRACT_EXPORTS = {
+    "AdmissionMode",
     "AdmissionReport",
     "CachePolicy",
     "DecoderTopology",
@@ -129,6 +131,7 @@ _RUNTIME_EXPORTS = {
 }
 
 __all__ = [
+    "AdmissionMode",
     "AdmissionReport",
     "ActiveUniverseObservation",
     "CachePolicy",

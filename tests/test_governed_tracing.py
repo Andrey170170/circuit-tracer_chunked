@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from circuit_tracer.governor import (
+    AdmissionMode,
     RECORDED_PROVIDER_PROFILES,
     ActiveUniverseObservation,
     FidelityMode,
@@ -117,6 +118,30 @@ def test_governor_fidelity_types_are_exported_from_public_roots() -> None:
     assert circuit_tracer.FidelityMode is FidelityMode
     assert tracing.GovernorFidelityPolicy is GovernorFidelityPolicy
     assert tracing.FidelityMode is FidelityMode
+
+
+def test_admission_mode_is_public_enforce_default_and_not_fingerprinted() -> None:
+    import circuit_tracer
+    import circuit_tracer.tracing as tracing
+
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
+    enforced = request(profile, batch=1000)
+    advisory = replace(enforced, governor_admission_mode=AdmissionMode.ADVISORY)
+
+    enforced_plan = resolve_trace_request(
+        enforced, resources=envelope(), provider_profile=profile
+    )
+    advisory_plan = resolve_trace_request(
+        advisory, resources=envelope(), provider_profile=profile
+    )
+
+    assert enforced.governor_admission_mode is AdmissionMode.ENFORCE
+    assert circuit_tracer.AdmissionMode is AdmissionMode
+    assert tracing.AdmissionMode is AdmissionMode
+    assert enforced_plan.requested_execution_fingerprint == (
+        advisory_plan.requested_execution_fingerprint
+    )
+    assert advisory_plan.governor_admission_mode is AdmissionMode.ADVISORY
 
 
 def test_default_governor_fidelity_remains_strict() -> None:
@@ -467,6 +492,94 @@ def test_active_universe_refusal_returns_terminal_refused_result(monkeypatch) ->
     assert result.telemetry_summary["requested_execution_fingerprint"] == (
         result.requested_execution_fingerprint
     )
+
+
+def test_advisory_late_refusal_succeeds_with_latest_report(monkeypatch) -> None:
+    profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_plt_b128_c4096_cache0"]
+    resources = envelope()
+    selected = replace(
+        request(profile, batch=128),
+        governor_admission_mode=AdmissionMode.ADVISORY,
+    )
+    unavailable = ProviderUnitProbe("cpu_test", False, reason="injected")
+    monkeypatch.setattr(
+        "circuit_tracer.governor.runtime.discover_host_budget",
+        lambda requested: HostBudgetDiscovery(
+            requested,
+            "test_allocation",
+            (HostBudgetCandidate("test_allocation", requested),),
+        ),
+    )
+    monkeypatch.setattr(
+        "circuit_tracer.tracing.runner.TorchLoadedStateSampler.sample",
+        lambda self, provider: LoadedStateObservation(
+            cuda_available=False,
+            cuda_allocated_bytes=None,
+            cuda_reserved_bytes=None,
+            cuda_total_bytes=None,
+            host_rss_bytes=None,
+            host_available_bytes=None,
+            decoder_probe=unavailable,
+            encoder_probe=unavailable,
+        ),
+    )
+    from circuit_tracer.governor.resolver import resolve_trace_plan as pure_resolve
+
+    calls = 0
+
+    def refuse_phase4(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        plan = pure_resolve(*args, **kwargs)
+        if calls == 4:
+            plan = replace(
+                plan,
+                admission=replace(
+                    plan.admission,
+                    admitted=False,
+                    refusals=("phase4 advisory refusal",),
+                ),
+                status=PlanStatus.ADVISORY_REFUSED,
+            )
+        return plan
+
+    monkeypatch.setattr(
+        "circuit_tracer.governor.runtime.resolve_trace_plan", refuse_phase4
+    )
+
+    def execute(
+        problem, plan, *, observer, forward_overrides, execution_identity, governor_runtime
+    ):
+        del problem, plan, observer, forward_overrides
+        nnz = governor_runtime.workload.estimated_active_features
+        governor_runtime.active_universe_replan(
+            ActiveUniverseObservation(
+                total_nnz=nnz,
+                shape=(1, 1, nnz),
+                per_layer_counts=(nnz,),
+                per_position_counts=(nnz,),
+                membership_fingerprint="advisory-late-refusal",
+                membership_sample=((0, 0, 0),),
+            )
+        )
+        governor_runtime.phase3_entry_replan()
+        governor_runtime.phase4_entry_replan()
+        execution_identity.mark_requested_as_effective()
+        return "completed"
+
+    monkeypatch.setattr("circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute)
+
+    result = trace_one(selected, resources=resources, provider_profile=profile)
+
+    assert result.status.value == "succeeded"
+    assert result.output == "completed"
+    assert result.admission_report.admitted is False
+    assert result.admission_report.refusals == ("phase4 advisory refusal",)
+    names = [event["name"] for event in result.telemetry_events]
+    assert "planning.admission_bypassed" in names
+    assert "attribute.refused" not in names
+    assert names[-1] == "attribute.done"
+    assert result.telemetry_summary["governor_admission_mode"] == "advisory"
 
 
 @pytest.mark.parametrize("api", [resolve_trace_request, trace_batch, open_session])

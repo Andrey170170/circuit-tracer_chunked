@@ -122,6 +122,7 @@ def _resolve_explicit_trace_request(request: TraceRequest) -> ResolvedTracePlan:
         semantic_fingerprint=fingerprint(semantics),
         requested_execution_fingerprint=fingerprint(execution),
         backend=backend,
+        governor_admission_mode=request.governor_admission_mode,
         evidence_metadata=request.evidence.metadata,
     )
 

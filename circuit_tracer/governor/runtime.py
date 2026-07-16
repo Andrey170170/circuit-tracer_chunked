@@ -19,6 +19,7 @@ import torch
 from circuit_tracer.observability.events import TraceEvent, TraceObserver
 
 from .contracts import (
+    AdmissionMode,
     DemandEstimate,
     DemandLifetime,
     DemandTier,
@@ -309,6 +310,7 @@ class TraceGovernorRuntime:
         envelope: ResourceEnvelope,
         requirements: PhysicalExecutionRequirements,
         observer: TraceObserver,
+        admission_mode: AdmissionMode = AdmissionMode.ENFORCE,
         host_budget_discoverer: Callable[[int | None], HostBudgetDiscovery] | None = None,
         resource_usage_sampler: ResourceUsageSampler | None = None,
     ) -> None:
@@ -318,13 +320,18 @@ class TraceGovernorRuntime:
         self.requirements = requirements
         self.current_plan = plan
         self.observer = observer
+        self.admission_mode = admission_mode
         self._host_budget_discoverer = host_budget_discoverer or discover_host_budget
         self._resource_usage_sampler = resource_usage_sampler or TorchResourceUsageSampler()
         self._started_at = time.perf_counter()
         self._last_resource_usage: tuple[PhaseId, str, ResourceUsageObservation] | None = None
         self.revisions: list[PlanRevision] = []
         self._next_epoch: PlanningEpoch | None = PlanningEpoch.PRE_EXECUTION_ADMISSION
-        self.ledger = ResourceLedger(envelope, event_sink=self._ledger_event)
+        self.ledger = ResourceLedger(
+            envelope,
+            admission_mode=admission_mode,
+            event_sink=self._ledger_event,
+        )
         self._grants: list[ResourceGrant] = []
 
     def pre_execution_admission(self) -> PlanRevision:
@@ -389,7 +396,11 @@ class TraceGovernorRuntime:
             self.envelope = replace(self.envelope, host_budget_bytes=min(host_candidates))
         # Loaded-state calibration is the last epoch before any grant exists.
         # Bind accounting to the measured envelope used by the revised plan.
-        self.ledger = ResourceLedger(self.envelope, event_sink=self._ledger_event)
+        self.ledger = ResourceLedger(
+            self.envelope,
+            admission_mode=self.admission_mode,
+            event_sink=self._ledger_event,
+        )
         self.observer.observe(
             TraceEvent(
                 scope="run",
@@ -414,7 +425,7 @@ class TraceGovernorRuntime:
         self._emit_observation(epoch, observation)
         revision = self._record_revision(epoch, candidate)
         self._next_epoch = PlanningEpoch.ACTIVE_UNIVERSE_REPLAN
-        if candidate.admission.admitted:
+        if candidate.admission.admitted or self.admission_mode is AdmissionMode.ADVISORY:
             for name, reason in _EXCLUDED_ESTIMATES.items():
                 self._emit_estimate_excluded(name, reason)
             self._reserve_permanent(candidate.admission.estimates)
@@ -468,7 +479,10 @@ class TraceGovernorRuntime:
         self._emit_observation(epoch, observation)
         revision = self._record_revision(epoch, candidate)
         self._next_epoch = PlanningEpoch.PHASE3_ENTRY_REPLAN
-        if not candidate.admission.admitted:
+        if (
+            not candidate.admission.admitted
+            and self.admission_mode is AdmissionMode.ENFORCE
+        ):
             raise RuntimePlanningRefusedError(revision)
         return revision
 
@@ -564,7 +578,10 @@ class TraceGovernorRuntime:
             )
         self._emit_observation(epoch, observation)
         revision = self._record_revision(epoch, candidate)
-        if not candidate.admission.admitted:
+        if (
+            not candidate.admission.admitted
+            and self.admission_mode is AdmissionMode.ENFORCE
+        ):
             raise RuntimePlanningRefusedError(revision)
         return revision
 
@@ -754,7 +771,20 @@ class TraceGovernorRuntime:
                 f"{usage.host_rss_bytes} > {self.envelope.host_budget_bytes}"
             )
         if violations:
-            raise ResourceUsageExceededError("; ".join(violations))
+            if self.admission_mode is AdmissionMode.ENFORCE:
+                raise ResourceUsageExceededError("; ".join(violations))
+            self.observer.observe(
+                TraceEvent(
+                    scope="phase",
+                    phase=phase.value,
+                    name="planning.resource_limit_bypassed",
+                    attrs={
+                        "boundary": boundary,
+                        "reason": "observed_governor_budget_exceeded",
+                        "violations": tuple(violations),
+                    },
+                )
+            )
 
     def _record_revision(self, epoch: PlanningEpoch, candidate: TracePlan) -> PlanRevision:
         parent = self.current_plan.execution_fingerprint
@@ -775,6 +805,7 @@ class TraceGovernorRuntime:
                 name=f"planning.{epoch.value}",
                 attrs={
                     "admitted": candidate.admission.admitted,
+                    "governor_admission_mode": self.admission_mode.value,
                     "parent_execution_fingerprint": parent,
                     "execution_fingerprint": candidate.execution_fingerprint,
                     "semantic_fingerprint": candidate.semantic_fingerprint,
@@ -822,6 +853,21 @@ class TraceGovernorRuntime:
                 },
             )
         )
+        if (
+            not candidate.admission.admitted
+            and self.admission_mode is AdmissionMode.ADVISORY
+        ):
+            self.observer.observe(
+                TraceEvent(
+                    scope="run",
+                    name="planning.admission_bypassed",
+                    attrs={
+                        "epoch": epoch.value,
+                        "reason": "admission_report_refused",
+                        "refusals": candidate.admission.refusals,
+                    },
+                )
+            )
         return revision
 
     def _require_epoch(self, requested: PlanningEpoch) -> None:
@@ -929,20 +975,29 @@ class TraceGovernorRuntime:
             if estimate.name in _PHASE_CLAIMS.get(event.phase, set())
             or (event.phase is PhaseId.LOADED and estimate.lifetime is DemandLifetime.PERMANENT)
         )
+        event_name = (
+            "planning.resource_limit_bypassed"
+            if event.kind == "resource_limit_bypassed"
+            else f"planning.ledger_{'grant' if event.kind == 'admitted' else event.kind}"
+        )
+        attrs = {
+            "grant_id": event.grant_id,
+            "active_grants": event.actual.active_grant_ids,
+            "reserved": tuple((tier.value, amount) for tier, amount in event.actual.reserved),
+            "planned": planned,
+            "violation": None if event.violation is None else event.violation.value,
+        }
+        if event.kind == "resource_limit_bypassed":
+            attrs.update(
+                reason="predicted_resource_ledger_budget_exceeded",
+                violations=event.reasons,
+            )
         self.observer.observe(
             TraceEvent(
                 scope="phase",
                 phase=event.phase.value,
-                name=f"planning.ledger_{'grant' if event.kind == 'admitted' else event.kind}",
-                attrs={
-                    "grant_id": event.grant_id,
-                    "active_grants": event.actual.active_grant_ids,
-                    "reserved": tuple(
-                        (tier.value, amount) for tier, amount in event.actual.reserved
-                    ),
-                    "planned": planned,
-                    "violation": None if event.violation is None else event.violation.value,
-                },
+                name=event_name,
+                attrs=attrs,
             )
         )
 

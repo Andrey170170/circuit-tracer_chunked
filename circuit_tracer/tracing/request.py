@@ -2,7 +2,11 @@
 
 from dataclasses import dataclass, field
 
-from circuit_tracer.governor.contracts import FidelityMode, PhysicalExecutionRequirements
+from circuit_tracer.governor.contracts import (
+    AdmissionMode,
+    FidelityMode,
+    PhysicalExecutionRequirements,
+)
 
 from .plan import ExecutionConstraints, TraceEvidence
 from .problem import AttributionProblem, TraceSemantics
@@ -63,3 +67,8 @@ class TraceRequest:
     evidence: TraceEvidence = field(default_factory=TraceEvidence)
     physical_requirements: PhysicalExecutionRequirements | None = None
     governor_fidelity: GovernorFidelityPolicy = field(default_factory=GovernorFidelityPolicy)
+    governor_admission_mode: AdmissionMode = AdmissionMode.ENFORCE
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.governor_admission_mode, AdmissionMode):
+            raise ValueError("governor admission mode must be an AdmissionMode")

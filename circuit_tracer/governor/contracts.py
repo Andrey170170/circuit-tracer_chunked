@@ -20,6 +20,11 @@ class FidelityMode(str, Enum):
     RESEARCH = "research"
 
 
+class AdmissionMode(str, Enum):
+    ENFORCE = "enforce"
+    ADVISORY = "advisory"
+
+
 class CachePolicy(str, Enum):
     AUTO = "auto"
     WARM = "warm"

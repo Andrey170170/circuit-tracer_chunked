@@ -360,6 +360,7 @@ def recompile_governed_plan(
         execution=current.execution,
         evidence=TraceEvidence(metadata=current.evidence_metadata),
         physical_requirements=current.planning_requirements,
+        governor_admission_mode=current.governor_admission_mode,
     )
     return compile_governed_revision(
         request,

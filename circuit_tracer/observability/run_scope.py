@@ -27,6 +27,7 @@ class TraceRunScope:
     compact_output: bool
     profile: bool
     execution_identity: ExecutionIdentityState
+    governor_admission_mode: str = "enforce"
     started_at: float = field(default_factory=time.perf_counter)
     _closed: bool = False
 
@@ -56,6 +57,7 @@ class TraceRunScope:
             "requested_execution_fingerprint": self.execution_identity.requested_fingerprint,
             "effective_execution_fingerprint": self.execution_identity.effective_fingerprint,
             "execution_fingerprint": self.execution_identity.execution_fingerprint,
+            "governor_admission_mode": self.governor_admission_mode,
             "status": terminal_status,
         }
         if primary_error is not None:
@@ -93,6 +95,7 @@ class TraceRunScope:
             requested_execution_fingerprint=self.execution_identity.requested_fingerprint,
             effective_execution_fingerprint=self.execution_identity.effective_fingerprint,
             execution_fingerprint=self.execution_identity.execution_fingerprint,
+            governor_admission_mode=self.governor_admission_mode,
         )
         telemetry_export["summary"] = terminal_summary
 

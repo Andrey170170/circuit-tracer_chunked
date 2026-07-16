@@ -10,7 +10,13 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from .contracts import DemandClass, DemandLifetime, DemandTier, ResourceEnvelope
+from .contracts import (
+    AdmissionMode,
+    DemandClass,
+    DemandLifetime,
+    DemandTier,
+    ResourceEnvelope,
+)
 
 
 class PhaseId(str, Enum):
@@ -104,6 +110,7 @@ class LedgerEvent:
     phase: PhaseId
     actual: ResourceActual
     violation: LedgerViolation | None = None
+    reasons: tuple[str, ...] = ()
 
 
 EventSink = Callable[[LedgerEvent], None]
@@ -120,8 +127,17 @@ class ResourceLedger:
         DemandTier.WALLTIME,
     )
 
-    def __init__(self, envelope: ResourceEnvelope, *, event_sink: EventSink | None = None) -> None:
+    def __init__(
+        self,
+        envelope: ResourceEnvelope,
+        *,
+        admission_mode: AdmissionMode = AdmissionMode.ENFORCE,
+        event_sink: EventSink | None = None,
+    ) -> None:
+        if not isinstance(admission_mode, AdmissionMode):
+            raise ValueError("admission mode must be an AdmissionMode")
         self.envelope = envelope
+        self.admission_mode = admission_mode
         self._event_sink = event_sink
         self._grants: dict[str, ResourceGrant] = {}
         self._history: list[LedgerEvent] = []
@@ -186,28 +202,34 @@ class ResourceLedger:
         if any(claim.lifetime not in expected_lifetimes for claim in claims):
             kind = "permanent" if permanent else "phase/transient"
             raise ValueError(f"{kind} grants require matching claim lifetimes")
-        self._check_admission(claims)
+        violations = self._admission_violations(claims)
+        if violations and self.admission_mode is AdmissionMode.ENFORCE:
+            raise ResourceAdmissionError("; ".join(violations))
         grant = ResourceGrant(
             id=f"grant-{self._next_grant_number:04d}", phase=phase, claims=claims
         )
         self._next_grant_number += 1
         self._grants[grant.id] = grant
+        if violations:
+            self._record("resource_limit_bypassed", grant, reasons=violations)
         self._record("admitted", grant)
         for claim in claims:
             if claim.tier is DemandTier.FILE_BACKED:
                 self._record("warning", grant, LedgerViolation.ELASTIC_FILE_BACKED)
         return grant
 
-    def _check_admission(self, claims: tuple[ResourceClaim, ...]) -> None:
+    def _admission_violations(
+        self, claims: tuple[ResourceClaim, ...]
+    ) -> tuple[str, ...]:
         totals = dict(self.actual.reserved)
         for claim in claims:
             if claim.demand_class is DemandClass.RIGID:
                 totals[claim.tier] = totals.get(claim.tier, 0) + claim.amount
-        for tier, limit in self._limits().items():
-            if totals.get(tier, 0) > limit:
-                raise ResourceAdmissionError(
-                    f"{tier.value} admission exceeds budget: {totals[tier]} > {limit}"
-                )
+        return tuple(
+            f"{tier.value} admission exceeds budget: {totals[tier]} > {limit}"
+            for tier, limit in self._limits().items()
+            if totals.get(tier, 0) > limit
+        )
 
     def _limits(self) -> dict[DemandTier, int | float]:
         return {
@@ -219,7 +241,12 @@ class ResourceLedger:
         }
 
     def _record(
-        self, kind: str, grant: ResourceGrant, violation: LedgerViolation | None = None) -> None:
+        self,
+        kind: str,
+        grant: ResourceGrant,
+        violation: LedgerViolation | None = None,
+        reasons: tuple[str, ...] = (),
+    ) -> None:
         event = LedgerEvent(
             sequence=len(self._history) + 1,
             kind=kind,
@@ -227,6 +254,7 @@ class ResourceLedger:
             phase=grant.phase,
             actual=self.actual,
             violation=violation,
+            reasons=reasons,
         )
         self._history.append(event)
         if self._event_sink is not None:

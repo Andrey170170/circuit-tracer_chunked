@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from circuit_tracer.governor.contracts import (
+    AdmissionMode,
     DemandClass,
     DemandLifetime,
     DemandTier,
@@ -65,6 +66,29 @@ def test_overcommit_fails_before_registration() -> None:
 
     assert ledger.actual.amount_for(DemandTier.VRAM) == 0
     assert ledger.history == ()
+
+
+def test_advisory_overcommit_records_bypass_before_admitted_grant() -> None:
+    ledger = ResourceLedger(_envelope(), admission_mode=AdmissionMode.ADVISORY)
+
+    grant = ledger.grant(
+        PhaseId.PHASE3,
+        [_claim("too-big", DemandTier.VRAM, DemandLifetime.PHASE, 101)],
+    )
+
+    assert ledger.actual.amount_for(DemandTier.VRAM) == 101
+    assert [event.kind for event in ledger.history] == [
+        "resource_limit_bypassed",
+        "admitted",
+    ]
+    bypass = ledger.history[0]
+    assert bypass.grant_id == grant.id
+    assert bypass.reasons == ("vram admission exceeds budget: 101 > 100",)
+
+
+def test_invalid_admission_mode_fails_closed() -> None:
+    with pytest.raises(ValueError, match="admission mode must be an AdmissionMode"):
+        ResourceLedger(_envelope(), admission_mode="enforce")  # type: ignore[arg-type]
 
 
 def test_context_release_runs_after_exception() -> None:

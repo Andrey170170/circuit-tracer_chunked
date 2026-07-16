@@ -1,6 +1,6 @@
 """Canonical typed tracing API."""
 
-from circuit_tracer.governor.contracts import FidelityMode
+from circuit_tracer.governor.contracts import AdmissionMode, FidelityMode
 
 from .api import open_session, trace_batch, trace_one
 from circuit_tracer.execution_identity import (
@@ -27,6 +27,7 @@ from .session import SessionWindow, TraceSession
 
 __all__ = [
     "AttributionProblem",
+    "AdmissionMode",
     "DecoderCachePolicy",
     "DecoderPlan",
     "ExecutionConstraints",

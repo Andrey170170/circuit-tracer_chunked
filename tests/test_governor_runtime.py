@@ -7,11 +7,16 @@ import torch
 
 from circuit_tracer.attribution.nnsight.execution import AttributionExecution
 from circuit_tracer.governor.contracts import (
+    AdmissionMode,
+    DemandClass,
+    DemandLifetime,
+    DemandTier,
     PhysicalExecutionRequirements,
+    PlanStatus,
     ResourceEnvelope,
     TraceSemantics,
 )
-from circuit_tracer.governor.ledger import PhaseId
+from circuit_tracer.governor.ledger import PhaseId, ResourceClaim
 from circuit_tracer.governor.host_budget import HostBudgetCandidate, HostBudgetDiscovery
 from circuit_tracer.governor.profiles import RECORDED_PROVIDER_PROFILES
 from circuit_tracer.governor.resolver import resolve_trace_plan
@@ -72,6 +77,7 @@ def runtime(
     nnz: int = 1000,
     disk: int = 100 * GIB,
     requirements: PhysicalExecutionRequirements | None = None,
+    admission_mode: AdmissionMode = AdmissionMode.ENFORCE,
 ):
     profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
     inputs = workload(nnz=nnz)
@@ -86,6 +92,7 @@ def runtime(
         envelope=resources,
         requirements=requirements,
         observer=observer,
+        admission_mode=admission_mode,
         host_budget_discoverer=lambda requested: HostBudgetDiscovery(
             requested,
             "test_allocation",
@@ -196,6 +203,60 @@ def test_all_planning_epochs_are_ordered_and_semantics_stay_stable() -> None:
         event.name == "planning.active_universe_layer"
         and event.attrs == {"layer_index": 0, "active_count": 100}
         for event in governed.observer.events
+    )
+
+
+def test_advisory_records_and_bypasses_refusal_at_all_planning_epochs(
+    monkeypatch,
+) -> None:
+    governed, observer = runtime(admission_mode=AdmissionMode.ADVISORY)
+    governed.current_plan = replace(
+        governed.current_plan,
+        admission=replace(
+            governed.current_plan.admission,
+            admitted=False,
+            refusals=("pre execution test refusal",),
+        ),
+        status=PlanStatus.ADVISORY_REFUSED,
+    )
+    original_resolve = resolve_trace_plan
+    refusal_number = 0
+
+    def refused(*args, **kwargs):
+        nonlocal refusal_number
+        refusal_number += 1
+        candidate = original_resolve(*args, **kwargs)
+        return replace(
+            candidate,
+            admission=replace(
+                candidate.admission,
+                admitted=False,
+                refusals=(f"runtime test refusal {refusal_number}",),
+            ),
+            status=PlanStatus.ADVISORY_REFUSED,
+        )
+
+    monkeypatch.setattr("circuit_tracer.governor.runtime.resolve_trace_plan", refused)
+
+    governed.pre_execution_admission()
+    governed.loaded_state_calibration(unavailable_loaded_state())
+    governed.active_universe_replan(active_observation(100))
+    governed.phase3_entry_replan()
+    governed.phase4_entry_replan()
+
+    bypasses = [
+        event
+        for event in observer.events
+        if event.name == "planning.admission_bypassed"
+    ]
+    assert [event.attrs["epoch"] for event in bypasses] == [
+        epoch.value for epoch in PlanningEpoch
+    ]
+    assert all(event.attrs["reason"] == "admission_report_refused" for event in bypasses)
+    assert all(
+        event.attrs["governor_admission_mode"] == "advisory"
+        for event in observer.events
+        if event.name.startswith("planning.") and event.name.endswith(("admission", "calibration", "replan"))
     )
 
 
@@ -698,6 +759,66 @@ def test_measured_usage_over_budget_fails_and_releases_grant() -> None:
         governed.grant(PhaseId.PHASE3)
 
     assert governed.ledger.actual.active_grant_ids == active_before_grant
+
+
+def test_advisory_measured_usage_over_budget_records_bypass_and_continues() -> None:
+    governed, observer = runtime(admission_mode=AdmissionMode.ADVISORY)
+    governed._resource_usage_sampler = type(
+        "Sampler",
+        (),
+        {
+            "sample": lambda self, *, started_at: ResourceUsageObservation(
+                cuda_allocated_bytes=None,
+                cuda_reserved_bytes=governed.envelope.effective_vram_budget_bytes + 1,
+                cuda_total_bytes=governed.envelope.total_vram_bytes,
+                host_rss_bytes=1,
+                host_available_bytes=1,
+                elapsed_seconds=0.0,
+            )
+        },
+    )()
+    advance_to_active(governed)
+    governed.active_universe_replan(active_observation(100))
+
+    grant = governed.grant(PhaseId.PHASE3)
+
+    assert grant is not None
+    bypass = next(
+        event
+        for event in observer.events
+        if event.name == "planning.resource_limit_bypassed"
+        and event.attrs["reason"] == "observed_governor_budget_exceeded"
+    )
+    assert bypass.attrs["boundary"] == "grant"
+    assert "VRAM budget" in bypass.attrs["violations"][0]
+    governed.release(grant)
+
+
+def test_advisory_predicted_ledger_limit_emits_bypass_before_grant() -> None:
+    governed, observer = runtime(admission_mode=AdmissionMode.ADVISORY)
+    claim = ResourceClaim(
+        name="forced-vram",
+        tier=DemandTier.VRAM,
+        demand_class=DemandClass.RIGID,
+        lifetime=DemandLifetime.PHASE,
+        amount=governed.envelope.effective_vram_budget_bytes + 1,
+    )
+
+    grant = governed.ledger.grant(PhaseId.PHASE3, [claim])
+
+    matching = [
+        event
+        for event in observer.events
+        if event.attrs.get("grant_id") == grant.id
+    ]
+    assert [event.name for event in matching] == [
+        "planning.resource_limit_bypassed",
+        "planning.ledger_grant",
+    ]
+    assert matching[0].attrs["reason"] == (
+        "predicted_resource_ledger_budget_exceeded"
+    )
+    assert "vram admission exceeds budget" in matching[0].attrs["violations"][0]
 
 
 def test_planning_epoch_state_machine_rejects_skips_and_duplicates() -> None:

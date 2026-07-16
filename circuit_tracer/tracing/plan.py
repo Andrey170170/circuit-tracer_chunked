@@ -7,6 +7,7 @@ from os import PathLike
 from typing import Any, Literal, Mapping
 
 from circuit_tracer.governor.contracts import (
+    AdmissionMode,
     AdmissionReport,
     CachePolicy,
     PhysicalExecutionRequirements,
@@ -240,6 +241,7 @@ class ResolvedTracePlan:
     semantic_fingerprint: str
     requested_execution_fingerprint: str
     backend: Literal["nnsight", "transformerlens"]
+    governor_admission_mode: AdmissionMode = AdmissionMode.ENFORCE
     evidence_metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
     admission_report: AdmissionReport | None = None
     planning_profile: ProviderProfile | None = field(default=None, repr=False)
