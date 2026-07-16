@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import Any
 
 from circuit_tracer.governor.contracts import (
@@ -16,13 +16,25 @@ from circuit_tracer.governor.contracts import (
     RowStorePolicy,
     StorageTier,
     TraceSemantics as PlanningWorkload,
+    canonical_json,
 )
 from circuit_tracer.governor.resolver import resolve_trace_plan
 from circuit_tracer.transcoder.provider import provider_fingerprint
 
 from .plan import DecoderCachePolicy, DecoderPlan, ResolvedTracePlan
 from .plan import TraceEvidence
-from .request import TraceRequest
+from .request import GovernorFidelityPolicy, TraceRequest
+
+
+_FIDELITY_BOOKKEEPING_FIELDS = frozenset(
+    {
+        "fidelity",
+        "evidence_name",
+        "evidence_version",
+        "semantic_overrides",
+        "research_overrides",
+    }
+)
 
 
 def _prompt_token_count(problem: Any) -> int:
@@ -103,7 +115,7 @@ def _workload(
     max_features = semantics.max_feature_nodes or math.ceil(
         token_count * profile.estimated_active_features_per_token
     )
-    return PlanningWorkload(
+    workload = PlanningWorkload(
         prompt_token_count=token_count,
         estimated_active_features=max(
             1, math.ceil(token_count * profile.estimated_active_features_per_token)
@@ -123,7 +135,39 @@ def _workload(
         decoder_reduction_tile=request.execution.replay.decoder_contraction_tile or 4096,
         frontier_refresh_stride=semantics.update_interval,
         dtype=semantics.exact_trace_internal_dtype,
-        fidelity=FidelityMode.STRICT,
+    )
+    return _authorize_fidelity(workload, request.governor_fidelity)
+
+
+def _authorize_fidelity(
+    workload: PlanningWorkload,
+    policy: GovernorFidelityPolicy,
+) -> PlanningWorkload:
+    if policy.mode is FidelityMode.STRICT:
+        return workload
+
+    semantic_fields = {item.name for item in fields(workload)} - _FIDELITY_BOOKKEEPING_FIELDS
+    invalid = tuple(name for name in policy.override_fields if name not in semantic_fields)
+    if invalid:
+        names = ", ".join(invalid)
+        raise ValueError(
+            "unknown or non-semantic PlanningWorkload override fields: " + names
+        )
+    overrides = tuple(
+        (name, canonical_json(getattr(workload, name))) for name in policy.override_fields
+    )
+    if policy.mode is FidelityMode.RESEARCH:
+        return replace(
+            workload,
+            fidelity=policy.mode,
+            research_overrides=overrides,
+        )
+    return replace(
+        workload,
+        fidelity=policy.mode,
+        evidence_name=policy.evidence_name,
+        evidence_version=policy.evidence_version,
+        semantic_overrides=overrides,
     )
 
 

@@ -8,6 +8,7 @@ import pytest
 
 from circuit_tracer.governor import GRANITE_H200_CALIBRATIONS
 from circuit_tracer.governor import HISTORICAL_STRESS_FIXTURES
+from circuit_tracer.governor import PhysicalExecutionRequirements
 from circuit_tracer.governor import RECORDED_PROVIDER_PROFILES
 from circuit_tracer.governor import ResourceEnvelope
 from circuit_tracer.governor import TRUSTED_VALIDATION_EVIDENCE_REGISTRY
@@ -133,6 +134,11 @@ def test_v03_profiles_separate_safety_support_and_session_memory() -> None:
 
     assert clt.safety_limits.max_physical_rows == 4096
     assert plt.safety_limits.max_physical_rows == 4096
+    assert clt.safety_limits.max_logical_batch_size == 4096
+    assert plt.safety_limits.max_logical_batch_size == 4096
+    assert clt.max_fetch_chunk_size == 10_080
+    assert plt.max_fetch_chunk_size == 32_768
+    assert all(profile.max_fetch_chunk_size == 32_768 for profile in larger)
     assert clt.phase_memory_models[0].session_vram_bytes_per_item == 87_000_000
     assert plt.phase_memory_models[0].session_vram_bytes_per_item == 87_000_000
     assert all(
@@ -149,6 +155,47 @@ def test_v03_profiles_separate_safety_support_and_session_memory() -> None:
         for profile in (clt, plt, *larger)
         for model in profile.phase_memory_models
     )
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "fetch_ceiling"),
+    [
+        ("granite_h200_1b_clt_b1000_c4096_cache8", 10_080),
+        ("granite_h200_1b_plt_b128_c4096_cache0", 32_768),
+    ],
+)
+def test_wave_a_fetch_ceiling_is_an_exact_physical_requirement(
+    profile_name,
+    fetch_ceiling,
+) -> None:
+    profile = RECORDED_PROVIDER_PROFILES[profile_name]
+    observation = next(
+        item for item in GRANITE_H200_CALIBRATIONS if item.profile_name == profile_name
+    )
+    envelope = ResourceEnvelope(
+        total_vram_bytes=141 * GIB,
+        host_budget_bytes=800 * GIB,
+        file_cache_allowance_bytes=64 * GIB,
+        local_disk_bytes=100 * GIB,
+        scratch_disk_bytes=100 * GIB,
+        walltime_seconds=10**30,
+    )
+
+    plan = resolve_trace_plan(
+        observation.reference_semantics(),
+        profile,
+        envelope,
+        PhysicalExecutionRequirements(decoder_fetch_chunk_size=fetch_ceiling),
+    )
+    assert plan.admission.admitted, plan.format()
+    assert plan.physical.decoder_fetch_chunk_size == fetch_ceiling
+    with pytest.raises(ValueError, match="within profile maximum"):
+        resolve_trace_plan(
+            observation.reference_semantics(),
+            profile,
+            envelope,
+            PhysicalExecutionRequirements(decoder_fetch_chunk_size=fetch_ceiling + 1),
+        )
 
 
 def test_historical_stress_fixtures_resolve_to_recommendations():

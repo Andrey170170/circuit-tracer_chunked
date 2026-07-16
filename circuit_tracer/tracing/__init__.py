@@ -1,5 +1,7 @@
 """Canonical typed tracing API."""
 
+from circuit_tracer.governor.contracts import FidelityMode
+
 from .api import open_session, trace_batch, trace_one
 from circuit_tracer.execution_identity import (
     EffectiveExecutionDescriptor,
@@ -19,7 +21,7 @@ from .plan import (
 )
 from .planning import resolve_trace_request
 from .problem import AttributionProblem, FrontierSemantics, PrefixViewTarget, TraceSemantics
-from .request import TraceRequest
+from .request import GovernorFidelityPolicy, TraceRequest
 from .result import TraceResult, TraceStatus
 from .session import SessionWindow, TraceSession
 
@@ -28,10 +30,12 @@ __all__ = [
     "DecoderCachePolicy",
     "DecoderPlan",
     "ExecutionConstraints",
+    "FidelityMode",
     "EffectiveExecutionDescriptor",
     "EffectiveExecutionIdentity",
     "FrontierExpansionPlan",
     "FrontierSemantics",
+    "GovernorFidelityPolicy",
     "ObservabilityPolicy",
     "PrefixViewTarget",
     "ReplayPlan",

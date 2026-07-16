@@ -359,7 +359,7 @@ def _profile(observation: ResourceCalibrationObservation) -> ProviderProfile:
             ),
         ),
         default_fetch_chunk_size=observation.fetch_chunk_size,
-        max_fetch_chunk_size=observation.fetch_chunk_size,
+        max_fetch_chunk_size=(10_080 if observation.architecture == "clt" else 32_768),
         max_session_capacity=4096,
         max_phase1_source_batch_size=4096,
         max_source_microbatch_size=4096,
