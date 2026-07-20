@@ -147,11 +147,11 @@ class Phase4WorkSummary:
     semantic_descriptor_top_k: int
     semantic_descriptor_dim: int
     feature_batch_size: int
-    executor_reference_batch_size: int
-    executor_microbatch_size: int
+    semantic_batch_max_rows: int
+    execution_batch_max_rows: int
     refresh_count: int
     scheduler_reference_batch_count: int
-    executor_microbatch_count: int
+    execution_batch_count: int
 
 
 @dataclass(frozen=True)

@@ -16,8 +16,13 @@ def finish_phase4(state):
             {
                 "selected_features": int(state.visited.sum().item()),
                 "final_feature_batch_size": state.phase4_feature_batch_size,
-                "phase4_batches": state.phase4_scheduler_reference_batch_count,
-                "phase4_executor_microbatch_count": state.phase4_executor_microbatch_count,
+                "phase4_semantic_batch_count": state.phase4_scheduler_reference_batch_count,
+                "phase4_semantic_rows": state.n_visited,
+                "phase4_execution_batch_count": state.phase4_execution_batch_count,
+                "phase4_execution_rows": state.n_visited,
+                "phase4_coalesced_execution_batch_count": (
+                    state.phase4_coalesced_execution_batch_count
+                ),
             },
         )
     )
@@ -31,8 +36,18 @@ def finish_phase4(state):
             attrs={
                 "selected_features": int(state.visited.sum().item()),
                 "feature_batch_size": int(state.phase4_feature_batch_size),
-                "phase4_batches": int(state.phase4_scheduler_reference_batch_count),
-                "phase4_executor_microbatch_count": int(state.phase4_executor_microbatch_count),
+                "phase4_semantic_batch_count": int(
+                    state.phase4_scheduler_reference_batch_count
+                ),
+                "phase4_semantic_rows": int(state.n_visited),
+                "phase4_execution_batch_count": int(state.phase4_execution_batch_count),
+                "phase4_execution_rows": int(state.n_visited),
+                "phase4_execution_batch_max_rows": int(
+                    state.phase4_execution_batch_max_rows
+                ),
+                "phase4_coalesced_execution_batch_count": int(
+                    state.phase4_coalesced_execution_batch_count
+                ),
                 "phase4_refreshes": int(state.phase4_refresh_count),
                 "phase4_refresh_elapsed_ms_total": float(state.phase4_refresh_elapsed_ms_total),
                 "phase4_feature_batch_elapsed_ms_total": float(

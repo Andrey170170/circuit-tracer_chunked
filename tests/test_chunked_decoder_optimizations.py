@@ -1928,58 +1928,55 @@ def test_phase4_streaming_v1_microbatch_size_is_capped() -> None:
     assert _resolve_phase4_streaming_v1_microbatch_size(256) == 64
 
 
-def test_phase4_executor_batch_telemetry_separates_scheduler_and_microbatch_counts() -> None:
+def test_phase4_executor_batch_telemetry_separates_semantic_and_execution_counts() -> None:
     telemetry = _build_phase4_executor_batch_telemetry(
-        scheduler_reference_batch_index=2,
-        scheduler_reference_batch_count=4,
-        scheduler_reference_batch_rows=128,
-        executor_microbatch_index=9,
-        executor_microbatch_count=12,
-        executor_configured_reference_batch_size=128,
-        executor_microbatch_rows=32,
-        executor_microbatch_size=32,
+        semantic_batch_count=4,
+        semantic_batch_max_rows=128,
+        semantic_batch_index_start=2,
+        semantic_batch_index_end=2,
+        semantic_batch_rows=(128,),
+        execution_batch_index=9,
+        execution_batch_count=12,
+        execution_batch_rows=32,
+        execution_batch_max_rows=32,
     )
 
-    assert telemetry["phase4_batch_count"] == 4
-    assert telemetry["phase4_batches"] == 4
-    assert telemetry["phase4_executor_microbatch_count"] == 12
-    assert telemetry["scheduler_reference_batch_index"] == 2
-    assert telemetry["scheduler_reference_batch_rows"] == 128
-    assert telemetry["executor_microbatch_index"] == 9
-    assert telemetry["executor_microbatch_rows"] == 32
-    assert telemetry["executor_configured_reference_batch_size"] == 128
-    assert telemetry["executor_reference_batch_size"] == 128
-    assert telemetry["executor_microbatch_size"] == 32
+    assert telemetry["phase4_semantic_batch_count"] == 4
+    assert telemetry["phase4_semantic_batch_max_rows"] == 128
+    assert telemetry["phase4_execution_batch_count"] == 12
+    assert telemetry["phase4_execution_batch_index"] == 9
+    assert telemetry["phase4_execution_batch_rows"] == 32
+    assert telemetry["phase4_execution_batch_max_rows"] == 32
 
 
-def test_phase4_executor_batch_telemetry_keeps_reference_and_microbatch_indices_separate() -> None:
+def test_phase4_executor_batch_telemetry_keeps_semantic_and_execution_indices_separate() -> None:
     first = _build_phase4_executor_batch_telemetry(
-        scheduler_reference_batch_index=0,
-        scheduler_reference_batch_count=1,
-        scheduler_reference_batch_rows=64,
-        executor_microbatch_index=1,
-        executor_microbatch_count=1,
-        executor_configured_reference_batch_size=64,
-        executor_microbatch_rows=32,
-        executor_microbatch_size=32,
+        semantic_batch_count=1,
+        semantic_batch_max_rows=64,
+        semantic_batch_index_start=0,
+        semantic_batch_index_end=0,
+        semantic_batch_rows=(64,),
+        execution_batch_index=1,
+        execution_batch_count=1,
+        execution_batch_rows=32,
+        execution_batch_max_rows=32,
     )
     second = _build_phase4_executor_batch_telemetry(
-        scheduler_reference_batch_index=1,
-        scheduler_reference_batch_count=2,
-        scheduler_reference_batch_rows=64,
-        executor_microbatch_index=2,
-        executor_microbatch_count=2,
-        executor_configured_reference_batch_size=64,
-        executor_microbatch_rows=32,
-        executor_microbatch_size=32,
+        semantic_batch_count=2,
+        semantic_batch_max_rows=64,
+        semantic_batch_index_start=1,
+        semantic_batch_index_end=1,
+        semantic_batch_rows=(64,),
+        execution_batch_index=2,
+        execution_batch_count=2,
+        execution_batch_rows=32,
+        execution_batch_max_rows=32,
     )
 
-    assert first["phase4_batch_count"] == 1
-    assert second["phase4_batch_count"] == 2
-    assert first["scheduler_reference_batch_index"] == 0
-    assert second["scheduler_reference_batch_index"] == 1
-    assert first["executor_microbatch_index"] == 1
-    assert second["executor_microbatch_index"] == 2
+    assert first["phase4_semantic_batch_count"] == 1
+    assert second["phase4_semantic_batch_count"] == 2
+    assert first["phase4_execution_batch_index"] == 1
+    assert second["phase4_execution_batch_index"] == 2
 
 
 def test_phase4_batch_locality_summary_reports_layer_and_chunk_ranges() -> None:

@@ -443,7 +443,7 @@ def _resolve_batches(
     validate_nnsight_session_control_requests(
         nnsight_session_capacity=session.capacity,
         phase3_compute_microbatch_max_rows=session.phase3_microbatch_max_rows,
-        phase4_compute_microbatch_max_rows=session.phase4_microbatch_max_rows,
+        phase4_execution_batch_max_rows=session.phase4_execution_batch_max_rows,
     )
     planner_enabled = _resolve_phase4_feature_batch_planner_enabled(
         plan_feature_batch_size=frontier_plan.feature_batch_planning,
@@ -495,7 +495,7 @@ def _resolve_batches(
     controls = resolve_nnsight_session_controls(
         nnsight_session_capacity=session.capacity,
         phase3_compute_microbatch_max_rows=session.phase3_microbatch_max_rows,
-        phase4_compute_microbatch_max_rows=session.phase4_microbatch_max_rows,
+        phase4_execution_batch_max_rows=session.phase4_execution_batch_max_rows,
         legacy_session_capacity=max(source_size, feature_size, logit_size),
         legacy_phase3_batch_rows=logit_size,
         legacy_phase4_batch_rows=legacy_phase4_rows,
@@ -685,7 +685,9 @@ def _effective_execution_identity(
             "feature_batch_planner_skip_reason": batches.planner_skip_reason,
             "session_capacity": batches.session_controls.session_capacity,
             "phase3_microbatch_max_rows": batches.session_controls.phase3_microbatch_max_rows,
-            "phase4_microbatch_max_rows": batches.session_controls.phase4_microbatch_max_rows,
+            "phase4_execution_batch_max_rows": (
+                batches.session_controls.phase4_execution_batch_max_rows
+            ),
             "trace_batch_size": batches.trace_batch_size,
         },
         frontier={

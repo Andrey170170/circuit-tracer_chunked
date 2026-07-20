@@ -270,6 +270,93 @@ def test_phase1_source_batch_size_changes_predicted_walltime():
     ]
 
 
+def test_phase4_execution_batch_costs_calls_across_fixed_refresh_window() -> None:
+    semantics = _semantics(feature_batch_size=128, frontier_refresh_stride=2)
+    profile = _profile(max_session_capacity=256, max_phase4_microbatch_size=256)
+    common = dict(
+        session_capacity=256,
+        source_microbatch_size=32,
+        logit_microbatch_size=16,
+    )
+    semantic_width = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(),
+        PhysicalExecutionRequirements(
+            **common,
+            feature_microbatch_size=128,
+        ),
+    )
+    coalesced = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(),
+        PhysicalExecutionRequirements(
+            **common,
+            feature_microbatch_size=256,
+        ),
+    )
+
+    assert coalesced.physical.session_capacity == 256
+    assert coalesced.physical.feature_microbatch_size == 256
+    assert _estimates(coalesced)["trace_vram"] == _estimates(semantic_width)["trace_vram"]
+    assert _estimates(coalesced)["predicted_walltime_high"] < _estimates(
+        semantic_width
+    )["predicted_walltime_high"]
+    assert _estimates(coalesced)["predicted_walltime_high"] == pytest.approx(
+        0.75 * _estimates(semantic_width)["predicted_walltime_high"]
+    )
+
+
+def test_phase4_execution_request_expands_session_domain_beyond_semantic_batch() -> None:
+    plan = resolve_trace_plan(
+        _semantics(feature_batch_size=128, frontier_refresh_stride=2),
+        _profile(max_session_capacity=256, max_phase4_microbatch_size=256),
+        _envelope(),
+        PhysicalExecutionRequirements(feature_microbatch_size=256),
+    )
+
+    assert plan.physical.feature_microbatch_size == 256
+    assert plan.physical.session_capacity == 256
+
+
+def test_unconstrained_solver_can_coalesce_across_semantic_batches() -> None:
+    plan = resolve_trace_plan(
+        _semantics(feature_batch_size=128, frontier_refresh_stride=4),
+        _profile(max_session_capacity=512, max_phase4_microbatch_size=512),
+        _envelope(),
+    )
+
+    assert plan.physical.feature_microbatch_size > 128
+    assert plan.physical.feature_microbatch_size <= 512
+
+
+def test_phase4_execution_batch_changes_only_execution_fingerprint() -> None:
+    semantics = _semantics(feature_batch_size=128, frontier_refresh_stride=2)
+    profile = _profile(max_session_capacity=256, max_phase4_microbatch_size=256)
+    reference = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(),
+        PhysicalExecutionRequirements(
+            session_capacity=256,
+            feature_microbatch_size=128,
+        ),
+    )
+    coalesced = resolve_trace_plan(
+        semantics,
+        profile,
+        _envelope(),
+        PhysicalExecutionRequirements(
+            session_capacity=256,
+            feature_microbatch_size=256,
+        ),
+    )
+
+    assert coalesced.semantic_fingerprint == reference.semantic_fingerprint
+    assert coalesced.execution_fingerprint != reference.execution_fingerprint
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

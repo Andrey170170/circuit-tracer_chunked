@@ -78,7 +78,7 @@ def _identity(
     controls = NNSightSessionControls(
         session_capacity=feature_batch_size,
         phase3_microbatch_max_rows=feature_batch_size,
-        phase4_microbatch_max_rows=feature_batch_size,
+        phase4_execution_batch_max_rows=feature_batch_size,
         metadata={},
     )
     batches = BatchMechanisms(

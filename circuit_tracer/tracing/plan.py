@@ -53,7 +53,7 @@ class SessionPlan:
     capacity: int | None = None
     source_microbatch_max_rows: int | None = None
     phase3_microbatch_max_rows: int | None = None
-    phase4_microbatch_max_rows: int | None = None
+    phase4_execution_batch_max_rows: int | None = None
     phase1_trace_batch_policy: Literal["legacy", "cap_effective_batches"] = "legacy"
     phase1_trace_batch_size_max: int | None = None
     decoder_cache: DecoderCachePolicy = field(default_factory=DecoderCachePolicy)
@@ -63,14 +63,14 @@ class SessionPlan:
             "capacity",
             "source_microbatch_max_rows",
             "phase3_microbatch_max_rows",
-            "phase4_microbatch_max_rows",
+            "phase4_execution_batch_max_rows",
         ):
             _positive(name, getattr(self, name))
         if self.capacity is not None:
             for name in (
                 "source_microbatch_max_rows",
                 "phase3_microbatch_max_rows",
-                "phase4_microbatch_max_rows",
+                "phase4_execution_batch_max_rows",
             ):
                 value = getattr(self, name)
                 if value is not None and value > self.capacity:
@@ -81,7 +81,6 @@ class SessionPlan:
             and self.phase1_trace_batch_size_max is None
         ):
             raise ValueError("capped Phase-1 batching requires phase1_trace_batch_size_max")
-
 
 @dataclass(frozen=True)
 class RowStoragePlan:

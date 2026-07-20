@@ -144,14 +144,14 @@ def reduce_feature_rows(state):
 
 def commit_feature_rows(state):
     """Commit feature and nonfeature rows to owned storage."""
-    if state.anomaly_debug_result is not None and state.phase4_executor_microbatch_count <= 2:
+    if state.anomaly_debug_result is not None and state.phase4_execution_batch_count <= 2:
         state.feature_row_batches = state.anomaly_debug_result.setdefault(
             "phase4_feature_row_batches", []
         )
         assert isinstance(state.feature_row_batches, list)
         state.feature_row_batches.append(
             {
-                "batch_index": int(state.executor_microbatch_index),
+                "batch_index": int(state.execution_batch_index),
                 "batch_row_count": int(state.row_count),
                 "row_input_stats": _build_matrix_abs_stats(
                     state.row_input_slice, epsilon=1e-12, top_k=8

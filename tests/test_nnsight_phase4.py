@@ -95,7 +95,7 @@ def _config() -> Phase4Config:
         n_logits=1,
         logit_offset=1,
         effective_feature_batch_size=2,
-        compute_microbatch_max_rows=2,
+        execution_batch_max_rows=2,
         max_phase4_feature_batch_size=4,
         update_interval=1,
         row_store_capacity_feature_nodes=0,
@@ -181,11 +181,11 @@ def test_phase4_returns_boundary_state_without_replacing_owned_buffers() -> None
     assert result.anomaly_debug_result is inputs.anomaly_debug_result
     assert result.anomaly_debug_result["status"] == "captured_refresh_debug"
     assert result.phase4_feature_batch_size == 2
-    assert result.phase4_executor_reference_batch_size == 2
-    assert result.phase4_executor_microbatch_size == 2
+    assert result.phase4_semantic_batch_max_rows == 2
+    assert result.phase4_execution_batch_max_rows == 2
+    assert result.phase4_execution_batch_count == 0
     assert result.phase4_refresh_count == 0
     assert result.phase4_scheduler_reference_batch_count == 0
-    assert result.phase4_executor_microbatch_count == 0
     assert len(observer.phases) == 1
 
 
@@ -229,7 +229,7 @@ def test_phase4_nonzero_dense_execution_writes_rows_and_returns_owned_state(
     assert result.row_to_node_index.tolist() == [7, 0]
     assert result.rows_cpu_staging is inputs.rows_cpu_staging
     assert result.phase4_execution_metadata is inputs.phase4_execution_metadata
-    assert result.phase4_execution_metadata["executor_reference_batch_size"] == 2
+    assert result.phase4_execution_metadata["phase4_semantic_batch_max_rows"] == 2
     assert result.phase4_frontier_buffer_metadata is inputs.phase4_frontier_buffer_metadata
     assert result.phase4_frontier_buffer_metadata["final_actual_max_feature_nodes"] == 1
     assert result.cross_cluster_debug_summary is inputs.cross_cluster_debug_summary
@@ -238,12 +238,12 @@ def test_phase4_nonzero_dense_execution_writes_rows_and_returns_owned_state(
     assert len(result.cross_cluster_debug_checkpoints) == 1
     assert len(result.cross_cluster_debug_batches) == 1
     assert result.phase4_scheduler_reference_batch_count == 1
-    assert result.phase4_executor_microbatch_count == 1
+    assert result.phase4_execution_batch_count == 1
     assert result.phase4_refresh_count == 0
     assert len(observer.batches) == 1
     assert observer.batches[0]["attrs"]["visited_features"] == 1
     assert len(observer.phases) == 1
-    assert observer.phases[0]["attrs"]["phase4_executor_microbatch_count"] == 1
+    assert observer.phases[0]["attrs"]["phase4_execution_batch_count"] == 1
 
 
 def test_phase4_nonzero_compact_execution_appends_partitioned_rows_to_owned_stores(
@@ -337,16 +337,160 @@ def test_phase4_physical_microbatches_preserve_order_and_refresh_result(monkeypa
 
     whole = run_phase4(
         inputs=inputs_for(FakeObserver()),
-        config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, compute_microbatch_max_rows=3),
+        config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, execution_batch_max_rows=3),
     )
     split_observer = FakeObserver()
     split = run_phase4(
         inputs=inputs_for(split_observer),
-        config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, compute_microbatch_max_rows=2),
+        config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, execution_batch_max_rows=2),
     )
 
     assert torch.equal(split.edge_matrix, whole.edge_matrix)
     assert torch.equal(split.row_to_node_index, whole.row_to_node_index)
     assert split.phase4_refresh_count == whole.phase4_refresh_count
     assert [batch["batch_index"] for batch in split_observer.batches] == [1, 2]
-    assert all(batch["attrs"]["executor_physically_split"] for batch in split_observer.batches)
+    assert all(
+        batch["attrs"]["phase4_execution_batch_split"]
+        for batch in split_observer.batches
+    )
+
+
+def test_phase4_coalesces_semantic_batches_without_changing_schedule_or_results() -> None:
+    def run(execution_batch_max_rows: int):
+        observer = FakeObserver()
+        materialized: list[list[int]] = []
+        compute_calls = 0
+
+        def materialize(indices: torch.Tensor) -> torch.Tensor:
+            materialized.append(indices.tolist())
+            return indices.to(dtype=torch.float32).reshape(-1, 1)
+
+        def compute_batch(**kwargs: object) -> torch.Tensor:
+            nonlocal compute_calls
+            compute_calls += 1
+            values = kwargs["inject_values"]
+            assert isinstance(values, torch.Tensor)
+            return torch.cat(tuple(values + offset for offset in range(5)), dim=1)
+
+        inputs = replace(
+            _nonzero_inputs(observer),
+            ctx=SimpleNamespace(
+                materialize_encoder_vectors=materialize,
+                compute_batch=compute_batch,
+            ),
+            edge_matrix=torch.zeros((5, 5)),
+            feat_ids=torch.tensor([20, 21, 22, 23]),
+            feat_layers=torch.zeros(4, dtype=torch.long),
+            feat_pos=torch.zeros(4, dtype=torch.long),
+            row_to_node_index=torch.tensor([7, -1, -1, -1, -1]),
+        )
+        result = run_phase4(
+            inputs=inputs,
+            config=replace(
+                _config(),
+                actual_max_feature_nodes=4,
+                total_active_feats=4,
+                logit_offset=5,
+                effective_feature_batch_size=2,
+                execution_batch_max_rows=execution_batch_max_rows,
+                update_interval=2,
+            ),
+        )
+        return result, observer, materialized, compute_calls
+
+    semantic, semantic_observer, semantic_order, semantic_calls = run(2)
+    coalesced, coalesced_observer, coalesced_order, coalesced_calls = run(4)
+
+    assert semantic_calls == 2
+    assert coalesced_calls == 1
+    assert [row for batch in semantic_order for row in batch] == [
+        row for batch in coalesced_order for row in batch
+    ]
+    assert torch.equal(coalesced.edge_matrix, semantic.edge_matrix)
+    assert torch.equal(coalesced.row_to_node_index, semantic.row_to_node_index)
+    assert torch.equal(coalesced.visited, semantic.visited)
+    assert coalesced.phase4_refresh_count == semantic.phase4_refresh_count
+    assert coalesced.phase4_scheduler_reference_batch_count == 2
+    assert coalesced.phase4_execution_batch_count == 1
+    assert semantic.phase4_execution_batch_count == 2
+    assert [
+        (item["checkpoint_name"], item["phase"])
+        for item in coalesced.cross_cluster_debug_checkpoints
+    ] == [
+        (item["checkpoint_name"], item["phase"])
+        for item in semantic.cross_cluster_debug_checkpoints
+    ]
+
+    semantic_attrs = [batch["attrs"] for batch in semantic_observer.batches]
+    coalesced_attrs = coalesced_observer.batches[0]["attrs"]
+    assert [attrs["phase4_semantic_batch_rows"] for attrs in semantic_attrs] == [(2,), (2,)]
+    assert coalesced_attrs["phase4_semantic_batch_rows"] == (2, 2)
+    assert coalesced_attrs["phase4_semantic_batch_index_start"] == 0
+    assert coalesced_attrs["phase4_semantic_batch_index_end"] == 1
+    assert coalesced_attrs["phase4_execution_batch_rows"] == 4
+    assert coalesced_attrs["phase4_execution_batch_coalesced"] is True
+    assert "executor_microbatch_rows" not in coalesced_attrs
+
+
+def test_phase4_coalescing_never_crosses_refresh_frontiers() -> None:
+    observer = FakeObserver()
+    materialized: list[list[int]] = []
+
+    def materialize(indices: torch.Tensor) -> torch.Tensor:
+        materialized.append(indices.tolist())
+        return indices.to(dtype=torch.float32).reshape(-1, 1)
+
+    def compute_batch(**kwargs: object) -> torch.Tensor:
+        values = kwargs["inject_values"]
+        assert isinstance(values, torch.Tensor)
+        return torch.cat(tuple(values + offset for offset in range(7)), dim=1)
+
+    inputs = replace(
+        _nonzero_inputs(observer),
+        ctx=SimpleNamespace(
+            materialize_encoder_vectors=materialize,
+            compute_batch=compute_batch,
+        ),
+        edge_matrix=torch.zeros((6, 7)),
+        feat_ids=torch.arange(6),
+        feat_layers=torch.zeros(6, dtype=torch.long),
+        feat_pos=torch.zeros(6, dtype=torch.long),
+        row_to_node_index=torch.tensor([6, -1, -1, -1, -1, -1]),
+        cross_cluster_debug_summary=None,
+        cross_cluster_debug_checkpoints=None,
+        cross_cluster_debug_batches=None,
+        anomaly_debug_result=None,
+    )
+
+    result = run_phase4(
+        inputs=inputs,
+        config=replace(
+            _config(),
+            actual_max_feature_nodes=5,
+            total_active_feats=6,
+            logit_offset=7,
+            effective_feature_batch_size=1,
+            execution_batch_max_rows=4,
+            update_interval=2,
+            phase4_ranker_config=_policy(
+                requested_mode="argsort", effective_mode="argsort"
+            ),
+        ),
+    )
+
+    assert result.phase4_refresh_count == 3
+    assert result.phase4_scheduler_reference_batch_count == 5
+    assert result.phase4_execution_batch_count == 3
+    assert [len(batch) for batch in materialized] == [2, 2, 1]
+    attrs = [
+        batch["attrs"]
+        for batch in observer.batches
+        if batch["name"] == "phase4.feature_batch"
+    ]
+    assert [batch["scheduler_refresh_index"] for batch in attrs] == [0, 1, 2]
+    assert [batch["phase4_semantic_batch_rows"] for batch in attrs] == [
+        (1, 1),
+        (1, 1),
+        (1,),
+    ]
+    assert [batch["phase4_execution_batch_rows"] for batch in attrs] == [2, 2, 1]

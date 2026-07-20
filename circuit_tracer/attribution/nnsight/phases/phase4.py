@@ -49,7 +49,7 @@ class Phase4Config:
     n_logits: int
     logit_offset: int
     effective_feature_batch_size: int
-    compute_microbatch_max_rows: int
+    execution_batch_max_rows: int
     max_phase4_feature_batch_size: int
     update_interval: int
     row_store_capacity_feature_nodes: int
@@ -104,11 +104,11 @@ class Phase4Result:
     anomaly_debug_result: dict[str, object] | None
     phase4_elapsed_ms: float
     phase4_feature_batch_size: int
-    phase4_executor_reference_batch_size: int
-    phase4_executor_microbatch_size: int
+    phase4_semantic_batch_max_rows: int
+    phase4_execution_batch_max_rows: int
+    phase4_execution_batch_count: int
     phase4_refresh_count: int
     phase4_scheduler_reference_batch_count: int
-    phase4_executor_microbatch_count: int
     phase4_refresh_elapsed_ms_total: float
     phase4_feature_batch_elapsed_ms_total: float
     phase4_refresh_partial_influence_elapsed_ms_total: float
@@ -143,11 +143,11 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
         anomaly_debug_result=state.anomaly_debug_result,
         phase4_elapsed_ms=state.phase4_elapsed_ms,
         phase4_feature_batch_size=state.phase4_feature_batch_size,
-        phase4_executor_reference_batch_size=state.phase4_executor_reference_batch_size,
-        phase4_executor_microbatch_size=state.phase4_executor_microbatch_size,
+        phase4_semantic_batch_max_rows=state.phase4_semantic_batch_max_rows,
+        phase4_execution_batch_max_rows=state.phase4_execution_batch_max_rows,
+        phase4_execution_batch_count=state.phase4_execution_batch_count,
         phase4_refresh_count=state.phase4_refresh_count,
         phase4_scheduler_reference_batch_count=state.phase4_scheduler_reference_batch_count,
-        phase4_executor_microbatch_count=state.phase4_executor_microbatch_count,
         phase4_refresh_elapsed_ms_total=state.phase4_refresh_elapsed_ms_total,
         phase4_feature_batch_elapsed_ms_total=state.phase4_feature_batch_elapsed_ms_total,
         phase4_refresh_partial_influence_elapsed_ms_total=state.phase4_refresh_partial_influence_elapsed_ms_total,

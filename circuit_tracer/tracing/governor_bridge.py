@@ -200,7 +200,7 @@ def _requirements(request: TraceRequest) -> PhysicalExecutionRequirements:
             else None
         ),
         source_microbatch_size=session.source_microbatch_max_rows,
-        feature_microbatch_size=session.phase4_microbatch_max_rows,
+        feature_microbatch_size=session.phase4_execution_batch_max_rows,
         logit_microbatch_size=session.phase3_microbatch_max_rows,
         replay_window=(
             execution.replay.feature_window
@@ -260,7 +260,7 @@ def _compile_execution(request: TraceRequest, planning: Any) -> Any:
         capacity=physical.session_capacity,
         source_microbatch_max_rows=physical.source_microbatch_size,
         phase3_microbatch_max_rows=physical.logit_microbatch_size,
-        phase4_microbatch_max_rows=physical.feature_microbatch_size,
+        phase4_execution_batch_max_rows=physical.feature_microbatch_size,
         phase1_trace_batch_policy=("cap_effective_batches" if phase1_is_capped else "legacy"),
         phase1_trace_batch_size_max=(
             physical.phase1_source_batch_size if phase1_is_capped else None

@@ -454,7 +454,9 @@ class AttributionExecution:
                 n_logits=phase2.n_logits,
                 logit_offset=phase2.logit_offset,
                 effective_feature_batch_size=p.batches.feature_batch_size,
-                compute_microbatch_max_rows=(p.batches.session_controls.phase4_microbatch_max_rows),
+                execution_batch_max_rows=(
+                    p.batches.session_controls.phase4_execution_batch_max_rows
+                ),
                 max_phase4_feature_batch_size=p.batches.max_phase4_feature_batch_size,
                 update_interval=plan.semantics.update_interval,
                 row_store_capacity_feature_nodes=phase2.row_store_capacity_feature_nodes,
@@ -619,11 +621,11 @@ class AttributionExecution:
                     semantic_descriptor_top_k=policy.semantic_descriptor_top_k,
                     semantic_descriptor_dim=policy.semantic_descriptor_dim,
                     feature_batch_size=phase4.phase4_feature_batch_size,
-                    executor_reference_batch_size=phase4.phase4_executor_reference_batch_size,
-                    executor_microbatch_size=phase4.phase4_executor_microbatch_size,
+                    semantic_batch_max_rows=phase4.phase4_semantic_batch_max_rows,
+                    execution_batch_max_rows=phase4.phase4_execution_batch_max_rows,
                     refresh_count=phase4.phase4_refresh_count,
                     scheduler_reference_batch_count=(phase4.phase4_scheduler_reference_batch_count),
-                    executor_microbatch_count=phase4.phase4_executor_microbatch_count,
+                    execution_batch_count=phase4.phase4_execution_batch_count,
                 ),
                 phase4_timings=Phase4TimingSummary(
                     elapsed_ms=phase4.phase4_elapsed_ms,

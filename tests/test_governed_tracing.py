@@ -266,7 +266,10 @@ def test_governed_clt_compiles_roomy_optimized_plan() -> None:
     assert governed.execution.session.capacity == governed.planning_trace_plan.physical.session_capacity
     assert governed.execution.session.source_microbatch_max_rows == governed.planning_trace_plan.physical.source_microbatch_size
     assert governed.execution.session.phase3_microbatch_max_rows == governed.planning_trace_plan.physical.logit_microbatch_size
-    assert governed.execution.session.phase4_microbatch_max_rows == governed.planning_trace_plan.physical.feature_microbatch_size
+    assert (
+        governed.execution.session.phase4_execution_batch_max_rows
+        == governed.planning_trace_plan.physical.feature_microbatch_size
+    )
     assert governed.execution.session.phase1_trace_batch_policy == "legacy"
     assert governed.execution.session.decoder_cache.max_bytes == 8 * GIB
     assert governed.execution.decoder.fetch_chunk_size == 4096

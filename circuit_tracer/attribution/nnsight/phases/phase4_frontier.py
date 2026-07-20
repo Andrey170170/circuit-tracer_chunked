@@ -67,23 +67,22 @@ def _configure_phase4_schedule(state):
         queue_multiplier=state.phase4_refresh_queue_multiplier,
     )
     state.phase4_row_executor_effective_mode = state.phase4_row_executor_config.effective_mode
-    state.phase4_executor_reference_batch_size = int(state.phase4_feature_batch_size)
-    state.phase4_executor_microbatch_size = min(
-        state.phase4_executor_reference_batch_size, state.config.compute_microbatch_max_rows
+    state.phase4_semantic_batch_max_rows = int(state.phase4_feature_batch_size)
+    state.phase4_execution_batch_max_rows = int(state.config.execution_batch_max_rows)
+    execution_may_split = (
+        state.phase4_execution_batch_max_rows < state.phase4_semantic_batch_max_rows
     )
-    state.executor_physically_split = (
-        state.phase4_executor_microbatch_size < state.phase4_executor_reference_batch_size
+    execution_may_coalesce = (
+        state.phase4_execution_batch_max_rows > state.phase4_semantic_batch_max_rows
     )
     state.phase4_execution_metadata.update(
         {
-            "executor_configured_reference_batch_size": int(
-                state.phase4_executor_reference_batch_size
-            ),
-            "executor_reference_batch_size": int(state.phase4_executor_reference_batch_size),
-            "executor_microbatch_size": int(state.phase4_executor_microbatch_size),
-            "executor_physically_split": bool(state.executor_physically_split),
-            "executor_effective_execution": "physical_microbatching_v1"
-            if state.executor_physically_split
+            "phase4_semantic_batch_max_rows": int(state.phase4_semantic_batch_max_rows),
+            "phase4_execution_batch_max_rows": int(state.phase4_execution_batch_max_rows),
+            "phase4_execution_may_split": bool(execution_may_split),
+            "phase4_execution_may_coalesce": bool(execution_may_coalesce),
+            "phase4_execution_policy": "static_semantic_preserving_v1"
+            if execution_may_split or execution_may_coalesce
             else state.phase4_row_executor_effective_mode,
             "refresh_cycle_batches_reference": int(state.phase4_refresh_reference_cycle_batches),
             "refresh_cycle_batches_effective": int(state.phase4_refresh_cycle_batches),
@@ -103,7 +102,7 @@ def _configure_phase4_schedule(state):
         )
     )
     state.logger.info(
-        f"Phase 4 execution flags | refresh_optimization={state.phase4_refresh_optimization_config.requested_mode} (effective={state.phase4_refresh_optimization_config.effective_mode}, behavior={state.phase4_refresh_optimization_config.effective_behavior}) | refresh_policy={state.phase4_refresh_policy_config.requested_policy} (effective={state.phase4_refresh_policy_config.effective_policy}, interval_multiplier={state.phase4_refresh_policy_config.requested_interval_multiplier}, interval_multiplier_effective={state.phase4_refresh_policy_config.effective_interval_multiplier}, queue_multiplier_effective={state.phase4_refresh_policy_config.effective_queue_multiplier}, queue_size_reference={state.phase4_refresh_reference_queue_size}, queue_size_effective={state.phase4_refresh_effective_queue_size}, behavior={state.phase4_refresh_policy_config.effective_behavior}) | ranker={state.phase4_ranker_config.requested_mode} (effective={state.phase4_ranker_config.effective_mode}, behavior={state.phase4_ranker_config.effective_behavior}) | row_executor={state.phase4_row_executor_config.requested_mode} (effective={state.phase4_row_executor_config.effective_mode}, behavior={state.phase4_row_executor_config.effective_behavior}) | row_store_cache_control={state.row_store_cache_control_config.requested_mode} (effective={state.row_store_cache_control_config.effective_mode}, behavior={state.row_store_cache_control_config.effective_behavior}) | exact_encoder_residency={state.exact_encoder_residency_config.requested_mode} (effective={state.exact_encoder_residency_config.effective_mode}, behavior={state.exact_encoder_residency_config.effective_behavior}) | executor_reference_batch_size={state.phase4_executor_reference_batch_size} | executor_microbatch_size={state.phase4_executor_microbatch_size}"
+        f"Phase 4 execution flags | refresh_optimization={state.phase4_refresh_optimization_config.requested_mode} (effective={state.phase4_refresh_optimization_config.effective_mode}, behavior={state.phase4_refresh_optimization_config.effective_behavior}) | refresh_policy={state.phase4_refresh_policy_config.requested_policy} (effective={state.phase4_refresh_policy_config.effective_policy}, interval_multiplier={state.phase4_refresh_policy_config.requested_interval_multiplier}, interval_multiplier_effective={state.phase4_refresh_policy_config.effective_interval_multiplier}, queue_multiplier_effective={state.phase4_refresh_policy_config.effective_queue_multiplier}, queue_size_reference={state.phase4_refresh_reference_queue_size}, queue_size_effective={state.phase4_refresh_effective_queue_size}, behavior={state.phase4_refresh_policy_config.effective_behavior}) | ranker={state.phase4_ranker_config.requested_mode} (effective={state.phase4_ranker_config.effective_mode}, behavior={state.phase4_ranker_config.effective_behavior}) | row_executor={state.phase4_row_executor_config.requested_mode} (effective={state.phase4_row_executor_config.effective_mode}, behavior={state.phase4_row_executor_config.effective_behavior}) | row_store_cache_control={state.row_store_cache_control_config.requested_mode} (effective={state.row_store_cache_control_config.effective_mode}, behavior={state.row_store_cache_control_config.effective_behavior}) | exact_encoder_residency={state.exact_encoder_residency_config.requested_mode} (effective={state.exact_encoder_residency_config.effective_mode}, behavior={state.exact_encoder_residency_config.effective_behavior}) | semantic_batch_max_rows={state.phase4_semantic_batch_max_rows} | execution_batch_max_rows={state.phase4_execution_batch_max_rows}"
     )
     state.scheduler_uses_reference_planner = state.phase4_scheduler_config.effective_mode in {
         "planner_v1",
@@ -136,7 +135,8 @@ def _initialize_phase4_counters(state):
     state.visited = torch.zeros(state.total_active_feats, dtype=torch.bool)
     state.n_visited = 0
     state.phase4_scheduler_reference_batch_count = 0
-    state.phase4_executor_microbatch_count = 0
+    state.phase4_execution_batch_count = 0
+    state.phase4_coalesced_execution_batch_count = 0
     state.phase4_refresh_count = 0
     state.phase4_frontier_buffer_extra_used_total = 0
     state.phase4_refresh_elapsed_ms_total = 0.0

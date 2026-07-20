@@ -31,9 +31,8 @@ def record_phase4_evidence(
         work, timings = config.phase4_work, config.phase4_timings
         counts = {
             "phase4_refresh_count": work.refresh_count,
-            "phase4_batch_count": work.scheduler_reference_batch_count,
-            "phase4_batches": work.scheduler_reference_batch_count,
-            "phase4_executor_microbatch_count": work.executor_microbatch_count,
+            "phase4_semantic_batch_count": work.scheduler_reference_batch_count,
+            "phase4_execution_batch_count": work.execution_batch_count,
         }
         _record_cross_cluster_checkpoint(
             cross_cluster_debug_summary=summary,

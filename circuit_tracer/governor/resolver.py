@@ -47,16 +47,20 @@ def compute_work_units(
     logit_microbatch_size: int,
     replay_window: int,
     prefetch_depth: int,
+    frontier_refresh_stride: int = 1,
 ) -> float:
     fetch_blocks = math.ceil(dimensions.d_features / decoder_fetch_chunk_size)
     # Count the independently scheduled Phase 1 source batches alongside the
     # Phase 3/4 partitions. The calibration reference uses one Phase 1 step, so
     # this keeps recorded plans anchored while pricing stricter source limits.
+    phase4_execution_calls_per_refresh = math.ceil(
+        frontier_refresh_stride * feature_batch_size / feature_microbatch_size
+    )
     microbatch_steps = math.ceil(
         effective_source_batch_size / source_microbatch_size
-    ) + math.ceil(
-        feature_batch_size / feature_microbatch_size
-    ) + math.ceil(logit_batch_size / logit_microbatch_size)
+    ) + phase4_execution_calls_per_refresh + math.ceil(
+        logit_batch_size / logit_microbatch_size
+    )
     logical_work = (
         prompt_token_count
         * estimated_active_features
@@ -243,16 +247,32 @@ def _resolve_physical(
     if cache and not capabilities.supports_decoder_chunk_cache:
         raise ValueError("provider does not support decoder_cache_bytes > 0")
 
-    logical_capacity = max(
+    semantic_capacity = max(
         effective_source, semantics.feature_batch_size, semantics.logit_batch_size
     )
+    phase4_execution_bound = min(
+        semantics.feature_batch_size * semantics.frontier_refresh_stride,
+        profile.max_phase4_microbatch_size,
+    )
+    session_capacity_bound = max(semantic_capacity, phase4_execution_bound)
+    required_execution_capacity = max(
+        requirements.source_microbatch_size or 0,
+        requirements.feature_microbatch_size or 0,
+        requirements.logit_microbatch_size or 0,
+    )
     session_capacity = (
-        min(logical_capacity, profile.max_session_capacity)
+        min(
+            max(semantic_capacity, required_execution_capacity),
+            profile.max_session_capacity,
+        )
         if requirements.session_capacity is None
         else requirements.session_capacity
     )
-    if not 0 < session_capacity <= logical_capacity:
-        raise ValueError("session_capacity must be positive and <= logical trace capacity")
+    if not 0 < session_capacity <= session_capacity_bound:
+        raise ValueError(
+            "session_capacity must be positive and no larger than the largest "
+            "executable semantic or Phase-4 refresh window"
+        )
     if session_capacity > profile.max_session_capacity:
         raise ValueError("session_capacity exceeds the provider profile maximum")
 
@@ -272,11 +292,13 @@ def _resolve_physical(
         (
             "source_microbatch_size",
             effective_source,
+            effective_source,
             profile.max_source_microbatch_size,
             requirements.source_microbatch_size,
         ),
         (
             "feature_microbatch_size",
+            phase4_execution_bound,
             semantics.feature_batch_size,
             profile.max_phase4_microbatch_size,
             requirements.feature_microbatch_size,
@@ -284,13 +306,14 @@ def _resolve_physical(
         (
             "logit_microbatch_size",
             semantics.logit_batch_size,
+            semantics.logit_batch_size,
             profile.max_phase3_microbatch_size,
             requirements.logit_microbatch_size,
         ),
     )
     microbatches: dict[str, int] = {}
-    for name, logical_bound, profile_bound, required in batch_specs:
-        value = min(logical_bound, profile_bound, session_capacity) if required is None else required
+    for name, logical_bound, default_bound, profile_bound, required in batch_specs:
+        value = min(default_bound, profile_bound, session_capacity) if required is None else required
         if not 0 < value <= logical_bound:
             raise ValueError(f"{name} must be positive and <= its logical/effective capacity")
         if value > profile_bound:
@@ -541,6 +564,7 @@ def _estimate_demands(
         logit_microbatch_size=physical.logit_microbatch_size,
         replay_window=physical.replay_window,
         prefetch_depth=physical.prefetch_depth,
+        frontier_refresh_stride=semantics.frontier_refresh_stride,
     )
     phase_walltimes: list[tuple[str, float, float]] = []
     if profile.phase_walltime_models and profile.calibration_support is not None:
@@ -559,7 +583,9 @@ def _estimate_demands(
             semantics.logit_batch_size / physical.logit_microbatch_size
         )
         phase4_steps = math.ceil(
-            semantics.feature_batch_size / physical.feature_microbatch_size
+            semantics.frontier_refresh_stride
+            * semantics.feature_batch_size
+            / physical.feature_microbatch_size
         )
         reference_session_steps = math.ceil(
             support.logical_batch_size / support.session_capacity
@@ -572,7 +598,9 @@ def _estimate_demands(
             support.logical_batch_size / support.phase3_microbatch_size
         )
         reference_phase4_steps = math.ceil(
-            support.logical_batch_size / support.phase4_microbatch_size
+            semantics.frontier_refresh_stride
+            * support.logical_batch_size
+            / support.phase4_microbatch_size
         )
         for model in profile.phase_walltime_models:
             scale = logical_scale
@@ -1233,7 +1261,7 @@ def resolve_trace_plan(
         (
             "feature_microbatch_size",
             requirements.feature_microbatch_size,
-            min(semantics.feature_batch_size, profile.max_phase4_microbatch_size),
+            profile.max_phase4_microbatch_size,
         ),
         (
             "logit_microbatch_size",
@@ -1254,8 +1282,19 @@ def resolve_trace_plan(
         and required_microbatch_capacity > requirements.session_capacity
     ):
         raise ValueError("required microbatch cannot exceed required session_capacity")
+    phase4_refresh_window_rows = (
+        semantics.frontier_refresh_stride * semantics.feature_batch_size
+    )
     logical_capacity = max(
-        effective_source, semantics.feature_batch_size, semantics.logit_batch_size
+        effective_source,
+        semantics.feature_batch_size,
+        semantics.logit_batch_size,
+        requirements.feature_microbatch_size or 0,
+        min(
+            phase4_refresh_window_rows,
+            profile.max_phase4_microbatch_size,
+            profile.max_session_capacity,
+        ),
     )
     row_limit = (
         profile.safety_limits.max_physical_rows
@@ -1296,9 +1335,9 @@ def resolve_trace_plan(
         required=requirements.logit_microbatch_size,
     )
     phase4_values = _batch_breakpoint_sizes(
-        logical_size=semantics.feature_batch_size,
+        logical_size=phase4_refresh_window_rows,
         maximum=min(
-            semantics.feature_batch_size,
+            phase4_refresh_window_rows,
             profile.max_phase4_microbatch_size,
             profile.max_session_capacity,
             requirements.session_capacity or profile.max_session_capacity,

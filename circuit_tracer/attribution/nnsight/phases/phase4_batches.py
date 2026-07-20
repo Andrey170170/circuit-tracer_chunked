@@ -1,6 +1,7 @@
 """Feature batch production and evidence operations for NNSight Phase 4."""
 
 from __future__ import annotations
+from dataclasses import dataclass
 import time
 import torch
 from circuit_tracer.attribution.nnsight.phase4_policy import (
@@ -29,12 +30,94 @@ from circuit_tracer.attribution.nnsight.phases.phase4_storage import (
 )
 
 
+@dataclass(frozen=True)
+class _SemanticBatch:
+    index: int
+    start: int
+    end: int
+    rows: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _ExecutionBatch:
+    start: int
+    end: int
+    rows: torch.Tensor
+    semantic_batches: tuple[_SemanticBatch, ...]
+    split_chunk_index: int | None = None
+    split_chunk_count: int | None = None
+
+    @property
+    def coalesced(self) -> bool:
+        return len(self.semantic_batches) > 1
+
+    @property
+    def split(self) -> bool:
+        return self.split_chunk_count is not None
+
+
+def _pack_semantic_batches(
+    semantic_batches: list[_SemanticBatch], *, execution_batch_max_rows: int
+) -> list[_ExecutionBatch]:
+    """Pack whole semantic batches in order, splitting only oversized batches."""
+    execution_batches: list[_ExecutionBatch] = []
+    pending_group: list[_SemanticBatch] = []
+
+    def flush_group() -> None:
+        if not pending_group:
+            return
+        first, last = pending_group[0], pending_group[-1]
+        rows = (
+            first.rows
+            if len(pending_group) == 1
+            else torch.cat(tuple(batch.rows for batch in pending_group))
+        )
+        execution_batches.append(
+            _ExecutionBatch(
+                start=first.start,
+                end=last.end,
+                rows=rows,
+                semantic_batches=tuple(pending_group),
+            )
+        )
+        pending_group.clear()
+
+    for semantic in semantic_batches:
+        semantic_rows = int(semantic.rows.numel())
+        if semantic_rows > execution_batch_max_rows:
+            flush_group()
+            split_count = (semantic_rows + execution_batch_max_rows - 1) // execution_batch_max_rows
+            for split_index, offset in enumerate(
+                range(0, semantic_rows, execution_batch_max_rows), start=1
+            ):
+                end_offset = min(offset + execution_batch_max_rows, semantic_rows)
+                execution_batches.append(
+                    _ExecutionBatch(
+                        start=semantic.start + offset,
+                        end=semantic.start + end_offset,
+                        rows=semantic.rows[offset:end_offset],
+                        semantic_batches=(semantic,),
+                        split_chunk_index=split_index,
+                        split_chunk_count=split_count,
+                    )
+                )
+            continue
+        grouped_rows = sum(int(batch.rows.numel()) for batch in pending_group)
+        if pending_group and grouped_rows + semantic_rows > execution_batch_max_rows:
+            flush_group()
+        pending_group.append(semantic)
+    flush_group()
+    return execution_batches
+
+
 def produce_feature_batch(state):
     """Materialize encoder vectors and produce one feature-row microbatch."""
     state.chunk_pending_end = state.chunk_pending_start + int(state.idx_batch.numel())
     state.n_visited += len(state.idx_batch)
-    state.phase4_executor_microbatch_count += 1
-    state.executor_microbatch_index = int(state.phase4_executor_microbatch_count)
+    state.phase4_execution_batch_count += 1
+    state.execution_batch_index = int(state.phase4_execution_batch_count)
+    if state.executor_physically_coalesced:
+        state.phase4_coalesced_execution_batch_count += 1
     state.ctx_before = state.diagnostic_snapshot(state.ctx) if state.profile else None
     state.transcoder_before = (
         state.diagnostic_snapshot(state.model.transcoders) if state.profile else None
@@ -126,7 +209,7 @@ def produce_feature_batch(state):
 def record_feature_batch_evidence(state):
     """Record profile, transfer, locality, and debug batch evidence."""
     if state.profile:
-        state.batch_number = state.executor_microbatch_index
+        state.batch_number = state.execution_batch_index
         if state.batch_number % state.profile_log_interval == 0:
             state.batch_elapsed_ms = (time.perf_counter() - state.batch_start) * 1000.0
             state.telemetry_observer.observe(
@@ -141,7 +224,7 @@ def record_feature_batch_evidence(state):
                     state.diagnostic_snapshot(state.model.transcoders),
                 )
             )
-    state.batch_number = state.executor_microbatch_index
+    state.batch_number = state.execution_batch_index
     state.batch_elapsed_ms = (time.perf_counter() - state.batch_start) * 1000.0
     state.batch_memory_after = state.memory_snapshot()
     state.phase4_feature_batch_elapsed_ms_total += state.batch_elapsed_ms
@@ -155,14 +238,17 @@ def record_feature_batch_evidence(state):
         state.executor_row_store_write_elapsed_ms
     )
     state.executor_batch_telemetry = _build_phase4_executor_batch_telemetry(
-        scheduler_reference_batch_index=state.scheduler_reference_batch_index,
-        scheduler_reference_batch_count=state.phase4_scheduler_reference_batch_count,
-        scheduler_reference_batch_rows=int(state.reference_idx_batch.numel()),
-        executor_microbatch_index=state.executor_microbatch_index,
-        executor_microbatch_count=state.phase4_executor_microbatch_count,
-        executor_configured_reference_batch_size=state.phase4_executor_reference_batch_size,
-        executor_microbatch_rows=int(state.idx_batch.numel()),
-        executor_microbatch_size=state.phase4_executor_microbatch_size,
+        semantic_batch_count=state.phase4_scheduler_reference_batch_count,
+        semantic_batch_max_rows=state.phase4_semantic_batch_max_rows,
+        semantic_batch_index_start=state.semantic_batch_index_start,
+        semantic_batch_index_end=state.semantic_batch_index_end,
+        semantic_batch_rows=state.semantic_batch_rows,
+        execution_batch_index=state.execution_batch_index,
+        execution_batch_count=state.phase4_execution_batch_count,
+        execution_batch_rows=int(state.idx_batch.numel()),
+        execution_batch_max_rows=state.phase4_execution_batch_max_rows,
+        execution_batch_coalesced=state.executor_physically_coalesced,
+        execution_batch_split=state.executor_physically_split,
     )
     state.executor_substage_telemetry = _build_phase4_executor_substage_telemetry(
         telemetry_detail=state.phase4_scheduler_config.telemetry_detail,
@@ -179,19 +265,18 @@ def record_feature_batch_evidence(state):
     ):
         state.executor_substage_telemetry.update(state.row_store_append_telemetry)
     state.executor_streaming_telemetry = {
-        "executor_reference_batch_size": int(state.reference_idx_batch.numel()),
-        "executor_microbatch_size": int(state.phase4_executor_microbatch_size),
-        "executor_streaming_chunk_index": int(state.streaming_chunk_index)
+        "phase4_execution_batch_max_rows": int(state.phase4_execution_batch_max_rows),
+        "phase4_execution_batch_rows": int(state.idx_batch.numel()),
+        "phase4_execution_batch_coalesced": bool(state.executor_physically_coalesced),
+        "phase4_execution_split_chunk_index": int(state.streaming_chunk_index)
         if state.executor_physically_split
         else None,
-        "executor_streaming_chunk_count": int(state.streaming_chunk_count)
+        "phase4_execution_split_chunk_count": int(state.streaming_chunk_count)
         if state.executor_physically_split
         else None,
-        "executor_physically_split": bool(state.executor_physically_split),
-        "scheduler_pending_start_index": int(state.chunk_pending_start),
-        "scheduler_pending_end_index": int(state.chunk_pending_end),
-        "scheduler_reference_pending_start_index": int(state.reference_pending_start),
-        "scheduler_reference_pending_end_index": int(state.reference_pending_end),
+        "phase4_execution_batch_split": bool(state.executor_physically_split),
+        "phase4_execution_pending_start_index": int(state.chunk_pending_start),
+        "phase4_execution_pending_end_index": int(state.chunk_pending_end),
     }
     state.batch_locality_summary = _build_phase4_batch_locality_summary(
         state.idx_batch,
@@ -265,7 +350,7 @@ def record_feature_batch_evidence(state):
 
 
 def execute_pending_frontier(state):
-    """Execute the selected frontier in reference batches and physical microbatches."""
+    """Execute one refresh-cycle frontier with static physical coalescing."""
     state.pending_offset = 0
     state.planned_boundaries = (
         state.phase4_frontier_plan.batch_boundaries
@@ -273,6 +358,8 @@ def execute_pending_frontier(state):
         else None
     )
     state.planned_boundary_offset = 0
+    semantic_batches: list[_SemanticBatch] = []
+    semantic_index_base = int(state.phase4_scheduler_reference_batch_count)
     while state.pending_offset < len(state.pending):
         if state.planned_boundaries is not None:
             if state.planned_boundary_offset >= len(state.planned_boundaries):
@@ -301,40 +388,44 @@ def execute_pending_frontier(state):
             raise RuntimeError(
                 f"Phase 4 scheduling produced a non-advancing batch boundary (offset={state.pending_offset}, batch_end={state.batch_end})"
             )
-        state.reference_pending_start = state.pending_offset
-        state.reference_pending_end = state.batch_end
-        state.reference_idx_batch = state.pending[
-            state.reference_pending_start : state.reference_pending_end
-        ]
+        semantic_pending_start = state.pending_offset
+        semantic_pending_end = state.batch_end
+        semantic_idx_batch = state.pending[semantic_pending_start:semantic_pending_end]
         state.pending_offset = state.batch_end
-        state.scheduler_reference_batch_index = int(state.phase4_scheduler_reference_batch_count)
-        state.phase4_scheduler_reference_batch_count += 1
-        if state.phase4_executor_microbatch_size < int(state.reference_idx_batch.numel()):
-            state.executor_batches: list[torch.Tensor] = []
-            state.streaming_pending_offset = 0
-            while state.streaming_pending_offset < int(state.reference_idx_batch.numel()):
-                state.streaming_end = min(
-                    state.streaming_pending_offset + state.phase4_executor_microbatch_size,
-                    int(state.reference_idx_batch.numel()),
-                )
-                state.executor_batches.append(
-                    state.reference_idx_batch[state.streaming_pending_offset : state.streaming_end]
-                )
-                state.streaming_pending_offset = state.streaming_end
-        else:
-            state.executor_batches = [state.reference_idx_batch]
-        state.streaming_chunk_count = int(len(state.executor_batches))
-        state.chunk_pending_start = state.reference_pending_start
-        for state.streaming_chunk_index, state.idx_batch in enumerate(
-            state.executor_batches, start=1
-        ):
-            produce_feature_batch(state)
-            reduce_feature_rows(state)
-            commit_feature_rows(state)
-            record_feature_batch_evidence(state)
+        semantic_batches.append(
+            _SemanticBatch(
+                index=semantic_index_base + len(semantic_batches),
+                start=semantic_pending_start,
+                end=semantic_pending_end,
+                rows=semantic_idx_batch,
+            )
+        )
     if state.planned_boundaries is not None and state.planned_boundary_offset != len(
         state.planned_boundaries
     ):
         raise RuntimeError(
             f"Planner v1 produced unused planned boundaries (used={state.planned_boundary_offset}, planned={len(state.planned_boundaries)})"
         )
+    execution_batches = _pack_semantic_batches(
+        semantic_batches,
+        execution_batch_max_rows=state.phase4_execution_batch_max_rows,
+    )
+    for execution_batch in execution_batches:
+        first_semantic = execution_batch.semantic_batches[0]
+        last_semantic = execution_batch.semantic_batches[-1]
+        state.phase4_scheduler_reference_batch_count = last_semantic.index + 1
+        state.semantic_batch_index_start = first_semantic.index
+        state.semantic_batch_index_end = last_semantic.index
+        state.semantic_batch_rows = tuple(
+            int(batch.rows.numel()) for batch in execution_batch.semantic_batches
+        )
+        state.chunk_pending_start = execution_batch.start
+        state.idx_batch = execution_batch.rows
+        state.executor_physically_split = execution_batch.split
+        state.executor_physically_coalesced = execution_batch.coalesced
+        state.streaming_chunk_index = execution_batch.split_chunk_index
+        state.streaming_chunk_count = execution_batch.split_chunk_count
+        produce_feature_batch(state)
+        reduce_feature_rows(state)
+        commit_feature_rows(state)
+        record_feature_batch_evidence(state)
