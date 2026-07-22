@@ -19,6 +19,7 @@ import torch
 from circuit_tracer.observability.events import TraceEvent, TraceObserver
 
 from .calibration import CalibrationCatalog
+from .response_models import ResponseBundle
 
 from .contracts import (
     AdmissionMode,
@@ -316,6 +317,7 @@ class TraceGovernorRuntime:
         host_budget_discoverer: Callable[[int | None], HostBudgetDiscovery] | None = None,
         resource_usage_sampler: ResourceUsageSampler | None = None,
         calibration_catalog: CalibrationCatalog | None = None,
+        response_bundle: ResponseBundle | None = None,
     ) -> None:
         self.workload = workload
         self.profile = profile
@@ -325,6 +327,7 @@ class TraceGovernorRuntime:
         self.observer = observer
         self.admission_mode = admission_mode
         self.calibration_catalog = calibration_catalog
+        self.response_bundle = response_bundle
         self._host_budget_discoverer = host_budget_discoverer or discover_host_budget
         self._resource_usage_sampler = resource_usage_sampler or TorchResourceUsageSampler()
         self._started_at = time.perf_counter()
@@ -429,6 +432,7 @@ class TraceGovernorRuntime:
             self.envelope,
             self.requirements,
             catalog=self.calibration_catalog,
+            response_bundle=self.response_bundle,
         )
         self._emit_observation(epoch, observation)
         revision = self._record_revision(epoch, candidate)
@@ -466,6 +470,7 @@ class TraceGovernorRuntime:
             reported_hard_constraints=self.requirements,
             progress=self._planning_progress(("phase0",)),
             catalog=self.calibration_catalog,
+            response_bundle=self.response_bundle,
         )
         candidate = replace(candidate, semantic_fingerprint=self.current_plan.semantic_fingerprint)
         changed = _changed_physical(self.current_plan.physical, candidate.physical)
@@ -566,6 +571,7 @@ class TraceGovernorRuntime:
                 else ("phase0", "phase1", "phase2", "phase3")
             ),
             catalog=self.calibration_catalog,
+            response_bundle=self.response_bundle,
         )
         candidate = replace(candidate, semantic_fingerprint=self.current_plan.semantic_fingerprint)
         changed = _changed_physical(current, candidate.physical)

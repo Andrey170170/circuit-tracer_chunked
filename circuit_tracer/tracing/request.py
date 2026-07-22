@@ -8,6 +8,7 @@ from circuit_tracer.governor.contracts import (
     PhysicalExecutionRequirements,
 )
 from circuit_tracer.governor.calibration import CalibrationCatalog, FidelityBudget
+from circuit_tracer.governor.response_models import ResponseBundle
 
 from .plan import ExecutionConstraints, TraceEvidence
 from .problem import AttributionProblem, TraceSemantics
@@ -62,6 +63,7 @@ class TraceRequest:
     physical_requirements: PhysicalExecutionRequirements | None = None
     governor_fidelity: GovernorFidelityPolicy = field(default_factory=GovernorFidelityPolicy)
     calibration_catalog: CalibrationCatalog | None = None
+    response_bundle: ResponseBundle | None = None
     governor_admission_mode: AdmissionMode = AdmissionMode.ENFORCE
 
     def __post_init__(self) -> None:

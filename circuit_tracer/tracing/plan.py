@@ -18,6 +18,7 @@ from circuit_tracer.governor.contracts import (
     TraceSemantics as PlanningWorkload,
 )
 from circuit_tracer.governor.calibration import CalibrationCatalog
+from circuit_tracer.governor.response_models import ResponseBundle
 
 from .problem import TraceSemantics, _nonnegative, _positive
 
@@ -250,6 +251,7 @@ class ResolvedTracePlan:
     planning_requirements: PhysicalExecutionRequirements | None = field(default=None, repr=False)
     planning_trace_plan: TracePlan | None = field(default=None, repr=False)
     planning_calibration_catalog: CalibrationCatalog | None = field(default=None, repr=False)
+    planning_response_bundle: ResponseBundle | None = field(default=None, repr=False)
     planning_parent_fingerprint: str | None = None
     planning_epoch_fingerprint: str | None = None
 

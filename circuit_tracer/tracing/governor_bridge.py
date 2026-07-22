@@ -303,6 +303,7 @@ def resolve_governed_trace_request(
         resources,
         requirements,
         catalog=request.calibration_catalog,
+        response_bundle=request.response_bundle,
     )
     _validate_load_time_mechanisms(request.problem, planning)
     compiled_request = replace(request, execution=_compile_execution(request, planning))
@@ -317,6 +318,7 @@ def resolve_governed_trace_request(
         planning_requirements=requirements,
         planning_trace_plan=planning,
         planning_calibration_catalog=request.calibration_catalog,
+        planning_response_bundle=request.response_bundle,
         planning_parent_fingerprint=explicit_plan.requested_execution_fingerprint,
         planning_epoch_fingerprint=planning.execution_fingerprint,
     )
@@ -342,6 +344,7 @@ def compile_governed_revision(
         planning_requirements=current.planning_requirements,
         planning_trace_plan=planning,
         planning_calibration_catalog=current.planning_calibration_catalog,
+        planning_response_bundle=current.planning_response_bundle,
         planning_parent_fingerprint=current.planning_epoch_fingerprint,
         planning_epoch_fingerprint=planning.execution_fingerprint,
     )
@@ -363,6 +366,7 @@ def recompile_governed_plan(
         physical_requirements=current.planning_requirements,
         governor_admission_mode=current.governor_admission_mode,
         calibration_catalog=current.planning_calibration_catalog,
+        response_bundle=current.planning_response_bundle,
     )
     return compile_governed_revision(
         request,

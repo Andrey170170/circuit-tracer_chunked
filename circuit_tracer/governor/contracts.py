@@ -797,6 +797,7 @@ class AdmissionReport:
     fidelity_prediction: FidelityPrediction | None = None
     fidelity_penalty: float = 0.0
     calibration_catalog_fingerprint: str | None = None
+    response_bundle_fingerprint: str | None = None
     pareto_alternatives: tuple[ParetoAlternative, ...] = ()
 
     def __post_init__(self) -> None:
@@ -932,6 +933,7 @@ def execution_fingerprint(
             "calibration_catalog_fingerprint": (
                 admission.calibration_catalog_fingerprint
             ),
+            "response_bundle_fingerprint": admission.response_bundle_fingerprint,
             "evidence_fingerprint": evidence_fingerprint,
         }
     )

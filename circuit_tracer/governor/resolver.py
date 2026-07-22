@@ -6,11 +6,13 @@ from dataclasses import replace
 from .calibration import (
     CalibrationCatalog,
     FidelityPrediction,
+    MetricPrediction,
     ParetoAlternative,
     PredictionSupport,
     PredictionSupportKind,
     PredictionUncertainty,
 )
+from .response_models import ResponseBundle
 
 from .contracts import (
     AdmissionReport,
@@ -950,17 +952,98 @@ def _profile_exact_prediction(
     )
 
 
+def _response_coordinates(
+    semantics: TraceSemantics,
+    profile: ProviderProfile,
+    physical: PhysicalExecutionConfig,
+) -> tuple[dict[str, float], dict[str, str], dict[str, str]]:
+    numeric = {
+        name: float(getattr(semantics, name))
+        for name in (
+            "prompt_token_count",
+            "estimated_active_features",
+            "max_feature_nodes",
+            "target_count",
+            "source_batch_size",
+            "feature_batch_size",
+            "logit_batch_size",
+            "frontier_refresh_stride",
+        )
+    }
+    numeric.update(
+        {
+            name: float(getattr(physical, name))
+            for name in (
+                "decoder_fetch_chunk_size",
+                "decoder_cache_bytes",
+                "session_capacity",
+                "phase1_source_batch_size",
+                "source_microbatch_size",
+                "feature_microbatch_size",
+                "logit_microbatch_size",
+                "replay_window",
+                "prefetch_depth",
+                "replay_tile_cache_bytes",
+            )
+        }
+    )
+    categorical = {
+        "provider_profile": profile.profile_name,
+        "provider_type": profile.identity.provider_type,
+        "architecture": profile.identity.architecture,
+        "row_store_policy": physical.row_store_policy,
+        "encoder_residency": physical.encoder_residency,
+    }
+    scope = {
+        "provider_profile": profile.profile_name,
+        "provider_type": profile.identity.provider_type,
+        "architecture": profile.identity.architecture,
+    }
+    return numeric, categorical, scope
+
+
 def _assess_fidelity(
     semantics: TraceSemantics,
     profile: ProviderProfile,
     physical: PhysicalExecutionConfig,
     catalog: CalibrationCatalog | None,
+    response_bundle: ResponseBundle | None,
 ) -> tuple[FidelityPrediction, float, tuple[str, ...], tuple[str, ...]]:
-    prediction = (
-        catalog.predict(_fidelity_coordinates(physical))
-        if catalog is not None
-        else _profile_exact_prediction(semantics, profile, physical)
-    )
+    if catalog is not None:
+        prediction = catalog.predict(_fidelity_coordinates(physical))
+    elif response_bundle is not None and semantics.fidelity is not FidelityMode.EXACT:
+        numeric, categorical, scope = _response_coordinates(
+            semantics, profile, physical
+        )
+        profile_prediction = _profile_exact_prediction(semantics, profile, physical)
+        metrics = tuple(
+            MetricPrediction(item.target, item.lower, item.estimate, item.upper)
+            for artifact in response_bundle.models
+            if artifact.model_kind == "local_conservative_fidelity"
+            if (item := response_bundle.predict(
+                artifact.target,
+                numeric=numeric,
+                categorical=categorical,
+                scope=scope,
+            )) is not None and item.supported
+        )
+        supported = bool(metrics)
+        prediction = FidelityPrediction(
+            metrics=tuple(sorted(metrics, key=lambda metric: metric.name)),
+            support=PredictionSupport(
+                PredictionSupportKind.NEAREST if supported else PredictionSupportKind.NONE,
+                "response-bundle" if supported else None,
+                0.0 if supported else None,
+                False,
+                profile_prediction.support.extrapolated_axes,
+            ),
+            uncertainty=PredictionUncertainty(
+                tuple((metric.name, metric.upper - metric.lower) for metric in metrics),
+                0.0 if supported else None,
+            ),
+        )
+    else:
+        prediction = _profile_exact_prediction(semantics, profile, physical)
     refusals: list[str] = []
     warnings: list[str] = []
     if semantics.fidelity is FidelityMode.EXACT:
@@ -1029,6 +1112,7 @@ def _resolve_single_trace_plan(
     requirements: PhysicalExecutionRequirements | None = None,
     progress: PlanningProgress = PlanningProgress(),
     catalog: CalibrationCatalog | None = None,
+    response_bundle: ResponseBundle | None = None,
 ) -> TracePlan:
     """Resolve a pure, provider-agnostic, advisory Phase B execution plan."""
 
@@ -1045,10 +1129,38 @@ def _resolve_single_trace_plan(
     )
     estimates = _apply_planning_progress(estimates, progress)
 
+    if response_bundle is not None:
+        numeric, categorical, scope = _response_coordinates(semantics, profile, physical)
+        feasibility = response_bundle.predict(
+            "feasible",
+            numeric=numeric,
+            categorical=categorical,
+            scope=scope,
+        )
+        if feasibility is not None and feasibility.supported and feasibility.upper <= 0:
+            physical_refusals += (
+                "response model identifies candidate as infeasible",
+            )
+        corrected = []
+        for estimate in estimates:
+            prediction = response_bundle.predict(
+                estimate.name,
+                numeric=numeric,
+                categorical=categorical,
+                scope=scope,
+                analytic_baseline=estimate.amount,
+            )
+            corrected.append(
+                replace(estimate, amount=max(0.0, prediction.upper))
+                if prediction is not None and prediction.supported
+                else estimate
+            )
+        estimates = tuple(corrected)
+
     warnings = list(physical_warnings)
     refusals = list(physical_refusals)
     fidelity_prediction, fidelity_penalty, fidelity_warnings, fidelity_refusals = (
-        _assess_fidelity(semantics, profile, physical, catalog)
+        _assess_fidelity(semantics, profile, physical, catalog, response_bundle)
     )
     warnings.extend(fidelity_warnings)
     refusals.extend(fidelity_refusals)
@@ -1188,6 +1300,9 @@ def _resolve_single_trace_plan(
         fidelity_penalty=fidelity_penalty,
         calibration_catalog_fingerprint=(
             catalog.content_fingerprint if catalog is not None else None
+        ),
+        response_bundle_fingerprint=(
+            response_bundle.content_fingerprint if response_bundle is not None else None
         ),
     )
     semantic_hash = semantic_fingerprint(semantics, profile.identity)
@@ -1450,6 +1565,7 @@ def resolve_trace_plan(
     reported_hard_constraints: PhysicalExecutionRequirements | None = None,
     progress: PlanningProgress | None = None,
     catalog: CalibrationCatalog | None = None,
+    response_bundle: ResponseBundle | None = None,
 ) -> TracePlan:
     """Select the fastest fitting physical plan under hard caller constraints."""
 
@@ -1638,6 +1754,7 @@ def resolve_trace_plan(
                     candidate_requirements,
                     progress,
                     catalog,
+                    response_bundle,
                 )
             )
         except ValueError:
@@ -1648,7 +1765,7 @@ def resolve_trace_plan(
     # validation error instead of an opaque empty-domain error.
     candidates.append(
         _resolve_single_trace_plan(
-            semantics, profile, envelope, requirements, progress, catalog
+            semantics, profile, envelope, requirements, progress, catalog, response_bundle
         )
     )
     seen.add(requirements)

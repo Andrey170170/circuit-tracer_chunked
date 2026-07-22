@@ -76,6 +76,7 @@ def run_trace(
                 observer=observer,
                 admission_mode=plan.governor_admission_mode,
                 calibration_catalog=plan.planning_calibration_catalog,
+                response_bundle=plan.planning_response_bundle,
             )
             governor_runtime.pre_execution_admission()
             if (
