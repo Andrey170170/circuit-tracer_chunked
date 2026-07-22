@@ -7,6 +7,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, TypeVar
 
+from .calibration import FidelityBudget, FidelityPrediction, ParetoAlternative
+
 
 FINGERPRINT_SCHEMA_VERSION = 3
 _DTYPE_BYTE_WIDTHS = MappingProxyType({"fp16": 2, "bf16": 2, "fp32": 4, "fp64": 8})
@@ -15,8 +17,9 @@ _V = TypeVar("_V")
 
 
 class FidelityMode(str, Enum):
-    STRICT = "strict"
-    VALIDATED_RELAXED = "validated_relaxed"
+    EXACT = "exact"
+    BOUNDED = "bounded"
+    BEST_EFFORT = "best_effort"
     RESEARCH = "research"
 
 
@@ -165,9 +168,8 @@ class TraceSemantics:
     feature_cap: int | None = None
     logit_cap: int | None = None
     row_store_content: str = "full"
-    fidelity: FidelityMode = FidelityMode.STRICT
-    evidence_name: str | None = None
-    evidence_version: str | None = None
+    fidelity: FidelityMode = FidelityMode.EXACT
+    fidelity_budget: FidelityBudget | None = None
     semantic_overrides: tuple[tuple[str, str], ...] = ()
     research_overrides: tuple[tuple[str, str], ...] = ()
 
@@ -203,8 +205,7 @@ class TraceSemantics:
         for override_name, override_value in self.semantic_overrides + self.research_overrides:
             if not hasattr(self, override_name) or override_name in {
                 "fidelity",
-                "evidence_name",
-                "evidence_version",
+                "fidelity_budget",
                 "semantic_overrides",
                 "research_overrides",
             }:
@@ -214,27 +215,27 @@ class TraceSemantics:
                 raise ValueError(
                     f"override {override_name} must equal its canonical requested value {expected}"
                 )
-        if self.fidelity is FidelityMode.STRICT:
-            if any(
-                (
-                    self.evidence_name,
-                    self.evidence_version,
-                    self.semantic_overrides,
-                    self.research_overrides,
-                )
+        if self.fidelity is FidelityMode.EXACT:
+            if self.fidelity_budget or self.semantic_overrides or self.research_overrides:
+                raise ValueError("exact fidelity does not accept a budget or semantic overrides")
+        elif self.fidelity is FidelityMode.BOUNDED:
+            if (
+                self.fidelity_budget is None
+                or not self.fidelity_budget.metric_floors
+                or not self.fidelity_budget.allowed_sensitive_axes
             ):
-                raise ValueError("strict fidelity does not accept evidence or semantic overrides")
-        elif self.fidelity is FidelityMode.VALIDATED_RELAXED:
-            if not (self.evidence_name and self.evidence_version and self.semantic_overrides):
                 raise ValueError(
-                    "validated_relaxed requires named, versioned evidence and exact overrides"
+                    "bounded fidelity requires metric floors and sensitive-axis allowances"
                 )
             if self.research_overrides:
-                raise ValueError("validated_relaxed does not accept research_overrides")
-        elif not self.research_overrides:
-            raise ValueError("research fidelity requires explicit research_overrides")
-        elif self.evidence_name or self.evidence_version or self.semantic_overrides:
-            raise ValueError("research fidelity does not accept validation evidence")
+                raise ValueError("bounded fidelity does not accept research overrides")
+        elif self.fidelity is FidelityMode.BEST_EFFORT:
+            if self.fidelity_budget is None or not self.fidelity_budget.allowed_sensitive_axes:
+                raise ValueError("best_effort fidelity requires explicit sensitive-axis allowances")
+            if self.research_overrides:
+                raise ValueError("best_effort fidelity does not accept research overrides")
+        elif self.semantic_overrides:
+            raise ValueError("research fidelity uses research_overrides only")
 
     @property
     def estimated_nnz(self) -> int:
@@ -645,70 +646,6 @@ class ProviderProfile:
 
 
 @dataclass(frozen=True)
-class ValidationEvidence:
-    evidence_id: str
-    evidence_version: str
-    provider_type: str
-    provider_version: str
-    checkpoint_identity: str
-    hook_identity: str
-    architecture: str
-    decoder_topology: DecoderTopology
-    provider_approximation: str
-    provider_semantic_parameters: tuple[tuple[str, str], ...]
-    semantic_parameters: tuple[tuple[str, str], ...]
-    dtype: str
-    scenario_id: str
-    window_id: str | None
-    environment_label: str
-    allowed_semantic_overrides: tuple[tuple[str, str], ...]
-    source_artifact_fingerprints: tuple[str, ...]
-    report_fingerprint: str
-    compared_configurations: tuple[tuple[str, str], ...]
-    metrics: tuple[tuple[str, float], ...]
-    acceptance_thresholds: tuple[tuple[str, float], ...]
-
-    def __post_init__(self) -> None:
-        for name in (
-            "evidence_id",
-            "evidence_version",
-            "provider_type",
-            "provider_version",
-            "checkpoint_identity",
-            "hook_identity",
-            "architecture",
-            "provider_approximation",
-            "scenario_id",
-            "environment_label",
-            "report_fingerprint",
-        ):
-            _nonempty(name, getattr(self, name))
-        dtype_byte_width(self.dtype)
-        _sorted_unique("provider_semantic_parameters", self.provider_semantic_parameters)
-        _sorted_unique("semantic_parameters", self.semantic_parameters)
-        _sorted_unique("allowed_semantic_overrides", self.allowed_semantic_overrides)
-        _sorted_unique("compared_configurations", self.compared_configurations)
-        _sorted_unique_metrics("metrics", self.metrics)
-        _sorted_unique_metrics("acceptance_thresholds", self.acceptance_thresholds)
-        if not self.allowed_semantic_overrides:
-            raise ValueError("validation evidence must allow at least one exact semantic override")
-        if not self.source_artifact_fingerprints or any(
-            not value for value in self.source_artifact_fingerprints
-        ):
-            raise ValueError("validation evidence requires source artifact fingerprints")
-        if tuple(sorted(set(self.source_artifact_fingerprints))) != self.source_artifact_fingerprints:
-            raise ValueError("source_artifact_fingerprints must be sorted and unique")
-        if not self.compared_configurations or not self.metrics or not self.acceptance_thresholds:
-            raise ValueError(
-                "validation evidence requires configurations, metrics, and acceptance thresholds"
-            )
-
-    @property
-    def evidence_fingerprint(self) -> str:
-        return fingerprint({"schema_version": 1, "validation_evidence": self})
-
-
-@dataclass(frozen=True)
 class DemandEstimate:
     name: str
     tier: DemandTier
@@ -857,6 +794,10 @@ class AdmissionReport:
     phase_predictions: tuple[tuple[str, float, float], ...] = ()
     remaining_projection: tuple[tuple[str, float, float], ...] = ()
     domain_summary: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    fidelity_prediction: FidelityPrediction | None = None
+    fidelity_penalty: float = 0.0
+    calibration_catalog_fingerprint: str | None = None
+    pareto_alternatives: tuple[ParetoAlternative, ...] = ()
 
     def __post_init__(self) -> None:
         _positive("trace_capacity", self.trace_capacity)
@@ -873,6 +814,7 @@ class AdmissionReport:
             raise ValueError("admitted must be false exactly when refusals are present")
         if self.confidence not in {"calibrated", "provisional", "extrapolated", "unknown"}:
             raise ValueError("invalid admission confidence")
+        _nonnegative("fidelity_penalty", self.fidelity_penalty)
 
     def format(self) -> str:
         lines = [
@@ -985,6 +927,11 @@ def execution_fingerprint(
             "decisions": admission.decisions,
             "warnings": admission.warnings,
             "refusals": admission.refusals,
+            "fidelity_prediction": admission.fidelity_prediction,
+            "fidelity_penalty": admission.fidelity_penalty,
+            "calibration_catalog_fingerprint": (
+                admission.calibration_catalog_fingerprint
+            ),
             "evidence_fingerprint": evidence_fingerprint,
         }
     )
@@ -992,8 +939,3 @@ def execution_fingerprint(
 
 def immutable_mapping(values: Mapping[_K, _V]) -> Mapping[_K, _V]:
     return MappingProxyType(dict(values))
-
-
-TRUSTED_VALIDATION_EVIDENCE_REGISTRY: Mapping[
-    tuple[str, str], ValidationEvidence
-] = immutable_mapping({})

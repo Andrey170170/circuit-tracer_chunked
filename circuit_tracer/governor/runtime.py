@@ -18,6 +18,8 @@ import torch
 
 from circuit_tracer.observability.events import TraceEvent, TraceObserver
 
+from .calibration import CalibrationCatalog
+
 from .contracts import (
     AdmissionMode,
     DemandEstimate,
@@ -313,6 +315,7 @@ class TraceGovernorRuntime:
         admission_mode: AdmissionMode = AdmissionMode.ENFORCE,
         host_budget_discoverer: Callable[[int | None], HostBudgetDiscovery] | None = None,
         resource_usage_sampler: ResourceUsageSampler | None = None,
+        calibration_catalog: CalibrationCatalog | None = None,
     ) -> None:
         self.workload = workload
         self.profile = profile
@@ -321,6 +324,7 @@ class TraceGovernorRuntime:
         self.current_plan = plan
         self.observer = observer
         self.admission_mode = admission_mode
+        self.calibration_catalog = calibration_catalog
         self._host_budget_discoverer = host_budget_discoverer or discover_host_budget
         self._resource_usage_sampler = resource_usage_sampler or TorchResourceUsageSampler()
         self._started_at = time.perf_counter()
@@ -420,7 +424,11 @@ class TraceGovernorRuntime:
             )
         )
         candidate = resolve_trace_plan(
-            self.workload, self.profile, self.envelope, self.requirements
+            self.workload,
+            self.profile,
+            self.envelope,
+            self.requirements,
+            catalog=self.calibration_catalog,
         )
         self._emit_observation(epoch, observation)
         revision = self._record_revision(epoch, candidate)
@@ -457,6 +465,7 @@ class TraceGovernorRuntime:
             frozen_fields=_FROZEN_FIELDS,
             reported_hard_constraints=self.requirements,
             progress=self._planning_progress(("phase0",)),
+            catalog=self.calibration_catalog,
         )
         candidate = replace(candidate, semantic_fingerprint=self.current_plan.semantic_fingerprint)
         changed = _changed_physical(self.current_plan.physical, candidate.physical)
@@ -556,6 +565,7 @@ class TraceGovernorRuntime:
                 if target_phase is PhaseId.PHASE3
                 else ("phase0", "phase1", "phase2", "phase3")
             ),
+            catalog=self.calibration_catalog,
         )
         candidate = replace(candidate, semantic_fingerprint=self.current_plan.semantic_fingerprint)
         changed = _changed_physical(current, candidate.physical)

@@ -3,6 +3,15 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 
+from .calibration import (
+    CalibrationCatalog,
+    FidelityPrediction,
+    ParetoAlternative,
+    PredictionSupport,
+    PredictionSupportKind,
+    PredictionUncertainty,
+)
+
 from .contracts import (
     AdmissionReport,
     CachePolicy,
@@ -24,7 +33,6 @@ from .contracts import (
     StorageTier,
     TracePlan,
     TraceSemantics,
-    TRUSTED_VALIDATION_EVIDENCE_REGISTRY,
     execution_fingerprint,
     semantic_fingerprint,
 )
@@ -96,44 +104,8 @@ def _validate_evidence(
     semantics: TraceSemantics,
     profile: ProviderProfile,
 ) -> str | None:
-    if semantics.fidelity is FidelityMode.STRICT:
-        return None
-    if semantics.fidelity is FidelityMode.RESEARCH:
-        return None
-    key = (semantics.evidence_name or "", semantics.evidence_version or "")
-    evidence = TRUSTED_VALIDATION_EVIDENCE_REGISTRY.get(key)
-    if evidence is None:
-        raise ValueError(
-            "validated_relaxed has no trusted package evidence for "
-            f"{key[0]!r} version {key[1]!r}"
-        )
-    identity = profile.identity
-    expected = {
-        "evidence_id": semantics.evidence_name,
-        "evidence_version": semantics.evidence_version,
-        "provider_type": identity.provider_type,
-        "provider_version": identity.provider_version,
-        "checkpoint_identity": identity.checkpoint_identity,
-        "hook_identity": identity.hook_identity,
-        "architecture": identity.architecture,
-        "decoder_topology": identity.decoder_topology,
-        "provider_approximation": identity.approximation,
-        "provider_semantic_parameters": identity.semantic_parameters,
-        "semantic_parameters": semantics.evidence_scope_parameters(),
-        "dtype": semantics.dtype,
-        "scenario_id": semantics.scenario_id,
-        "window_id": semantics.window_id,
-        "environment_label": semantics.environment_label,
-        "allowed_semantic_overrides": semantics.semantic_overrides,
-    }
-    mismatches = [
-        name for name, expected_value in expected.items() if getattr(evidence, name) != expected_value
-    ]
-    if mismatches:
-        raise ValueError(
-            "validation evidence scope mismatch: " + ", ".join(sorted(mismatches))
-        )
-    return evidence.evidence_fingerprint
+    del semantics, profile
+    return None
 
 
 def _cache_policy(file_bytes: int, allowance: int, requested: CachePolicy) -> CachePolicy:
@@ -882,12 +854,181 @@ def _apply_planning_progress(
         else estimate
         for estimate in estimates
     )
+
+
+def _fidelity_coordinates(
+    physical: PhysicalExecutionConfig,
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (name, str(getattr(physical, name)))
+            for name in (
+                "decoder_fetch_chunk_size",
+                "decoder_cache_bytes",
+                "session_capacity",
+                "phase1_source_batch_size",
+                "source_microbatch_size",
+                "feature_microbatch_size",
+                "logit_microbatch_size",
+                "replay_window",
+                "prefetch_depth",
+                "replay_tile_cache_bytes",
+                "encoder_residency",
+                "row_store_policy",
+            )
+        )
+    )
+
+
+def _profile_exact_prediction(
+    semantics: TraceSemantics,
+    profile: ProviderProfile,
+    physical: PhysicalExecutionConfig,
+) -> FidelityPrediction:
+    """Conservative built-in exact support for the profile's reference mechanism."""
+    support = profile.calibration_support
+    effective_source, _, _ = _effective_batches(semantics)
+    reference_session = (
+        support.session_capacity if support is not None else profile.max_session_capacity
+    )
+    reference_phase1 = (
+        support.phase1_source_batch_size
+        if support is not None
+        else profile.max_phase1_source_batch_size
+    )
+    # Exact mechanisms remain optimizer variables. Only execution shapes known
+    # to change floating-point grouping require scope-matched certification.
+    expected_sensitive = {
+        "decoder_fetch_chunk_size": profile.default_fetch_chunk_size,
+        "session_capacity": min(
+            max(
+                effective_source,
+                semantics.feature_batch_size,
+                semantics.logit_batch_size,
+                min(
+                    semantics.frontier_refresh_stride * semantics.feature_batch_size,
+                    profile.max_phase4_microbatch_size,
+                    profile.max_session_capacity,
+                ),
+            ),
+            reference_session,
+        ),
+        "phase1_source_batch_size": min(effective_source, reference_phase1),
+        "source_microbatch_size": min(
+            effective_source,
+            reference_session,
+            reference_phase1,
+            profile.max_source_microbatch_size,
+        ),
+        "feature_microbatch_size": min(
+            semantics.frontier_refresh_stride * semantics.feature_batch_size,
+            support.phase4_microbatch_size if support else profile.max_phase4_microbatch_size,
+            reference_session,
+        ),
+        "logit_microbatch_size": min(
+            semantics.logit_batch_size,
+            support.phase3_microbatch_size if support else profile.max_phase3_microbatch_size,
+            reference_session,
+        ),
+    }
+    extrapolated = tuple(
+        name
+        for name, value in expected_sensitive.items()
+        if getattr(physical, name) != value
+    )
+    exact = not extrapolated
+    return FidelityPrediction(
+        metrics=(),
+        support=PredictionSupport(
+            PredictionSupportKind.EXACT if exact else PredictionSupportKind.NONE,
+            "provider-profile-reference" if exact else None,
+            0.0 if exact else None,
+            exact,
+            extrapolated,
+        ),
+        uncertainty=PredictionUncertainty((), 0.0 if exact else None),
+    )
+
+
+def _assess_fidelity(
+    semantics: TraceSemantics,
+    profile: ProviderProfile,
+    physical: PhysicalExecutionConfig,
+    catalog: CalibrationCatalog | None,
+) -> tuple[FidelityPrediction, float, tuple[str, ...], tuple[str, ...]]:
+    prediction = (
+        catalog.predict(_fidelity_coordinates(physical))
+        if catalog is not None
+        else _profile_exact_prediction(semantics, profile, physical)
+    )
+    refusals: list[str] = []
+    warnings: list[str] = []
+    if semantics.fidelity is FidelityMode.EXACT:
+        if not prediction.support.certified_exact:
+            refusals.append(
+                "exact fidelity requires certified exact evidence for sensitive axes"
+            )
+    elif semantics.fidelity is FidelityMode.BOUNDED:
+        assert semantics.fidelity_budget is not None
+        disallowed = tuple(
+            axis
+            for axis in prediction.support.extrapolated_axes
+            if axis not in semantics.fidelity_budget.allowed_sensitive_axes
+        )
+        if disallowed:
+            refusals.append(
+                "bounded candidate changes sensitive axes without allowance: "
+                + ", ".join(disallowed)
+            )
+        for metric, floor in semantics.fidelity_budget.metric_floors:
+            lower = prediction.lower_bound(metric)
+            if lower is None:
+                refusals.append(f"bounded fidelity has no prediction for metric {metric}")
+            elif lower < floor:
+                refusals.append(
+                    f"bounded fidelity metric {metric} lower bound {lower:.6g} is below floor {floor:.6g}"
+                )
+    elif semantics.fidelity is FidelityMode.BEST_EFFORT:
+        assert semantics.fidelity_budget is not None
+        disallowed = tuple(
+            axis
+            for axis in prediction.support.extrapolated_axes
+            if axis not in semantics.fidelity_budget.allowed_sensitive_axes
+        )
+        if disallowed:
+            refusals.append(
+                "best_effort candidate changes sensitive axes without allowance: "
+                + ", ".join(disallowed)
+            )
+    elif semantics.fidelity is FidelityMode.RESEARCH:
+        if prediction.support.kind in {
+            PredictionSupportKind.EXTRAPOLATED,
+            PredictionSupportKind.NONE,
+        }:
+            warnings.append(
+                "research fidelity uses extrapolated or unsupported calibration evidence"
+            )
+
+    if semantics.fidelity_budget is not None:
+        penalty = semantics.fidelity_budget.penalty_weight * sum(
+            max(0.0, floor - (prediction.lower_bound(metric) or -1.0))
+            for metric, floor in semantics.fidelity_budget.metric_floors
+        )
+    elif prediction.metrics:
+        penalty = sum(max(0.0, 1.0 - metric.lower) for metric in prediction.metrics)
+    else:
+        penalty = 0.0 if prediction.support.certified_exact else 1.0
+    penalty += 0.0 if prediction.support.normalized_distance is not None else 1.0
+    return prediction, penalty, tuple(warnings), tuple(refusals)
+
+
 def _resolve_single_trace_plan(
     semantics: TraceSemantics,
     profile: ProviderProfile,
     envelope: ResourceEnvelope,
     requirements: PhysicalExecutionRequirements | None = None,
     progress: PlanningProgress = PlanningProgress(),
+    catalog: CalibrationCatalog | None = None,
 ) -> TracePlan:
     """Resolve a pure, provider-agnostic, advisory Phase B execution plan."""
 
@@ -906,6 +1047,11 @@ def _resolve_single_trace_plan(
 
     warnings = list(physical_warnings)
     refusals = list(physical_refusals)
+    fidelity_prediction, fidelity_penalty, fidelity_warnings, fidelity_refusals = (
+        _assess_fidelity(semantics, profile, physical, catalog)
+    )
+    warnings.extend(fidelity_warnings)
+    refusals.extend(fidelity_refusals)
     confidence, extrapolated, calibration_evidence, invalid = _support_metadata(
         semantics, profile, physical
     )
@@ -1037,6 +1183,11 @@ def _resolve_single_trace_plan(
             prediction
             for prediction in phase_predictions
             if prediction[0] not in progress.completed_phases
+        ),
+        fidelity_prediction=fidelity_prediction,
+        fidelity_penalty=fidelity_penalty,
+        calibration_catalog_fingerprint=(
+            catalog.content_fingerprint if catalog is not None else None
         ),
     )
     semantic_hash = semantic_fingerprint(semantics, profile.identity)
@@ -1176,6 +1327,58 @@ def _objective(plan: TracePlan) -> tuple[float, ...]:
     )
 
 
+def _selection_key(plan: TracePlan, fidelity: FidelityMode) -> tuple[object, ...]:
+    confidence = {"calibrated": 0, "provisional": 1, "extrapolated": 2, "unknown": 3}[
+        plan.admission.confidence
+    ]
+    support = (confidence, len(plan.admission.extrapolated_dimensions))
+    objective = _objective(plan)
+    if fidelity is FidelityMode.BEST_EFFORT:
+        risk_adjusted_walltime = objective[0] * (1.0 + plan.admission.fidelity_penalty)
+        policy = (risk_adjusted_walltime, *support, *objective)
+    elif fidelity is FidelityMode.RESEARCH:
+        policy = (*objective, *support)
+    else:
+        policy = (*support, *objective)
+    return (
+        0 if plan.admission.admitted else len(plan.admission.refusals),
+        *policy,
+    )
+
+
+def _pareto_alternatives(candidates: tuple[TracePlan, ...]) -> tuple[ParetoAlternative, ...]:
+    admitted = tuple(candidate for candidate in candidates if candidate.admission.admitted)
+    points = tuple(
+        (
+            candidate,
+            (
+                candidate.admission.fidelity_penalty,
+                *_objective(candidate),
+            ),
+        )
+        for candidate in admitted
+    )
+    frontier = []
+    for candidate, point in points:
+        dominated = any(
+            all(other_value <= value for other_value, value in zip(other, point))
+            and any(other_value < value for other_value, value in zip(other, point))
+            for other_candidate, other in points
+            if other_candidate is not candidate
+        )
+        if not dominated:
+            frontier.append(
+                ParetoAlternative(
+                    candidate.execution_fingerprint,
+                    point[0], point[1], point[2], point[3], point[4],
+                )
+            )
+    return tuple(sorted(frontier, key=lambda item: (
+        item.fidelity_penalty, item.walltime_high_seconds,
+        item.peak_vram_bytes, item.execution_fingerprint,
+    ))[:12])
+
+
 def _with_optimization_report(
     plan: TracePlan,
     *,
@@ -1225,6 +1428,7 @@ def _with_optimization_report(
         ),
         rejected_candidates=rejected,
         domain_summary=domain_summary,
+        pareto_alternatives=_pareto_alternatives(candidates),
     )
     execution_hash = execution_fingerprint(
         profile=plan.profile,
@@ -1245,6 +1449,7 @@ def resolve_trace_plan(
     frozen_fields: tuple[str, ...] = (),
     reported_hard_constraints: PhysicalExecutionRequirements | None = None,
     progress: PlanningProgress | None = None,
+    catalog: CalibrationCatalog | None = None,
 ) -> TracePlan:
     """Select the fastest fitting physical plan under hard caller constraints."""
 
@@ -1432,6 +1637,7 @@ def resolve_trace_plan(
                     envelope,
                     candidate_requirements,
                     progress,
+                    catalog,
                 )
             )
         except ValueError:
@@ -1441,7 +1647,9 @@ def resolve_trace_plan(
     # this also fail-closes malformed explicit requirements with their precise
     # validation error instead of an opaque empty-domain error.
     candidates.append(
-        _resolve_single_trace_plan(semantics, profile, envelope, requirements, progress)
+        _resolve_single_trace_plan(
+            semantics, profile, envelope, requirements, progress, catalog
+        )
     )
     seen.add(requirements)
     support = profile.calibration_support
@@ -1620,12 +1828,7 @@ def resolve_trace_plan(
     selected = min(
         admitted or tuple(candidates),
         key=lambda candidate: (
-            0 if candidate.admission.admitted else len(candidate.admission.refusals),
-            {"calibrated": 0, "provisional": 1, "extrapolated": 2, "unknown": 3}[
-                candidate.admission.confidence
-            ],
-            len(candidate.admission.extrapolated_dimensions),
-            _objective(candidate),
+            _selection_key(candidate, semantics.fidelity),
             0
             if candidate.physical.encoder_residency
             == profile.default_encoder_residency.value

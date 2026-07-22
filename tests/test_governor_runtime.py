@@ -11,6 +11,7 @@ from circuit_tracer.governor.contracts import (
     DemandClass,
     DemandLifetime,
     DemandTier,
+    FidelityMode,
     PhysicalExecutionRequirements,
     PlanStatus,
     ResourceEnvelope,
@@ -47,7 +48,9 @@ class Observer:
         self.events.append(event)
 
 
-def workload(*, nnz: int = 1000) -> TraceSemantics:
+def workload(
+    *, nnz: int = 1000, fidelity: FidelityMode = FidelityMode.EXACT
+) -> TraceSemantics:
     return TraceSemantics(
         prompt_token_count=16,
         estimated_active_features=nnz,
@@ -58,6 +61,7 @@ def workload(*, nnz: int = 1000) -> TraceSemantics:
         source_batch_size=64,
         feature_batch_size=64,
         logit_batch_size=64,
+        fidelity=fidelity,
     )
 
 
@@ -78,9 +82,10 @@ def runtime(
     disk: int = 100 * GIB,
     requirements: PhysicalExecutionRequirements | None = None,
     admission_mode: AdmissionMode = AdmissionMode.ENFORCE,
+    fidelity: FidelityMode = FidelityMode.EXACT,
 ):
     profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
-    inputs = workload(nnz=nnz)
+    inputs = workload(nnz=nnz, fidelity=fidelity)
     resources = envelope(disk=disk)
     requirements = requirements or PhysicalExecutionRequirements()
     plan = resolve_trace_plan(inputs, profile, resources, requirements)
@@ -358,7 +363,10 @@ def test_phase_entry_original_hard_target_requirements_remain_fixed() -> None:
         logit_microbatch_size=8,
         feature_microbatch_size=16,
     )
-    governed, _ = runtime(requirements=requirements)
+    governed, _ = runtime(
+        requirements=requirements,
+        fidelity=FidelityMode.RESEARCH,
+    )
     advance_to_active(governed)
     governed.active_universe_replan(active_observation(100))
 

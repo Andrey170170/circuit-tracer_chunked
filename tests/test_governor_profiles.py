@@ -1,19 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import subprocess
 import sys
-from types import MappingProxyType
 
 import pytest
 
 from circuit_tracer.governor import GRANITE_H200_CALIBRATIONS
+from circuit_tracer.governor import CalibrationObservation
+from circuit_tracer.governor import FidelityMode
 from circuit_tracer.governor import HISTORICAL_STRESS_FIXTURES
 from circuit_tracer.governor import PhysicalExecutionRequirements
 from circuit_tracer.governor import RECORDED_PROVIDER_PROFILES
 from circuit_tracer.governor import ResourceEnvelope
-from circuit_tracer.governor import TRUSTED_VALIDATION_EVIDENCE_REGISTRY
 from circuit_tracer.governor import resolve_trace_plan
-from circuit_tracer.governor.contracts import ValidationEvidence
 
 
 GIB = 1024**3
@@ -164,7 +164,7 @@ def test_v03_profiles_separate_safety_support_and_session_memory() -> None:
         ("granite_h200_1b_plt_b128_c4096_cache0", 32_768),
     ],
 )
-def test_wave_a_fetch_ceiling_is_an_exact_physical_requirement(
+def test_wave_a_fetch_ceiling_is_a_safe_research_physical_requirement(
     profile_name,
     fetch_ceiling,
 ) -> None:
@@ -182,7 +182,10 @@ def test_wave_a_fetch_ceiling_is_an_exact_physical_requirement(
     )
 
     plan = resolve_trace_plan(
-        observation.reference_semantics(),
+        replace(
+            observation.reference_semantics(),
+            fidelity=FidelityMode.RESEARCH,
+        ),
         profile,
         envelope,
         PhysicalExecutionRequirements(decoder_fetch_chunk_size=fetch_ceiling),
@@ -212,11 +215,9 @@ def test_historical_stress_fixtures_resolve_to_recommendations():
         assert plan.physical.decoder_cache_bytes == recommendation.decoder_cache_bytes
 
 
-def test_calibration_profiles_are_not_validation_evidence_registry():
-    assert isinstance(TRUSTED_VALIDATION_EVIDENCE_REGISTRY, MappingProxyType)
-    assert not TRUSTED_VALIDATION_EVIDENCE_REGISTRY
+def test_resource_profiles_are_not_fidelity_observations():
     assert not any(
-        isinstance(value, ValidationEvidence)
+        isinstance(value, CalibrationObservation)
         for value in RECORDED_PROVIDER_PROFILES.values()
     )
 

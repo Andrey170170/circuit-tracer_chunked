@@ -7,6 +7,7 @@ from circuit_tracer.governor.contracts import (
     FidelityMode,
     PhysicalExecutionRequirements,
 )
+from circuit_tracer.governor.calibration import CalibrationCatalog, FidelityBudget
 
 from .plan import ExecutionConstraints, TraceEvidence
 from .problem import AttributionProblem, TraceSemantics
@@ -16,10 +17,9 @@ from .problem import AttributionProblem, TraceSemantics
 class GovernorFidelityPolicy:
     """Authorize named semantic deviations in governed planning."""
 
-    mode: FidelityMode = FidelityMode.STRICT
+    mode: FidelityMode = FidelityMode.EXACT
+    budget: FidelityBudget | None = None
     override_fields: tuple[str, ...] = ()
-    evidence_name: str | None = None
-    evidence_version: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, FidelityMode):
@@ -31,30 +31,24 @@ class GovernorFidelityPolicy:
             or len(set(self.override_fields)) != len(self.override_fields)
         ):
             raise ValueError("governor fidelity override fields must be sorted and unique")
-        if (self.evidence_name is None) != (self.evidence_version is None):
-            raise ValueError("governor fidelity evidence name and version must be provided together")
-        if any(
-            value is not None and (not isinstance(value, str) or not value)
-            for value in (self.evidence_name, self.evidence_version)
+        if self.mode is FidelityMode.EXACT and (self.override_fields or self.budget):
+            raise ValueError("exact governor fidelity accepts no overrides or budget")
+        if self.mode is FidelityMode.BOUNDED and (
+            self.budget is None
+            or not self.budget.metric_floors
+            or not self.budget.allowed_sensitive_axes
         ):
             raise ValueError(
-                "governor fidelity evidence name and version must be nonempty strings"
+                "bounded governor fidelity requires metric floors and sensitive-axis allowances"
             )
-
-        has_evidence = self.evidence_name is not None
-        if self.mode is FidelityMode.STRICT:
-            if self.override_fields or has_evidence:
-                raise ValueError("strict governor fidelity accepts no overrides or evidence")
-        elif self.mode is FidelityMode.RESEARCH:
-            if not self.override_fields:
-                raise ValueError("research governor fidelity requires override fields")
-            if has_evidence:
-                raise ValueError("research governor fidelity accepts no evidence")
-        elif self.mode is FidelityMode.VALIDATED_RELAXED:
-            if not self.override_fields or not has_evidence:
-                raise ValueError(
-                    "validated_relaxed governor fidelity requires override fields and evidence"
-                )
+        if self.mode is FidelityMode.BEST_EFFORT and (
+            self.budget is None or not self.budget.allowed_sensitive_axes
+        ):
+            raise ValueError(
+                "best_effort governor fidelity requires explicit sensitive-axis allowances"
+            )
+        if self.mode is FidelityMode.RESEARCH and self.budget is not None:
+            raise ValueError("research governor fidelity accepts no bounded budget")
 
 
 @dataclass(frozen=True)
@@ -67,6 +61,7 @@ class TraceRequest:
     evidence: TraceEvidence = field(default_factory=TraceEvidence)
     physical_requirements: PhysicalExecutionRequirements | None = None
     governor_fidelity: GovernorFidelityPolicy = field(default_factory=GovernorFidelityPolicy)
+    calibration_catalog: CalibrationCatalog | None = None
     governor_admission_mode: AdmissionMode = AdmissionMode.ENFORCE
 
     def __post_init__(self) -> None:

@@ -29,8 +29,7 @@ from .request import GovernorFidelityPolicy, TraceRequest
 _FIDELITY_BOOKKEEPING_FIELDS = frozenset(
     {
         "fidelity",
-        "evidence_name",
-        "evidence_version",
+        "fidelity_budget",
         "semantic_overrides",
         "research_overrides",
     }
@@ -143,7 +142,7 @@ def _authorize_fidelity(
     workload: PlanningWorkload,
     policy: GovernorFidelityPolicy,
 ) -> PlanningWorkload:
-    if policy.mode is FidelityMode.STRICT:
+    if policy.mode is FidelityMode.EXACT:
         return workload
 
     semantic_fields = {item.name for item in fields(workload)} - _FIDELITY_BOOKKEEPING_FIELDS
@@ -165,8 +164,7 @@ def _authorize_fidelity(
     return replace(
         workload,
         fidelity=policy.mode,
-        evidence_name=policy.evidence_name,
-        evidence_version=policy.evidence_version,
+        fidelity_budget=policy.budget,
         semantic_overrides=overrides,
     )
 
@@ -304,6 +302,7 @@ def resolve_governed_trace_request(
         provider_profile,
         resources,
         requirements,
+        catalog=request.calibration_catalog,
     )
     _validate_load_time_mechanisms(request.problem, planning)
     compiled_request = replace(request, execution=_compile_execution(request, planning))
@@ -317,6 +316,7 @@ def resolve_governed_trace_request(
         planning_workload=workload,
         planning_requirements=requirements,
         planning_trace_plan=planning,
+        planning_calibration_catalog=request.calibration_catalog,
         planning_parent_fingerprint=explicit_plan.requested_execution_fingerprint,
         planning_epoch_fingerprint=planning.execution_fingerprint,
     )
@@ -341,6 +341,7 @@ def compile_governed_revision(
         planning_workload=current.planning_workload,
         planning_requirements=current.planning_requirements,
         planning_trace_plan=planning,
+        planning_calibration_catalog=current.planning_calibration_catalog,
         planning_parent_fingerprint=current.planning_epoch_fingerprint,
         planning_epoch_fingerprint=planning.execution_fingerprint,
     )
@@ -361,6 +362,7 @@ def recompile_governed_plan(
         evidence=TraceEvidence(metadata=current.evidence_metadata),
         physical_requirements=current.planning_requirements,
         governor_admission_mode=current.governor_admission_mode,
+        calibration_catalog=current.planning_calibration_catalog,
     )
     return compile_governed_revision(
         request,

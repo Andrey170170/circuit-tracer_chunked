@@ -1,6 +1,20 @@
 """Canonical typed tracing API."""
 
 from circuit_tracer.governor.contracts import AdmissionMode, FidelityMode
+from circuit_tracer.governor.calibration import (
+    CalibrationCatalog,
+    CalibrationObservation,
+    DEFAULT_KNOB_SENSITIVITIES,
+    FidelityBudget,
+    FidelityPrediction,
+    KnobSensitivity,
+    MetricPrediction,
+    ParetoAlternative,
+    PredictionSupport,
+    PredictionSupportKind,
+    PredictionUncertainty,
+    SensitivityClass,
+)
 
 from .api import open_session, trace_batch, trace_one
 from circuit_tracer.execution_identity import (
@@ -27,23 +41,35 @@ from .session import SessionWindow, TraceSession
 
 __all__ = [
     "AttributionProblem",
+    "CalibrationCatalog",
+    "CalibrationObservation",
+    "DEFAULT_KNOB_SENSITIVITIES",
     "AdmissionMode",
     "DecoderCachePolicy",
     "DecoderPlan",
     "ExecutionConstraints",
     "FidelityMode",
+    "FidelityBudget",
+    "FidelityPrediction",
     "EffectiveExecutionDescriptor",
     "EffectiveExecutionIdentity",
     "FrontierExpansionPlan",
     "FrontierSemantics",
     "GovernorFidelityPolicy",
+    "KnobSensitivity",
+    "MetricPrediction",
     "ObservabilityPolicy",
     "PrefixViewTarget",
+    "ParetoAlternative",
+    "PredictionSupport",
+    "PredictionSupportKind",
+    "PredictionUncertainty",
     "ReplayPlan",
     "ResolvedTracePlan",
     "RowStoragePlan",
     "SessionPlan",
     "SessionWindow",
+    "SensitivityClass",
     "TraceEvidence",
     "TraceRequest",
     "TraceResult",

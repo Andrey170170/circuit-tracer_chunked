@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from types import MappingProxyType
 
 import pytest
 
@@ -11,6 +10,13 @@ from circuit_tracer.governor import DecoderTopology
 from circuit_tracer.governor import CachePolicy
 from circuit_tracer.governor import EncoderResidency
 from circuit_tracer.governor import FidelityMode
+from circuit_tracer.governor import FidelityBudget
+from circuit_tracer.governor import CalibrationCatalog
+from circuit_tracer.governor import CalibrationObservation
+from circuit_tracer.governor import KnobSensitivity
+from circuit_tracer.governor import MetricPrediction
+from circuit_tracer.governor import PredictionSupportKind
+from circuit_tracer.governor import SensitivityClass
 from circuit_tracer.governor import PhysicalExecutionRequirements
 from circuit_tracer.governor import PlanningProgress
 from circuit_tracer.governor import ProviderCapabilities
@@ -22,7 +28,6 @@ from circuit_tracer.governor import ResourceEnvelope
 from circuit_tracer.governor import RowStorePolicy
 from circuit_tracer.governor import StorageTier
 from circuit_tracer.governor import TraceSemantics
-from circuit_tracer.governor import ValidationEvidence
 from circuit_tracer.governor import dtype_byte_width
 from circuit_tracer.governor import resolve_trace_plan
 from circuit_tracer.governor.profiles import RECORDED_PROVIDER_PROFILES
@@ -138,33 +143,6 @@ def _envelope(**changes) -> ResourceEnvelope:
 
 def _estimates(plan) -> dict[str, float]:
     return {estimate.name: estimate.amount for estimate in plan.admission.estimates}
-
-
-def _evidence(semantics: TraceSemantics, profile: ProviderProfile) -> ValidationEvidence:
-    identity = profile.identity
-    return ValidationEvidence(
-        evidence_id=semantics.evidence_name or "missing",
-        evidence_version=semantics.evidence_version or "missing",
-        provider_type=identity.provider_type,
-        provider_version=identity.provider_version,
-        checkpoint_identity=identity.checkpoint_identity,
-        hook_identity=identity.hook_identity,
-        architecture=identity.architecture,
-        decoder_topology=identity.decoder_topology,
-        provider_approximation=identity.approximation,
-        provider_semantic_parameters=identity.semantic_parameters,
-        semantic_parameters=semantics.evidence_scope_parameters(),
-        dtype=semantics.dtype,
-        scenario_id=semantics.scenario_id,
-        window_id=semantics.window_id,
-        environment_label=semantics.environment_label,
-        allowed_semantic_overrides=semantics.semantic_overrides,
-        source_artifact_fingerprints=("artifact-sha256-a",),
-        report_fingerprint="report-sha256-a",
-        compared_configurations=(("baseline", "strict-a"), ("candidate", "relaxed-a")),
-        metrics=(("weighted_edge_similarity", 0.99),),
-        acceptance_thresholds=(("weighted_edge_similarity", 0.98),),
-    )
 
 
 def test_dtype_mapping_is_fail_closed():
@@ -609,8 +587,12 @@ def test_optimizer_searches_small_breakpoints_needed_for_admission():
             logit_microbatch_vram_coefficient=100_000.0,
         )
     )
-    explicit = resolve_trace_plan(
+    research_semantics = replace(
         _semantics(feature_batch_size=64, logit_batch_size=64),
+        fidelity=FidelityMode.RESEARCH,
+    )
+    explicit = resolve_trace_plan(
+        research_semantics,
         constrained_profile,
         _envelope(vram_fraction=1.0),
         PhysicalExecutionRequirements(
@@ -623,7 +605,7 @@ def test_optimizer_searches_small_breakpoints_needed_for_admission():
         dict(explicit.admission.selected_objective)["predicted_peak_vram_bytes"]
     )
     automatic = resolve_trace_plan(
-        _semantics(feature_batch_size=64, logit_batch_size=64),
+        research_semantics,
         constrained_profile,
         _envelope(
             total_vram_bytes=budget,
@@ -704,54 +686,103 @@ def test_row_store_overrides_validate_capability_and_capacity():
     assert any("no configured spill tier fits" in reason for reason in refused.admission.refusals)
 
 
-def test_validated_relaxed_uses_only_package_owned_trusted_registry(monkeypatch):
-    semantics = _semantics(
-        fidelity=FidelityMode.VALIDATED_RELAXED,
-        decoder_reduction_tile=1024,
-        evidence_name="evidence-a",
-        evidence_version="1",
-        semantic_overrides=(("decoder_reduction_tile", "1024"),),
+def test_bounded_fidelity_uses_conservative_catalog_floor_and_reports_pareto():
+    baseline = resolve_trace_plan(_semantics(), _profile(), _envelope())
+    coordinates = resolver_module._fidelity_coordinates(baseline.physical)
+    catalog = CalibrationCatalog(
+        observations=(CalibrationObservation(
+            "certified-a",
+            coordinates,
+            (MetricPrediction("edge_recall", 0.97, 0.98, 0.99),),
+            certified_exact=True,
+        ),),
+        sensitivities=(KnobSensitivity(
+            "row_store_policy", SensitivityClass.NUMERICALLY_SENSITIVE, ("edge_recall",)
+        ),),
     )
-    profile = _profile()
-    evidence = _evidence(semantics, profile)
-    assert not resolver_module.TRUSTED_VALIDATION_EVIDENCE_REGISTRY
-    with pytest.raises(ValueError, match="no trusted package evidence"):
-        resolve_trace_plan(semantics, profile, _envelope())
-    with pytest.raises(TypeError, match="unexpected keyword argument"):
-        getattr(resolver_module, "resolve_trace_plan")(
-            semantics, profile, _envelope(), evidence=evidence
+    bounded = _semantics(
+        fidelity=FidelityMode.BOUNDED,
+        fidelity_budget=FidelityBudget(
+            (("edge_recall", 0.96),),
+            ("row_store_policy",),
+        ),
+    )
+    plan = resolve_trace_plan(
+        bounded,
+        _profile(),
+        _envelope(),
+        PhysicalExecutionRequirements(**{
+            name: getattr(baseline.physical, name)
+            for name in PhysicalExecutionRequirements.__dataclass_fields__
+            if name not in {"row_store_policy", "encoder_residency", "spill_target", "cache_policy"}
+            and hasattr(baseline.physical, name)
+        }, row_store_policy=RowStorePolicy(baseline.physical.row_store_policy),
+           encoder_residency=EncoderResidency(baseline.physical.encoder_residency),
+           spill_target=StorageTier(baseline.physical.spill_target)),
+        catalog=catalog,
+    )
+    assert plan.admission.admitted
+    assert plan.admission.fidelity_prediction.support.kind is PredictionSupportKind.EXACT
+    assert plan.admission.calibration_catalog_fingerprint == catalog.content_fingerprint
+    assert plan.admission.pareto_alternatives
+
+    refused = resolve_trace_plan(
+        replace(
+            bounded,
+            fidelity_budget=FidelityBudget(
+                (("edge_recall", 0.98),),
+                ("row_store_policy",),
+            ),
+        ),
+        _profile(), _envelope(), catalog=catalog,
+    )
+    assert not refused.admission.admitted
+    assert any("below floor" in reason or "no prediction" in reason for reason in refused.admission.refusals)
+
+
+def test_exact_fidelity_rejects_uncertified_numerical_execution_shape():
+    baseline = resolve_trace_plan(_semantics(), _profile(), _envelope())
+    changed = resolve_trace_plan(
+        _semantics(),
+        _profile(),
+        _envelope(),
+        PhysicalExecutionRequirements(
+            feature_microbatch_size=max(1, baseline.physical.feature_microbatch_size // 2)
+        ),
+    )
+
+    assert not changed.admission.admitted
+    assert any("certified exact evidence" in reason for reason in changed.admission.refusals)
+
+
+def test_best_effort_uses_soft_risk_adjusted_runtime_objective():
+    plan = resolve_trace_plan(_semantics(), _profile(), _envelope())
+
+    def candidate(walltime: float, penalty: float):
+        estimates = tuple(
+            replace(estimate, amount=walltime)
+            if estimate.name == "predicted_walltime_high"
+            else estimate
+            for estimate in plan.admission.estimates
+        )
+        return replace(
+            plan,
+            admission=replace(
+                plan.admission,
+                estimates=estimates,
+                fidelity_penalty=penalty,
+            ),
         )
 
-    monkeypatch.setattr(
-        resolver_module,
-        "TRUSTED_VALIDATION_EVIDENCE_REGISTRY",
-        MappingProxyType({("evidence-a", "1"): evidence}),
-    )
-    plan = resolve_trace_plan(semantics, profile, _envelope())
-    assert plan.evidence_fingerprint == evidence.evidence_fingerprint
-    monkeypatch.setattr(
-        resolver_module,
-        "TRUSTED_VALIDATION_EVIDENCE_REGISTRY",
-        MappingProxyType(
-            {("evidence-a", "1"): replace(evidence, environment_label="other")}
-        ),
-    )
-    with pytest.raises(ValueError, match="scope mismatch.*environment_label"):
-        resolve_trace_plan(semantics, profile, _envelope())
-    monkeypatch.setattr(
-        resolver_module,
-        "TRUSTED_VALIDATION_EVIDENCE_REGISTRY",
-        MappingProxyType(
-            {
-                ("evidence-a", "1"): replace(
-                    evidence,
-                    allowed_semantic_overrides=(("frontier_refresh_stride", "8"),),
-                )
-            }
-        ),
-    )
-    with pytest.raises(ValueError, match="scope mismatch.*allowed_semantic_overrides"):
-        resolve_trace_plan(semantics, profile, _envelope())
+    faithful = candidate(100.0, 0.0)
+    worthwhile = candidate(50.0, 0.5)
+    too_risky = candidate(50.0, 2.0)
+    assert resolver_module._selection_key(
+        worthwhile, FidelityMode.BEST_EFFORT
+    ) < resolver_module._selection_key(faithful, FidelityMode.BEST_EFFORT)
+    assert resolver_module._selection_key(
+        faithful, FidelityMode.BEST_EFFORT
+    ) < resolver_module._selection_key(too_risky, FidelityMode.BEST_EFFORT)
 
 
 def test_research_overrides_are_explicit_and_fingerprinted():
@@ -1059,6 +1090,7 @@ def test_v03_constrained_search_retains_intermediate_batch_rungs() -> None:
         source_batch_size=support.logical_batch_size,
         feature_batch_size=support.logical_batch_size,
         logit_batch_size=support.logical_batch_size,
+        fidelity=FidelityMode.RESEARCH,
     )
     plan = resolve_trace_plan(
         semantics,

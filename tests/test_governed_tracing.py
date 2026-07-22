@@ -9,6 +9,7 @@ from circuit_tracer.governor import (
     RECORDED_PROVIDER_PROFILES,
     ActiveUniverseObservation,
     FidelityMode,
+    FidelityBudget,
     PlanStatus,
     ResourceEnvelope,
     PhysicalExecutionRequirements,
@@ -86,23 +87,16 @@ def request(profile, *, batch: int, prompt_tokens: int = 16) -> TraceRequest:
 
 
 def test_governor_fidelity_policy_validates_mode_matrix() -> None:
-    assert GovernorFidelityPolicy().mode is FidelityMode.STRICT
-    with pytest.raises(ValueError, match="strict.*no overrides"):
+    assert GovernorFidelityPolicy().mode is FidelityMode.EXACT
+    with pytest.raises(ValueError, match="exact.*no overrides"):
         GovernorFidelityPolicy(override_fields=("source_batch_size",))
-    with pytest.raises(ValueError, match="research.*requires override fields"):
-        GovernorFidelityPolicy(mode=FidelityMode.RESEARCH)
-    with pytest.raises(ValueError, match="research.*no evidence"):
+    with pytest.raises(ValueError, match="research.*no bounded budget"):
         GovernorFidelityPolicy(
             mode=FidelityMode.RESEARCH,
-            override_fields=("source_batch_size",),
-            evidence_name="gate",
-            evidence_version="1",
+            budget=FidelityBudget((("edge_recall", 0.9),)),
         )
-    with pytest.raises(ValueError, match="validated_relaxed.*requires"):
-        GovernorFidelityPolicy(
-            mode=FidelityMode.VALIDATED_RELAXED,
-            override_fields=("source_batch_size",),
-        )
+    with pytest.raises(ValueError, match="bounded.*requires"):
+        GovernorFidelityPolicy(mode=FidelityMode.BOUNDED)
     with pytest.raises(ValueError, match="sorted and unique"):
         GovernorFidelityPolicy(
             mode=FidelityMode.RESEARCH,
@@ -144,7 +138,7 @@ def test_admission_mode_is_public_enforce_default_and_not_fingerprinted() -> Non
     assert advisory_plan.governor_admission_mode is AdmissionMode.ADVISORY
 
 
-def test_default_governor_fidelity_remains_strict() -> None:
+def test_default_governor_fidelity_is_exact() -> None:
     profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
     governed = resolve_trace_request(
         request(profile, batch=1000),
@@ -153,9 +147,8 @@ def test_default_governor_fidelity_remains_strict() -> None:
     )
 
     workload = governed.planning_workload
-    assert workload.fidelity is FidelityMode.STRICT
-    assert workload.evidence_name is None
-    assert workload.evidence_version is None
+    assert workload.fidelity is FidelityMode.EXACT
+    assert workload.fidelity_budget is None
     assert workload.semantic_overrides == ()
     assert workload.research_overrides == ()
 
@@ -214,17 +207,17 @@ def test_governor_fidelity_rejects_unknown_or_bookkeeping_fields_before_resoluti
         )
 
 
-def test_validated_relaxed_fidelity_forwards_without_registry_mutation(monkeypatch) -> None:
-    from circuit_tracer.governor import TRUSTED_VALIDATION_EVIDENCE_REGISTRY
-
+def test_bounded_fidelity_forwards_typed_budget(monkeypatch) -> None:
     profile = RECORDED_PROVIDER_PROFILES["granite_h200_1b_clt_b1000_c4096_cache8"]
     selected = replace(
         request(profile, batch=1000),
         governor_fidelity=GovernorFidelityPolicy(
-            mode=FidelityMode.VALIDATED_RELAXED,
+            mode=FidelityMode.BOUNDED,
+            budget=FidelityBudget(
+                (("edge_recall", 0.95),),
+                ("decoder_reduction_tile",),
+            ),
             override_fields=("decoder_reduction_tile",),
-            evidence_name="wave-a-gate",
-            evidence_version="1",
         ),
     )
     captured = {}
@@ -232,11 +225,10 @@ def test_validated_relaxed_fidelity_forwards_without_registry_mutation(monkeypat
     class WorkloadCaptured(RuntimeError):
         pass
 
-    def capture(workload, *_args):
+    def capture(workload, *_args, **_kwargs):
         captured["workload"] = workload
         raise WorkloadCaptured
 
-    assert not TRUSTED_VALIDATION_EVIDENCE_REGISTRY
     monkeypatch.setattr(
         "circuit_tracer.tracing.governor_bridge.resolve_trace_plan",
         capture,
@@ -249,12 +241,13 @@ def test_validated_relaxed_fidelity_forwards_without_registry_mutation(monkeypat
         )
 
     workload = captured["workload"]
-    assert workload.fidelity is FidelityMode.VALIDATED_RELAXED
-    assert workload.evidence_name == "wave-a-gate"
-    assert workload.evidence_version == "1"
+    assert workload.fidelity is FidelityMode.BOUNDED
+    assert workload.fidelity_budget == FidelityBudget(
+        (("edge_recall", 0.95),),
+        ("decoder_reduction_tile",),
+    )
     assert workload.semantic_overrides == (("decoder_reduction_tile", "4096"),)
     assert workload.research_overrides == ()
-    assert not TRUSTED_VALIDATION_EVIDENCE_REGISTRY
 
 
 def test_governed_clt_compiles_roomy_optimized_plan() -> None:

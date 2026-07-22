@@ -4,6 +4,18 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
+    from .calibration import CalibrationCatalog
+    from .calibration import CalibrationObservation
+    from .calibration import DEFAULT_KNOB_SENSITIVITIES
+    from .calibration import FidelityBudget
+    from .calibration import FidelityPrediction
+    from .calibration import KnobSensitivity
+    from .calibration import MetricPrediction
+    from .calibration import ParetoAlternative
+    from .calibration import PredictionSupport
+    from .calibration import PredictionSupportKind
+    from .calibration import PredictionUncertainty
+    from .calibration import SensitivityClass
     from .contracts import AdmissionMode
     from .contracts import AdmissionReport
     from .contracts import CachePolicy
@@ -32,8 +44,6 @@ if TYPE_CHECKING:
     from .contracts import StorageTier
     from .contracts import TracePlan
     from .contracts import TraceSemantics
-    from .contracts import TRUSTED_VALIDATION_EVIDENCE_REGISTRY
-    from .contracts import ValidationEvidence
     from .contracts import canonical_json
     from .contracts import dtype_byte_width
     from .contracts import execution_fingerprint
@@ -95,13 +105,17 @@ _CONTRACT_EXPORTS = {
     "StorageTier",
     "TracePlan",
     "TraceSemantics",
-    "TRUSTED_VALIDATION_EVIDENCE_REGISTRY",
-    "ValidationEvidence",
     "canonical_json",
     "dtype_byte_width",
     "execution_fingerprint",
     "fingerprint",
     "semantic_fingerprint",
+}
+_CALIBRATION_EXPORTS = {
+    "CalibrationCatalog", "CalibrationObservation", "DEFAULT_KNOB_SENSITIVITIES", "FidelityBudget",
+    "FidelityPrediction", "KnobSensitivity", "MetricPrediction",
+    "ParetoAlternative", "PredictionSupport", "PredictionSupportKind",
+    "PredictionUncertainty", "SensitivityClass",
 }
 _HOST_EXPORTS = {"HostBudgetCandidate", "HostBudgetDiscovery", "discover_host_budget"}
 _PROFILE_EXPORTS = {
@@ -131,6 +145,9 @@ _RUNTIME_EXPORTS = {
 }
 
 __all__ = [
+    "CalibrationCatalog",
+    "CalibrationObservation",
+    "DEFAULT_KNOB_SENSITIVITIES",
     "AdmissionMode",
     "AdmissionReport",
     "ActiveUniverseObservation",
@@ -142,6 +159,8 @@ __all__ = [
     "DemandTier",
     "EncoderResidency",
     "FidelityMode",
+    "FidelityBudget",
+    "FidelityPrediction",
     "FrozenMechanismRevisionError",
     "GRANITE_H200_CALIBRATIONS",
     "HISTORICAL_STRESS_FIXTURES",
@@ -149,6 +168,8 @@ __all__ = [
     "HostBudgetCandidate",
     "HostBudgetDiscovery",
     "LoadedStateObservation",
+    "KnobSensitivity",
+    "MetricPrediction",
     "PhysicalExecutionConfig",
     "PhysicalExecutionRequirements",
     "PlanningProgress",
@@ -158,6 +179,10 @@ __all__ = [
     "PlanningEpoch",
     "PlanningEpochOrderError",
     "PlanRevision",
+    "ParetoAlternative",
+    "PredictionSupport",
+    "PredictionSupportKind",
+    "PredictionUncertainty",
     "ProviderCapabilities",
     "ProviderSafetyLimits",
     "CalibrationSupport",
@@ -176,12 +201,11 @@ __all__ = [
     "StressArithmeticFixture",
     "StressRecommendation",
     "StorageTier",
+    "SensitivityClass",
     "TracePlan",
     "TraceGovernorRuntime",
     "TraceSemantics",
     "TorchResourceUsageSampler",
-    "TRUSTED_VALIDATION_EVIDENCE_REGISTRY",
-    "ValidationEvidence",
     "canonical_json",
     "compute_work_units",
     "discover_host_budget",
@@ -195,7 +219,9 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    if name in _CONTRACT_EXPORTS:
+    if name in _CALIBRATION_EXPORTS:
+        module_name = "circuit_tracer.governor.calibration"
+    elif name in _CONTRACT_EXPORTS:
         module_name = "circuit_tracer.governor.contracts"
     elif name in _HOST_EXPORTS:
         module_name = "circuit_tracer.governor.host_budget"

@@ -75,6 +75,7 @@ def run_trace(
                 requirements=plan.planning_requirements,
                 observer=observer,
                 admission_mode=plan.governor_admission_mode,
+                calibration_catalog=plan.planning_calibration_catalog,
             )
             governor_runtime.pre_execution_admission()
             if (
