@@ -7,6 +7,7 @@ import torch
 import yaml
 from safetensors.torch import save_file
 
+from circuit_tracer.attribution import context_nnsight
 from circuit_tracer.attribution.context_transformerlens import (
     AttributionContext as TransformerLensAttributionContext,
 )
@@ -878,6 +879,169 @@ def test_nnsight_row_subchunk_override_matches_default_replay() -> None:
 
     assert torch.allclose(custom_ctx._batch_buffer, baseline_ctx._batch_buffer)
     assert custom_ctx.get_diagnostic_snapshot()["row_subchunk_size"] == 1.0
+
+
+def _legacy_full_decoder_page_cast_replay(
+    *,
+    provider: FakeDecoderProvider,
+    positions: torch.Tensor,
+    feature_ids: torch.Tensor,
+    activation_values: torch.Tensor,
+    grads_by_output_layer: tuple[torch.Tensor, ...],
+    row_subchunk_size: int,
+) -> torch.Tensor:
+    """Reference the pre-optimization full-page cast and contraction order."""
+    batch_buffer = torch.zeros(
+        feature_ids.numel(),
+        grads_by_output_layer[0].shape[0],
+        dtype=grads_by_output_layer[0].dtype,
+    )
+    chunk_ids = torch.div(feature_ids, provider.decoder_chunk_size, rounding_mode="floor")
+    for chunk_id_tensor in torch.unique(chunk_ids, sorted=True):
+        chunk_id = int(chunk_id_tensor.item())
+        chunk_rows = (chunk_ids == chunk_id_tensor).nonzero(as_tuple=False).flatten()
+        chunk_positions = positions[chunk_rows]
+        chunk_local_feature_ids = (
+            feature_ids[chunk_rows] - chunk_id * provider.decoder_chunk_size
+        ).long()
+        decoder_chunk = provider.blocks[0][
+            chunk_id
+            * provider.decoder_chunk_size : (chunk_id + 1)
+            * provider.decoder_chunk_size
+        ]
+        chunk_activations = activation_values[chunk_rows].to(
+            dtype=batch_buffer.dtype
+        )[:, None]
+        for output_layer, grads in enumerate(grads_by_output_layer):
+            decoder_vectors = decoder_chunk[:, output_layer].to(dtype=batch_buffer.dtype)
+            typed_grads = grads.to(dtype=batch_buffer.dtype)
+            for row_start in range(0, len(chunk_rows), row_subchunk_size):
+                row_slice = slice(row_start, row_start + row_subchunk_size)
+                row_chunk_rows = chunk_rows[row_slice]
+                row_chunk_positions = chunk_positions[row_slice]
+                row_chunk_local_feature_ids = chunk_local_feature_ids[row_slice]
+                scaled_decoders = (
+                    decoder_vectors[row_chunk_local_feature_ids]
+                    * chunk_activations[row_slice]
+                )
+                batch_buffer[row_chunk_rows] += torch.einsum(
+                    "bpd,pd->pb",
+                    typed_grads[:, row_chunk_positions],
+                    scaled_decoders,
+                )
+    return batch_buffer
+
+
+@pytest.mark.parametrize("decoder_storage_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("row_subchunk_size", [1, 3])
+@pytest.mark.parametrize("replay_mode", ["direct", "tape"])
+def test_nnsight_gather_before_decoder_cast_is_bitwise_legacy_equivalent(
+    decoder_storage_dtype: torch.dtype,
+    row_subchunk_size: int,
+    replay_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Position ordering deliberately makes decoder chunk IDs [2, 0, 2, 1, 0, 2].
+    # Feature ID 5 is repeated, exercising repeated advanced-index gather rows.
+    feature_ids = torch.tensor([5, 1, 5, 3, 0, 4])
+    positions = torch.arange(feature_ids.numel())
+    activation_values = torch.tensor([0.5, -1.25, 2.0, 0.75, -0.5, 1.5])
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.stack(
+            [torch.zeros_like(feature_ids), positions, feature_ids]
+        ),
+        values=activation_values,
+        size=(2, feature_ids.numel(), 6),
+        check_invariants=True,
+    ).coalesce()
+    decoder_block = (
+        torch.arange(6 * 2 * 4, dtype=torch.float32).reshape(6, 2, 4) / 7
+    ).to(decoder_storage_dtype)
+    provider = FakeDecoderProvider(
+        {0: decoder_block},
+        chunk_size=2,
+        enable_cache=False,
+    )
+    first_grads = (
+        torch.arange(2 * feature_ids.numel() * 4, dtype=torch.float32)
+        .reshape(2, feature_ids.numel(), 4)
+        .div(11)
+    )
+    second_grads = first_grads.flip((0, 1)).mul(-0.75)
+    grad_batches = (
+        (first_grads, first_grads.flip(-1).mul(1.25)),
+        (second_grads, second_grads.flip(-1).mul(-1.5)),
+    )
+    expected = [
+        _legacy_full_decoder_page_cast_replay(
+            provider=provider,
+            positions=positions,
+            feature_ids=feature_ids,
+            activation_values=activation_values,
+            grads_by_output_layer=grads,
+            row_subchunk_size=row_subchunk_size,
+        )
+        for grads in grad_batches
+    ]
+    selected_decoder_row_counts: list[int] = []
+    original_einsum = context_nnsight.einsum
+
+    def _recording_einsum(*args, **kwargs):
+        selected_decoder_row_counts.append(int(args[1].shape[0]))
+        return original_einsum(*args, **kwargs)
+
+    monkeypatch.setattr(context_nnsight, "einsum", _recording_einsum)
+
+    ctx = _make_nnsight_context(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, feature_ids.numel(), 4),
+        token_vectors=torch.zeros(feature_ids.numel(), 4),
+        decoder_vecs=torch.empty((0, 4)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 4)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+        row_subchunk_size=row_subchunk_size,
+    )
+
+    if replay_mode == "direct":
+        observed = []
+        ctx._batch_buffer = torch.zeros(ctx._row_size, 2)
+        for grads in grad_batches:
+            ctx._batch_buffer.zero_()
+            ctx._compute_chunked_feature_attributions_from_grads(list(grads))
+            observed.append(ctx._batch_buffer.clone())
+    else:
+        ctx._batch_buffer = None
+        entries = tuple(
+            FeatureVjpTapeEntry(
+                batch_call_index=batch_index,
+                gradients=grads,
+                row_buffer=torch.zeros(ctx._row_size, 2),
+                batch_size=2,
+                host_nbytes=1,
+                device_nbytes=0,
+                row_nbytes=0,
+                total_nbytes=1,
+                pinned_host_nbytes=0,
+                pageable_host_nbytes=1,
+            )
+            for batch_index, grads in enumerate(grad_batches)
+        )
+        observed = [result.T for result in ctx.replay_feature_vjp_tape(entries)]
+
+    feature_row_count = feature_ids.numel()
+    assert torch.equal(observed[0][:feature_row_count], expected[0])
+    assert torch.equal(observed[1][:feature_row_count], expected[1])
+    assert selected_decoder_row_counts
+    assert max(selected_decoder_row_counts) <= provider.decoder_chunk_size
 
 
 def _create_gemmascope2_clt_files(

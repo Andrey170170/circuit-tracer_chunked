@@ -917,7 +917,7 @@ class AttributionContext:
         feature_ids = self.chunked_decoder_state["feature_ids"]
         activation_values = self.chunked_decoder_state["activation_values"]
         chunk_size = getattr(self.decoder_provider, "decoder_chunk_size", 256)
-        row_subchunk_size = self._effective_row_subchunk_size()
+        row_subchunk_size = min(self._effective_row_subchunk_size(), chunk_size)
         active_output_layers = sorted(
             {
                 layer
@@ -1037,9 +1037,7 @@ class AttributionContext:
                         raise TypeError("exact chunked provider is missing decoder_output_slot")
                     else:
                         decoder_slot = output_layer - source_layer
-                    decoder_vectors = decoder_chunk[:, decoder_slot].to(
-                        dtype=grad_batches[0][1].dtype
-                    )
+                    decoder_vectors = decoder_chunk[:, decoder_slot]
                     for output_layer_grads, batch_buffer, grad_batch_index in grad_batches:
                         grads = output_layer_grads[output_layer]
                         if grads is None:
@@ -1063,10 +1061,10 @@ class AttributionContext:
                             row_chunk_positions = chunk_positions[row_slice]
                             row_chunk_local_feat_ids = chunk_local_feat_ids[row_slice]
                             row_chunk_activations = chunk_activations[row_slice]
-                            scaled_decoders = (
-                                decoder_vectors[row_chunk_local_feat_ids]
-                                * row_chunk_activations
-                            )
+                            selected_decoder_vectors = decoder_vectors[
+                                row_chunk_local_feat_ids
+                            ].to(dtype=batch_buffer.dtype)
+                            scaled_decoders = selected_decoder_vectors * row_chunk_activations
                             selected_grads = typed_grads[:, row_chunk_positions]
                             write_rows = row_chunk_rows
                             if self._produced_feature_range is not None:
