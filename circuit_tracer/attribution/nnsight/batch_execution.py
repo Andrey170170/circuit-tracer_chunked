@@ -14,6 +14,10 @@ from circuit_tracer.observability.events import (
     MemorySnapshotAttrs,
     TraceObserver,
 )
+from circuit_tracer.attribution.nnsight.feature_vjp_tape import (
+    FeatureVjpTapeEntry,
+    tensor_nbytes,
+)
 
 
 _MEMORY_ATTR_KEYS: tuple[str, ...] = (
@@ -26,6 +30,20 @@ _MEMORY_ATTR_KEYS: tuple[str, ...] = (
     "cuda_allocated_gib",
     "cuda_reserved_gib",
 )
+
+_PIN_MEMORY_FALLBACK_MARKERS = (
+    "pin_memory",
+    "pinned memory",
+    "pin memory",
+    "out of memory",
+    "cuda driver",
+    "cuda error",
+)
+
+
+def _is_expected_pin_memory_failure(error: RuntimeError) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in _PIN_MEMORY_FALLBACK_MARKERS)
 
 
 def slice_phase3_gradient_replay_batch(
@@ -80,6 +98,7 @@ class BatchExecutionResult:
     batch_buffer_nbytes: int
     layers_in_batch: tuple[int, ...]
     chunked_feature_grad_window_peak: int
+    feature_vjp_tape_entry: FeatureVjpTapeEntry | None = None
 
 
 class BatchExecutionHost(Protocol):
@@ -118,6 +137,7 @@ def execute_backward_batch(
     request: BatchAttributionRequest,
     *,
     batch_call_index: int,
+    defer_feature_vjps: bool = False,
 ) -> BatchExecutionResult:
     """Execute gradient injection and direct-effect extraction in canonical order."""
     execution_device = host._resid_activations[0].device
@@ -157,6 +177,13 @@ def execute_backward_batch(
     capture = bool(host.capture_phase3_gradients and request.phase_label == "phase3_logits")
     replay = bool(host.phase3_gradient_replay_tensor is not None and request.phase_label == "phase3_logits")
     captured: list[torch.Tensor | None] | None = [None] * host.n_layers if capture else None
+    deferred: list[torch.Tensor | None] | None = (
+        [None] * host.n_layers if defer_feature_vjps else None
+    )
+    pinned_host_nbytes = 0
+    pageable_host_nbytes = 0
+    pin_fallback_count = 0
+    pin_fallback_reason = None
     replay_gradients = host.phase3_gradient_replay_tensor
     peak = 0
 
@@ -179,7 +206,30 @@ def execute_backward_batch(
                     if captured is not None and 0 <= layer < host.n_layers:
                         captured[layer] = grad.detach().to(device="cpu", dtype=torch.float32).contiguous()
                     feature_start = time.perf_counter()
-                    if chunked_feature_grads is None:
+                    if deferred is not None:
+                        if execution_device.type == "cuda":
+                            try:
+                                staged = torch.empty_like(
+                                    grad,
+                                    device="cpu",
+                                    memory_format=torch.contiguous_format,
+                                    pin_memory=True,
+                                )
+                                staged.copy_(grad.detach(), non_blocking=False)
+                                pinned_host_nbytes += tensor_nbytes(staged)
+                            except RuntimeError as exc:  # pragma: no cover - host dependent
+                                if not _is_expected_pin_memory_failure(exc):
+                                    raise
+                                staged = grad.detach().to(device="cpu").contiguous()
+                                pageable_host_nbytes += tensor_nbytes(staged)
+                                pin_fallback_count += 1
+                                if pin_fallback_reason is None:
+                                    pin_fallback_reason = f"{type(exc).__name__}: {exc}"
+                        else:
+                            staged = grad.detach().to(device="cpu").contiguous()
+                            pageable_host_nbytes += tensor_nbytes(staged)
+                        deferred[layer] = staged
+                    elif chunked_feature_grads is None:
                         host.compute_feature_attributions(layer, grad, phase_label=request.phase_label, batch_index=batch_call_index)
                         if host.diagnostic_mode:
                             host._add_layer_stat("feature_attr_seconds_by_layer", layer, time.perf_counter() - feature_start)
@@ -204,7 +254,7 @@ def execute_backward_batch(
             host.compute_token_attributions(host._feature_output_activations[0].grad[:batch_size])
             if host.diagnostic_mode:
                 host._add_stat("token_attr_seconds", time.perf_counter() - token_start)
-            if chunked_feature_grads is not None:
+            if chunked_feature_grads is not None and deferred is None:
                 host._flush_chunked_feature_grad_window(chunked_feature_grads, chunked_feature_grad_layers, phase_label=request.phase_label, batch_index=batch_call_index)
     finally:
         host._clear_saved_grads()
@@ -224,12 +274,38 @@ def execute_backward_batch(
     assert buffer is not None
     host._produced_feature_range = None
     host._produce_nonfeature = True
+    tape_entry = None
+    if deferred is not None:
+        gradient_bytes = sum(
+            tensor_nbytes(gradient) for gradient in deferred if gradient is not None
+        )
+        device_gradient_bytes = sum(
+            int(gradient.numel() * buffer.element_size())
+            for gradient in deferred
+            if gradient is not None
+        )
+        row_nbytes = tensor_nbytes(buffer)
+        tape_entry = FeatureVjpTapeEntry(
+            batch_call_index=int(batch_call_index),
+            gradients=tuple(deferred),
+            row_buffer=buffer,
+            batch_size=batch_size,
+            host_nbytes=gradient_bytes,
+            device_nbytes=device_gradient_bytes,
+            row_nbytes=row_nbytes,
+            total_nbytes=gradient_bytes + device_gradient_bytes + row_nbytes,
+            pinned_host_nbytes=pinned_host_nbytes,
+            pageable_host_nbytes=pageable_host_nbytes,
+            pin_fallback_count=pin_fallback_count,
+            pin_fallback_reason=pin_fallback_reason,
+        )
     return BatchExecutionResult(
         rows=buffer.T[:batch_size],
         inject_values_nbytes=int(inject_values.numel() * inject_values.element_size()),
         batch_buffer_nbytes=batch_buffer_nbytes,
         layers_in_batch=layers_in_batch,
         chunked_feature_grad_window_peak=peak,
+        feature_vjp_tape_entry=tape_entry,
     )
 
 
@@ -238,6 +314,7 @@ def execute_observed_batch(
     request: BatchAttributionRequest,
     *,
     batch_call_index: int,
+    defer_feature_vjps: bool = False,
 ) -> BatchExecutionResult:
     """Execute a batch while owning resource sampling and typed event rendering."""
     batch_size = request.validate(
@@ -284,7 +361,12 @@ def execute_observed_batch(
             else {}
         ),
     )
-    result = execute_backward_batch(host, request, batch_call_index=batch_call_index)
+    result = execute_backward_batch(
+        host,
+        request,
+        batch_call_index=batch_call_index,
+        defer_feature_vjps=defer_feature_vjps,
+    )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     memory_after = (
         cast(dict[str, object], observer.observe(MemorySnapshot(execution_device)))
@@ -327,6 +409,7 @@ def execute_observed_batch(
             "batch_buffer_nbytes": result.batch_buffer_nbytes,
             "chunked_feature_replay_window": int(host._chunked_feature_replay_window),
             "chunked_feature_grad_window_peak": result.chunked_feature_grad_window_peak,
+            "feature_vjp_deferred": defer_feature_vjps,
             **memory_attrs,
         },
     )

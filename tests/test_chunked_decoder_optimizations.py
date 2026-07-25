@@ -20,6 +20,7 @@ from circuit_tracer.attribution.nnsight.context_state import (
     ContextNumericPolicy,
     DecoderRuntime,
 )
+from circuit_tracer.attribution.nnsight.feature_vjp_tape import FeatureVjpTapeEntry
 from circuit_tracer.tracing.plan import ObservabilityPolicy
 from circuit_tracer.observability.lifecycle import TelemetryObserver
 from circuit_tracer.attribution.nnsight.phase1_policy import (
@@ -3425,6 +3426,57 @@ def test_chunked_feature_replay_windows_match_full_replay() -> None:
     )
 
     assert torch.allclose(windowed_ctx._batch_buffer, expected)
+
+
+def test_feature_vjp_tape_reuses_each_decoder_page_across_batches() -> None:
+    grads = (
+        torch.tensor(
+            [
+                [[1.0, 10.0], [2.0, 20.0]],
+                [[3.0, 30.0], [4.0, 40.0]],
+            ]
+        ),
+        torch.tensor(
+            [
+                [[5.0, 50.0], [6.0, 60.0]],
+                [[7.0, 70.0], [8.0, 80.0]],
+            ]
+        ),
+        None,
+    )
+    sequential_ctx, sequential_provider = _make_chunked_context(
+        _make_nnsight_context, enable_cache=False
+    )
+    sequential_ctx._compute_chunked_feature_attributions_from_grads(list(grads))
+    first = sequential_ctx._batch_buffer.clone()
+    sequential_ctx._batch_buffer.zero_()
+    sequential_ctx._compute_chunked_feature_attributions_from_grads(list(grads))
+    second = sequential_ctx._batch_buffer.clone()
+
+    tape_ctx, tape_provider = _make_chunked_context(
+        _make_nnsight_context, enable_cache=False
+    )
+    tape_ctx._batch_buffer = None
+    entries = tuple(
+        FeatureVjpTapeEntry(
+            batch_call_index=index,
+            gradients=grads,
+            row_buffer=torch.zeros(tape_ctx._row_size, 2),
+            batch_size=2,
+            host_nbytes=1,
+            device_nbytes=0,
+            row_nbytes=0,
+            total_nbytes=1,
+            pinned_host_nbytes=0,
+            pageable_host_nbytes=1,
+        )
+        for index in (1, 2)
+    )
+    replayed = tape_ctx.replay_feature_vjp_tape(entries)
+
+    assert torch.equal(replayed[0], first.T)
+    assert torch.equal(replayed[1], second.T)
+    assert len(sequential_provider.load_calls) == 2 * len(tape_provider.load_calls)
 
 
 def test_chunked_attr_fallback_handles_nonmonotonic_chunk_ids_within_layer() -> None:

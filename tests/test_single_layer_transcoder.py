@@ -193,6 +193,40 @@ def test_transcoder_set_exact_provider_cache_metadata_round_trip(
         load_transcoders_from_cache("org/plt-set", cache_dir=cache_root)
 
 
+def test_plt_decoder_provider_reports_request_load_bytes_and_cache_hits(
+    create_test_transcoder_file,
+):
+    paths = {}
+    for layer in range(2):
+        src, _ = create_test_transcoder_file(d_model=4, d_sae=6)
+        paths[layer] = src
+    provider = load_transcoder_set(
+        paths,
+        scan="test_scan",
+        feature_input_hook="hook_resid_mid",
+        feature_output_hook="hook_mlp_out",
+        device=torch.device("cpu"),
+        lazy_encoder=False,
+        lazy_decoder=False,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    cache = provider.create_decoder_block_cache(max_bytes=1_000_000)
+
+    first = provider.get_decoder_chunk(0, 0, decoder_cache=cache)
+    second = provider.get_decoder_chunk(0, 0, decoder_cache=cache)
+    snapshot = provider.get_diagnostic_snapshot()
+    chunk_nbytes = int(first.numel() * first.element_size())
+
+    assert second.data_ptr() == first.data_ptr()
+    assert snapshot["decoder_chunk_request_count"] == 2
+    assert snapshot["decoder_chunk_request_bytes"] == 2 * chunk_nbytes
+    assert snapshot["decoder_load_count"] == 1
+    assert snapshot["decoder_load_bytes"] == chunk_nbytes
+    assert snapshot["decoder_cache_hit_count"] == 1
+    assert snapshot["decoder_cache_miss_count"] == 1
+
+
 def test_sparse_encode_decode(create_test_transcoder_file):
     """Test sparse encoding and decoding functionality."""
     path, _ = create_test_transcoder_file(d_model=128, d_sae=512)

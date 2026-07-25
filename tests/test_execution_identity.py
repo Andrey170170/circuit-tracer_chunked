@@ -18,6 +18,7 @@ from circuit_tracer.execution_identity import ExecutionIdentityState
 from circuit_tracer.tracing.plan import (
     DecoderCachePolicy,
     ExecutionConstraints,
+    FrontierExpansionPlan,
     RowStoragePlan,
     SessionPlan,
 )
@@ -31,6 +32,8 @@ def _identity(
     compact_row_store: bool = True,
     row_backend: str = "full_file",
     decoder_cache_bytes: int = 0,
+    tape_window: int = 1,
+    tape_bytes: int = 0,
 ):
     provider = ProviderMechanisms(
         capabilities=TranscoderCapabilities(
@@ -134,6 +137,22 @@ def _identity(
         prepared_chunk_cache_bytes_effective=4096 if compact_row_store else 0,
         active_row_accumulation_effective="direct_v1" if compact_row_store else "zero_fill",
         refresh_aux_fallback_reason=None if compact_row_store else "not_applicable",
+        feature_vjp_tape_enabled=tape_window > 1 and row_backend == "full_file",
+        feature_vjp_tape_batch_window_effective=(
+            tape_window if tape_window > 1 and row_backend == "full_file" else 1
+        ),
+        feature_vjp_tape_max_bytes_effective=(
+            tape_bytes if tape_window > 1 and row_backend == "full_file" else 0
+        ),
+        feature_vjp_tape_fallback_reason=(
+            None
+            if tape_window > 1 and row_backend == "full_file"
+            else (
+                "requires_full_file_backend"
+                if tape_window > 1
+                else "window_one_streaming_fallback"
+            )
+        ),
     )
     plan = SimpleNamespace(
         execution=ExecutionConstraints(
@@ -144,6 +163,10 @@ def _identity(
                 )
             ),
             storage=RowStoragePlan(full_retention_backend=row_backend),
+            frontier=FrontierExpansionPlan(
+                feature_vjp_tape_batch_window=tape_window,
+                feature_vjp_tape_max_bytes=tape_bytes,
+            ),
         )
     )
     return _effective_execution_identity(provider, numerics, replay, batches, frontier, plan)
@@ -187,6 +210,34 @@ def test_effective_identity_covers_storage_and_decoder_mechanisms() -> None:
     assert tiled.descriptor.storage["backend"] == "column_tiled_v1"
     assert cached.descriptor is not None
     assert cached.descriptor.decoder["cache_max_bytes"] == 4096
+
+
+def test_effective_identity_changes_with_feature_vjp_tape_physical_controls() -> None:
+    streaming = _identity()
+    taped = _identity(tape_window=2, tape_bytes=4096)
+
+    assert streaming.fingerprint != taped.fingerprint
+    assert taped.descriptor is not None
+    assert taped.descriptor.frontier["feature_vjp_tape_enabled"] is True
+    assert taped.descriptor.frontier["feature_vjp_tape_batch_window_effective"] == 2
+    assert taped.descriptor.frontier["feature_vjp_tape_max_bytes_effective"] == 4096
+
+
+def test_effective_identity_records_unsupported_tape_storage_as_explicit_noop() -> None:
+    tiled = _identity(
+        row_backend="column_tiled_v1",
+        tape_window=2,
+        tape_bytes=4096,
+    )
+
+    assert tiled.descriptor is not None
+    assert tiled.descriptor.frontier["feature_vjp_tape_enabled"] is False
+    assert tiled.descriptor.frontier["feature_vjp_tape_batch_window_requested"] == 2
+    assert tiled.descriptor.frontier["feature_vjp_tape_batch_window_effective"] == 1
+    assert (
+        tiled.descriptor.frontier["feature_vjp_tape_fallback_reason"]
+        == "requires_full_file_backend"
+    )
 
 
 def test_effective_identity_state_records_allowed_runtime_revisions() -> None:

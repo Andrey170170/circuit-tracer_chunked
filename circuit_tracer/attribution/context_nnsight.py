@@ -17,6 +17,10 @@ from circuit_tracer.attribution.nnsight.batch_execution import (
     execute_observed_batch,
     slice_phase3_gradient_replay_batch as _slice_phase3_gradient_replay_batch,  # noqa: F401
 )
+from circuit_tracer.attribution.nnsight.feature_vjp_tape import (
+    FeatureVjpTapeByteEstimate,
+    FeatureVjpTapeEntry,
+)
 from circuit_tracer.attribution.nnsight.context_state import (
     AttributionTensorState,
     ContextNumericPolicy,
@@ -894,32 +898,40 @@ class AttributionContext:
         )
         return stats
 
-    def _compute_chunked_feature_attributions_from_grads(
+    def _compute_chunked_feature_attributions_from_grad_batches(
         self,
-        output_layer_grads: list[torch.Tensor | None],
+        grad_batches: list[
+            tuple[tuple[torch.Tensor | None, ...] | list[torch.Tensor | None], torch.Tensor, int]
+        ],
         *,
         phase_label: str | None = None,
         batch_index: int | None = None,
     ) -> None:
         assert self.chunked_decoder_state is not None
         assert self.decoder_provider is not None
-        assert self._batch_buffer is not None
         assert self._chunked_layer_spans is not None
+        if not grad_batches:
+            return
 
         positions = self.chunked_decoder_state["positions"]
         feature_ids = self.chunked_decoder_state["feature_ids"]
         activation_values = self.chunked_decoder_state["activation_values"]
         chunk_size = getattr(self.decoder_provider, "decoder_chunk_size", 256)
         row_subchunk_size = self._effective_row_subchunk_size()
-        active_output_layers = [
-            layer for layer, grads in enumerate(output_layer_grads) if grads is not None
-        ]
+        active_output_layers = sorted(
+            {
+                layer
+                for output_layer_grads, _, _ in grad_batches
+                for layer, grads in enumerate(output_layer_grads)
+                if grads is not None
+            }
+        )
         if not active_output_layers:
             return
 
         output_layer_seconds = {layer: 0.0 for layer in active_output_layers}
         chunk_counts = {layer: 0 for layer in active_output_layers}
-        grad_cache: dict[int, torch.Tensor] = {}
+        grad_cache: dict[tuple[int, int], torch.Tensor] = {}
         replay_start = time.perf_counter()
 
         for layer in active_output_layers:
@@ -1007,7 +1019,7 @@ class AttributionContext:
                 )
                 chunk_activations = activation_values[chunk_rows].to(
                     device=decoder_chunk.device,
-                    dtype=self._batch_buffer.dtype,
+                    dtype=grad_batches[0][1].dtype,
                     non_blocking=decoder_chunk.device.type == "cuda",
                 )[:, None]
                 total_row_subchunks = max(
@@ -1017,17 +1029,6 @@ class AttributionContext:
 
                 for output_layer in relevant_output_layers:
                     output_layer_start = time.perf_counter()
-                    typed_grads = grad_cache.get(output_layer)
-                    if typed_grads is None:
-                        grads = output_layer_grads[output_layer]
-                        assert grads is not None
-                        typed_grads = grads.to(
-                            device=decoder_chunk.device,
-                            dtype=self._batch_buffer.dtype,
-                            non_blocking=decoder_chunk.device.type == "cuda",
-                        )
-                        grad_cache[output_layer] = typed_grads
-
                     if hasattr(self.decoder_provider, "decoder_output_slot"):
                         decoder_slot = self.decoder_provider.decoder_output_slot(
                             source_layer, output_layer
@@ -1037,47 +1038,61 @@ class AttributionContext:
                     else:
                         decoder_slot = output_layer - source_layer
                     decoder_vectors = decoder_chunk[:, decoder_slot].to(
-                        dtype=self._batch_buffer.dtype
+                        dtype=grad_batches[0][1].dtype
                     )
-                    for row_subchunk_idx, row_start in enumerate(
-                        range(0, len(chunk_rows), row_subchunk_size),
-                        start=1,
-                    ):
-                        row_stop = row_start + row_subchunk_size
-                        row_slice = slice(row_start, row_stop)
-                        row_chunk_rows = chunk_rows[row_slice]
-                        row_chunk_positions = chunk_positions[row_slice]
-                        row_chunk_local_feat_ids = chunk_local_feat_ids[row_slice]
-                        row_chunk_activations = chunk_activations[row_slice]
-                        scaled_decoders = (
-                            decoder_vectors[row_chunk_local_feat_ids] * row_chunk_activations
-                        )
-                        selected_grads = typed_grads[:, row_chunk_positions]
-                        write_rows = row_chunk_rows
-                        if self._produced_feature_range is not None:
-                            write_rows = write_rows - self._produced_feature_range[0]
-                        self._batch_buffer[write_rows] += einsum(
-                            selected_grads,
-                            scaled_decoders,
-                            "batch position d_model, position d_model -> position batch",
-                        )
-                        chunk_counts[output_layer] += 1
-
-                        if (
-                            chunk_counts[output_layer] <= 2
-                            or chunk_counts[output_layer] % self._trace_chunk_interval == 0
-                        ):
-                            self._emit_trace(
-                                "phase3.chunked_attr.chunk",
-                                output_layer=output_layer,
-                                source_layer=source_layer,
-                                chunk=chunk_counts[output_layer],
-                                decoder_chunk_id=chunk_id,
-                                processed_chunks=chunk_position,
-                                total_chunks=total_chunks,
-                                row_subchunk=row_subchunk_idx,
-                                total_row_subchunks=total_row_subchunks,
+                    for output_layer_grads, batch_buffer, grad_batch_index in grad_batches:
+                        grads = output_layer_grads[output_layer]
+                        if grads is None:
+                            continue
+                        cache_key = (grad_batch_index, output_layer)
+                        typed_grads = grad_cache.get(cache_key)
+                        if typed_grads is None:
+                            typed_grads = grads.to(
+                                device=decoder_chunk.device,
+                                dtype=batch_buffer.dtype,
+                                non_blocking=decoder_chunk.device.type == "cuda",
                             )
+                            grad_cache[cache_key] = typed_grads
+                        for row_subchunk_idx, row_start in enumerate(
+                            range(0, len(chunk_rows), row_subchunk_size),
+                            start=1,
+                        ):
+                            row_stop = row_start + row_subchunk_size
+                            row_slice = slice(row_start, row_stop)
+                            row_chunk_rows = chunk_rows[row_slice]
+                            row_chunk_positions = chunk_positions[row_slice]
+                            row_chunk_local_feat_ids = chunk_local_feat_ids[row_slice]
+                            row_chunk_activations = chunk_activations[row_slice]
+                            scaled_decoders = (
+                                decoder_vectors[row_chunk_local_feat_ids]
+                                * row_chunk_activations
+                            )
+                            selected_grads = typed_grads[:, row_chunk_positions]
+                            write_rows = row_chunk_rows
+                            if self._produced_feature_range is not None:
+                                write_rows = write_rows - self._produced_feature_range[0]
+                            batch_buffer[write_rows] += einsum(
+                                selected_grads,
+                                scaled_decoders,
+                                "batch position d_model, position d_model -> position batch",
+                            )
+                            chunk_counts[output_layer] += 1
+
+                            if (
+                                chunk_counts[output_layer] <= 2
+                                or chunk_counts[output_layer] % self._trace_chunk_interval == 0
+                            ):
+                                self._emit_trace(
+                                    "phase3.chunked_attr.chunk",
+                                    output_layer=output_layer,
+                                    source_layer=source_layer,
+                                    chunk=chunk_counts[output_layer],
+                                    decoder_chunk_id=chunk_id,
+                                    processed_chunks=chunk_position,
+                                    total_chunks=total_chunks,
+                                    row_subchunk=row_subchunk_idx,
+                                    total_row_subchunks=total_row_subchunks,
+                                )
 
                     output_layer_seconds[output_layer] += time.perf_counter() - output_layer_start
 
@@ -1127,6 +1142,41 @@ class AttributionContext:
             elapsed_ms=(time.perf_counter() - replay_start) * 1000.0,
             attrs={"active_output_layers": int(len(active_output_layers))},
         )
+
+    def _compute_chunked_feature_attributions_from_grads(
+        self,
+        output_layer_grads: list[torch.Tensor | None],
+        *,
+        phase_label: str | None = None,
+        batch_index: int | None = None,
+    ) -> None:
+        assert self._batch_buffer is not None
+        self._compute_chunked_feature_attributions_from_grad_batches(
+            [(output_layer_grads, self._batch_buffer, int(batch_index or 0))],
+            phase_label=phase_label,
+            batch_index=batch_index,
+        )
+
+    def replay_feature_vjp_tape(
+        self,
+        entries: tuple[FeatureVjpTapeEntry, ...],
+        *,
+        phase_label: str = "phase4_features",
+    ) -> list[torch.Tensor]:
+        """Contract captured batches decoder-page-major without coalescing arithmetic."""
+        if self.chunked_decoder_state is None:
+            raise RuntimeError("FeatureVjpTape requires exact chunked decoder state")
+        if self._produced_feature_range is not None:
+            raise RuntimeError("FeatureVjpTape does not support tiled feature ranges")
+        self._compute_chunked_feature_attributions_from_grad_batches(
+            [
+                (entry.gradients, entry.row_buffer, entry.batch_call_index)
+                for entry in entries
+            ],
+            phase_label=phase_label,
+            batch_index=None,
+        )
+        return [entry.row_buffer.T[: entry.batch_size] for entry in entries]
 
     def _compute_chunked_feature_attributions(
         self,
@@ -1338,6 +1388,68 @@ class AttributionContext:
             batch_call_index=self._compute_batch_call_index,
         )
         return result.rows
+
+    def estimate_feature_vjp_tape_entry_nbytes(
+        self,
+        *,
+        layers: torch.Tensor,
+        batch_size: int,
+    ) -> FeatureVjpTapeByteEstimate:
+        """Return the exact owned bytes for a full-range deferred batch."""
+        if batch_size <= 0:
+            raise ValueError("FeatureVjpTape batch_size must be > 0")
+        last_layer = int(layers.max().item())
+        gradient_numel = sum(
+            int(batch_size * self._feature_output_activations[layer + 1][0].numel())
+            for layer in range(last_layer)
+        )
+        host_nbytes = sum(
+            int(
+                batch_size
+                * self._feature_output_activations[layer + 1][0].numel()
+                * self._feature_output_activations[layer + 1].element_size()
+            )
+            for layer in range(last_layer)
+        )
+        device_nbytes = int(gradient_numel * torch.float32.itemsize)
+        row_nbytes = int(self._row_size * batch_size * torch.float32.itemsize)
+        # One conservative cap bounds simultaneous host, replay-device, and row ownership.
+        return FeatureVjpTapeByteEstimate(
+            host_nbytes=host_nbytes,
+            device_nbytes=device_nbytes,
+            row_nbytes=row_nbytes,
+            total_nbytes=host_nbytes + device_nbytes + row_nbytes,
+        )
+
+    def capture_feature_vjp_batch(
+        self,
+        *,
+        layers: torch.Tensor,
+        positions: torch.Tensor,
+        inject_values: torch.Tensor,
+        retain_graph: bool,
+        phase_label: str = "phase4_features",
+    ) -> FeatureVjpTapeEntry:
+        """Run backward/error/token attribution and defer only decoder contraction."""
+        if self.chunked_decoder_state is None:
+            raise RuntimeError("FeatureVjpTape requires exact chunked decoder state")
+        self._compute_batch_call_index += 1
+        result = execute_observed_batch(
+            self,
+            BatchAttributionRequest(
+                layers=layers,
+                positions=positions,
+                inject_values=inject_values,
+                retain_graph=retain_graph,
+                phase_label=phase_label,
+                feature_column_range=None,
+                include_nonfeature=True,
+            ),
+            batch_call_index=self._compute_batch_call_index,
+            defer_feature_vjps=True,
+        )
+        assert result.feature_vjp_tape_entry is not None
+        return result.feature_vjp_tape_entry
 
     def produce_row_tiles(
         self,

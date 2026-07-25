@@ -84,6 +84,10 @@ class Phase4Config:
     influence_column_tile_size: int = 2048
     feature_row_column_tile_size: int = 2048
     feature_row_retention: str = "full_file"
+    feature_vjp_tape_batch_window: int = 1
+    feature_vjp_tape_max_bytes: int = 0
+    feature_vjp_tape_enabled: bool = False
+    feature_vjp_tape_fallback_reason: str | None = "window_one_streaming_fallback"
 
 
 @dataclass(frozen=True)

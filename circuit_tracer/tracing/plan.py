@@ -165,11 +165,20 @@ class FrontierExpansionPlan:
     feature_batch_target_reserved_fraction: float = 0.9
     feature_batch_min_free_fraction: float = 0.05
     feature_batch_probe_batches: int = 1
+    feature_vjp_tape_batch_window: int = 1
+    feature_vjp_tape_max_bytes: int = 0
 
     def __post_init__(self) -> None:
         _nonnegative("refresh_prepared_chunk_cache_bytes", self.refresh_prepared_chunk_cache_bytes)
         _positive("feature_batch_size_max", self.feature_batch_size_max)
         _positive("feature_batch_probe_batches", self.feature_batch_probe_batches)
+        _positive("feature_vjp_tape_batch_window", self.feature_vjp_tape_batch_window)
+        _nonnegative("feature_vjp_tape_max_bytes", self.feature_vjp_tape_max_bytes)
+        if self.feature_vjp_tape_batch_window > 1 and self.feature_vjp_tape_max_bytes == 0:
+            raise ValueError(
+                "feature_vjp_tape_batch_window > 1 requires "
+                "feature_vjp_tape_max_bytes > 0"
+            )
         for name in (
             "feature_batch_target_reserved_fraction",
             "feature_batch_min_free_fraction",

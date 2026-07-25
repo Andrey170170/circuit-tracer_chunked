@@ -385,6 +385,14 @@ class TranscoderSet(nn.Module):
             if cross_batch_decoder_cache_bytes is None
             else int(cross_batch_decoder_cache_bytes)
         )
+        self._decoder_diagnostic_stats = {
+            "decoder_chunk_request_count": 0,
+            "decoder_chunk_request_bytes": 0,
+            "decoder_load_count": 0,
+            "decoder_load_bytes": 0,
+            "decoder_cache_hit_count": 0,
+            "decoder_cache_miss_count": 0,
+        }
 
     @property
     def architecture(self):
@@ -473,9 +481,19 @@ class TranscoderSet(nn.Module):
         if decoder_cache is not None:
             cached = decoder_cache.get(cache_key)
             if cached is not None:
+                cached_nbytes = int(cached.numel() * cached.element_size())
+                self._decoder_diagnostic_stats["decoder_chunk_request_count"] += 1
+                self._decoder_diagnostic_stats["decoder_chunk_request_bytes"] += cached_nbytes
+                self._decoder_diagnostic_stats["decoder_cache_hit_count"] += 1
                 return cached
         transcoder = cast(SingleLayerTranscoder, self.transcoders[int(source_layer)])
         result = transcoder.get_decoder_chunk(chunk_id, self.decoder_chunk_size)
+        result_nbytes = int(result.numel() * result.element_size())
+        self._decoder_diagnostic_stats["decoder_chunk_request_count"] += 1
+        self._decoder_diagnostic_stats["decoder_chunk_request_bytes"] += result_nbytes
+        self._decoder_diagnostic_stats["decoder_load_count"] += 1
+        self._decoder_diagnostic_stats["decoder_load_bytes"] += result_nbytes
+        self._decoder_diagnostic_stats["decoder_cache_miss_count"] += 1
         if decoder_cache is not None:
             if hasattr(decoder_cache, "put"):
                 decoder_cache.put(cache_key, result)
@@ -502,6 +520,7 @@ class TranscoderSet(nn.Module):
             "n_layers": self.n_layers,
             "d_model": self.d_model,
             "d_transcoder": self.d_transcoder,
+            **self._decoder_diagnostic_stats,
         }
 
     def _decode_sparse_with_decoder_chunks(

@@ -1,9 +1,15 @@
+import gc
+import weakref
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from circuit_tracer.attribution.nnsight.feature_vjp_tape import (
+    FeatureVjpTapeByteEstimate,
+    FeatureVjpTapeEntry,
+)
 from circuit_tracer.attribution.nnsight.phases.phase4 import (
     Phase4Config,
     Phase4Inputs,
@@ -494,3 +500,182 @@ def test_phase4_coalescing_never_crosses_refresh_frontiers() -> None:
         (1,),
     ]
     assert [batch["phase4_execution_batch_rows"] for batch in attrs] == [2, 2, 1]
+
+
+class _FakeTapeContext:
+    def __init__(self, *, row_width: int, entry_bytes: int = 10) -> None:
+        self.row_width = row_width
+        self.entry_bytes = entry_bytes
+        self.replay_windows: list[list[int]] = []
+        self.next_call_index = 0
+        self.previous_replay_storage_refs: list[weakref.ReferenceType[object]] = []
+        self.previous_replay_storage_released: list[bool] = []
+
+    def materialize_encoder_vectors(self, indices: torch.Tensor) -> torch.Tensor:
+        return indices.to(dtype=torch.float32).reshape(-1, 1)
+
+    def _rows(self, values: torch.Tensor) -> torch.Tensor:
+        return torch.cat(tuple(values + offset for offset in range(self.row_width)), dim=1)
+
+    def compute_batch(self, **kwargs: object) -> torch.Tensor:
+        values = kwargs["inject_values"]
+        assert isinstance(values, torch.Tensor)
+        return self._rows(values)
+
+    def estimate_feature_vjp_tape_entry_nbytes(
+        self, *, layers: torch.Tensor, batch_size: int
+    ) -> FeatureVjpTapeByteEstimate:
+        del layers, batch_size
+        return FeatureVjpTapeByteEstimate(
+            host_nbytes=self.entry_bytes // 3,
+            device_nbytes=self.entry_bytes // 3,
+            row_nbytes=self.entry_bytes - (2 * (self.entry_bytes // 3)),
+            total_nbytes=self.entry_bytes,
+        )
+
+    def capture_feature_vjp_batch(self, **kwargs: object) -> FeatureVjpTapeEntry:
+        if self.previous_replay_storage_refs:
+            gc.collect()
+            self.previous_replay_storage_released.append(
+                all(ref() is None for ref in self.previous_replay_storage_refs)
+            )
+            self.previous_replay_storage_refs.clear()
+        values = kwargs["inject_values"]
+        assert isinstance(values, torch.Tensor)
+        self.next_call_index += 1
+        rows = self._rows(values)
+        return FeatureVjpTapeEntry(
+            batch_call_index=self.next_call_index,
+            gradients=(),
+            row_buffer=rows.T.clone(),
+            batch_size=len(values),
+            host_nbytes=self.entry_bytes // 3,
+            device_nbytes=self.entry_bytes // 3,
+            row_nbytes=self.entry_bytes - (2 * (self.entry_bytes // 3)),
+            total_nbytes=self.entry_bytes,
+            pinned_host_nbytes=0,
+            pageable_host_nbytes=self.entry_bytes // 3,
+        )
+
+    def replay_feature_vjp_tape(
+        self,
+        entries: tuple[FeatureVjpTapeEntry, ...],
+        *,
+        phase_label: str,
+    ) -> list[torch.Tensor]:
+        del phase_label
+        self.replay_windows.append([entry.batch_call_index for entry in entries])
+        storages = [entry.row_buffer.untyped_storage() for entry in entries]
+        self.previous_replay_storage_refs = [weakref.ref(storage) for storage in storages]
+        return [entry.row_buffer.T[: entry.batch_size] for entry in entries]
+
+
+def _run_tape_phase4(
+    *,
+    window: int,
+    max_bytes: int,
+    update_interval: int = 2,
+    partial_frontier: bool = False,
+    gpu_reduction: bool = False,
+) -> tuple[object, FakeObserver, _FakeTapeContext]:
+    observer = FakeObserver()
+    total_features = 6 if partial_frontier else 4
+    actual_features = 5 if partial_frontier else 4
+    row_width = total_features + 1
+    ctx = _FakeTapeContext(row_width=row_width)
+    inputs = replace(
+        _nonzero_inputs(observer),
+        ctx=ctx,
+        model=SimpleNamespace(
+            device=torch.device("cpu"),
+            transcoders=SimpleNamespace(decoder_chunk_size=2),
+        ),
+        edge_matrix=torch.zeros((actual_features + 1, row_width)),
+        feat_ids=torch.arange(20, 20 + total_features),
+        feat_layers=torch.zeros(total_features, dtype=torch.long),
+        feat_pos=torch.zeros(total_features, dtype=torch.long),
+        row_to_node_index=torch.full((actual_features + 1,), -1, dtype=torch.long),
+        cross_cluster_debug_summary=None if partial_frontier else {},
+        cross_cluster_debug_checkpoints=None if partial_frontier else [],
+        cross_cluster_debug_batches=None if partial_frontier else [],
+        anomaly_debug_result=None if partial_frontier else {"records": []},
+        feature_row_store=FakeRowStore() if gpu_reduction else None,
+        nonfeature_row_store=FakeRowStore() if gpu_reduction else None,
+    )
+    result = run_phase4(
+        inputs=inputs,
+        config=replace(
+            _config(),
+            actual_max_feature_nodes=actual_features,
+            total_active_feats=total_features,
+            logit_offset=row_width,
+            effective_feature_batch_size=1,
+            execution_batch_max_rows=1,
+            update_interval=update_interval,
+            exact_chunked_decoder=True,
+            feature_vjp_tape_batch_window=window,
+            feature_vjp_tape_max_bytes=max_bytes,
+            feature_vjp_tape_enabled=window > 1,
+            feature_vjp_tape_fallback_reason=(
+                None if window > 1 else "window_one_streaming_fallback"
+            ),
+            use_compact_feature_row_store=gpu_reduction,
+            phase4_row_reduction_config=_policy(
+                effective_mode="gpu_v1" if gpu_reduction else "off"
+            ),
+            phase4_ranker_config=_policy(
+                requested_mode="argsort",
+                effective_mode="argsort" if partial_frontier else "off",
+            ),
+        ),
+    )
+    return result, observer, ctx
+
+
+def test_phase4_feature_vjp_tape_window_two_matches_window_one_and_reuses_windows() -> None:
+    baseline, _, _ = _run_tape_phase4(window=1, max_bytes=0)
+    taped, observer, ctx = _run_tape_phase4(window=2, max_bytes=20)
+
+    assert torch.equal(taped.edge_matrix, baseline.edge_matrix)
+    assert torch.equal(taped.row_to_node_index, baseline.row_to_node_index)
+    assert ctx.replay_windows == [[1, 2], [3, 4]]
+    attrs = next(
+        event["attrs"]
+        for event in observer.phases
+        if event["name"] == "phase4.feature_attribution"
+    )
+    assert attrs["phase4_feature_vjp_tape_window_count"] == 2
+    assert attrs["phase4_feature_vjp_tape_batch_count"] == 4
+    assert attrs["phase4_feature_vjp_tape_high_watermark_bytes"] == 20
+    assert attrs["phase4_feature_vjp_planned_decoder_traversal_numerator"] == 2
+    assert attrs["phase4_feature_vjp_planned_decoder_traversal_denominator"] == 4
+
+
+def test_phase4_feature_vjp_tape_cap_flushes_and_never_crosses_frontier() -> None:
+    _, cap_observer, cap_ctx = _run_tape_phase4(window=2, max_bytes=9)
+    _, _, frontier_ctx = _run_tape_phase4(
+        window=2,
+        max_bytes=20,
+        partial_frontier=True,
+    )
+
+    assert cap_ctx.replay_windows == []
+    cap_attrs = next(
+        event["attrs"]
+        for event in cap_observer.phases
+        if event["name"] == "phase4.feature_attribution"
+    )
+    assert cap_attrs["phase4_feature_vjp_tape_oversize_fallback_batches"] == 4
+    assert cap_attrs["phase4_feature_vjp_tape_batch_count"] == 0
+    assert frontier_ctx.replay_windows == [[1, 2], [3, 4], [5]]
+
+
+def test_phase4_tape_releases_gpu_reduction_row_storage_before_next_window() -> None:
+    _, _, ctx = _run_tape_phase4(
+        window=2,
+        max_bytes=20,
+        gpu_reduction=True,
+    )
+
+    assert ctx.replay_windows == [[1, 2], [3, 4]]
+    assert ctx.previous_replay_storage_released == [True]

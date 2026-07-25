@@ -110,6 +110,106 @@ def finish_phase4(state):
                 "phase4_feature_transient_peak_bytes": int(
                     state.phase4_feature_transient_peak_bytes
                 ),
+                "phase4_feature_vjp_tape_window_count": int(
+                    state.phase4_feature_vjp_tape_window_count
+                ),
+                "phase4_feature_vjp_tape_batch_count": int(
+                    state.phase4_feature_vjp_tape_batch_count
+                ),
+                "phase4_feature_vjp_tape_bytes_total": int(
+                    state.phase4_feature_vjp_tape_bytes_total
+                ),
+                "phase4_feature_vjp_tape_high_watermark_bytes": int(
+                    state.phase4_feature_vjp_tape_high_watermark_bytes
+                ),
+                "phase4_feature_vjp_tape_host_bytes_total": int(
+                    state.phase4_feature_vjp_tape_host_bytes_total
+                ),
+                "phase4_feature_vjp_tape_device_bytes_total": int(
+                    state.phase4_feature_vjp_tape_device_bytes_total
+                ),
+                "phase4_feature_vjp_tape_row_bytes_total": int(
+                    state.phase4_feature_vjp_tape_row_bytes_total
+                ),
+                "phase4_feature_vjp_tape_pinned_host_bytes_total": int(
+                    state.phase4_feature_vjp_tape_pinned_host_bytes_total
+                ),
+                "phase4_feature_vjp_tape_pageable_host_bytes_total": int(
+                    state.phase4_feature_vjp_tape_pageable_host_bytes_total
+                ),
+                "phase4_feature_vjp_tape_host_high_watermark_bytes": int(
+                    state.phase4_feature_vjp_tape_host_high_watermark_bytes
+                ),
+                "phase4_feature_vjp_tape_device_high_watermark_bytes": int(
+                    state.phase4_feature_vjp_tape_device_high_watermark_bytes
+                ),
+                "phase4_feature_vjp_tape_row_high_watermark_bytes": int(
+                    state.phase4_feature_vjp_tape_row_high_watermark_bytes
+                ),
+                "phase4_feature_vjp_tape_pinned_host_high_watermark_bytes": int(
+                    state.phase4_feature_vjp_tape_pinned_host_high_watermark_bytes
+                ),
+                "phase4_feature_vjp_tape_pageable_host_high_watermark_bytes": int(
+                    state.phase4_feature_vjp_tape_pageable_host_high_watermark_bytes
+                ),
+                "phase4_feature_vjp_pin_fallback_count": int(
+                    state.phase4_feature_vjp_pin_fallback_count
+                ),
+                "phase4_feature_vjp_pin_fallback_reasons": tuple(
+                    sorted(state.phase4_feature_vjp_pin_fallback_reasons)
+                ),
+                "phase4_feature_vjp_effective_host_placements": tuple(
+                    sorted(state.phase4_feature_vjp_effective_host_placements)
+                ),
+                "phase4_feature_vjp_tape_oversize_fallback_batches": int(
+                    state.phase4_feature_vjp_tape_oversize_fallback_batches
+                ),
+                "phase4_feature_vjp_decoder_replay_count": int(
+                    state.phase4_feature_vjp_decoder_replay_count
+                ),
+                "phase4_feature_vjp_planned_decoder_traversal_numerator": int(
+                    state.phase4_feature_vjp_planned_decoder_traversal_numerator
+                ),
+                "phase4_feature_vjp_planned_decoder_traversal_denominator": int(
+                    state.phase4_feature_vjp_planned_decoder_traversal_denominator
+                ),
+                "phase4_feature_vjp_actual_decoder_page_load_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_load_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_load_bytes_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_load_bytes"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_request_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_chunk_request_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_request_bytes_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_chunk_request_bytes"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_cache_hit_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_cache_hit_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_page_load_windows": int(
+                    state.phase4_feature_vjp_actual_decoder_page_load_windows
+                ),
+                "phase4_feature_vjp_capture_elapsed_ms_total": float(
+                    state.phase4_feature_vjp_capture_elapsed_ms_total
+                ),
+                "phase4_feature_vjp_replay_elapsed_ms_total": float(
+                    state.phase4_feature_vjp_replay_elapsed_ms_total
+                ),
+                "phase4_feature_vjp_commit_elapsed_ms_total": float(
+                    state.phase4_feature_vjp_commit_elapsed_ms_total
+                ),
                 **state.phase4_execution_metadata,
                 **(state.phase4_no_refresh_plan_telemetry or {}),
             },

@@ -154,6 +154,10 @@ class FrontierMechanisms:
     prepared_chunk_cache_bytes_effective: int
     active_row_accumulation_effective: str
     refresh_aux_fallback_reason: str | None
+    feature_vjp_tape_enabled: bool = False
+    feature_vjp_tape_batch_window_effective: int = 1
+    feature_vjp_tape_max_bytes_effective: int = 0
+    feature_vjp_tape_fallback_reason: str | None = "window_one_streaming_fallback"
 
 
 @dataclass
@@ -382,6 +386,31 @@ def _resolve_frontier(
         supports_exact_encoder_residency=provider.exact_encoder_residency,
     )
     residency_metadata = _build_exact_encoder_residency_metadata(residency)
+    tape_window_requested = int(frontier.feature_vjp_tape_batch_window)
+    tape_max_bytes_requested = int(frontier.feature_vjp_tape_max_bytes)
+    tape_fallback_reason = None
+    if tape_window_requested <= 1:
+        tape_fallback_reason = "window_one_streaming_fallback"
+    elif not provider.exact_chunked:
+        tape_fallback_reason = "requires_exact_chunked_provider"
+    elif execution.storage.retention != "full_file":
+        tape_fallback_reason = "requires_full_file_retention"
+    elif execution.storage.full_retention_backend != "full_file":
+        tape_fallback_reason = "requires_full_file_backend"
+    tape_enabled = tape_fallback_reason is None
+    tape_window_effective = tape_window_requested if tape_enabled else 1
+    tape_max_bytes_effective = tape_max_bytes_requested if tape_enabled else 0
+    tape_metadata = {
+        "feature_vjp_tape_enabled": tape_enabled,
+        "feature_vjp_tape_batch_window_requested": tape_window_requested,
+        "feature_vjp_tape_batch_window_effective": tape_window_effective,
+        "feature_vjp_tape_max_bytes_requested": tape_max_bytes_requested,
+        "feature_vjp_tape_max_bytes_effective": tape_max_bytes_effective,
+        "feature_vjp_tape_fallback_reason": tape_fallback_reason,
+        "feature_vjp_tape_byte_cap_scope": (
+            "simultaneous_host_device_and_row_ownership"
+        ),
+    }
     metadata = {
         **_build_phase4_scheduler_metadata(scheduler),
         **refresh_metadata,
@@ -391,6 +420,7 @@ def _resolve_frontier(
         **_build_phase4_ranker_metadata(ranker),
         **_build_row_store_cache_control_metadata(cache_control),
         **residency_metadata,
+        **tape_metadata,
     }
     return FrontierMechanisms(
         scheduler=scheduler,
@@ -407,6 +437,10 @@ def _resolve_frontier(
         prepared_chunk_cache_bytes_effective=prepared_cache_bytes,
         active_row_accumulation_effective=active_accumulation,
         refresh_aux_fallback_reason=fallback_reason,
+        feature_vjp_tape_enabled=tape_enabled,
+        feature_vjp_tape_batch_window_effective=tape_window_effective,
+        feature_vjp_tape_max_bytes_effective=tape_max_bytes_effective,
+        feature_vjp_tape_fallback_reason=tape_fallback_reason,
     )
 
 
@@ -712,6 +746,25 @@ def _effective_execution_identity(
             "prepared_chunk_cache_bytes": frontier.prepared_chunk_cache_bytes_effective,
             "active_row_accumulation": frontier.active_row_accumulation_effective,
             "refresh_aux_fallback_reason": frontier.refresh_aux_fallback_reason,
+            "feature_vjp_tape_enabled": frontier.feature_vjp_tape_enabled,
+            "feature_vjp_tape_batch_window_requested": (
+                plan.execution.frontier.feature_vjp_tape_batch_window
+            ),
+            "feature_vjp_tape_batch_window_effective": (
+                frontier.feature_vjp_tape_batch_window_effective
+            ),
+            "feature_vjp_tape_max_bytes_requested": (
+                plan.execution.frontier.feature_vjp_tape_max_bytes
+            ),
+            "feature_vjp_tape_max_bytes_effective": (
+                frontier.feature_vjp_tape_max_bytes_effective
+            ),
+            "feature_vjp_tape_fallback_reason": (
+                frontier.feature_vjp_tape_fallback_reason
+            ),
+            "feature_vjp_tape_byte_cap_scope": (
+                "simultaneous_host_device_and_row_ownership"
+            ),
         },
         decoder={
             "fetch_chunk_size": plan.execution.decoder.fetch_chunk_size,

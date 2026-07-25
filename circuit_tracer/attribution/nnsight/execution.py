@@ -495,6 +495,16 @@ class AttributionExecution:
                 influence_column_tile_size=storage.influence_column_tile_size,
                 feature_row_column_tile_size=storage.feature_column_tile_size,
                 feature_row_retention=storage.retention,
+                feature_vjp_tape_batch_window=(
+                    p.frontier.feature_vjp_tape_batch_window_effective
+                ),
+                feature_vjp_tape_max_bytes=(
+                    p.frontier.feature_vjp_tape_max_bytes_effective
+                ),
+                feature_vjp_tape_enabled=p.frontier.feature_vjp_tape_enabled,
+                feature_vjp_tape_fallback_reason=(
+                    p.frontier.feature_vjp_tape_fallback_reason
+                ),
                 exact_encoder_residency_config=p.frontier.exact_encoder_residency,
                 profile=policy.profile,
                 profile_log_interval=policy.profile_log_interval,

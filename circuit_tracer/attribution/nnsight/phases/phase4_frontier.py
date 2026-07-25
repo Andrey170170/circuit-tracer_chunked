@@ -88,6 +88,19 @@ def _configure_phase4_schedule(state):
             "refresh_cycle_batches_effective": int(state.phase4_refresh_cycle_batches),
             "refresh_queue_size_reference": int(state.phase4_refresh_reference_queue_size),
             "refresh_queue_size_effective": int(state.phase4_refresh_effective_queue_size),
+            "feature_vjp_tape_enabled": bool(state.config.feature_vjp_tape_enabled),
+            "feature_vjp_tape_batch_window_effective": int(
+                state.config.feature_vjp_tape_batch_window
+            ),
+            "feature_vjp_tape_max_bytes_effective": int(
+                state.config.feature_vjp_tape_max_bytes
+            ),
+            "feature_vjp_tape_fallback_reason": (
+                state.config.feature_vjp_tape_fallback_reason
+            ),
+            "feature_vjp_tape_byte_cap_scope": (
+                "simultaneous_host_device_and_row_ownership"
+            ),
         }
     )
     state.logger.info(
@@ -162,6 +175,38 @@ def _initialize_phase4_counters(state):
     state.phase4_feature_produced_tile_count_total = 0
     state.phase4_feature_backward_tile_count_total = 0
     state.phase4_feature_transient_peak_bytes = 0
+    state.phase4_feature_vjp_tape_window_count = 0
+    state.phase4_feature_vjp_tape_batch_count = 0
+    state.phase4_feature_vjp_tape_bytes_total = 0
+    state.phase4_feature_vjp_tape_high_watermark_bytes = 0
+    state.phase4_feature_vjp_tape_host_bytes_total = 0
+    state.phase4_feature_vjp_tape_device_bytes_total = 0
+    state.phase4_feature_vjp_tape_row_bytes_total = 0
+    state.phase4_feature_vjp_tape_pinned_host_bytes_total = 0
+    state.phase4_feature_vjp_tape_pageable_host_bytes_total = 0
+    state.phase4_feature_vjp_tape_host_high_watermark_bytes = 0
+    state.phase4_feature_vjp_tape_device_high_watermark_bytes = 0
+    state.phase4_feature_vjp_tape_row_high_watermark_bytes = 0
+    state.phase4_feature_vjp_tape_pinned_host_high_watermark_bytes = 0
+    state.phase4_feature_vjp_tape_pageable_host_high_watermark_bytes = 0
+    state.phase4_feature_vjp_pin_fallback_count = 0
+    state.phase4_feature_vjp_pin_fallback_reasons: set[str] = set()
+    state.phase4_feature_vjp_effective_host_placements: set[str] = set()
+    state.phase4_feature_vjp_tape_oversize_fallback_batches = 0
+    state.phase4_feature_vjp_decoder_replay_count = 0
+    state.phase4_feature_vjp_planned_decoder_traversal_numerator = 0
+    state.phase4_feature_vjp_planned_decoder_traversal_denominator = 0
+    state.phase4_feature_vjp_actual_decoder_counters = {
+        "decoder_chunk_request_count": 0,
+        "decoder_chunk_request_bytes": 0,
+        "decoder_load_count": 0,
+        "decoder_load_bytes": 0,
+        "decoder_cache_hit_count": 0,
+    }
+    state.phase4_feature_vjp_actual_decoder_page_load_windows = 0
+    state.phase4_feature_vjp_capture_elapsed_ms_total = 0.0
+    state.phase4_feature_vjp_replay_elapsed_ms_total = 0.0
+    state.phase4_feature_vjp_commit_elapsed_ms_total = 0.0
     state.phase4_no_refresh_plan_telemetry: dict[str, object] | None = None
     state.previous_phase4_pending: torch.Tensor | None = None
     state.first_phase4_pending: torch.Tensor | None = None

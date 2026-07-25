@@ -23,6 +23,10 @@ from circuit_tracer.attribution.nnsight.tiled_rows import (
     produce_and_store_tiled_rows,
     produce_tiled_rows_no_retention,
 )
+from circuit_tracer.attribution.nnsight.feature_vjp_tape import (
+    FeatureVjpTape,
+    FeatureVjpTapeEntry,
+)
 from circuit_tracer.observability.events import BatchProfile, TraceEvent
 from circuit_tracer.attribution.nnsight.phases.phase4_storage import (
     commit_feature_rows,
@@ -54,6 +58,12 @@ class _ExecutionBatch:
     @property
     def split(self) -> bool:
         return self.split_chunk_count is not None
+
+
+@dataclass(frozen=True)
+class _CapturedExecutionBatch:
+    entry: FeatureVjpTapeEntry
+    attrs: dict[str, object]
 
 
 def _pack_semantic_batches(
@@ -110,7 +120,7 @@ def _pack_semantic_batches(
     return execution_batches
 
 
-def produce_feature_batch(state):
+def produce_feature_batch(state, *, defer_feature_vjps: bool = False):
     """Materialize encoder vectors and produce one feature-row microbatch."""
     state.chunk_pending_end = state.chunk_pending_start + int(state.idx_batch.numel())
     state.n_visited += len(state.idx_batch)
@@ -164,7 +174,18 @@ def produce_feature_batch(state):
         state.config.full_retention_backend == "column_tiled_v1" or state.no_retention
     )
     state.tiled_feature_telemetry: dict[str, int | float] = {}
-    if state.no_retention:
+    if defer_feature_vjps:
+        if state.tiled_production:
+            raise RuntimeError("FeatureVjpTape does not support tiled row production")
+        state.feature_vjp_tape_entry = state.ctx.capture_feature_vjp_batch(
+            layers=state.feat_layers[state.idx_batch],
+            positions=state.feat_pos[state.idx_batch],
+            inject_values=state.encoder_vectors,
+            retain_graph=state.n_visited < state.actual_max_feature_nodes,
+            phase_label="phase4_features",
+        )
+        state.rows = None
+    elif state.no_retention:
         state.ctx.reset_saved_graph_handles()
         state.ctx.rebuild_saved_graph_handles()
         state.rows, state.tiled_denominator = produce_tiled_rows_no_retention(
@@ -204,6 +225,201 @@ def produce_feature_batch(state):
     state.executor_compute_batch_elapsed_ms = (
         time.perf_counter() - state.compute_batch_start
     ) * 1000.0
+    state.feature_vjp_capture_elapsed_ms = (
+        (time.perf_counter() - state.batch_start) * 1000.0
+        if defer_feature_vjps
+        else 0.0
+    )
+    state.feature_vjp_deferred_commit = defer_feature_vjps
+
+
+_CAPTURED_BATCH_ATTRS = (
+    "idx_batch",
+    "chunk_pending_start",
+    "chunk_pending_end",
+    "semantic_batch_index_start",
+    "semantic_batch_index_end",
+    "semantic_batch_rows",
+    "executor_physically_split",
+    "executor_physically_coalesced",
+    "streaming_chunk_index",
+    "streaming_chunk_count",
+    "execution_batch_index",
+    "phase4_execution_batch_count",
+    "phase4_scheduler_reference_batch_count",
+    "n_visited",
+    "ctx_before",
+    "transcoder_before",
+    "batch_memory_before",
+    "encoder_vectors_source_device",
+    "encoder_vectors_source_dtype",
+    "encoder_vectors_transfer_bytes",
+    "encoder_vectors_transfer_telemetry",
+    "executor_encoder_materialize_elapsed_ms",
+    "executor_compute_batch_elapsed_ms",
+    "feature_vjp_capture_elapsed_ms",
+    "feature_vjp_deferred_commit",
+    "no_retention",
+    "tiled_production",
+    "tiled_feature_telemetry",
+)
+
+
+def _capture_batch_attrs(state) -> dict[str, object]:
+    return {name: getattr(state, name) for name in _CAPTURED_BATCH_ATTRS}
+
+
+def _restore_batch_attrs(state, attrs: dict[str, object]) -> None:
+    for name, value in attrs.items():
+        setattr(state, name, value)
+
+
+def _clear_replayed_row_aliases(state) -> None:
+    for name in (
+        "rows",
+        "rows_cpu",
+        "row_input_slice",
+        "feature_row_slice",
+        "nonfeature_row_slice",
+        "row_abs_max_gpu",
+        "row_l1_scaled_gpu",
+        "row_abs_max_cpu",
+        "row_l1_scaled_cpu",
+        "row_denominator_scaled_l1",
+    ):
+        if hasattr(state, name):
+            setattr(state, name, None)
+
+
+def _decoder_counters(provider: object) -> dict[str, int] | None:
+    snapshot = getattr(provider, "get_diagnostic_snapshot", None)
+    if not callable(snapshot):
+        return None
+    payload = snapshot()
+    if not isinstance(payload, dict):
+        return None
+    keys = (
+        "decoder_chunk_request_count",
+        "decoder_chunk_request_bytes",
+        "decoder_load_count",
+        "decoder_load_bytes",
+        "decoder_cache_hit_count",
+    )
+    counters: dict[str, int] = {}
+    for key in keys:
+        value = payload.get(key)
+        if not isinstance(value, (int, float)):
+            return None
+        counters[key] = int(value)
+    return counters
+
+
+def _finish_captured_window(
+    state,
+    tape: FeatureVjpTape,
+    captured: list[_CapturedExecutionBatch],
+) -> None:
+    if not captured:
+        return
+    decoder_counters_before = _decoder_counters(state.model.transcoders)
+    replay_started = time.perf_counter()
+    try:
+        rows_by_batch = state.ctx.replay_feature_vjp_tape(
+            tuple(item.entry for item in captured),
+            phase_label="phase4_features",
+        )
+    except BaseException:
+        tape.clear()
+        captured.clear()
+        raise
+    replay_elapsed_ms = (time.perf_counter() - replay_started) * 1000.0
+    decoder_counters_after = _decoder_counters(state.model.transcoders)
+    if decoder_counters_before is not None and decoder_counters_after is not None:
+        for key in decoder_counters_before:
+            state.phase4_feature_vjp_actual_decoder_counters[key] += max(
+                decoder_counters_after[key] - decoder_counters_before[key],
+                0,
+            )
+        state.phase4_feature_vjp_actual_decoder_page_load_windows += 1
+    final_n_visited = state.n_visited
+    final_execution_count = state.phase4_execution_batch_count
+    final_scheduler_reference_count = state.phase4_scheduler_reference_batch_count
+    capture_elapsed_ms = sum(
+        float(item.attrs["feature_vjp_capture_elapsed_ms"]) for item in captured
+    )
+    state.phase4_feature_batch_elapsed_ms_total += capture_elapsed_ms + replay_elapsed_ms
+    state.phase4_feature_vjp_capture_elapsed_ms_total += capture_elapsed_ms
+    state.phase4_feature_vjp_replay_elapsed_ms_total += replay_elapsed_ms
+    try:
+        for item, rows in zip(captured, rows_by_batch, strict=True):
+            _restore_batch_attrs(state, item.attrs)
+            state.rows = rows
+            state.batch_start = time.perf_counter()
+            reduce_feature_rows(state)
+            commit_feature_rows(state)
+            record_feature_batch_evidence(state)
+            state.phase4_feature_vjp_commit_elapsed_ms_total += state.batch_elapsed_ms
+    except BaseException:
+        _clear_replayed_row_aliases(state)
+        rows_by_batch.clear()
+        tape.clear()
+        captured.clear()
+        raise
+    state.n_visited = final_n_visited
+    state.phase4_execution_batch_count = final_execution_count
+    state.phase4_scheduler_reference_batch_count = final_scheduler_reference_count
+    state.phase4_executor_compute_batch_elapsed_ms_total += replay_elapsed_ms
+    state.phase4_feature_vjp_tape_window_count += 1
+    state.phase4_feature_vjp_tape_batch_count += len(captured)
+    state.phase4_feature_vjp_tape_bytes_total += sum(
+        item.entry.total_nbytes for item in captured
+    )
+    state.phase4_feature_vjp_tape_host_bytes_total += sum(
+        item.entry.host_nbytes for item in captured
+    )
+    state.phase4_feature_vjp_tape_device_bytes_total += sum(
+        item.entry.device_nbytes for item in captured
+    )
+    state.phase4_feature_vjp_tape_row_bytes_total += sum(
+        item.entry.row_nbytes for item in captured
+    )
+    state.phase4_feature_vjp_tape_pinned_host_bytes_total += sum(
+        item.entry.pinned_host_nbytes for item in captured
+    )
+    state.phase4_feature_vjp_tape_pageable_host_bytes_total += sum(
+        item.entry.pageable_host_nbytes for item in captured
+    )
+    state.phase4_feature_vjp_tape_high_watermark_bytes = max(
+        state.phase4_feature_vjp_tape_high_watermark_bytes,
+        tape.high_watermark_bytes,
+    )
+    for tier in ("host", "device", "row", "pinned_host", "pageable_host"):
+        state_name = f"phase4_feature_vjp_tape_{tier}_high_watermark_bytes"
+        tape_name = f"high_watermark_{tier}_nbytes"
+        setattr(
+            state,
+            state_name,
+            max(int(getattr(state, state_name)), int(getattr(tape, tape_name))),
+        )
+    state.phase4_feature_vjp_pin_fallback_count += sum(
+        item.entry.pin_fallback_count for item in captured
+    )
+    state.phase4_feature_vjp_pin_fallback_reasons.update(
+        item.entry.pin_fallback_reason
+        for item in captured
+        if item.entry.pin_fallback_reason is not None
+    )
+    if any(item.entry.pinned_host_nbytes > 0 for item in captured):
+        state.phase4_feature_vjp_effective_host_placements.add("pinned_host")
+    if any(item.entry.pageable_host_nbytes > 0 for item in captured):
+        state.phase4_feature_vjp_effective_host_placements.add("pageable_host")
+    state.phase4_feature_vjp_decoder_replay_count += 1
+    state.phase4_feature_vjp_planned_decoder_traversal_numerator += 1
+    state.phase4_feature_vjp_planned_decoder_traversal_denominator += len(captured)
+    _clear_replayed_row_aliases(state)
+    rows_by_batch.clear()
+    tape.clear()
+    captured.clear()
 
 
 def record_feature_batch_evidence(state):
@@ -214,14 +430,24 @@ def record_feature_batch_evidence(state):
             state.batch_elapsed_ms = (time.perf_counter() - state.batch_start) * 1000.0
             state.telemetry_observer.observe(
                 BatchProfile(
-                    "Phase 4",
+                    "Phase 4 commit"
+                    if state.feature_vjp_deferred_commit
+                    else "Phase 4",
                     state.batch_number,
                     None,
                     state.batch_elapsed_ms / 1000.0,
-                    state.ctx_before,
-                    state.diagnostic_snapshot(state.ctx),
-                    state.transcoder_before,
-                    state.diagnostic_snapshot(state.model.transcoders),
+                    None if state.feature_vjp_deferred_commit else state.ctx_before,
+                    (
+                        None
+                        if state.feature_vjp_deferred_commit
+                        else state.diagnostic_snapshot(state.ctx)
+                    ),
+                    None if state.feature_vjp_deferred_commit else state.transcoder_before,
+                    (
+                        None
+                        if state.feature_vjp_deferred_commit
+                        else state.diagnostic_snapshot(state.model.transcoders)
+                    ),
                 )
             )
     state.batch_number = state.execution_batch_index
@@ -277,6 +503,13 @@ def record_feature_batch_evidence(state):
         "phase4_execution_batch_split": bool(state.executor_physically_split),
         "phase4_execution_pending_start_index": int(state.chunk_pending_start),
         "phase4_execution_pending_end_index": int(state.chunk_pending_end),
+        "phase4_feature_vjp_capture_elapsed_ms": float(
+            state.feature_vjp_capture_elapsed_ms
+        ),
+        "phase4_feature_vjp_commit_elapsed_ms": float(state.batch_elapsed_ms),
+        "phase4_batch_elapsed_scope": (
+            "commit_only" if state.feature_vjp_deferred_commit else "full_batch"
+        ),
     }
     state.batch_locality_summary = _build_phase4_batch_locality_summary(
         state.idx_batch,
@@ -410,6 +643,14 @@ def execute_pending_frontier(state):
         semantic_batches,
         execution_batch_max_rows=state.phase4_execution_batch_max_rows,
     )
+    tape_enabled = bool(state.config.feature_vjp_tape_enabled)
+    tape = FeatureVjpTape(
+        max_batches=(
+            state.config.feature_vjp_tape_batch_window if tape_enabled else 1
+        ),
+        max_bytes=(state.config.feature_vjp_tape_max_bytes if tape_enabled else 0),
+    )
+    captured: list[_CapturedExecutionBatch] = []
     for execution_batch in execution_batches:
         first_semantic = execution_batch.semantic_batches[0]
         last_semantic = execution_batch.semantic_batches[-1]
@@ -425,7 +666,50 @@ def execute_pending_frontier(state):
         state.executor_physically_coalesced = execution_batch.coalesced
         state.streaming_chunk_index = execution_batch.split_chunk_index
         state.streaming_chunk_count = execution_batch.split_chunk_count
+        estimate = (
+            state.ctx.estimate_feature_vjp_tape_entry_nbytes(
+                layers=state.feat_layers[state.idx_batch],
+                batch_size=int(state.idx_batch.numel()),
+            )
+            if tape_enabled
+            else None
+        )
+        estimated_total_nbytes = estimate.total_nbytes if estimate is not None else 0
+        if tape_enabled and captured and not tape.can_accept(estimated_total_nbytes):
+            _finish_captured_window(state, tape, captured)
+        if tape_enabled and tape.can_accept(estimated_total_nbytes):
+            try:
+                produce_feature_batch(state, defer_feature_vjps=True)
+                entry = state.feature_vjp_tape_entry
+                if (
+                    entry.total_nbytes != estimated_total_nbytes
+                    or entry.host_nbytes != estimate.host_nbytes
+                    or entry.device_nbytes != estimate.device_nbytes
+                    or entry.row_nbytes != estimate.row_nbytes
+                ):
+                    raise RuntimeError(
+                        "FeatureVjpTape byte estimate mismatch "
+                        f"(estimated={estimate}, actual_total={entry.total_nbytes}, "
+                        f"actual_host={entry.host_nbytes}, "
+                        f"actual_device={entry.device_nbytes}, "
+                        f"actual_rows={entry.row_nbytes})"
+                    )
+                tape.append(entry)
+                state.encoder_vectors = None
+            except BaseException:
+                tape.clear()
+                captured.clear()
+                raise
+            captured.append(
+                _CapturedExecutionBatch(entry=entry, attrs=_capture_batch_attrs(state))
+            )
+            if tape.batch_count == tape.max_batches:
+                _finish_captured_window(state, tape, captured)
+            continue
         produce_feature_batch(state)
         reduce_feature_rows(state)
         commit_feature_rows(state)
         record_feature_batch_evidence(state)
+        if tape_enabled:
+            state.phase4_feature_vjp_tape_oversize_fallback_batches += 1
+    _finish_captured_window(state, tape, captured)
