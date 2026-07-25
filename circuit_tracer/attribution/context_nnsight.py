@@ -21,6 +21,7 @@ from circuit_tracer.attribution.nnsight.feature_vjp_tape import (
     FeatureVjpTapeByteEstimate,
     FeatureVjpTapeEntry,
 )
+from circuit_tracer.attribution.nnsight.decoder_page_prefetch import DecoderPagePrefetch
 from circuit_tracer.attribution.nnsight.context_state import (
     AttributionTensorState,
     ContextNumericPolicy,
@@ -159,6 +160,8 @@ class AttributionContext:
         self.phase3_gradient_replay_status = "disabled"
         self.phase3_gradient_replay_column_offset = 0
         self._compute_batch_call_index = 0
+        self.decoder_page_prefetch_depth = 0
+        self._decoder_page_prefetch: DecoderPagePrefetch | None = None
         self._replay_model = None
         self._replay_trace_input_ids: torch.Tensor | None = None
         self._replay_trace_batch_size: int | None = None
@@ -907,6 +910,44 @@ class AttributionContext:
         phase_label: str | None = None,
         batch_index: int | None = None,
     ) -> None:
+        prefetch = DecoderPagePrefetch(
+            provider=self.decoder_provider,
+            decoder_cache=self.decoder_chunk_cache,
+            depth=int(self.decoder_page_prefetch_depth),
+        )
+        self._decoder_page_prefetch = prefetch
+        primary_error: BaseException | None = None
+        try:
+            self._compute_chunked_feature_attributions_from_grad_batches_impl(
+                grad_batches,
+                phase_label=phase_label,
+                batch_index=batch_index,
+            )
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                prefetch.close()
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "decoder page prefetch cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            finally:
+                self._decoder_page_prefetch = None
+
+    def _compute_chunked_feature_attributions_from_grad_batches_impl(
+        self,
+        grad_batches: list[
+            tuple[tuple[torch.Tensor | None, ...] | list[torch.Tensor | None], torch.Tensor, int]
+        ],
+        *,
+        phase_label: str | None = None,
+        batch_index: int | None = None,
+    ) -> None:
         assert self.chunked_decoder_state is not None
         assert self.decoder_provider is not None
         assert self._chunked_layer_spans is not None
@@ -1012,11 +1053,11 @@ class AttributionContext:
                     chunk_local_feat_ids = (
                         layer_feature_ids[chunk_mask] - (chunk_id * chunk_size)
                     ).long()
-                decoder_chunk = self.decoder_provider.get_decoder_chunk(
-                    source_layer,
-                    chunk_id,
-                    decoder_cache=self.decoder_chunk_cache,
-                )
+                assert self._decoder_page_prefetch is not None
+                decoder_chunk = self._decoder_page_prefetch.get(source_layer, chunk_id)
+                if chunk_position < total_chunks:
+                    next_chunk_id = int(ordered_chunk_ids[chunk_position].item())
+                    self._decoder_page_prefetch.schedule(source_layer, next_chunk_id)
                 chunk_activations = activation_values[chunk_rows].to(
                     device=decoder_chunk.device,
                     dtype=grad_batches[0][1].dtype,

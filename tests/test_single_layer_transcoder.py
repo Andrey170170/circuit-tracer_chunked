@@ -7,6 +7,7 @@ import torch
 import yaml
 from safetensors.torch import save_file
 
+from circuit_tracer.attribution.nnsight.decoder_page_prefetch import DecoderPagePrefetch
 from circuit_tracer.transcoder.single_layer_transcoder import (
     load_gemma_scope_2_transcoder,
     load_relu_transcoder,
@@ -225,6 +226,48 @@ def test_plt_decoder_provider_reports_request_load_bytes_and_cache_hits(
     assert snapshot["decoder_load_bytes"] == chunk_nbytes
     assert snapshot["decoder_cache_hit_count"] == 1
     assert snapshot["decoder_cache_miss_count"] == 1
+
+
+def test_lazy_plt_decoder_prefetch_reports_load_cache_wait_and_residency(
+    create_test_transcoder_file,
+):
+    src, _ = create_test_transcoder_file(d_model=4, d_sae=6)
+    provider = load_transcoder_set(
+        {0: src},
+        scan="test_scan",
+        feature_input_hook="hook_resid_mid",
+        feature_output_hook="hook_mlp_out",
+        device=torch.device("cpu"),
+        lazy_encoder=False,
+        lazy_decoder=True,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    assert provider.capabilities.supports_decoder_page_prefetch is True
+    cache = provider.create_decoder_block_cache(max_bytes=1_000_000)
+
+    with DecoderPagePrefetch(provider=provider, decoder_cache=cache, depth=1) as pages:
+        first = pages.get(0, 0)
+        pages.schedule(0, 1)
+        second = pages.get(0, 1)
+        pages.schedule(0, 1)
+        cached_second = pages.get(0, 1)
+
+    snapshot = provider.get_diagnostic_snapshot()
+    page_nbytes = int(second.numel() * second.element_size())
+    assert first.shape == second.shape
+    assert cached_second.data_ptr() == second.data_ptr()
+    assert snapshot["decoder_prefetch_request_count"] == 2
+    assert snapshot["decoder_prefetch_load_count"] == 1
+    assert snapshot["decoder_prefetch_load_bytes"] == page_nbytes
+    assert snapshot["decoder_prefetch_cache_hit_count"] == 1
+    assert snapshot["decoder_prefetch_consume_hit_count"] == 2
+    assert snapshot["decoder_prefetch_host_wait_count"] >= 0
+    assert snapshot["decoder_prefetch_host_wait_seconds"] >= 0.0
+    assert snapshot["decoder_prefetch_in_flight_high_watermark"] == 1
+    assert snapshot["decoder_prefetch_in_flight_bytes_high_watermark"] == page_nbytes
+    assert snapshot["decoder_prefetch_in_flight_count"] == 0
+    assert snapshot["decoder_prefetch_in_flight_bytes"] == 0
 
 
 def test_sparse_encode_decode(create_test_transcoder_file):

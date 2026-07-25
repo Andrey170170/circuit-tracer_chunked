@@ -145,7 +145,9 @@ class FakeDecoderProvider:
         self.enable_cache = enable_cache
         self.decoder_output_topology = decoder_output_topology
         self.load_calls: list[tuple[int, int]] = []
+        self.prefetch_events: list[tuple[str, dict[str, object]]] = []
         self.clear_calls = 0
+        self.decoder_device = torch.device("cpu")
 
     def create_decoder_block_cache(self):
         return {} if self.enable_cache else None
@@ -155,7 +157,24 @@ class FakeDecoderProvider:
         if cache is not None:
             cache.clear()
 
-    def get_decoder_chunk(self, layer_id: int, chunk_id: int, decoder_cache=None) -> torch.Tensor:
+    def decoder_chunk_nbytes(self, layer_id: int, chunk_id: int) -> int:
+        start = chunk_id * self.decoder_chunk_size
+        stop = min(start + self.decoder_chunk_size, self.blocks[layer_id].shape[0])
+        block = self.blocks[layer_id][start:stop]
+        return int(block.numel() * block.element_size())
+
+    def record_decoder_prefetch_event(self, event: str, **attrs: object) -> None:
+        self.prefetch_events.append((event, attrs))
+
+    def get_decoder_chunk(
+        self,
+        layer_id: int,
+        chunk_id: int,
+        decoder_cache=None,
+        *,
+        request_kind: str = "demand",
+    ) -> torch.Tensor:
+        del request_kind
         cache_key = (layer_id, chunk_id)
         if decoder_cache is not None and cache_key in decoder_cache:
             return decoder_cache[cache_key]
@@ -3590,6 +3609,47 @@ def test_chunked_feature_replay_windows_match_full_replay() -> None:
     )
 
     assert torch.allclose(windowed_ctx._batch_buffer, expected)
+
+
+def test_depth_one_decoder_prefetch_preserves_chunked_replay_values_and_order() -> None:
+    grads_by_output_layer = [
+        torch.tensor(
+            [
+                [[1.0, 10.0], [2.0, 20.0]],
+                [[3.0, 30.0], [4.0, 40.0]],
+            ]
+        ),
+        torch.tensor(
+            [
+                [[5.0, 50.0], [6.0, 60.0]],
+                [[7.0, 70.0], [8.0, 80.0]],
+            ]
+        ),
+        None,
+    ]
+    synchronous_ctx, synchronous_provider = _make_chunked_context(
+        _make_nnsight_context, enable_cache=False
+    )
+    synchronous_ctx._compute_chunked_feature_attributions_from_grads(
+        grads_by_output_layer
+    )
+
+    prefetched_ctx, prefetched_provider = _make_chunked_context(
+        _make_nnsight_context, enable_cache=False
+    )
+    prefetched_ctx.decoder_page_prefetch_depth = 1
+    prefetched_ctx._compute_chunked_feature_attributions_from_grads(
+        grads_by_output_layer
+    )
+
+    assert torch.equal(prefetched_ctx._batch_buffer, synchronous_ctx._batch_buffer)
+    assert prefetched_provider.load_calls == synchronous_provider.load_calls
+    assert [event for event, _ in prefetched_provider.prefetch_events].count(
+        "schedule"
+    ) == 1
+    assert [event for event, _ in prefetched_provider.prefetch_events].count(
+        "consume"
+    ) == 1
 
 
 def test_feature_vjp_tape_reuses_each_decoder_page_across_batches() -> None:

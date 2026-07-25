@@ -88,6 +88,7 @@ class Phase4Config:
     feature_vjp_tape_max_bytes: int = 0
     feature_vjp_tape_enabled: bool = False
     feature_vjp_tape_fallback_reason: str | None = "window_one_streaming_fallback"
+    decoder_page_prefetch_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -124,12 +125,17 @@ class Phase4Result:
 def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     """Sequence Phase 4 domain operations without owning their subsystem logic."""
     state = FeatureAttributionRun(inputs=inputs, config=config)
-    initialize_phase4(state)
-    while state.n_visited < state.actual_max_feature_nodes:
-        prepare_feature_frontier(state)
-        execute_pending_frontier(state)
-    finish_phase4(state)
-    summarize_phase4_diagnostics(state)
+    prior_prefetch_depth = int(getattr(inputs.ctx, "decoder_page_prefetch_depth", 0))
+    inputs.ctx.decoder_page_prefetch_depth = int(config.decoder_page_prefetch_depth)
+    try:
+        initialize_phase4(state)
+        while state.n_visited < state.actual_max_feature_nodes:
+            prepare_feature_frontier(state)
+            execute_pending_frontier(state)
+        finish_phase4(state)
+        summarize_phase4_diagnostics(state)
+    finally:
+        inputs.ctx.decoder_page_prefetch_depth = prior_prefetch_depth
     return Phase4Result(
         visited=state.visited,
         actual_max_feature_nodes=state.actual_max_feature_nodes,

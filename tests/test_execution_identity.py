@@ -34,6 +34,7 @@ def _identity(
     decoder_cache_bytes: int = 0,
     tape_window: int = 1,
     tape_bytes: int = 0,
+    decoder_prefetch_depth: int = 0,
 ):
     provider = ProviderMechanisms(
         capabilities=TranscoderCapabilities(
@@ -43,6 +44,7 @@ def _identity(
             supports_compact_row_store=compact_row_store,
             supports_decoder_chunk_cache=True,
             supports_exact_encoder_residency=True,
+            supports_decoder_page_prefetch=True,
         ),
         exact_chunked=True,
         compact_row_store=compact_row_store,
@@ -153,6 +155,10 @@ def _identity(
                 else "window_one_streaming_fallback"
             )
         ),
+        decoder_page_prefetch_depth_effective=decoder_prefetch_depth,
+        decoder_page_prefetch_fallback_reason=(
+            None if decoder_prefetch_depth else "disabled"
+        ),
     )
     plan = SimpleNamespace(
         execution=ExecutionConstraints(
@@ -166,6 +172,7 @@ def _identity(
             frontier=FrontierExpansionPlan(
                 feature_vjp_tape_batch_window=tape_window,
                 feature_vjp_tape_max_bytes=tape_bytes,
+                decoder_page_prefetch_depth=decoder_prefetch_depth,
             ),
         )
     )
@@ -237,6 +244,27 @@ def test_effective_identity_records_unsupported_tape_storage_as_explicit_noop() 
     assert (
         tiled.descriptor.frontier["feature_vjp_tape_fallback_reason"]
         == "requires_full_file_backend"
+    )
+
+
+def test_effective_identity_changes_with_decoder_page_prefetch_depth() -> None:
+    synchronous = _identity()
+    prefetched = _identity(decoder_prefetch_depth=1)
+
+    assert synchronous.fingerprint != prefetched.fingerprint
+    assert prefetched.descriptor is not None
+    assert prefetched.descriptor.frontier["decoder_page_prefetch_depth_requested"] == 1
+    assert prefetched.descriptor.frontier["decoder_page_prefetch_depth_effective"] == 1
+    assert prefetched.descriptor.frontier["decoder_page_prefetch_fallback_reason"] is None
+    assert (
+        prefetched.descriptor.frontier["decoder_page_prefetch_wait_telemetry_scope"]
+        == "host_future_only_excludes_cuda_event_stall"
+    )
+    assert (
+        prefetched.descriptor.frontier[
+            "decoder_page_prefetch_loader_dtype_conversion_transient_bytes"
+        ]
+        == "unmeasured"
     )
 
 

@@ -158,6 +158,8 @@ class FrontierMechanisms:
     feature_vjp_tape_batch_window_effective: int = 1
     feature_vjp_tape_max_bytes_effective: int = 0
     feature_vjp_tape_fallback_reason: str | None = "window_one_streaming_fallback"
+    decoder_page_prefetch_depth_effective: int = 0
+    decoder_page_prefetch_fallback_reason: str | None = "disabled"
 
 
 @dataclass
@@ -411,6 +413,33 @@ def _resolve_frontier(
             "simultaneous_host_device_and_row_ownership"
         ),
     }
+    prefetch_depth_requested = int(frontier.decoder_page_prefetch_depth)
+    prefetch_fallback_reason = None
+    if prefetch_depth_requested == 0:
+        prefetch_fallback_reason = "disabled"
+    elif not provider.exact_chunked:
+        prefetch_fallback_reason = "requires_exact_chunked_provider"
+    elif not bool(
+        getattr(provider.capabilities, "supports_decoder_page_prefetch", False)
+    ):
+        prefetch_fallback_reason = "provider_capability_unavailable"
+    elif prefetch_depth_requested > 1:
+        prefetch_fallback_reason = "only_depth_one_supported"
+    prefetch_depth_effective = (
+        prefetch_depth_requested if prefetch_fallback_reason is None else 0
+    )
+    prefetch_metadata = {
+        "decoder_page_prefetch_depth_requested": prefetch_depth_requested,
+        "decoder_page_prefetch_depth_effective": prefetch_depth_effective,
+        "decoder_page_prefetch_fallback_reason": prefetch_fallback_reason,
+        "decoder_page_prefetch_extra_final_page_residency_bound": (
+            "depth_times_max_final_decoder_page_bytes"
+        ),
+        "decoder_page_prefetch_loader_dtype_conversion_transient_bytes": "unmeasured",
+        "decoder_page_prefetch_wait_telemetry_scope": (
+            "host_future_only_excludes_cuda_event_stall"
+        ),
+    }
     metadata = {
         **_build_phase4_scheduler_metadata(scheduler),
         **refresh_metadata,
@@ -421,6 +450,7 @@ def _resolve_frontier(
         **_build_row_store_cache_control_metadata(cache_control),
         **residency_metadata,
         **tape_metadata,
+        **prefetch_metadata,
     }
     return FrontierMechanisms(
         scheduler=scheduler,
@@ -441,6 +471,8 @@ def _resolve_frontier(
         feature_vjp_tape_batch_window_effective=tape_window_effective,
         feature_vjp_tape_max_bytes_effective=tape_max_bytes_effective,
         feature_vjp_tape_fallback_reason=tape_fallback_reason,
+        decoder_page_prefetch_depth_effective=prefetch_depth_effective,
+        decoder_page_prefetch_fallback_reason=prefetch_fallback_reason,
     )
 
 
@@ -764,6 +796,22 @@ def _effective_execution_identity(
             ),
             "feature_vjp_tape_byte_cap_scope": (
                 "simultaneous_host_device_and_row_ownership"
+            ),
+            "decoder_page_prefetch_depth_requested": (
+                plan.execution.frontier.decoder_page_prefetch_depth
+            ),
+            "decoder_page_prefetch_depth_effective": (
+                frontier.decoder_page_prefetch_depth_effective
+            ),
+            "decoder_page_prefetch_fallback_reason": (
+                frontier.decoder_page_prefetch_fallback_reason
+            ),
+            "decoder_page_prefetch_extra_final_page_residency_bound": (
+                "depth_times_max_final_decoder_page_bytes"
+            ),
+            "decoder_page_prefetch_loader_dtype_conversion_transient_bytes": "unmeasured",
+            "decoder_page_prefetch_wait_telemetry_scope": (
+                "host_future_only_excludes_cuda_event_stall"
             ),
         },
         decoder={

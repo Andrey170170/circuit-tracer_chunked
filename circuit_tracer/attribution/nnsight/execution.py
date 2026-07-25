@@ -505,6 +505,9 @@ class AttributionExecution:
                 feature_vjp_tape_fallback_reason=(
                     p.frontier.feature_vjp_tape_fallback_reason
                 ),
+                decoder_page_prefetch_depth=(
+                    p.frontier.decoder_page_prefetch_depth_effective
+                ),
                 exact_encoder_residency_config=p.frontier.exact_encoder_residency,
                 profile=policy.profile,
                 profile_log_interval=policy.profile_log_interval,

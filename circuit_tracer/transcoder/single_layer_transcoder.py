@@ -1,6 +1,7 @@
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from threading import Lock
 from typing import Literal, cast
 
 import numpy as np
@@ -392,7 +393,19 @@ class TranscoderSet(nn.Module):
             "decoder_load_bytes": 0,
             "decoder_cache_hit_count": 0,
             "decoder_cache_miss_count": 0,
+            "decoder_prefetch_request_count": 0,
+            "decoder_prefetch_load_count": 0,
+            "decoder_prefetch_load_bytes": 0,
+            "decoder_prefetch_cache_hit_count": 0,
+            "decoder_prefetch_consume_hit_count": 0,
+            "decoder_prefetch_host_wait_count": 0,
+            "decoder_prefetch_host_wait_seconds": 0.0,
+            "decoder_prefetch_in_flight_count": 0,
+            "decoder_prefetch_in_flight_high_watermark": 0,
+            "decoder_prefetch_in_flight_bytes": 0,
+            "decoder_prefetch_in_flight_bytes_high_watermark": 0,
         }
+        self._decoder_diagnostic_lock = Lock()
 
     @property
     def architecture(self):
@@ -422,6 +435,9 @@ class TranscoderSet(nn.Module):
             supports_lazy_decoder_chunks=exact,
             supports_lazy_encoder_rows=exact,
             supports_exact_row_replay=exact,
+            supports_decoder_page_prefetch=bool(
+                exact and any(t.lazy_decoder for t in self.transcoders)
+            ),
             decoder_output_topology="same_layer",
             default_decoder_chunk_size=int(self.decoder_chunk_size),
             default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),
@@ -474,32 +490,99 @@ class TranscoderSet(nn.Module):
             )
         return active_encoders
 
+    @property
+    def decoder_device(self) -> torch.device:
+        return cast(SingleLayerTranscoder, self.transcoders[0]).device
+
+    def decoder_chunk_nbytes(self, source_layer: int, chunk_id: int) -> int:
+        transcoder = cast(SingleLayerTranscoder, self.transcoders[int(source_layer)])
+        start = int(chunk_id) * self.decoder_chunk_size
+        stop = min(start + self.decoder_chunk_size, transcoder.d_transcoder)
+        if start >= transcoder.d_transcoder or stop <= start:
+            raise IndexError(
+                f"Decoder chunk {chunk_id} out of range for layer {source_layer}"
+            )
+        return int((stop - start) * self.d_model * self.dtype.itemsize)
+
     def get_decoder_chunk(
-        self, source_layer: int, chunk_id: int, decoder_cache=None
+        self,
+        source_layer: int,
+        chunk_id: int,
+        decoder_cache=None,
+        *,
+        request_kind: Literal["demand", "prefetch"] = "demand",
     ) -> torch.Tensor:
         cache_key = (int(source_layer), int(chunk_id))
         if decoder_cache is not None:
             cached = decoder_cache.get(cache_key)
             if cached is not None:
                 cached_nbytes = int(cached.numel() * cached.element_size())
-                self._decoder_diagnostic_stats["decoder_chunk_request_count"] += 1
-                self._decoder_diagnostic_stats["decoder_chunk_request_bytes"] += cached_nbytes
-                self._decoder_diagnostic_stats["decoder_cache_hit_count"] += 1
+                with self._decoder_diagnostic_lock:
+                    self._decoder_diagnostic_stats["decoder_chunk_request_count"] += 1
+                    self._decoder_diagnostic_stats["decoder_chunk_request_bytes"] += cached_nbytes
+                    self._decoder_diagnostic_stats["decoder_cache_hit_count"] += 1
+                    if request_kind == "prefetch":
+                        self._decoder_diagnostic_stats["decoder_prefetch_request_count"] += 1
+                        self._decoder_diagnostic_stats["decoder_prefetch_cache_hit_count"] += 1
                 return cached
         transcoder = cast(SingleLayerTranscoder, self.transcoders[int(source_layer)])
         result = transcoder.get_decoder_chunk(chunk_id, self.decoder_chunk_size)
         result_nbytes = int(result.numel() * result.element_size())
-        self._decoder_diagnostic_stats["decoder_chunk_request_count"] += 1
-        self._decoder_diagnostic_stats["decoder_chunk_request_bytes"] += result_nbytes
-        self._decoder_diagnostic_stats["decoder_load_count"] += 1
-        self._decoder_diagnostic_stats["decoder_load_bytes"] += result_nbytes
-        self._decoder_diagnostic_stats["decoder_cache_miss_count"] += 1
+        with self._decoder_diagnostic_lock:
+            self._decoder_diagnostic_stats["decoder_chunk_request_count"] += 1
+            self._decoder_diagnostic_stats["decoder_chunk_request_bytes"] += result_nbytes
+            self._decoder_diagnostic_stats["decoder_load_count"] += 1
+            self._decoder_diagnostic_stats["decoder_load_bytes"] += result_nbytes
+            self._decoder_diagnostic_stats["decoder_cache_miss_count"] += 1
+            if request_kind == "prefetch":
+                self._decoder_diagnostic_stats["decoder_prefetch_request_count"] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_load_count"] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_load_bytes"] += result_nbytes
         if decoder_cache is not None:
             if hasattr(decoder_cache, "put"):
                 decoder_cache.put(cache_key, result)
             else:
                 decoder_cache[cache_key] = result
         return result
+
+    def record_decoder_prefetch_event(self, event: str, **attrs: object) -> None:
+        nbytes = int(attrs.get("nbytes", 0))
+        with self._decoder_diagnostic_lock:
+            if event == "schedule":
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"] += nbytes
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_in_flight_high_watermark"
+                ] = max(
+                    self._decoder_diagnostic_stats[
+                        "decoder_prefetch_in_flight_high_watermark"
+                    ],
+                    self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"],
+                )
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_in_flight_bytes_high_watermark"
+                ] = max(
+                    self._decoder_diagnostic_stats[
+                        "decoder_prefetch_in_flight_bytes_high_watermark"
+                    ],
+                    self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"],
+                )
+            elif event == "consume":
+                self._decoder_diagnostic_stats["decoder_prefetch_consume_hit_count"] += 1
+                if bool(attrs.get("host_waited", False)):
+                    self._decoder_diagnostic_stats[
+                        "decoder_prefetch_host_wait_count"
+                    ] += 1
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_host_wait_seconds"
+                ] += float(
+                    attrs.get("host_wait_seconds", 0.0)
+                )
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"] -= 1
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"] -= nbytes
+            elif event == "release":
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"] -= 1
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"] -= nbytes
 
     def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None):
         from circuit_tracer.transcoder.cross_layer_transcoder import DecoderChunkCache

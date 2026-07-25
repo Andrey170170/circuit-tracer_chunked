@@ -24,6 +24,7 @@ class TranscoderCapabilities:
     supports_lazy_decoder_chunks: bool = False
     supports_lazy_encoder_rows: bool = False
     supports_exact_row_replay: bool = False
+    supports_decoder_page_prefetch: bool = False
     decoder_output_topology: DecoderOutputTopology = "cross_layer"
     default_decoder_chunk_size: int | None = None
     default_cross_batch_decoder_cache_bytes: int | None = None
