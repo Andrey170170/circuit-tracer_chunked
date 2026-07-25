@@ -249,9 +249,12 @@ def test_lazy_plt_decoder_prefetch_reports_load_cache_wait_and_residency(
     with DecoderPagePrefetch(provider=provider, decoder_cache=cache, depth=1) as pages:
         first = pages.get(0, 0)
         pages.schedule(0, 1)
+        pages.finish(first)
         second = pages.get(0, 1)
+        pages.finish(second)
         pages.schedule(0, 1)
         cached_second = pages.get(0, 1)
+        pages.finish(cached_second)
 
     snapshot = provider.get_diagnostic_snapshot()
     page_nbytes = int(second.numel() * second.element_size())
@@ -268,6 +271,29 @@ def test_lazy_plt_decoder_prefetch_reports_load_cache_wait_and_residency(
     assert snapshot["decoder_prefetch_in_flight_bytes_high_watermark"] == page_nbytes
     assert snapshot["decoder_prefetch_in_flight_count"] == 0
     assert snapshot["decoder_prefetch_in_flight_bytes"] == 0
+    assert snapshot["decoder_prefetch_consumer_retirement_count"] == 3
+    assert snapshot["decoder_prefetch_consumer_retained_count"] == 0
+    assert snapshot["decoder_prefetch_pipeline_owned_final_page_count"] == 0
+    assert snapshot["decoder_prefetch_pipeline_owned_final_page_bytes"] == 0
+    assert snapshot["decoder_prefetch_pipeline_owned_final_page_high_watermark"] <= 2
+    assert (
+        snapshot["decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark"]
+        <= 2 * page_nbytes
+    )
+    assert snapshot["decoder_prefetch_owner_open_count"] == 1
+    assert snapshot["decoder_prefetch_owner_close_count"] == 1
+    assert snapshot["decoder_prefetch_owner_count"] == 0
+    assert snapshot["decoder_prefetch_owner_high_watermark"] == 1
+
+    # A later Phase-4 owner starts a fresh telemetry scope rather than
+    # inheriting the prior trace's counters or page high-watermarks.
+    with DecoderPagePrefetch(provider=provider, decoder_cache=cache, depth=1):
+        pass
+    next_snapshot = provider.get_diagnostic_snapshot()
+    assert next_snapshot["decoder_prefetch_owner_open_count"] == 1
+    assert next_snapshot["decoder_prefetch_owner_close_count"] == 1
+    assert next_snapshot["decoder_prefetch_load_count"] == 0
+    assert next_snapshot["decoder_prefetch_pipeline_owned_final_page_high_watermark"] == 0
 
 
 def test_sparse_encode_decode(create_test_transcoder_file):

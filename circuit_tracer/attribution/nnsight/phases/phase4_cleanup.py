@@ -198,6 +198,141 @@ def finish_phase4(state):
                         "decoder_cache_hit_count"
                     ]
                 ),
+                "phase4_feature_vjp_actual_decoder_prefetch_request_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_request_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_load_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_load_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_load_bytes_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_load_bytes"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_cache_hit_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_cache_hit_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consume_hit_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_consume_hit_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_host_wait_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_host_wait_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_host_wait_seconds_total": float(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_host_wait_seconds"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_in_flight_high_watermark": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[
+                        "decoder_prefetch_in_flight_high_watermark"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_in_flight_bytes_high_watermark": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[
+                        "decoder_prefetch_in_flight_bytes_high_watermark"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_in_flight_count_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_in_flight_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_in_flight_bytes_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_in_flight_bytes"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consumer_retirement_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_consumer_retirement_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consumer_backpressure_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_consumer_backpressure_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consumer_backpressure_seconds_total": float(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_consumer_backpressure_seconds"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_owner_open_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_owner_open_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_owner_close_count_total": int(
+                    state.phase4_feature_vjp_actual_decoder_counters[
+                        "decoder_prefetch_owner_close_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consumer_retained_bytes_high_watermark": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[
+                        "decoder_prefetch_consumer_retained_bytes_high_watermark"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_high_watermark": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[
+                        "decoder_prefetch_pipeline_owned_final_page_high_watermark"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[
+                        "decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_owner_high_watermark": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[
+                        "decoder_prefetch_owner_high_watermark"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consumer_active_count_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_consumer_active_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consumer_active_bytes_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_consumer_active_bytes"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consumer_retained_count_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_consumer_retained_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_consumer_retained_bytes_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_consumer_retained_bytes"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_count_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_pipeline_owned_final_page_count"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_bytes_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_pipeline_owned_final_page_bytes"
+                    ]
+                ),
+                "phase4_feature_vjp_actual_decoder_prefetch_owner_count_final": int(
+                    state.phase4_feature_vjp_actual_decoder_prefetch_current[
+                        "decoder_prefetch_owner_count"
+                    ]
+                ),
                 "phase4_feature_vjp_actual_decoder_page_load_windows": int(
                     state.phase4_feature_vjp_actual_decoder_page_load_windows
                 ),

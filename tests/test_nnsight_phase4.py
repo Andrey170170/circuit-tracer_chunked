@@ -15,6 +15,11 @@ from circuit_tracer.attribution.nnsight.phases.phase4 import (
     Phase4Inputs,
     run_phase4,
 )
+from circuit_tracer.attribution.nnsight.phases.phase4_batches import (
+    _DECODER_DELTA_COUNTER_KEYS,
+    _DECODER_PREFETCH_CURRENT_KEYS,
+    _DECODER_PREFETCH_HIGH_WATERMARK_KEYS,
+)
 from circuit_tracer.observability.events import (
     BatchProfile,
     DiagnosticSnapshot,
@@ -193,6 +198,103 @@ def test_phase4_returns_boundary_state_without_replacing_owned_buffers() -> None
     assert result.phase4_refresh_count == 0
     assert result.phase4_scheduler_reference_batch_count == 0
     assert len(observer.phases) == 1
+
+
+def test_phase4_rejects_preexisting_prefetch_owner_even_at_depth_zero() -> None:
+    inputs = _inputs(FakeObserver())
+    inputs.ctx._decoder_page_prefetch = object()
+
+    with pytest.raises(RuntimeError, match="open decoder prefetch lifecycle"):
+        run_phase4(inputs=inputs, config=_config())
+
+
+def test_phase4_closes_prefetch_before_terminal_lifecycle_telemetry() -> None:
+    observer = FakeObserver()
+    inputs = _inputs(observer)
+    values = {
+        key: 0.0 if key.endswith("_seconds") else 0
+        for key in (
+            *_DECODER_DELTA_COUNTER_KEYS,
+            *_DECODER_PREFETCH_HIGH_WATERMARK_KEYS,
+            *_DECODER_PREFETCH_CURRENT_KEYS,
+        )
+    }
+    lifecycle: list[str] = []
+
+    class _Provider:
+        def get_diagnostic_snapshot(self):
+            return dict(values)
+
+    provider = _Provider()
+
+    class _Context:
+        _decoder_page_prefetch = None
+        decoder_page_prefetch_depth = 0
+
+        def open_decoder_page_prefetch(self, *, depth: int):
+            assert depth == 1
+            lifecycle.append("open")
+            owner = object()
+            self._decoder_page_prefetch = owner
+            values["decoder_prefetch_owner_open_count"] = 1
+            values["decoder_prefetch_owner_count"] = 1
+            values["decoder_prefetch_owner_high_watermark"] = 1
+            return owner
+
+        def close_decoder_page_prefetch(self, owner) -> None:
+            assert owner is self._decoder_page_prefetch
+            lifecycle.append("close")
+            values["decoder_prefetch_owner_close_count"] = 1
+            values["decoder_prefetch_owner_count"] = 0
+            self._decoder_page_prefetch = None
+
+    inputs = replace(
+        inputs,
+        ctx=_Context(),
+        model=SimpleNamespace(device=torch.device("cpu"), transcoders=provider),
+    )
+    run_phase4(
+        inputs=inputs,
+        config=replace(_config(), decoder_page_prefetch_depth=1),
+    )
+
+    phase = next(item for item in observer.phases if item["name"] == "phase4.feature_attribution")
+    attrs = phase["attrs"]
+    assert lifecycle == ["open", "close"]
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_open_count_total"] == 1
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_close_count_total"] == 1
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_count_final"] == 0
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_high_watermark"] == 1
+
+    depth_zero_observer = FakeObserver()
+    run_phase4(
+        inputs=replace(inputs, telemetry_observer=depth_zero_observer),
+        config=_config(),
+    )
+    depth_zero_phase = next(
+        item
+        for item in depth_zero_observer.phases
+        if item["name"] == "phase4.feature_attribution"
+    )
+    depth_zero_attrs = depth_zero_phase["attrs"]
+    assert (
+        depth_zero_attrs[
+            "phase4_feature_vjp_actual_decoder_prefetch_owner_open_count_total"
+        ]
+        == 0
+    )
+    assert (
+        depth_zero_attrs[
+            "phase4_feature_vjp_actual_decoder_prefetch_owner_close_count_total"
+        ]
+        == 0
+    )
+    assert (
+        depth_zero_attrs[
+            "phase4_feature_vjp_actual_decoder_prefetch_owner_high_watermark"
+        ]
+        == 0
+    )
 
 
 def _nonzero_inputs(observer: FakeObserver) -> Phase4Inputs:
@@ -502,10 +604,78 @@ def test_phase4_coalescing_never_crosses_refresh_frontiers() -> None:
     assert [batch["phase4_execution_batch_rows"] for batch in attrs] == [2, 2, 1]
 
 
+class _FakePrefetchTranscoders:
+    def __init__(self) -> None:
+        self.snapshot = {
+            "decoder_chunk_request_count": 0,
+            "decoder_chunk_request_bytes": 0,
+            "decoder_load_count": 0,
+            "decoder_load_bytes": 0,
+            "decoder_cache_hit_count": 0,
+            "decoder_prefetch_request_count": 0,
+            "decoder_prefetch_load_count": 0,
+            "decoder_prefetch_load_bytes": 0,
+            "decoder_prefetch_cache_hit_count": 0,
+            "decoder_prefetch_consume_hit_count": 0,
+            "decoder_prefetch_host_wait_count": 0,
+            "decoder_prefetch_host_wait_seconds": 0.0,
+            "decoder_prefetch_in_flight_count": 0,
+            "decoder_prefetch_in_flight_high_watermark": 0,
+            "decoder_prefetch_in_flight_bytes": 0,
+            "decoder_prefetch_in_flight_bytes_high_watermark": 0,
+            "decoder_prefetch_consumer_active_count": 0,
+            "decoder_prefetch_consumer_active_bytes": 0,
+            "decoder_prefetch_consumer_retained_count": 0,
+            "decoder_prefetch_consumer_retained_bytes": 0,
+            "decoder_prefetch_consumer_retained_bytes_high_watermark": 0,
+            "decoder_prefetch_consumer_retirement_count": 0,
+            "decoder_prefetch_consumer_backpressure_count": 0,
+            "decoder_prefetch_consumer_backpressure_seconds": 0.0,
+            "decoder_prefetch_pipeline_owned_final_page_count": 0,
+            "decoder_prefetch_pipeline_owned_final_page_high_watermark": 0,
+            "decoder_prefetch_pipeline_owned_final_page_bytes": 0,
+            "decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark": 0,
+            "decoder_prefetch_owner_count": 0,
+            "decoder_prefetch_owner_high_watermark": 0,
+            "decoder_prefetch_owner_open_count": 0,
+            "decoder_prefetch_owner_close_count": 0,
+        }
+
+    def get_diagnostic_snapshot(self) -> dict[str, int | float]:
+        return dict(self.snapshot)
+
+    def record_replay(self) -> None:
+        self.snapshot["decoder_prefetch_request_count"] += 2
+        self.snapshot["decoder_prefetch_load_count"] += 1
+        self.snapshot["decoder_prefetch_load_bytes"] += 16
+        self.snapshot["decoder_prefetch_cache_hit_count"] += 1
+        self.snapshot["decoder_prefetch_consume_hit_count"] += 2
+        self.snapshot["decoder_prefetch_host_wait_count"] += 1
+        self.snapshot["decoder_prefetch_host_wait_seconds"] += 0.25
+        self.snapshot["decoder_prefetch_in_flight_high_watermark"] += 1
+        self.snapshot["decoder_prefetch_in_flight_bytes_high_watermark"] += 16
+        self.snapshot["decoder_prefetch_consumer_retirement_count"] += 1
+        self.snapshot["decoder_prefetch_consumer_backpressure_count"] += 1
+        self.snapshot["decoder_prefetch_consumer_backpressure_seconds"] += 0.5
+        self.snapshot["decoder_prefetch_owner_open_count"] += 1
+        self.snapshot["decoder_prefetch_owner_close_count"] += 1
+        self.snapshot["decoder_prefetch_consumer_retained_bytes_high_watermark"] += 8
+        self.snapshot["decoder_prefetch_pipeline_owned_final_page_high_watermark"] += 1
+        self.snapshot["decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark"] += 16
+        self.snapshot["decoder_prefetch_owner_high_watermark"] += 1
+
+
 class _FakeTapeContext:
-    def __init__(self, *, row_width: int, entry_bytes: int = 10) -> None:
+    def __init__(
+        self,
+        *,
+        row_width: int,
+        entry_bytes: int = 10,
+        transcoders: _FakePrefetchTranscoders | None = None,
+    ) -> None:
         self.row_width = row_width
         self.entry_bytes = entry_bytes
+        self.transcoders = transcoders
         self.replay_windows: list[list[int]] = []
         self.next_call_index = 0
         self.previous_replay_storage_refs: list[weakref.ReferenceType[object]] = []
@@ -564,6 +734,8 @@ class _FakeTapeContext:
         phase_label: str,
     ) -> list[torch.Tensor]:
         del phase_label
+        if self.transcoders is not None:
+            self.transcoders.record_replay()
         self.replay_windows.append([entry.batch_call_index for entry in entries])
         storages = [entry.row_buffer.untyped_storage() for entry in entries]
         self.previous_replay_storage_refs = [weakref.ref(storage) for storage in storages]
@@ -577,18 +749,24 @@ def _run_tape_phase4(
     update_interval: int = 2,
     partial_frontier: bool = False,
     gpu_reduction: bool = False,
+    prefetch_diagnostics: bool = False,
 ) -> tuple[object, FakeObserver, _FakeTapeContext]:
     observer = FakeObserver()
     total_features = 6 if partial_frontier else 4
     actual_features = 5 if partial_frontier else 4
     row_width = total_features + 1
-    ctx = _FakeTapeContext(row_width=row_width)
+    transcoders = _FakePrefetchTranscoders() if prefetch_diagnostics else None
+    ctx = _FakeTapeContext(row_width=row_width, transcoders=transcoders)
     inputs = replace(
         _nonzero_inputs(observer),
         ctx=ctx,
         model=SimpleNamespace(
             device=torch.device("cpu"),
-            transcoders=SimpleNamespace(decoder_chunk_size=2),
+            transcoders=(
+                transcoders
+                if transcoders is not None
+                else SimpleNamespace(decoder_chunk_size=2)
+            ),
         ),
         edge_matrix=torch.zeros((actual_features + 1, row_width)),
         feat_ids=torch.arange(20, 20 + total_features),
@@ -649,6 +827,51 @@ def test_phase4_feature_vjp_tape_window_two_matches_window_one_and_reuses_window
     assert attrs["phase4_feature_vjp_tape_high_watermark_bytes"] == 20
     assert attrs["phase4_feature_vjp_planned_decoder_traversal_numerator"] == 2
     assert attrs["phase4_feature_vjp_planned_decoder_traversal_denominator"] == 4
+
+
+def test_phase4_tape_preserves_prefetch_deltas_and_high_watermarks() -> None:
+    _, observer, _ = _run_tape_phase4(
+        window=2, max_bytes=20, prefetch_diagnostics=True
+    )
+
+    attrs = next(
+        event["attrs"]
+        for event in observer.phases
+        if event["name"] == "phase4.feature_attribution"
+    )
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_request_count_total"] == 4
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_load_count_total"] == 2
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_load_bytes_total"] == 32
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_cache_hit_count_total"] == 2
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_consume_hit_count_total"] == 4
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_host_wait_count_total"] == 2
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_host_wait_seconds_total"] == 0.5
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_in_flight_high_watermark"] == 2
+    assert attrs[
+        "phase4_feature_vjp_actual_decoder_prefetch_in_flight_bytes_high_watermark"
+    ] == 32
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_in_flight_count_final"] == 0
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_in_flight_bytes_final"] == 0
+    assert attrs[
+        "phase4_feature_vjp_actual_decoder_prefetch_consumer_retirement_count_total"
+    ] == 2
+    assert attrs[
+        "phase4_feature_vjp_actual_decoder_prefetch_consumer_backpressure_seconds_total"
+    ] == 1.0
+    assert attrs[
+        "phase4_feature_vjp_actual_decoder_prefetch_consumer_retained_bytes_high_watermark"
+    ] == 16
+    assert attrs[
+        "phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_high_watermark"
+    ] == 2
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_high_watermark"] == 2
+    assert attrs[
+        "phase4_feature_vjp_actual_decoder_prefetch_consumer_active_count_final"
+    ] == 0
+    assert attrs[
+        "phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_bytes_final"
+    ] == 0
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_count_final"] == 0
 
 
 def test_phase4_feature_vjp_tape_cap_flushes_and_never_crosses_frontier() -> None:

@@ -291,27 +291,95 @@ def _clear_replayed_row_aliases(state) -> None:
             setattr(state, name, None)
 
 
-def _decoder_counters(provider: object) -> dict[str, int] | None:
+_DECODER_DELTA_COUNTER_KEYS = (
+    "decoder_chunk_request_count",
+    "decoder_chunk_request_bytes",
+    "decoder_load_count",
+    "decoder_load_bytes",
+    "decoder_cache_hit_count",
+    "decoder_prefetch_request_count",
+    "decoder_prefetch_load_count",
+    "decoder_prefetch_load_bytes",
+    "decoder_prefetch_cache_hit_count",
+    "decoder_prefetch_consume_hit_count",
+    "decoder_prefetch_host_wait_count",
+    "decoder_prefetch_host_wait_seconds",
+    "decoder_prefetch_consumer_retirement_count",
+    "decoder_prefetch_consumer_backpressure_count",
+    "decoder_prefetch_consumer_backpressure_seconds",
+    "decoder_prefetch_owner_open_count",
+    "decoder_prefetch_owner_close_count",
+)
+
+_DECODER_PREFETCH_HIGH_WATERMARK_KEYS = (
+    "decoder_prefetch_in_flight_high_watermark",
+    "decoder_prefetch_in_flight_bytes_high_watermark",
+    "decoder_prefetch_consumer_retained_bytes_high_watermark",
+    "decoder_prefetch_pipeline_owned_final_page_high_watermark",
+    "decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark",
+    "decoder_prefetch_owner_high_watermark",
+)
+
+_DECODER_PREFETCH_CURRENT_KEYS = (
+    "decoder_prefetch_in_flight_count",
+    "decoder_prefetch_in_flight_bytes",
+    "decoder_prefetch_consumer_active_count",
+    "decoder_prefetch_consumer_active_bytes",
+    "decoder_prefetch_consumer_retained_count",
+    "decoder_prefetch_consumer_retained_bytes",
+    "decoder_prefetch_pipeline_owned_final_page_count",
+    "decoder_prefetch_pipeline_owned_final_page_bytes",
+    "decoder_prefetch_owner_count",
+)
+
+
+def _decoder_counters(provider: object) -> dict[str, int | float] | None:
     snapshot = getattr(provider, "get_diagnostic_snapshot", None)
     if not callable(snapshot):
         return None
     payload = snapshot()
     if not isinstance(payload, dict):
         return None
-    keys = (
-        "decoder_chunk_request_count",
-        "decoder_chunk_request_bytes",
-        "decoder_load_count",
-        "decoder_load_bytes",
-        "decoder_cache_hit_count",
-    )
-    counters: dict[str, int] = {}
-    for key in keys:
+    counters: dict[str, int | float] = {}
+    for key in _DECODER_DELTA_COUNTER_KEYS:
         value = payload.get(key)
         if not isinstance(value, (int, float)):
             return None
-        counters[key] = int(value)
+        counters[key] = float(value) if isinstance(value, float) else int(value)
     return counters
+
+
+def _decoder_prefetch_snapshot(provider: object) -> dict[str, int] | None:
+    snapshot = getattr(provider, "get_diagnostic_snapshot", None)
+    if not callable(snapshot):
+        return None
+    payload = snapshot()
+    if not isinstance(payload, dict):
+        return None
+    values: dict[str, int] = {}
+    for key in (*_DECODER_PREFETCH_HIGH_WATERMARK_KEYS, *_DECODER_PREFETCH_CURRENT_KEYS):
+        value = payload.get(key)
+        if not isinstance(value, (int, float)):
+            return None
+        values[key] = int(value)
+    return values
+
+
+def capture_decoder_prefetch_terminal_state(state) -> None:
+    """Capture owner-scoped counters and terminal gauges after Phase-4 cleanup."""
+    counters = _decoder_counters(state.model.transcoders)
+    snapshot = _decoder_prefetch_snapshot(state.model.transcoders)
+    if counters is not None:
+        for key, value in counters.items():
+            if key.startswith("decoder_prefetch_"):
+                state.phase4_feature_vjp_actual_decoder_counters[key] = value
+    if snapshot is not None:
+        for key in _DECODER_PREFETCH_HIGH_WATERMARK_KEYS:
+            state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[key] = (
+                snapshot[key]
+            )
+        for key in _DECODER_PREFETCH_CURRENT_KEYS:
+            state.phase4_feature_vjp_actual_decoder_prefetch_current[key] = snapshot[key]
 
 
 def _finish_captured_window(
@@ -322,6 +390,7 @@ def _finish_captured_window(
     if not captured:
         return
     decoder_counters_before = _decoder_counters(state.model.transcoders)
+    decoder_prefetch_before = _decoder_prefetch_snapshot(state.model.transcoders)
     replay_started = time.perf_counter()
     try:
         rows_by_batch = state.ctx.replay_feature_vjp_tape(
@@ -334,6 +403,7 @@ def _finish_captured_window(
         raise
     replay_elapsed_ms = (time.perf_counter() - replay_started) * 1000.0
     decoder_counters_after = _decoder_counters(state.model.transcoders)
+    decoder_prefetch_after = _decoder_prefetch_snapshot(state.model.transcoders)
     if decoder_counters_before is not None and decoder_counters_after is not None:
         for key in decoder_counters_before:
             state.phase4_feature_vjp_actual_decoder_counters[key] += max(
@@ -341,6 +411,17 @@ def _finish_captured_window(
                 0,
             )
         state.phase4_feature_vjp_actual_decoder_page_load_windows += 1
+    if decoder_prefetch_before is not None and decoder_prefetch_after is not None:
+        for key in _DECODER_PREFETCH_HIGH_WATERMARK_KEYS:
+            state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[key] = max(
+                state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[key],
+                decoder_prefetch_before[key],
+                decoder_prefetch_after[key],
+            )
+        for key in _DECODER_PREFETCH_CURRENT_KEYS:
+            state.phase4_feature_vjp_actual_decoder_prefetch_current[key] = (
+                decoder_prefetch_after[key]
+            )
     final_n_visited = state.n_visited
     final_execution_count = state.phase4_execution_batch_count
     final_scheduler_reference_count = state.phase4_scheduler_reference_batch_count

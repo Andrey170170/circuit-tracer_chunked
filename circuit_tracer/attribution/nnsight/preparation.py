@@ -436,6 +436,11 @@ def _resolve_frontier(
             "depth_times_max_final_decoder_page_bytes"
         ),
         "decoder_page_prefetch_loader_dtype_conversion_transient_bytes": "unmeasured",
+        "decoder_page_prefetch_pipeline_final_page_bound": (
+            "current_plus_next_final_pages_at_most_two;"
+            "source_and_dtype_conversion_transients_unmeasured;"
+            "allocator_rounding_excluded"
+        ),
         "decoder_page_prefetch_wait_telemetry_scope": (
             "host_future_only_excludes_cuda_event_stall"
         ),
@@ -810,6 +815,11 @@ def _effective_execution_identity(
                 "depth_times_max_final_decoder_page_bytes"
             ),
             "decoder_page_prefetch_loader_dtype_conversion_transient_bytes": "unmeasured",
+            "decoder_page_prefetch_pipeline_final_page_bound": (
+                "current_plus_next_final_pages_at_most_two;"
+                "source_and_dtype_conversion_transients_unmeasured;"
+                "allocator_rounding_excluded"
+            ),
             "decoder_page_prefetch_wait_telemetry_scope": (
                 "host_future_only_excludes_cuda_event_stall"
             ),

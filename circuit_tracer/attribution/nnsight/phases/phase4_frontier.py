@@ -202,6 +202,37 @@ def _initialize_phase4_counters(state):
         "decoder_load_count": 0,
         "decoder_load_bytes": 0,
         "decoder_cache_hit_count": 0,
+        "decoder_prefetch_request_count": 0,
+        "decoder_prefetch_load_count": 0,
+        "decoder_prefetch_load_bytes": 0,
+        "decoder_prefetch_cache_hit_count": 0,
+        "decoder_prefetch_consume_hit_count": 0,
+        "decoder_prefetch_host_wait_count": 0,
+        "decoder_prefetch_host_wait_seconds": 0.0,
+        "decoder_prefetch_consumer_retirement_count": 0,
+        "decoder_prefetch_consumer_backpressure_count": 0,
+        "decoder_prefetch_consumer_backpressure_seconds": 0.0,
+        "decoder_prefetch_owner_open_count": 0,
+        "decoder_prefetch_owner_close_count": 0,
+    }
+    state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks = {
+        "decoder_prefetch_in_flight_high_watermark": 0,
+        "decoder_prefetch_in_flight_bytes_high_watermark": 0,
+        "decoder_prefetch_consumer_retained_bytes_high_watermark": 0,
+        "decoder_prefetch_pipeline_owned_final_page_high_watermark": 0,
+        "decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark": 0,
+        "decoder_prefetch_owner_high_watermark": 0,
+    }
+    state.phase4_feature_vjp_actual_decoder_prefetch_current = {
+        "decoder_prefetch_in_flight_count": 0,
+        "decoder_prefetch_in_flight_bytes": 0,
+        "decoder_prefetch_consumer_active_count": 0,
+        "decoder_prefetch_consumer_active_bytes": 0,
+        "decoder_prefetch_consumer_retained_count": 0,
+        "decoder_prefetch_consumer_retained_bytes": 0,
+        "decoder_prefetch_pipeline_owned_final_page_count": 0,
+        "decoder_prefetch_pipeline_owned_final_page_bytes": 0,
+        "decoder_prefetch_owner_count": 0,
     }
     state.phase4_feature_vjp_actual_decoder_page_load_windows = 0
     state.phase4_feature_vjp_capture_elapsed_ms_total = 0.0

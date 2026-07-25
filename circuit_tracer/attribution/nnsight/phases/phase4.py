@@ -6,7 +6,10 @@ from typing import Any
 import torch
 from circuit_tracer.attribution.targets import AttributionTargets
 from circuit_tracer.attribution.nnsight.row_store import _FileBackedFeatureRowStore
-from circuit_tracer.attribution.nnsight.phases.phase4_batches import execute_pending_frontier
+from circuit_tracer.attribution.nnsight.phases.phase4_batches import (
+    capture_decoder_prefetch_terminal_state,
+    execute_pending_frontier,
+)
 from circuit_tracer.attribution.nnsight.phases.phase4_cleanup import finish_phase4
 from circuit_tracer.attribution.nnsight.phases.phase4_diagnostics import (
     summarize_phase4_diagnostics,
@@ -126,16 +129,39 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
     """Sequence Phase 4 domain operations without owning their subsystem logic."""
     state = FeatureAttributionRun(inputs=inputs, config=config)
     prior_prefetch_depth = int(getattr(inputs.ctx, "decoder_page_prefetch_depth", 0))
-    inputs.ctx.decoder_page_prefetch_depth = int(config.decoder_page_prefetch_depth)
+    prefetch_depth = int(config.decoder_page_prefetch_depth)
+    if getattr(inputs.ctx, "_decoder_page_prefetch", None) is not None:
+        raise RuntimeError("cannot enter Phase 4 with an open decoder prefetch lifecycle")
+    inputs.ctx.decoder_page_prefetch_depth = prefetch_depth
+    prefetch_owner = None
+    primary_error: BaseException | None = None
     try:
+        if prefetch_depth > 0:
+            prefetch_owner = inputs.ctx.open_decoder_page_prefetch(depth=prefetch_depth)
         initialize_phase4(state)
         while state.n_visited < state.actual_max_feature_nodes:
             prepare_feature_frontier(state)
             execute_pending_frontier(state)
-        finish_phase4(state)
-        summarize_phase4_diagnostics(state)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        inputs.ctx.decoder_page_prefetch_depth = prior_prefetch_depth
+        try:
+            if prefetch_owner is not None:
+                inputs.ctx.close_decoder_page_prefetch(prefetch_owner)
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "Phase 4 decoder page prefetch cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        finally:
+            inputs.ctx.decoder_page_prefetch_depth = prior_prefetch_depth
+    if prefetch_owner is not None:
+        capture_decoder_prefetch_terminal_state(state)
+    finish_phase4(state)
+    summarize_phase4_diagnostics(state)
     return Phase4Result(
         visited=state.visited,
         actual_max_feature_nodes=state.actual_max_feature_nodes,

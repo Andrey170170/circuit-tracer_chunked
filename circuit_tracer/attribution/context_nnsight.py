@@ -910,12 +910,12 @@ class AttributionContext:
         phase_label: str | None = None,
         batch_index: int | None = None,
     ) -> None:
-        prefetch = DecoderPagePrefetch(
-            provider=self.decoder_provider,
-            decoder_cache=self.decoder_chunk_cache,
-            depth=int(self.decoder_page_prefetch_depth),
-        )
-        self._decoder_page_prefetch = prefetch
+        prefetch = self._decoder_page_prefetch
+        owns_prefetch = prefetch is None
+        if prefetch is None:
+            prefetch = self.open_decoder_page_prefetch(
+                depth=int(self.decoder_page_prefetch_depth)
+            )
         primary_error: BaseException | None = None
         try:
             self._compute_chunked_feature_attributions_from_grad_batches_impl(
@@ -927,17 +927,35 @@ class AttributionContext:
             primary_error = error
             raise
         finally:
-            try:
-                prefetch.close()
-            except BaseException as cleanup_error:
-                if primary_error is None:
-                    raise
-                primary_error.add_note(
-                    "decoder page prefetch cleanup also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
-            finally:
-                self._decoder_page_prefetch = None
+            if owns_prefetch:
+                try:
+                    self.close_decoder_page_prefetch(prefetch)
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(
+                        "decoder page prefetch cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+
+    def open_decoder_page_prefetch(self, *, depth: int) -> DecoderPagePrefetch:
+        if self._decoder_page_prefetch is not None:
+            raise RuntimeError("decoder page prefetch lifecycle is already open")
+        owner = DecoderPagePrefetch(
+            provider=self.decoder_provider,
+            decoder_cache=self.decoder_chunk_cache,
+            depth=int(depth),
+        )
+        self._decoder_page_prefetch = owner
+        return owner
+
+    def close_decoder_page_prefetch(self, owner: DecoderPagePrefetch) -> None:
+        if self._decoder_page_prefetch is not owner:
+            raise RuntimeError("decoder page prefetch lifecycle owner mismatch")
+        try:
+            owner.close()
+        finally:
+            self._decoder_page_prefetch = None
 
     def _compute_chunked_feature_attributions_from_grad_batches_impl(
         self,
@@ -1134,6 +1152,7 @@ class AttributionContext:
                                 )
 
                     output_layer_seconds[output_layer] += time.perf_counter() - output_layer_start
+                self._decoder_page_prefetch.finish(decoder_chunk)
 
             if self.diagnostic_mode:
                 self._add_layer_stat(

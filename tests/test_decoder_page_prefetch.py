@@ -24,6 +24,9 @@ class _Provider:
         self.in_flight_peak = 0
         self.in_flight_bytes = 0
         self.in_flight_bytes_peak = 0
+        self.active = 0
+        self.retained = 0
+        self.pipeline_owned_peak = 0
         self.consumes = 0
         self.host_waits = 0
         self.fail_key: tuple[int, int] | None = None
@@ -79,6 +82,17 @@ class _Provider:
             elif event == "release":
                 self.in_flight -= 1
                 self.in_flight_bytes -= nbytes
+            elif event == "handoff":
+                self.active += 1
+            elif event == "consumer_finish":
+                self.active -= 1
+                self.retained += 1
+            elif event == "consumer_retire":
+                self.retained -= 1
+            self.pipeline_owned_peak = max(
+                self.pipeline_owned_peak,
+                self.in_flight + self.active + self.retained,
+            )
 
 
 class _DepthZeroProvider:
@@ -160,6 +174,43 @@ def test_context_clears_prefetch_owner_when_close_is_primary_error(monkeypatch) 
     assert ctx._decoder_page_prefetch is None
 
 
+def test_context_reuses_one_owner_across_replay_windows(monkeypatch) -> None:
+    instances = []
+    replay_calls = 0
+
+    class _PersistentOwner:
+        def __init__(self, **_kwargs) -> None:
+            self.close_calls = 0
+            instances.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def _replay(self, *_args, **_kwargs) -> None:
+        nonlocal replay_calls
+        replay_calls += 1
+
+    monkeypatch.setattr(context_module, "DecoderPagePrefetch", _PersistentOwner)
+    monkeypatch.setattr(
+        AttributionContext,
+        "_compute_chunked_feature_attributions_from_grad_batches_impl",
+        _replay,
+    )
+    ctx = _bare_context()
+    owner = ctx.open_decoder_page_prefetch(depth=1)
+
+    ctx._compute_chunked_feature_attributions_from_grad_batches([])
+    ctx._compute_chunked_feature_attributions_from_grad_batches([])
+
+    assert instances == [owner]
+    assert owner.close_calls == 0
+    assert ctx._decoder_page_prefetch is owner
+    assert replay_calls == 2
+    ctx.close_decoder_page_prefetch(owner)
+    assert owner.close_calls == 1
+    assert ctx._decoder_page_prefetch is None
+
+
 def test_depth_one_prefetch_preserves_page_order_and_values() -> None:
     provider = _Provider()
     with DecoderPagePrefetch(provider=provider, decoder_cache=None, depth=1) as pages:
@@ -169,6 +220,7 @@ def test_depth_one_prefetch_preserves_page_order_and_values() -> None:
             if chunk_id < 2:
                 pages.schedule(0, chunk_id + 1)
             values.append(float(page.sum()))
+            pages.finish(page)
 
     assert values == [0.0, 4.0, 8.0]
     assert provider.calls == [
@@ -180,6 +232,9 @@ def test_depth_one_prefetch_preserves_page_order_and_values() -> None:
     assert provider.in_flight_bytes_peak == 16
     assert provider.in_flight == 0
     assert provider.consumes == 2
+    assert provider.pipeline_owned_peak == 2
+    assert provider.active == 0
+    assert provider.retained == 0
 
 
 def test_prefetch_runs_while_current_page_is_available() -> None:
@@ -191,7 +246,10 @@ def test_prefetch_runs_while_current_page_is_available() -> None:
         assert provider.started.wait(timeout=2)
         assert float(current.sum()) == 0.0
         provider.release.set()
-        assert float(pages.get(0, 1).sum()) == 4.0
+        pages.finish(current)
+        next_page = pages.get(0, 1)
+        assert float(next_page.sum()) == 4.0
+        pages.finish(next_page)
 
 
 def test_cuda_page_records_consumer_stream_after_wait(monkeypatch) -> None:
@@ -213,13 +271,27 @@ def test_cuda_page_records_consumer_stream_after_wait(monkeypatch) -> None:
         def get_decoder_chunk(self, *_args, **_kwargs):
             return _FakeTensor()
 
+    event_count = 0
+
     class _FakeEvent:
+        def __init__(self) -> None:
+            nonlocal event_count
+            event_count += 1
+            self.kind = "producer" if event_count == 1 else "consumer"
+
         def record(self, stream) -> None:
-            assert stream == "producer-stream"
-            calls.append("event_record")
+            expected = (
+                "producer-stream" if self.kind == "producer" else "consumer-stream"
+            )
+            assert stream == expected
+            calls.append(f"{self.kind}_event_record")
+
+        def query(self) -> bool:
+            calls.append("consumer_event_query")
+            return False
 
         def synchronize(self) -> None:
-            calls.append("event_synchronize")
+            calls.append(f"{self.kind}_event_synchronize")
 
     class _ConsumerStream:
         def wait_event(self, event) -> None:
@@ -242,9 +314,17 @@ def test_cuda_page_records_consumer_stream_after_wait(monkeypatch) -> None:
     ) as pages:
         pages.schedule(0, 1)
         result = pages.get(0, 1)
+        pages.finish(result)
 
     assert isinstance(result, _FakeTensor)
-    assert calls == ["event_record", "wait_event", "record_stream"]
+    assert calls == [
+        "producer_event_record",
+        "wait_event",
+        "record_stream",
+        "consumer_event_record",
+        "consumer_event_query",
+        "consumer_event_synchronize",
+    ]
 
 
 def test_cached_prefetch_does_not_duplicate_load() -> None:
@@ -252,9 +332,11 @@ def test_cached_prefetch_does_not_duplicate_load() -> None:
     cached = torch.ones((2, 2))
     cache = {(0, 1): cached}
     with DecoderPagePrefetch(provider=provider, decoder_cache=cache, depth=1) as pages:
-        pages.get(0, 0)
+        current = pages.get(0, 0)
         pages.schedule(0, 1)
+        pages.finish(current)
         result = pages.get(0, 1)
+        pages.finish(result)
 
     assert result is cached
     assert provider.loads == 1
@@ -267,8 +349,9 @@ def test_prefetch_exception_releases_owned_page_slot() -> None:
     provider.fail_key = (0, 1)
     with pytest.raises(RuntimeError, match="page load failed"):
         with DecoderPagePrefetch(provider=provider, decoder_cache=None, depth=1) as pages:
-            pages.get(0, 0)
+            current = pages.get(0, 0)
             pages.schedule(0, 1)
+            pages.finish(current)
             pages.get(0, 1)
 
     assert provider.in_flight == 0

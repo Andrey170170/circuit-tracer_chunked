@@ -404,6 +404,22 @@ class TranscoderSet(nn.Module):
             "decoder_prefetch_in_flight_high_watermark": 0,
             "decoder_prefetch_in_flight_bytes": 0,
             "decoder_prefetch_in_flight_bytes_high_watermark": 0,
+            "decoder_prefetch_consumer_active_count": 0,
+            "decoder_prefetch_consumer_active_bytes": 0,
+            "decoder_prefetch_consumer_retained_count": 0,
+            "decoder_prefetch_consumer_retained_bytes": 0,
+            "decoder_prefetch_consumer_retained_bytes_high_watermark": 0,
+            "decoder_prefetch_consumer_retirement_count": 0,
+            "decoder_prefetch_consumer_backpressure_count": 0,
+            "decoder_prefetch_consumer_backpressure_seconds": 0.0,
+            "decoder_prefetch_pipeline_owned_final_page_count": 0,
+            "decoder_prefetch_pipeline_owned_final_page_high_watermark": 0,
+            "decoder_prefetch_pipeline_owned_final_page_bytes": 0,
+            "decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark": 0,
+            "decoder_prefetch_owner_count": 0,
+            "decoder_prefetch_owner_high_watermark": 0,
+            "decoder_prefetch_owner_open_count": 0,
+            "decoder_prefetch_owner_close_count": 0,
         }
         self._decoder_diagnostic_lock = Lock()
 
@@ -548,6 +564,12 @@ class TranscoderSet(nn.Module):
     def record_decoder_prefetch_event(self, event: str, **attrs: object) -> None:
         nbytes = int(attrs.get("nbytes", 0))
         with self._decoder_diagnostic_lock:
+            if event == "owner_open":
+                for key, value in self._decoder_diagnostic_stats.items():
+                    if key.startswith("decoder_prefetch_"):
+                        self._decoder_diagnostic_stats[key] = (
+                            0.0 if isinstance(value, float) else 0
+                        )
             if event == "schedule":
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"] += 1
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"] += nbytes
@@ -583,6 +605,96 @@ class TranscoderSet(nn.Module):
             elif event == "release":
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"] -= 1
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"] -= nbytes
+            elif event == "handoff":
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_active_count"] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_active_bytes"] += nbytes
+            elif event == "consumer_finish":
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_active_count"] -= 1
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_active_bytes"] -= nbytes
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_retained_count"
+                ] += 1
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_retained_bytes"
+                ] += nbytes
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_retained_bytes_high_watermark"
+                ] = max(
+                    self._decoder_diagnostic_stats[
+                        "decoder_prefetch_consumer_retained_bytes_high_watermark"
+                    ],
+                    self._decoder_diagnostic_stats[
+                        "decoder_prefetch_consumer_retained_bytes"
+                    ],
+                )
+            elif event == "consumer_retire":
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_retained_count"
+                ] -= 1
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_retained_bytes"
+                ] -= nbytes
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_retirement_count"
+                ] += 1
+                if bool(attrs.get("backpressure_waited", False)):
+                    self._decoder_diagnostic_stats[
+                        "decoder_prefetch_consumer_backpressure_count"
+                    ] += 1
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_backpressure_seconds"
+                ] += float(attrs.get("backpressure_wait_seconds", 0.0))
+            elif event == "owner_open":
+                self._decoder_diagnostic_stats["decoder_prefetch_owner_count"] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_owner_open_count"] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_owner_high_watermark"] = max(
+                    self._decoder_diagnostic_stats["decoder_prefetch_owner_high_watermark"],
+                    self._decoder_diagnostic_stats["decoder_prefetch_owner_count"],
+                )
+            elif event == "owner_close":
+                self._decoder_diagnostic_stats["decoder_prefetch_owner_count"] -= 1
+                self._decoder_diagnostic_stats["decoder_prefetch_owner_close_count"] += 1
+
+            owned_count = (
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"]
+                + self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_active_count"
+                ]
+                + self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_retained_count"
+                ]
+            )
+            owned_bytes = (
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"]
+                + self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_active_bytes"
+                ]
+                + self._decoder_diagnostic_stats[
+                    "decoder_prefetch_consumer_retained_bytes"
+                ]
+            )
+            self._decoder_diagnostic_stats[
+                "decoder_prefetch_pipeline_owned_final_page_count"
+            ] = owned_count
+            self._decoder_diagnostic_stats[
+                "decoder_prefetch_pipeline_owned_final_page_bytes"
+            ] = owned_bytes
+            self._decoder_diagnostic_stats[
+                "decoder_prefetch_pipeline_owned_final_page_high_watermark"
+            ] = max(
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_pipeline_owned_final_page_high_watermark"
+                ],
+                owned_count,
+            )
+            self._decoder_diagnostic_stats[
+                "decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark"
+            ] = max(
+                self._decoder_diagnostic_stats[
+                    "decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark"
+                ],
+                owned_bytes,
+            )
 
     def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None):
         from circuit_tracer.transcoder.cross_layer_transcoder import DecoderChunkCache

@@ -16,6 +16,13 @@ class _LoadedDecoderPage:
     ready_event: torch.cuda.Event | None
 
 
+@dataclass(frozen=True)
+class _ConsumedDecoderPage:
+    tensor: torch.Tensor
+    completion_event: torch.cuda.Event | None
+    nbytes: int
+
+
 class DecoderPagePrefetch:
     """Own at most one decoder page loaded ahead of the consumer.
 
@@ -47,7 +54,12 @@ class DecoderPagePrefetch:
         self._future: Future[_LoadedDecoderPage] | None = None
         self._key: tuple[int, int] | None = None
         self._scheduled_nbytes = 0
+        self._active_tensor: torch.Tensor | None = None
+        self._active_nbytes = 0
+        self._consumed: _ConsumedDecoderPage | None = None
         self._closed = False
+        if self._depth == 1:
+            self._record("owner_open")
 
     def __enter__(self) -> DecoderPagePrefetch:
         return self
@@ -57,11 +69,21 @@ class DecoderPagePrefetch:
 
     def get(self, source_layer: int, chunk_id: int) -> torch.Tensor:
         key = (int(source_layer), int(chunk_id))
-        if self._future is None:
+        if self._depth == 0:
             return self._provider.get_decoder_chunk(
                 *key,
                 decoder_cache=self._decoder_cache,
             )
+        if self._active_tensor is not None:
+            raise RuntimeError("finish the active decoder page before requesting the next page")
+        self._retire_consumed()
+        if self._future is None:
+            tensor = self._provider.get_decoder_chunk(
+                *key,
+                decoder_cache=self._decoder_cache,
+            )
+            self._accept(tensor, nbytes=int(self._provider.decoder_chunk_nbytes(*key)))
+            return tensor
         if key != self._key:
             raise RuntimeError(
                 f"decoder prefetch traversal mismatch: expected {self._key}, got {key}"
@@ -91,8 +113,26 @@ class DecoderPagePrefetch:
             host_waited=waited,
             host_wait_seconds=wait_seconds,
         )
+        self._accept(loaded.tensor, nbytes=self._scheduled_nbytes)
         self._scheduled_nbytes = 0
         return loaded.tensor
+
+    def finish(self, tensor: torch.Tensor) -> None:
+        """Mark contraction of the active page complete on the consumer stream."""
+        if self._depth == 0:
+            return
+        if tensor is not self._active_tensor:
+            raise RuntimeError("decoder page finish does not match the active page")
+        completion_event = None
+        if tensor.device.type == "cuda":
+            consumer_stream = torch.cuda.current_stream(device=tensor.device)
+            completion_event = torch.cuda.Event()
+            completion_event.record(consumer_stream)
+        nbytes = self._active_nbytes
+        self._consumed = _ConsumedDecoderPage(tensor, completion_event, nbytes)
+        self._active_tensor = None
+        self._active_nbytes = 0
+        self._record("consumer_finish", nbytes=nbytes)
 
     def schedule(self, source_layer: int, chunk_id: int) -> None:
         if self._depth == 0:
@@ -119,12 +159,36 @@ class DecoderPagePrefetch:
         if self._closed:
             return
         self._closed = True
+        first_error: BaseException | None = None
         try:
+            if self._active_tensor is not None:
+                try:
+                    self.finish(self._active_tensor)
+                except BaseException as error:
+                    first_error = error
+                    self._active_tensor = None
+                    self._active_nbytes = 0
+            try:
+                self._retire_consumed()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                else:
+                    first_error.add_note(
+                        f"consumer page retirement also failed: {type(error).__name__}: {error}"
+                    )
             if self._future is not None:
                 try:
                     loaded = self._future.result()
                     if loaded.ready_event is not None:
                         loaded.ready_event.synchronize()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                    else:
+                        first_error.add_note(
+                            f"prefetched page cleanup also failed: {type(error).__name__}: {error}"
+                        )
                 finally:
                     self._record("release", nbytes=self._scheduled_nbytes)
                     self._future = None
@@ -135,6 +199,10 @@ class DecoderPagePrefetch:
                 self._executor.shutdown(wait=True, cancel_futures=True)
                 self._executor = None
             self._cuda_stream = None
+            if self._depth == 1:
+                self._record("owner_close")
+        if first_error is not None:
+            raise first_error
 
     def _load(self, key: tuple[int, int]) -> _LoadedDecoderPage:
         device = torch.device(self._provider.decoder_device)
@@ -165,3 +233,26 @@ class DecoderPagePrefetch:
         recorder = getattr(self._provider, "record_decoder_prefetch_event", None)
         if callable(recorder):
             recorder(event, **attrs)
+
+    def _accept(self, tensor: torch.Tensor, *, nbytes: int) -> None:
+        self._active_tensor = tensor
+        self._active_nbytes = int(nbytes)
+        self._record("handoff", nbytes=nbytes)
+
+    def _retire_consumed(self) -> None:
+        consumed = self._consumed
+        if consumed is None:
+            return
+        waited = False
+        wait_start = time.perf_counter()
+        if consumed.completion_event is not None:
+            waited = not consumed.completion_event.query()
+            consumed.completion_event.synchronize()
+        wait_seconds = time.perf_counter() - wait_start
+        self._consumed = None
+        self._record(
+            "consumer_retire",
+            nbytes=consumed.nbytes,
+            backpressure_waited=waited,
+            backpressure_wait_seconds=wait_seconds,
+        )
