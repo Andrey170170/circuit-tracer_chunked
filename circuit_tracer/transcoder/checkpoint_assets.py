@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat as stat_module
+from mmap import PAGESIZE
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -180,6 +181,14 @@ class CheckpointManifest:
 
 @dataclass(frozen=True, slots=True)
 class CheckpointPageTelemetry:
+    """Evidence about one exact-range advisory request.
+
+    ``offset`` and ``length`` are the exact bytes passed to ``posix_fadvise``.
+    The kernel may interpret advice at page granularity, represented by the
+    containing ``page_span_*`` fields. A successful syscall means ``issued``;
+    it does not verify prefaulting, eviction, or any other page-cache effect.
+    """
+
     advice: CheckpointPageAdvice
     outcome: CheckpointPageOutcome
     asset_id: str
@@ -189,6 +198,11 @@ class CheckpointPageTelemetry:
     role: str
     offset: int
     length: int
+    page_size: int
+    page_span_offset: int
+    page_span_length: int
+    kernel_effect_granularity: Literal["page"]
+    kernel_effect_verified: bool
     supported: bool
     effective: bool
     refused: bool
@@ -271,13 +285,14 @@ class CheckpointPageLifecycle:
             previous = self._completed.get(key)
             if previous is not None:
                 result = replace(previous, attempted=False, idempotent=True)
-                self._emit(result)
-                return result
+            else:
+                result = self._advise_once(byte_range, advice)
+                self._completed[key] = result
 
-            result = self._advise_once(byte_range, advice)
-            self._completed[key] = result
-            self._emit(result)
-            return result
+        # A telemetry sink may synchronously call back into this lifecycle.
+        # Never invoke user code while holding the non-reentrant state lock.
+        self._emit(result)
+        return result
 
     def _advise_once(
         self,
@@ -407,6 +422,8 @@ class CheckpointPageLifecycle:
         reason: str | None = None,
         error: str | None = None,
     ) -> CheckpointPageTelemetry:
+        page_span_offset = byte_range.offset - (byte_range.offset % PAGESIZE)
+        page_span_end = ((byte_range.end + PAGESIZE - 1) // PAGESIZE) * PAGESIZE
         return CheckpointPageTelemetry(
             advice=advice,
             outcome=outcome,
@@ -417,6 +434,11 @@ class CheckpointPageLifecycle:
             role=byte_range.role,
             offset=byte_range.offset,
             length=byte_range.length,
+            page_size=PAGESIZE,
+            page_span_offset=page_span_offset,
+            page_span_length=page_span_end - page_span_offset,
+            kernel_effect_granularity="page",
+            kernel_effect_verified=False,
             supported=supported,
             effective=effective,
             refused=refused,

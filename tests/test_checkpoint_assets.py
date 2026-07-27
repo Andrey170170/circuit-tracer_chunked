@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from mmap import PAGESIZE
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -106,6 +108,35 @@ def test_mixed_role_file_uses_only_exact_target_ranges(checkpoint_file: Path) ->
     assert not prefault.effective and not release.effective
     assert calls == [(0, 8, 11), (16, 24, 12)]
     assert all(length > 0 for _, length, _ in calls)
+
+
+def test_advice_reports_exact_request_and_unverified_containing_page_span(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "page-span.safetensors"
+    path.write_bytes(b"x" * (PAGESIZE + 16))
+    byte_range = CheckpointRange("weights", "decoder", PAGESIZE - 2, 4)
+    asset = _asset(path, ranges=(byte_range,))
+    calls: list[tuple[int, int]] = []
+
+    def fadvise(_fd: int, offset: int, length: int, _flag: int) -> None:
+        calls.append((offset, length))
+
+    event = CheckpointPageLifecycle(
+        CheckpointManifest((asset,)),
+        posix_fadvise=fadvise,
+        prefault_flag=11,
+        release_flag=12,
+    ).release(byte_range)
+
+    assert calls == [(PAGESIZE - 2, 4)]
+    assert (event.offset, event.length) == (PAGESIZE - 2, 4)
+    assert event.page_size == PAGESIZE
+    assert event.page_span_offset == 0
+    assert event.page_span_length == 2 * PAGESIZE
+    assert event.kernel_effect_granularity == "page"
+    assert not event.kernel_effect_verified
+    assert event.issued and not event.effective
 
 
 def test_shared_file_refuses_advice_without_calling_platform(checkpoint_file: Path) -> None:
@@ -249,6 +280,46 @@ def test_prefault_release_and_advice_are_idempotent(checkpoint_file: Path) -> No
         first_release,
         second_release,
     ]
+
+
+def test_reentrant_telemetry_callback_does_not_deadlock(checkpoint_file: Path) -> None:
+    byte_range = CheckpointRange("weights", "decoder", 8, 16)
+    asset = _asset(checkpoint_file, ranges=(byte_range,))
+    calls = 0
+    callback_events = []
+    nested_events = []
+    reentered = False
+    lifecycle: CheckpointPageLifecycle
+
+    def fadvise(*_args: object) -> None:
+        nonlocal calls
+        calls += 1
+
+    def telemetry(event) -> None:
+        nonlocal reentered
+        callback_events.append(event)
+        if not reentered:
+            reentered = True
+            nested_events.append(lifecycle.release(byte_range))
+
+    lifecycle = CheckpointPageLifecycle(
+        CheckpointManifest((asset,)),
+        telemetry=telemetry,
+        posix_fadvise=fadvise,
+        prefault_flag=11,
+        release_flag=12,
+    )
+    result = []
+    thread = Thread(target=lambda: result.append(lifecycle.release(byte_range)), daemon=True)
+    thread.start()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(result) == 1
+    assert result[0].issued
+    assert len(nested_events) == 1 and nested_events[0].idempotent
+    assert [event.idempotent for event in callback_events] == [False, True]
+    assert calls == 1
 
 
 def test_unavailable_advice_is_observable_noop(checkpoint_file: Path) -> None:
