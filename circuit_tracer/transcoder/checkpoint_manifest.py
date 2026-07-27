@@ -48,6 +48,8 @@ class SafetensorsPayload:
     key: str
     offset: int
     length: int
+    dtype: str
+    shape: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,16 +131,31 @@ def parse_safetensors_payloads(path: str | os.PathLike[str]) -> SafetensorsHeade
             if not isinstance(entry, dict):
                 raise ValueError(f"tensor {key!r} has a non-object header entry")
             offsets = entry.get("data_offsets")
+            dtype = entry.get("dtype")
+            shape = entry.get("shape")
             if (
                 not isinstance(offsets, list)
                 or len(offsets) != 2
                 or any(not isinstance(value, int) or isinstance(value, bool) for value in offsets)
             ):
                 raise ValueError(f"tensor {key!r} has invalid data_offsets")
+            if not isinstance(dtype, str) or not dtype:
+                raise ValueError(f"tensor {key!r} has invalid dtype")
+            if (
+                not isinstance(shape, list)
+                or not shape
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                    for value in shape
+                )
+            ):
+                raise ValueError(f"tensor {key!r} has invalid shape")
             start, end = offsets
             if start < 0 or end <= start or data_start + end > file_size:
                 raise ValueError(f"tensor {key!r} payload is outside file bounds")
-            payloads.append(SafetensorsPayload(key, data_start + start, end - start))
+            payloads.append(
+                SafetensorsPayload(key, data_start + start, end - start, dtype, tuple(shape))
+            )
         if not payloads:
             raise ValueError("safetensors file contains no non-empty tensor payloads")
         ordered = sorted(payloads, key=lambda payload: (payload.offset, payload.key))

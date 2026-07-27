@@ -153,8 +153,8 @@ def test_transcoder_set_exact_provider_cache_metadata_round_trip(
         feature_input_hook="hook_resid_mid",
         feature_output_hook="hook_mlp_out",
         device=torch.device("cpu"),
-        lazy_encoder=False,
-        lazy_decoder=False,
+        lazy_encoder=True,
+        lazy_decoder=True,
         exact_chunked_provider=True,
         decoder_chunk_size=3,
     )
@@ -183,6 +183,7 @@ def test_transcoder_set_exact_provider_cache_metadata_round_trip(
     assert loaded.architecture == "plt"
     assert loaded.capabilities.decoder_output_topology == "same_layer"
     assert loaded.capabilities.supports_exact_chunked_provider is True
+    assert loaded.capabilities.supports_decoder_row_source is True
     assert (
         provider_fingerprint(loaded, checkpoint_format="standard", checkpoint_identity="test_scan")
         == fingerprint

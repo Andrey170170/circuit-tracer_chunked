@@ -61,6 +61,26 @@ class Phase0DecoderRangeTelemetry:
     logical_materialized_bytes: int
     baseline_full_page_count: int
     baseline_full_page_bytes: int
+    backend: str = "coalesced_ranges"
+    occurrence_row_count: int = 0
+    mapping_count: int = 0
+    block_count: int = 0
+    read_count: int = 0
+    backend_request_count: int = 0
+    page_span_bytes: int = 0
+    backend_requested_bytes: int = 0
+    backend_materialized_bytes: int = 0
+    planned_overfetch_ratio: float = 0.0
+    physical_read_estimate_bytes: int | None = None
+    fault_read_seconds: float = 0.0
+    reorder_seconds: float = 0.0
+    h2d_seconds: float = 0.0
+    total_seconds: float = 0.0
+    occurrence_row_bytes: int = 0
+    mapping_open_count: int = 0
+    range_count: int = 0
+    output_bytes: int = 0
+    temporary_staging_high_water_bytes: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -82,6 +102,28 @@ class Phase0DecoderRangeTelemetry:
             "logical_materialized_bytes": self.logical_materialized_bytes,
             "baseline_full_page_count": self.baseline_full_page_count,
             "baseline_full_page_bytes": self.baseline_full_page_bytes,
+            "backend": self.backend,
+            "occurrence_row_count": self.occurrence_row_count,
+            "mapping_count": self.mapping_count,
+            "block_count": self.block_count,
+            "read_count": self.read_count,
+            "backend_request_count": self.backend_request_count,
+            "page_span_bytes": self.page_span_bytes,
+            "backend_requested_bytes": self.backend_requested_bytes,
+            "backend_materialized_bytes": self.backend_materialized_bytes,
+            "planned_overfetch_ratio": self.planned_overfetch_ratio,
+            "physical_read_estimate_bytes": self.physical_read_estimate_bytes,
+            "fault_read_seconds": self.fault_read_seconds,
+            "reorder_seconds": self.reorder_seconds,
+            "h2d_seconds": self.h2d_seconds,
+            "total_seconds": self.total_seconds,
+            "occurrence_row_bytes": self.occurrence_row_bytes,
+            "mapping_open_count": self.mapping_open_count,
+            "range_count": self.range_count,
+            "output_bytes": self.output_bytes,
+            "temporary_staging_high_water_bytes": (
+                self.temporary_staging_high_water_bytes
+            ),
         }
 
 
@@ -269,6 +311,57 @@ def combine_phase0_decoder_range_telemetry(
         ),
         baseline_full_page_bytes=sum(
             telemetry.baseline_full_page_bytes for telemetry in layers
+        ),
+        backend=",".join(dict.fromkeys(telemetry.backend for telemetry in layers)),
+        occurrence_row_count=sum(
+            telemetry.occurrence_row_count for telemetry in layers
+        ),
+        mapping_count=sum(telemetry.mapping_count for telemetry in layers),
+        block_count=sum(telemetry.block_count for telemetry in layers),
+        read_count=sum(telemetry.read_count for telemetry in layers),
+        backend_request_count=sum(
+            telemetry.backend_request_count for telemetry in layers
+        ),
+        page_span_bytes=sum(telemetry.page_span_bytes for telemetry in layers),
+        backend_requested_bytes=sum(
+            telemetry.backend_requested_bytes for telemetry in layers
+        ),
+        backend_materialized_bytes=sum(
+            telemetry.backend_materialized_bytes for telemetry in layers
+        ),
+        planned_overfetch_ratio=(
+            max(
+                0.0,
+                sum(telemetry.backend_materialized_bytes for telemetry in layers)
+                / max(
+                    1,
+                    sum(telemetry.backend_requested_bytes for telemetry in layers),
+                )
+                - 1.0,
+            )
+        ),
+        physical_read_estimate_bytes=(
+            None
+            if any(
+                telemetry.physical_read_estimate_bytes is None for telemetry in layers
+            )
+            else sum(
+                int(telemetry.physical_read_estimate_bytes or 0)
+                for telemetry in layers
+            )
+        ),
+        fault_read_seconds=sum(telemetry.fault_read_seconds for telemetry in layers),
+        reorder_seconds=sum(telemetry.reorder_seconds for telemetry in layers),
+        h2d_seconds=sum(telemetry.h2d_seconds for telemetry in layers),
+        total_seconds=sum(telemetry.total_seconds for telemetry in layers),
+        occurrence_row_bytes=sum(
+            telemetry.occurrence_row_bytes for telemetry in layers
+        ),
+        mapping_open_count=sum(telemetry.mapping_open_count for telemetry in layers),
+        range_count=sum(telemetry.range_count for telemetry in layers),
+        output_bytes=sum(telemetry.output_bytes for telemetry in layers),
+        temporary_staging_high_water_bytes=max(
+            telemetry.temporary_staging_high_water_bytes for telemetry in layers
         ),
     )
 

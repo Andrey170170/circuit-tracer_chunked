@@ -39,6 +39,7 @@ def _active_decoder_row_residency(
             "requested": bool(metadata.get("phase0_decoder_row_ranges_requested", False)),
             "effective": bool(metadata.get("phase0_decoder_row_ranges_effective", False)),
             "fallback_reason": metadata.get("phase0_decoder_row_ranges_fallback_reason"),
+            "backend": metadata.get("phase0_decoder_row_ranges_backend"),
             "planning_seconds": float(
                 metadata.get("phase0_decoder_row_ranges_planning_seconds", 0.0) or 0.0
             ),
@@ -81,6 +82,71 @@ def _active_decoder_row_residency(
             ),
             "baseline_full_page_bytes": int(
                 metadata.get("phase0_decoder_row_ranges_baseline_full_page_bytes", 0) or 0
+            ),
+            "occurrence_row_count": int(
+                metadata.get("phase0_decoder_row_ranges_occurrence_row_count", 0) or 0
+            ),
+            "mapping_count": int(
+                metadata.get("phase0_decoder_row_ranges_mapping_count", 0) or 0
+            ),
+            "block_count": int(
+                metadata.get("phase0_decoder_row_ranges_block_count", 0) or 0
+            ),
+            "read_count": int(
+                metadata.get("phase0_decoder_row_ranges_read_count", 0) or 0
+            ),
+            "backend_request_count": int(
+                metadata.get(
+                    "phase0_decoder_row_ranges_backend_request_count", 0
+                )
+                or 0
+            ),
+            "page_span_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_page_span_bytes", 0) or 0
+            ),
+            "backend_requested_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_backend_requested_bytes", 0) or 0
+            ),
+            "backend_materialized_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_backend_materialized_bytes", 0) or 0
+            ),
+            "planned_overfetch_ratio": float(
+                metadata.get("phase0_decoder_row_ranges_planned_overfetch_ratio", 0.0)
+                or 0.0
+            ),
+            "physical_read_estimate_bytes": metadata.get(
+                "phase0_decoder_row_ranges_physical_read_estimate_bytes"
+            ),
+            "fault_read_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_fault_read_seconds", 0.0) or 0.0
+            ),
+            "reorder_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_reorder_seconds", 0.0) or 0.0
+            ),
+            "h2d_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_h2d_seconds", 0.0) or 0.0
+            ),
+            "total_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_total_seconds", 0.0) or 0.0
+            ),
+            "occurrence_row_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_occurrence_row_bytes", 0) or 0
+            ),
+            "mapping_open_count": int(
+                metadata.get("phase0_decoder_row_ranges_mapping_open_count", 0) or 0
+            ),
+            "range_count": int(
+                metadata.get("phase0_decoder_row_ranges_range_count", 0) or 0
+            ),
+            "output_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_output_bytes", 0) or 0
+            ),
+            "temporary_staging_high_water_bytes": int(
+                metadata.get(
+                    "phase0_decoder_row_ranges_temporary_staging_high_water_bytes",
+                    0,
+                )
+                or 0
             ),
         },
         "resident": {

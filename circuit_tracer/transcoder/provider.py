@@ -28,6 +28,7 @@ class TranscoderCapabilities:
     supports_decoder_page_prefetch: bool = False
     supports_active_decoder_row_residency: bool = False
     supports_phase0_decoder_row_ranges: bool = False
+    supports_decoder_row_source: bool = False
     decoder_output_topology: DecoderOutputTopology = "cross_layer"
     default_decoder_chunk_size: int | None = None
     default_cross_batch_decoder_cache_bytes: int | None = None
@@ -58,6 +59,10 @@ class ExactChunkedProvider(Protocol):
     def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None): ...
 
     def clear_decoder_block_cache(self, cache) -> None: ...
+
+    def create_decoder_row_source(
+        self, source_layer: int, *, max_staging_bytes: int
+    ): ...
 
 
 @runtime_checkable
@@ -134,6 +139,8 @@ def provider_contract_missing_methods(obj: object | None) -> tuple[str, ...]:
     ]
     if caps.supports_decoder_chunk_cache:
         required.extend(("create_decoder_block_cache", "clear_decoder_block_cache"))
+    if caps.supports_decoder_row_source:
+        required.append("create_decoder_row_source")
     required.append("materialize_encoder_rows")
     return tuple(name for name in required if not callable(getattr(obj, name, None)))
 
@@ -191,10 +198,17 @@ def normalize_provider_fingerprints_for_comparison(
     for capability_key in (
         "supports_active_decoder_row_residency",
         "supports_phase0_decoder_row_ranges",
+        "supports_decoder_row_source",
     ):
         if capability_key not in expected or capability_key not in current:
             normalized_expected[capability_key] = False
             normalized_current[capability_key] = False
+    if (
+        "decoder_row_source_backend" not in expected
+        or "decoder_row_source_backend" not in current
+    ):
+        normalized_expected["decoder_row_source_backend"] = None
+        normalized_current["decoder_row_source_backend"] = None
     return normalized_expected, normalized_current
 
 
@@ -230,6 +244,10 @@ def provider_fingerprint(
         "supports_exact_row_replay": caps.supports_exact_row_replay,
         "supports_active_decoder_row_residency": caps.supports_active_decoder_row_residency,
         "supports_phase0_decoder_row_ranges": caps.supports_phase0_decoder_row_ranges,
+        "supports_decoder_row_source": caps.supports_decoder_row_source,
+        "decoder_row_source_backend": (
+            "mapped_safetensors_v1" if caps.supports_decoder_row_source else None
+        ),
         "decoder_chunk_size": caps.default_decoder_chunk_size,
         "cross_batch_decoder_cache_bytes": caps.default_cross_batch_decoder_cache_bytes,
         "legacy_exact_chunked_decoder": caps.legacy_exact_chunked_decoder,

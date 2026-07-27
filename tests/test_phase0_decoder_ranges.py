@@ -13,6 +13,10 @@ from circuit_tracer.transcoder.phase0_decoder_ranges import (
     load_decoder_row_ranges,
     plan_decoder_row_ranges,
 )
+from circuit_tracer.transcoder.decoder_row_source import (
+    DecoderRowRefusal,
+    DecoderRowRefusalCode,
+)
 from circuit_tracer.transcoder.single_layer_transcoder import load_transcoder_set
 
 
@@ -29,14 +33,19 @@ def _write_transcoder(path, decoder: torch.Tensor) -> None:
     )
 
 
-def _provider(path, *, decoder_chunk_size: int = 4):
+def _provider(
+    path,
+    *,
+    decoder_chunk_size: int = 4,
+    dtype: torch.dtype = torch.float32,
+):
     return load_transcoder_set(
         {0: str(path)},
         "synthetic",
         "in",
         "out",
         device=torch.device("cpu"),
-        dtype=torch.float32,
+        dtype=dtype,
         lazy_encoder=True,
         lazy_decoder=True,
         exact_chunked_provider=True,
@@ -181,6 +190,11 @@ def test_phase0_ranges_preserve_chunk_reconstruction_and_reuse_rows_for_seed(
         "get_decoder_chunk",
         lambda *args, **kwargs: pytest.fail("selective path reloaded a full decoder page"),
     )
+    monkeypatch.setattr(
+        single_layer_module,
+        "load_decoder_row_ranges",
+        lambda **_kwargs: pytest.fail("mapped source fell back to coalesced ranges"),
+    )
     got, seed, materialized_bytes, telemetry = (
         provider._decode_sparse_with_decoder_row_ranges(0, sparse)
     )
@@ -192,11 +206,74 @@ def test_phase0_ranges_preserve_chunk_reconstruction_and_reuse_rows_for_seed(
     assert torch.equal(seed.rows, baseline_seed.rows)
     assert telemetry.effective is True
     assert telemetry.fallback_reason is None
+    assert telemetry.backend == "mapped_safetensors"
+    assert telemetry.mapping_count == 1
+    assert telemetry.mapping_open_count == 1
+    assert telemetry.read_count == 0
+    assert telemetry.block_count >= 1
     assert telemetry.unique_row_count == int(seed.feature_ids.numel())
+    assert telemetry.occurrence_row_count == sparse._nnz()
     assert telemetry.logical_requested_bytes == seed.rows.numel() * seed.rows.element_size()
     assert telemetry.logical_materialized_bytes == materialized_bytes
+    assert telemetry.backend_requested_bytes == telemetry.logical_requested_bytes
+    assert telemetry.backend_materialized_bytes == telemetry.logical_requested_bytes
+    assert telemetry.planned_overfetch_ratio == 0.0
     assert telemetry.logical_materialized_bytes < baseline_bytes
-    assert telemetry.range_request_count == len(telemetry.range_rows)
+    assert telemetry.range_request_count == 0
+    assert telemetry.range_rows == ()
+
+
+def test_mapped_f32_rows_cast_chunkwise_to_bf16_provider_dtype(
+    tmp_path, monkeypatch
+) -> None:
+    decoder = torch.arange(16 * 3, dtype=torch.float32).reshape(16, 3).div(13)
+    path = tmp_path / "layer_0.safetensors"
+    _write_transcoder(path, decoder)
+    provider = _provider(path, dtype=torch.bfloat16)
+    sparse = _sparse(
+        [1, 2, 3, 13, 14, 15],
+        [0.5, -1.0, 2.0, 0.25, -0.75, 1.5],
+    )
+    baseline, baseline_seed, _ = provider._decode_sparse_with_decoder_chunks(
+        0,
+        sparse,
+        capture_decoder_row_seed=True,
+    )
+    monkeypatch.setattr(
+        provider,
+        "get_decoder_chunk",
+        lambda *args, **kwargs: pytest.fail(
+            "mapped source reloaded a canonical decoder page"
+        ),
+    )
+    monkeypatch.setattr(
+        single_layer_module,
+        "load_decoder_row_ranges",
+        lambda **_kwargs: pytest.fail("mapped source fell back to coalesced ranges"),
+    )
+
+    got, seed, materialized_bytes, telemetry = (
+        provider._decode_sparse_with_decoder_row_ranges(0, sparse)
+    )
+
+    assert torch.equal(got, baseline)
+    assert baseline_seed is not None and seed is not None
+    assert seed.rows.dtype is torch.bfloat16
+    assert torch.equal(seed.rows, baseline_seed.rows)
+    retained_bytes = seed.rows.numel() * seed.rows.element_size()
+    raw_bytes = seed.rows.numel() * decoder.element_size()
+    assert materialized_bytes == retained_bytes
+    assert telemetry.logical_requested_bytes == retained_bytes
+    assert telemetry.logical_materialized_bytes == retained_bytes
+    assert telemetry.output_bytes == retained_bytes
+    assert telemetry.backend_requested_bytes == raw_bytes
+    assert telemetry.backend_materialized_bytes == raw_bytes
+    assert telemetry.backend_request_count == 1
+    assert telemetry.overfetch_bytes == 0
+    assert telemetry.planned_overfetch_ratio == 0.0
+    assert telemetry.temporary_staging_high_water_bytes >= (
+        raw_bytes + retained_bytes
+    )
 
 
 def test_phase0_ranges_fall_back_to_exact_full_pages_when_overfetch_is_excessive(
@@ -221,6 +298,14 @@ def test_phase0_ranges_fall_back_to_exact_full_pages_when_overfetch_is_excessive
         return original_get_decoder_chunk(*args, **kwargs)
 
     monkeypatch.setattr(provider, "get_decoder_chunk", tracked_get_decoder_chunk)
+    monkeypatch.setattr(
+        single_layer_module.MappedSafetensorsDecoderRowSource,
+        "materialize",
+        lambda *_args, **_kwargs: DecoderRowRefusal(
+            DecoderRowRefusalCode.PER_ROW_REQUESTS,
+            "synthetic mapped-source refusal",
+        ),
+    )
     got, seed, materialized_bytes, telemetry = (
         provider._decode_sparse_with_decoder_row_ranges(0, sparse)
     )
@@ -232,7 +317,10 @@ def test_phase0_ranges_fall_back_to_exact_full_pages_when_overfetch_is_excessive
     assert full_page_reads == 1
     assert materialized_bytes == baseline_bytes
     assert telemetry.effective is False
-    assert telemetry.fallback_reason == "overfetch_fraction_exceeds_max"
+    assert telemetry.fallback_reason == (
+        "mapped_source:per_row_requests:synthetic mapped-source refusal;"
+        "coalesced_ranges:overfetch_fraction_exceeds_max"
+    )
     assert telemetry.range_request_count == 0
     assert telemetry.logical_materialized_bytes == baseline_bytes
 
@@ -253,6 +341,14 @@ def test_phase0_range_reconstruction_failure_releases_staged_rows(
         return rows, read_seconds, gather_seconds
 
     monkeypatch.setattr(single_layer_module, "load_decoder_row_ranges", staged_rows)
+    monkeypatch.setattr(
+        single_layer_module.MappedSafetensorsDecoderRowSource,
+        "materialize",
+        lambda *_args, **_kwargs: DecoderRowRefusal(
+            DecoderRowRefusalCode.PER_ROW_REQUESTS,
+            "synthetic mapped-source refusal",
+        ),
+    )
     transcoder = provider.transcoders[0]
     transcoder.W_skip = torch.nn.Parameter(torch.eye(3))
 
