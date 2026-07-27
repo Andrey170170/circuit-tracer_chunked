@@ -1,4 +1,5 @@
 import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from threading import Lock
@@ -18,8 +19,12 @@ from circuit_tracer.attribution.sparsification import (
     select_candidate_feature_indices,
 )
 from circuit_tracer.transcoder.activation_functions import JumpReLU
-from circuit_tracer.transcoder.attribution_result import AttributionComponents
-from circuit_tracer.transcoder.provider import TranscoderCapabilities
+from circuit_tracer.transcoder.attribution_result import (
+    AttributionComponents,
+    DecoderRowSeed,
+    DecoderRowSeedLayer,
+)
+from circuit_tracer.transcoder.provider import TranscoderCapabilities, provider_fingerprint
 from circuit_tracer.utils import get_default_device
 
 
@@ -454,6 +459,7 @@ class TranscoderSet(nn.Module):
             supports_decoder_page_prefetch=bool(
                 exact and any(t.lazy_decoder for t in self.transcoders)
             ),
+            supports_active_decoder_row_residency=exact,
             decoder_output_topology="same_layer",
             default_decoder_chunk_size=int(self.decoder_chunk_size),
             default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),
@@ -515,9 +521,7 @@ class TranscoderSet(nn.Module):
         start = int(chunk_id) * self.decoder_chunk_size
         stop = min(start + self.decoder_chunk_size, transcoder.d_transcoder)
         if start >= transcoder.d_transcoder or stop <= start:
-            raise IndexError(
-                f"Decoder chunk {chunk_id} out of range for layer {source_layer}"
-            )
+            raise IndexError(f"Decoder chunk {chunk_id} out of range for layer {source_layer}")
         return int((stop - start) * self.d_model * self.dtype.itemsize)
 
     def get_decoder_chunk(
@@ -567,18 +571,12 @@ class TranscoderSet(nn.Module):
             if event == "owner_open":
                 for key, value in self._decoder_diagnostic_stats.items():
                     if key.startswith("decoder_prefetch_"):
-                        self._decoder_diagnostic_stats[key] = (
-                            0.0 if isinstance(value, float) else 0
-                        )
+                        self._decoder_diagnostic_stats[key] = 0.0 if isinstance(value, float) else 0
             if event == "schedule":
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"] += 1
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"] += nbytes
-                self._decoder_diagnostic_stats[
-                    "decoder_prefetch_in_flight_high_watermark"
-                ] = max(
-                    self._decoder_diagnostic_stats[
-                        "decoder_prefetch_in_flight_high_watermark"
-                    ],
+                self._decoder_diagnostic_stats["decoder_prefetch_in_flight_high_watermark"] = max(
+                    self._decoder_diagnostic_stats["decoder_prefetch_in_flight_high_watermark"],
                     self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"],
                 )
                 self._decoder_diagnostic_stats[
@@ -592,12 +590,8 @@ class TranscoderSet(nn.Module):
             elif event == "consume":
                 self._decoder_diagnostic_stats["decoder_prefetch_consume_hit_count"] += 1
                 if bool(attrs.get("host_waited", False)):
-                    self._decoder_diagnostic_stats[
-                        "decoder_prefetch_host_wait_count"
-                    ] += 1
-                self._decoder_diagnostic_stats[
-                    "decoder_prefetch_host_wait_seconds"
-                ] += float(
+                    self._decoder_diagnostic_stats["decoder_prefetch_host_wait_count"] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_host_wait_seconds"] += float(
                     attrs.get("host_wait_seconds", 0.0)
                 )
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"] -= 1
@@ -611,32 +605,20 @@ class TranscoderSet(nn.Module):
             elif event == "consumer_finish":
                 self._decoder_diagnostic_stats["decoder_prefetch_consumer_active_count"] -= 1
                 self._decoder_diagnostic_stats["decoder_prefetch_consumer_active_bytes"] -= nbytes
-                self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_retained_count"
-                ] += 1
-                self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_retained_bytes"
-                ] += nbytes
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_retained_count"] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_retained_bytes"] += nbytes
                 self._decoder_diagnostic_stats[
                     "decoder_prefetch_consumer_retained_bytes_high_watermark"
                 ] = max(
                     self._decoder_diagnostic_stats[
                         "decoder_prefetch_consumer_retained_bytes_high_watermark"
                     ],
-                    self._decoder_diagnostic_stats[
-                        "decoder_prefetch_consumer_retained_bytes"
-                    ],
+                    self._decoder_diagnostic_stats["decoder_prefetch_consumer_retained_bytes"],
                 )
             elif event == "consumer_retire":
-                self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_retained_count"
-                ] -= 1
-                self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_retained_bytes"
-                ] -= nbytes
-                self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_retirement_count"
-                ] += 1
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_retained_count"] -= 1
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_retained_bytes"] -= nbytes
+                self._decoder_diagnostic_stats["decoder_prefetch_consumer_retirement_count"] += 1
                 if bool(attrs.get("backpressure_waited", False)):
                     self._decoder_diagnostic_stats[
                         "decoder_prefetch_consumer_backpressure_count"
@@ -657,28 +639,20 @@ class TranscoderSet(nn.Module):
 
             owned_count = (
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_count"]
-                + self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_active_count"
-                ]
-                + self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_retained_count"
-                ]
+                + self._decoder_diagnostic_stats["decoder_prefetch_consumer_active_count"]
+                + self._decoder_diagnostic_stats["decoder_prefetch_consumer_retained_count"]
             )
             owned_bytes = (
                 self._decoder_diagnostic_stats["decoder_prefetch_in_flight_bytes"]
-                + self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_active_bytes"
-                ]
-                + self._decoder_diagnostic_stats[
-                    "decoder_prefetch_consumer_retained_bytes"
-                ]
+                + self._decoder_diagnostic_stats["decoder_prefetch_consumer_active_bytes"]
+                + self._decoder_diagnostic_stats["decoder_prefetch_consumer_retained_bytes"]
             )
-            self._decoder_diagnostic_stats[
-                "decoder_prefetch_pipeline_owned_final_page_count"
-            ] = owned_count
-            self._decoder_diagnostic_stats[
-                "decoder_prefetch_pipeline_owned_final_page_bytes"
-            ] = owned_bytes
+            self._decoder_diagnostic_stats["decoder_prefetch_pipeline_owned_final_page_count"] = (
+                owned_count
+            )
+            self._decoder_diagnostic_stats["decoder_prefetch_pipeline_owned_final_page_bytes"] = (
+                owned_bytes
+            )
             self._decoder_diagnostic_stats[
                 "decoder_prefetch_pipeline_owned_final_page_high_watermark"
             ] = max(
@@ -723,7 +697,9 @@ class TranscoderSet(nn.Module):
         layer: int,
         sparse_acts: torch.Tensor,
         input_acts: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        *,
+        capture_decoder_row_seed: bool = False,
+    ) -> tuple[torch.Tensor, DecoderRowSeedLayer | None, int]:
         sparse_acts = sparse_acts.coalesce()
         pos_idx, feat_idx = sparse_acts.indices()
         values = sparse_acts.values()
@@ -733,21 +709,53 @@ class TranscoderSet(nn.Module):
             device=sparse_acts.device,
             dtype=sparse_acts.dtype,
         )
+        unique_feature_ids = torch.unique(feat_idx, sorted=True)
+        seed_rows: torch.Tensor | None = None
+        traversal_bytes = 0
 
-        if feat_idx.numel() > 0:
-            chunk_ids = torch.div(feat_idx, self.decoder_chunk_size, rounding_mode="floor")
-            for chunk_id_tensor in torch.unique(chunk_ids, sorted=True):
-                chunk_id = int(chunk_id_tensor.item())
-                chunk_mask = chunk_ids == chunk_id_tensor
-                local_feat_idx = (feat_idx[chunk_mask] - chunk_id * self.decoder_chunk_size).long()
-                decoder_chunk = self.get_decoder_chunk(layer, chunk_id)
-                decoder_vectors = decoder_chunk[:, 0].to(
-                    device=sparse_acts.device,
-                    dtype=sparse_acts.dtype,
-                    non_blocking=decoder_chunk.device.type == "cuda",
+        try:
+            if feat_idx.numel() > 0:
+                chunk_ids = torch.div(feat_idx, self.decoder_chunk_size, rounding_mode="floor")
+                unique_chunk_ids = torch.div(
+                    unique_feature_ids, self.decoder_chunk_size, rounding_mode="floor"
                 )
-                scaled_decoders = decoder_vectors[local_feat_idx] * values[chunk_mask, None]
-                reconstruction.index_add_(0, pos_idx[chunk_mask], scaled_decoders)
+                for chunk_id_tensor in torch.unique(chunk_ids, sorted=True):
+                    chunk_id = int(chunk_id_tensor.item())
+                    chunk_mask = chunk_ids == chunk_id_tensor
+                    local_feat_idx = (
+                        feat_idx[chunk_mask] - chunk_id * self.decoder_chunk_size
+                    ).long()
+                    decoder_chunk = self.get_decoder_chunk(layer, chunk_id)
+                    traversal_bytes += int(decoder_chunk.numel() * decoder_chunk.element_size())
+                    if capture_decoder_row_seed:
+                        if seed_rows is None:
+                            seed_rows = torch.empty(
+                                (int(unique_feature_ids.numel()), 1, self.d_model),
+                                device=decoder_chunk.device,
+                                dtype=decoder_chunk.dtype,
+                            )
+                        unique_chunk_mask = unique_chunk_ids == chunk_id_tensor
+                        unique_destinations = unique_chunk_mask.nonzero(as_tuple=False).flatten()
+                        unique_local_ids = (
+                            unique_feature_ids[unique_chunk_mask]
+                            - chunk_id * self.decoder_chunk_size
+                        ).to(device=decoder_chunk.device, dtype=torch.long)
+                        seed_rows[unique_destinations.to(device=decoder_chunk.device)] = (
+                            decoder_chunk[unique_local_ids, :1]
+                        )
+                    decoder_vectors = decoder_chunk[:, 0].to(
+                        device=sparse_acts.device,
+                        dtype=sparse_acts.dtype,
+                        non_blocking=decoder_chunk.device.type == "cuda",
+                    )
+                    scaled_decoders = decoder_vectors[local_feat_idx] * values[chunk_mask, None]
+                    reconstruction.index_add_(0, pos_idx[chunk_mask], scaled_decoders)
+
+        except BaseException:
+            decoder_vectors = None
+            decoder_chunk = None
+            seed_rows = None
+            raise
 
         transcoder = cast(SingleLayerTranscoder, self.transcoders[layer])
         if transcoder.W_skip is not None:
@@ -758,7 +766,17 @@ class TranscoderSet(nn.Module):
         reconstruction = reconstruction + transcoder.b_dec.to(
             device=reconstruction.device, dtype=reconstruction.dtype
         )
-        return reconstruction
+        seed_layer = None
+        if capture_decoder_row_seed and seed_rows is not None:
+            seed_layer = DecoderRowSeedLayer(
+                source_layer=layer,
+                output_layers=(layer,),
+                feature_ids=unique_feature_ids.detach()
+                .to(device="cpu", dtype=torch.long)
+                .contiguous(),
+                rows=seed_rows.detach().to(device="cpu").contiguous(),
+            )
+        return reconstruction, seed_layer, traversal_bytes
 
     def __len__(self):
         return self.n_layers
@@ -829,6 +847,8 @@ class TranscoderSet(nn.Module):
         sparsification: SparsificationConfig | None = None,
         *,
         materialize_encoder_vecs: bool = True,
+        decoder_active_row_residency: bool = False,
+        decoder_active_row_max_bytes: int = 0,
     ) -> AttributionComponents:
         """Extract active features and their encoder/decoder vectors for attribution.
 
@@ -868,6 +888,22 @@ class TranscoderSet(nn.Module):
         layer_ids, pos_ids, feat_ids = activation_matrix.indices()
 
         if self.exact_chunked_provider:
+            seed_estimated_bytes = (
+                int(activation_matrix._nnz()) * self.d_model * int(self.dtype.itemsize)
+            )
+            seed_refusal_reason = None
+            if not decoder_active_row_residency:
+                seed_refusal_reason = "not_requested"
+            elif int(decoder_active_row_max_bytes) <= 0:
+                seed_refusal_reason = "max_bytes_nonpositive"
+            elif seed_estimated_bytes > int(decoder_active_row_max_bytes):
+                seed_refusal_reason = "phase0_occurrence_bytes_exceed_max"
+            capture_seed = seed_refusal_reason is None
+            seed_started = time.perf_counter()
+            load_count_before = int(self._decoder_diagnostic_stats["decoder_load_count"])
+            load_bytes_before = int(self._decoder_diagnostic_stats["decoder_load_bytes"])
+            seed_layers: list[DecoderRowSeedLayer | None] = []
+            seed_traversal_bytes = 0
             for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
                 layer_mask = layer_ids == layer
                 layer_sparse = torch.sparse_coo_tensor(
@@ -877,10 +913,34 @@ class TranscoderSet(nn.Module):
                     device=device,
                     dtype=activation_matrix.dtype,
                 ).coalesce()
-                reconstruction[layer] = self._decode_sparse_with_decoder_chunks(
-                    layer,
-                    layer_sparse,
-                    mlp_inputs[layer],
+                layer_reconstruction, seed_layer, traversal_bytes = (
+                    self._decode_sparse_with_decoder_chunks(
+                        layer,
+                        layer_sparse,
+                        mlp_inputs[layer],
+                        capture_decoder_row_seed=capture_seed,
+                    )
+                )
+                reconstruction[layer] = layer_reconstruction
+                seed_layers.append(seed_layer)
+                seed_traversal_bytes += traversal_bytes
+
+            decoder_row_seed = None
+            if capture_seed:
+                decoder_row_seed = DecoderRowSeed(
+                    layers=tuple(seed_layers),
+                    source_fingerprint=provider_fingerprint(self),
+                    occurrence_estimated_bytes=seed_estimated_bytes,
+                    capture_seconds=time.perf_counter() - seed_started,
+                    shared_traversal_bytes=seed_traversal_bytes,
+                    shared_decoder_load_count=(
+                        int(self._decoder_diagnostic_stats["decoder_load_count"])
+                        - load_count_before
+                    ),
+                    shared_decoder_load_bytes=(
+                        int(self._decoder_diagnostic_stats["decoder_load_bytes"])
+                        - load_bytes_before
+                    ),
                 )
 
             encoder_vecs = (
@@ -906,6 +966,9 @@ class TranscoderSet(nn.Module):
                     "activation_values": activation_matrix.values(),
                 },
                 sparsification_stats=sparsification_stats,
+                decoder_row_seed=decoder_row_seed,
+                decoder_row_seed_refusal_reason=seed_refusal_reason,
+                decoder_row_seed_estimated_bytes=seed_estimated_bytes,
             )
 
         for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore

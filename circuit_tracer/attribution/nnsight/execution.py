@@ -63,6 +63,7 @@ from circuit_tracer.attribution.nnsight.phases.phase5 import (
 )
 from circuit_tracer.attribution.nnsight.preparation import (
     PreparedBackend,
+    finalize_active_decoder_row_admission,
     reprepare_after_active_universe,
 )
 from circuit_tracer.attribution.nnsight.run_scope import AttributionRunScope
@@ -106,6 +107,7 @@ class AttributionExecution:
             self.row_store_grant = self._grant(PhaseId.PHASE2)
             self.setup_active_features_and_storage()
             self.apply_phase3_entry_replan()
+            self.finalize_active_decoder_row_admission()
             self._run_with_grant(PhaseId.PHASE3, self.attribute_seed_nodes)
             self.apply_phase4_entry_replan()
             self._run_with_grant(PhaseId.PHASE4, self.expand_feature_frontier)
@@ -128,6 +130,30 @@ class AttributionExecution:
     def apply_phase4_entry_replan(self) -> None:
         if self.governor_runtime is not None:
             self._apply_governor_revision(self.governor_runtime.phase4_entry_replan())
+        self._refresh_active_decoder_row_execution_metadata()
+
+    def finalize_active_decoder_row_admission(self) -> None:
+        """Resolve active-state-dependent residency before the Phase-3 grant."""
+
+        frontier = self.prepared.frontier
+        if not frontier.decoder_active_row_residency_effective:
+            return
+        estimated_bytes = self._phase0().ctx.estimate_active_decoder_row_bytes()
+        self.prepared = finalize_active_decoder_row_admission(
+            self.prepared,
+            estimated_bytes=estimated_bytes,
+        )
+        if self.execution_identity is None:
+            raise RuntimeError("active-row admission requires execution identity state")
+        self.execution_identity.revise_effective(self.prepared.effective_execution)
+
+    def _refresh_active_decoder_row_execution_metadata(self) -> None:
+        if self.phase0 is None:
+            return
+        snapshot = self.phase0.ctx.get_diagnostic_snapshot()
+        self.prepared.frontier.execution_metadata.update(
+            {key: value for key, value in snapshot.items() if key.startswith("decoder_active_row_")}
+        )
 
     def _apply_governor_revision(self, revision: PlanRevision) -> None:
         from circuit_tracer.tracing.governor_bridge import recompile_governed_plan
@@ -223,6 +249,12 @@ class AttributionExecution:
                     decoder_cache_fingerprint=p.forward_overrides.decoder_cache_fingerprint,
                     capture_phase3_gradient_bundle_enabled=(policy.capture_phase3_gradient_bundle),
                     diagnostic_feature_cap=plan.semantics.diagnostic_feature_cap,
+                    decoder_active_row_residency=(
+                        p.frontier.decoder_active_row_residency_effective
+                    ),
+                    decoder_active_row_max_bytes=int(
+                        plan.execution.frontier.decoder_active_row_max_bytes
+                    ),
                 ),
             )
         except Phase0ExecutionError as exc:
@@ -348,6 +380,15 @@ class AttributionExecution:
         phase2 = self._phase2()
         policy = plan.execution.observability
         storage = plan.execution.storage
+        ctx = self._phase0().ctx
+        ctx.prepare_active_decoder_rows(
+            requested=p.frontier.decoder_active_row_residency_requested,
+            enabled=p.frontier.decoder_active_row_residency_effective,
+            max_bytes=p.frontier.decoder_active_row_max_bytes_effective,
+            fallback_reason=p.frontier.decoder_active_row_fallback_reason,
+            admitted_estimated_bytes=p.frontier.decoder_active_row_estimated_bytes,
+        )
+        self._refresh_active_decoder_row_execution_metadata()
         self.phase3 = self.operations.run_phase3(
             inputs=Phase3Inputs(
                 logger=p.logger,
@@ -495,19 +536,11 @@ class AttributionExecution:
                 influence_column_tile_size=storage.influence_column_tile_size,
                 feature_row_column_tile_size=storage.feature_column_tile_size,
                 feature_row_retention=storage.retention,
-                feature_vjp_tape_batch_window=(
-                    p.frontier.feature_vjp_tape_batch_window_effective
-                ),
-                feature_vjp_tape_max_bytes=(
-                    p.frontier.feature_vjp_tape_max_bytes_effective
-                ),
+                feature_vjp_tape_batch_window=(p.frontier.feature_vjp_tape_batch_window_effective),
+                feature_vjp_tape_max_bytes=(p.frontier.feature_vjp_tape_max_bytes_effective),
                 feature_vjp_tape_enabled=p.frontier.feature_vjp_tape_enabled,
-                feature_vjp_tape_fallback_reason=(
-                    p.frontier.feature_vjp_tape_fallback_reason
-                ),
-                decoder_page_prefetch_depth=(
-                    p.frontier.decoder_page_prefetch_depth_effective
-                ),
+                feature_vjp_tape_fallback_reason=(p.frontier.feature_vjp_tape_fallback_reason),
+                decoder_page_prefetch_depth=(p.frontier.decoder_page_prefetch_depth_effective),
                 exact_encoder_residency_config=p.frontier.exact_encoder_residency,
                 profile=policy.profile,
                 profile_log_interval=policy.profile_log_interval,

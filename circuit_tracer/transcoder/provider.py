@@ -25,6 +25,7 @@ class TranscoderCapabilities:
     supports_lazy_encoder_rows: bool = False
     supports_exact_row_replay: bool = False
     supports_decoder_page_prefetch: bool = False
+    supports_active_decoder_row_residency: bool = False
     decoder_output_topology: DecoderOutputTopology = "cross_layer"
     default_decoder_chunk_size: int | None = None
     default_cross_batch_decoder_cache_bytes: int | None = None
@@ -148,6 +149,27 @@ def require_exact_row_replay_provider(obj: object | None) -> None:
         )
 
 
+def normalize_provider_fingerprints_for_comparison(
+    expected: dict[str, object],
+    current: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Project a legacy pair onto schema v1 without weakening other fields.
+
+    Active decoder-row residency was added as an optional physical capability
+    without changing fingerprint schema version 1. If either side predates the
+    key, both sides compare at the legacy default of ``False``. Fingerprints
+    that both record the key continue to compare its explicit value.
+    """
+
+    normalized_expected = dict(expected)
+    normalized_current = dict(current)
+    capability_key = "supports_active_decoder_row_residency"
+    if capability_key not in expected or capability_key not in current:
+        normalized_expected[capability_key] = False
+        normalized_current[capability_key] = False
+    return normalized_expected, normalized_current
+
+
 def provider_fingerprint(
     obj: object,
     *,
@@ -178,6 +200,7 @@ def provider_fingerprint(
         "supports_lazy_decoder_chunks": caps.supports_lazy_decoder_chunks,
         "supports_lazy_encoder_rows": caps.supports_lazy_encoder_rows,
         "supports_exact_row_replay": caps.supports_exact_row_replay,
+        "supports_active_decoder_row_residency": caps.supports_active_decoder_row_residency,
         "decoder_chunk_size": caps.default_decoder_chunk_size,
         "cross_batch_decoder_cache_bytes": caps.default_cross_batch_decoder_cache_bytes,
         "legacy_exact_chunked_decoder": caps.legacy_exact_chunked_decoder,

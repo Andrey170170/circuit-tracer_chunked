@@ -168,6 +168,8 @@ class FrontierExpansionPlan:
     feature_vjp_tape_batch_window: int = 1
     feature_vjp_tape_max_bytes: int = 0
     decoder_page_prefetch_depth: int = 0
+    decoder_active_row_residency: bool = False
+    decoder_active_row_max_bytes: int = 0
 
     def __post_init__(self) -> None:
         _nonnegative("refresh_prepared_chunk_cache_bytes", self.refresh_prepared_chunk_cache_bytes)
@@ -176,6 +178,7 @@ class FrontierExpansionPlan:
         _positive("feature_vjp_tape_batch_window", self.feature_vjp_tape_batch_window)
         _nonnegative("feature_vjp_tape_max_bytes", self.feature_vjp_tape_max_bytes)
         _nonnegative("decoder_page_prefetch_depth", self.decoder_page_prefetch_depth)
+        _nonnegative("decoder_active_row_max_bytes", self.decoder_active_row_max_bytes)
         if self.feature_vjp_tape_batch_window > 1 and self.feature_vjp_tape_max_bytes == 0:
             raise ValueError(
                 "feature_vjp_tape_batch_window > 1 requires "

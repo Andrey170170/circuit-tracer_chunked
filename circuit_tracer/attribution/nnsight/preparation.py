@@ -160,6 +160,12 @@ class FrontierMechanisms:
     feature_vjp_tape_fallback_reason: str | None = "window_one_streaming_fallback"
     decoder_page_prefetch_depth_effective: int = 0
     decoder_page_prefetch_fallback_reason: str | None = "disabled"
+    decoder_active_row_residency_requested: bool = False
+    decoder_active_row_residency_effective: bool = False
+    decoder_active_row_max_bytes_effective: int = 0
+    decoder_active_row_estimated_bytes: int | None = None
+    decoder_active_row_admission_finalized: bool = False
+    decoder_active_row_fallback_reason: str | None = "disabled"
 
 
 @dataclass
@@ -409,9 +415,7 @@ def _resolve_frontier(
         "feature_vjp_tape_max_bytes_requested": tape_max_bytes_requested,
         "feature_vjp_tape_max_bytes_effective": tape_max_bytes_effective,
         "feature_vjp_tape_fallback_reason": tape_fallback_reason,
-        "feature_vjp_tape_byte_cap_scope": (
-            "simultaneous_host_device_and_row_ownership"
-        ),
+        "feature_vjp_tape_byte_cap_scope": ("simultaneous_host_device_and_row_ownership"),
     }
     prefetch_depth_requested = int(frontier.decoder_page_prefetch_depth)
     prefetch_fallback_reason = None
@@ -419,15 +423,11 @@ def _resolve_frontier(
         prefetch_fallback_reason = "disabled"
     elif not provider.exact_chunked:
         prefetch_fallback_reason = "requires_exact_chunked_provider"
-    elif not bool(
-        getattr(provider.capabilities, "supports_decoder_page_prefetch", False)
-    ):
+    elif not bool(getattr(provider.capabilities, "supports_decoder_page_prefetch", False)):
         prefetch_fallback_reason = "provider_capability_unavailable"
     elif prefetch_depth_requested > 1:
         prefetch_fallback_reason = "only_depth_one_supported"
-    prefetch_depth_effective = (
-        prefetch_depth_requested if prefetch_fallback_reason is None else 0
-    )
+    prefetch_depth_effective = prefetch_depth_requested if prefetch_fallback_reason is None else 0
     prefetch_metadata = {
         "decoder_page_prefetch_depth_requested": prefetch_depth_requested,
         "decoder_page_prefetch_depth_effective": prefetch_depth_effective,
@@ -445,6 +445,28 @@ def _resolve_frontier(
             "host_future_only_excludes_cuda_event_stall"
         ),
     }
+    active_rows_requested = bool(frontier.decoder_active_row_residency)
+    active_rows_max_bytes_requested = int(frontier.decoder_active_row_max_bytes)
+    active_rows_fallback_reason = None
+    if not active_rows_requested:
+        active_rows_fallback_reason = "disabled"
+    elif not provider.exact_chunked:
+        active_rows_fallback_reason = "requires_exact_chunked_provider"
+    elif not bool(getattr(provider.capabilities, "supports_active_decoder_row_residency", False)):
+        active_rows_fallback_reason = "provider_capability_unavailable"
+    elif active_rows_max_bytes_requested == 0:
+        active_rows_fallback_reason = "max_bytes_disabled"
+    active_rows_effective = active_rows_fallback_reason is None
+    active_rows_max_bytes_effective = (
+        active_rows_max_bytes_requested if active_rows_effective else 0
+    )
+    active_rows_metadata = {
+        "decoder_active_row_residency_requested": active_rows_requested,
+        "decoder_active_row_residency_effective": active_rows_effective,
+        "decoder_active_row_max_bytes_requested": active_rows_max_bytes_requested,
+        "decoder_active_row_max_bytes_effective": active_rows_max_bytes_effective,
+        "decoder_active_row_fallback_reason": active_rows_fallback_reason,
+    }
     metadata = {
         **_build_phase4_scheduler_metadata(scheduler),
         **refresh_metadata,
@@ -456,6 +478,7 @@ def _resolve_frontier(
         **residency_metadata,
         **tape_metadata,
         **prefetch_metadata,
+        **active_rows_metadata,
     }
     return FrontierMechanisms(
         scheduler=scheduler,
@@ -478,6 +501,12 @@ def _resolve_frontier(
         feature_vjp_tape_fallback_reason=tape_fallback_reason,
         decoder_page_prefetch_depth_effective=prefetch_depth_effective,
         decoder_page_prefetch_fallback_reason=prefetch_fallback_reason,
+        decoder_active_row_residency_requested=active_rows_requested,
+        decoder_active_row_residency_effective=active_rows_effective,
+        decoder_active_row_max_bytes_effective=active_rows_max_bytes_effective,
+        decoder_active_row_estimated_bytes=None,
+        decoder_active_row_admission_finalized=False,
+        decoder_active_row_fallback_reason=active_rows_fallback_reason,
     )
 
 
@@ -793,15 +822,9 @@ def _effective_execution_identity(
             "feature_vjp_tape_max_bytes_requested": (
                 plan.execution.frontier.feature_vjp_tape_max_bytes
             ),
-            "feature_vjp_tape_max_bytes_effective": (
-                frontier.feature_vjp_tape_max_bytes_effective
-            ),
-            "feature_vjp_tape_fallback_reason": (
-                frontier.feature_vjp_tape_fallback_reason
-            ),
-            "feature_vjp_tape_byte_cap_scope": (
-                "simultaneous_host_device_and_row_ownership"
-            ),
+            "feature_vjp_tape_max_bytes_effective": (frontier.feature_vjp_tape_max_bytes_effective),
+            "feature_vjp_tape_fallback_reason": (frontier.feature_vjp_tape_fallback_reason),
+            "feature_vjp_tape_byte_cap_scope": ("simultaneous_host_device_and_row_ownership"),
             "decoder_page_prefetch_depth_requested": (
                 plan.execution.frontier.decoder_page_prefetch_depth
             ),
@@ -823,6 +846,20 @@ def _effective_execution_identity(
             "decoder_page_prefetch_wait_telemetry_scope": (
                 "host_future_only_excludes_cuda_event_stall"
             ),
+            "decoder_active_row_residency_requested": (
+                plan.execution.frontier.decoder_active_row_residency
+            ),
+            "decoder_active_row_residency_effective": (
+                frontier.decoder_active_row_residency_effective
+            ),
+            "decoder_active_row_max_bytes_requested": (
+                plan.execution.frontier.decoder_active_row_max_bytes
+            ),
+            "decoder_active_row_max_bytes_effective": (
+                frontier.decoder_active_row_max_bytes_effective
+            ),
+            "decoder_active_row_estimated_bytes": (frontier.decoder_active_row_estimated_bytes),
+            "decoder_active_row_fallback_reason": frontier.decoder_active_row_fallback_reason,
         },
         decoder={
             "fetch_chunk_size": plan.execution.decoder.fetch_chunk_size,
@@ -916,6 +953,15 @@ def reprepare_after_active_universe(
     controls are rebuilt from the final governed plan.
     """
     frontier = _resolve_frontier(plan, prepared.provider)
+    if prepared.frontier.decoder_active_row_admission_finalized:
+        estimated_bytes = prepared.frontier.decoder_active_row_estimated_bytes
+        if estimated_bytes is None:
+            raise RuntimeError("finalized active-row admission is missing its exact byte estimate")
+        frontier = _finalize_active_decoder_row_frontier(
+            frontier,
+            max_bytes=int(plan.execution.frontier.decoder_active_row_max_bytes),
+            estimated_bytes=estimated_bytes,
+        )
     batches = _resolve_batches(
         prepared.problem,
         plan,
@@ -946,6 +992,67 @@ def reprepare_after_active_universe(
         prepared,
         plan=plan,
         batches=batches,
+        frontier=frontier,
+        effective_execution=effective,
+    )
+
+
+def _finalize_active_decoder_row_frontier(
+    frontier: FrontierMechanisms,
+    *,
+    max_bytes: int,
+    estimated_bytes: int,
+) -> FrontierMechanisms:
+    if not frontier.decoder_active_row_residency_effective:
+        return frontier
+    admitted = estimated_bytes <= max_bytes
+    fallback_reason = None if admitted else "estimated_bytes_exceed_max"
+    metadata = dict(frontier.execution_metadata)
+    metadata.update(
+        {
+            "decoder_active_row_residency_effective": admitted,
+            "decoder_active_row_max_bytes_effective": max_bytes if admitted else 0,
+            "decoder_active_row_estimated_bytes": estimated_bytes,
+            "decoder_active_row_fallback_reason": fallback_reason,
+        }
+    )
+    return replace(
+        frontier,
+        execution_metadata=metadata,
+        decoder_active_row_residency_effective=admitted,
+        decoder_active_row_max_bytes_effective=max_bytes if admitted else 0,
+        decoder_active_row_estimated_bytes=estimated_bytes,
+        decoder_active_row_admission_finalized=True,
+        decoder_active_row_fallback_reason=fallback_reason,
+    )
+
+
+def finalize_active_decoder_row_admission(
+    prepared: PreparedBackend,
+    *,
+    estimated_bytes: int,
+) -> PreparedBackend:
+    """Finalize exact active-row byte admission before Phase 3 executes."""
+
+    frontier = prepared.frontier
+    if not frontier.decoder_active_row_residency_effective:
+        return prepared
+    max_bytes = int(prepared.plan.execution.frontier.decoder_active_row_max_bytes)
+    frontier = _finalize_active_decoder_row_frontier(
+        frontier,
+        max_bytes=max_bytes,
+        estimated_bytes=estimated_bytes,
+    )
+    effective = _effective_execution_identity(
+        prepared.provider,
+        prepared.numerics,
+        prepared.replay,
+        prepared.batches,
+        frontier,
+        prepared.plan,
+    )
+    return replace(
+        prepared,
         frontier=frontier,
         effective_execution=effective,
     )

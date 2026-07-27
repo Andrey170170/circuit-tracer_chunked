@@ -8,6 +8,58 @@ import torch
 
 
 @dataclass(frozen=True)
+class DecoderRowSeedLayer:
+    """CPU-staged unique raw decoder rows captured during Phase-0 reconstruction."""
+
+    source_layer: int
+    output_layers: tuple[int, ...]
+    feature_ids: torch.Tensor
+    rows: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if self.feature_ids.device.type != "cpu" or self.rows.device.type != "cpu":
+            raise ValueError("decoder row seed tensors must be CPU staged")
+        if self.feature_ids.ndim != 1 or self.feature_ids.dtype != torch.long:
+            raise ValueError("decoder row seed feature ids must be a rank-1 long tensor")
+        if self.rows.ndim != 3:
+            raise ValueError("decoder row seed rows must be rank 3")
+        if tuple(self.rows.shape[:2]) != (int(self.feature_ids.numel()), len(self.output_layers)):
+            raise ValueError("decoder row seed rows must align with feature ids and output layers")
+        if self.feature_ids.numel() > 1 and not bool(
+            torch.all(self.feature_ids[1:] > self.feature_ids[:-1])
+        ):
+            raise ValueError("decoder row seed feature ids must be strictly increasing")
+
+
+@dataclass(frozen=True)
+class DecoderRowSeed:
+    """Bounded CPU seed used to materialize final active decoder rows after admission."""
+
+    layers: tuple[DecoderRowSeedLayer | None, ...]
+    source_fingerprint: dict[str, object]
+    occurrence_estimated_bytes: int
+    capture_seconds: float
+    shared_traversal_bytes: int
+    shared_decoder_load_count: int
+    shared_decoder_load_bytes: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_fingerprint", dict(self.source_fingerprint))
+
+    @property
+    def unique_row_count(self) -> int:
+        return sum(int(layer.feature_ids.numel()) for layer in self.layers if layer is not None)
+
+    @property
+    def seed_bytes(self) -> int:
+        return sum(
+            int(layer.rows.numel() * layer.rows.element_size())
+            for layer in self.layers
+            if layer is not None
+        )
+
+
+@dataclass(frozen=True)
 class AttributionComponents:
     """Validated feature decomposition consumed by attribution runtimes.
 
@@ -23,6 +75,9 @@ class AttributionComponents:
     decoder_locations: torch.Tensor
     chunked_decoder_state: dict[str, torch.Tensor] | None = None
     sparsification_stats: dict[str, object] | None = None
+    decoder_row_seed: DecoderRowSeed | None = None
+    decoder_row_seed_refusal_reason: str | None = None
+    decoder_row_seed_estimated_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if not self.activation_matrix.is_sparse:
@@ -47,7 +102,11 @@ class AttributionComponents:
             raise ValueError("encoder-to-decoder map must be empty or match decoder rows")
 
         if self.chunked_decoder_state is not None:
-            if decoder_rows or self.encoder_to_decoder_map.numel() or self.decoder_locations.numel():
+            if (
+                decoder_rows
+                or self.encoder_to_decoder_map.numel()
+                or self.decoder_locations.numel()
+            ):
                 raise ValueError("chunked components must not materialize decoder rows")
             required = {"source_layers", "positions", "feature_ids", "activation_values"}
             missing = required.difference(self.chunked_decoder_state)
@@ -56,6 +115,8 @@ class AttributionComponents:
             lengths = {int(self.chunked_decoder_state[name].numel()) for name in required}
             if lengths != {active_features}:
                 raise ValueError("chunked decoder state must contain one entry per active feature")
+        elif self.decoder_row_seed is not None:
+            raise ValueError("decoder row seed requires chunked decoder state")
 
     @property
     def active_feature_count(self) -> int:

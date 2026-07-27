@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 import torch
@@ -21,6 +21,7 @@ from circuit_tracer.observability.events import MemorySnapshot, TraceObserver
 from circuit_tracer.transcoder.provider import (
     TranscoderCapabilities,
     get_transcoder_capabilities,
+    provider_fingerprint,
     require_exact_chunked_provider,
 )
 
@@ -35,7 +36,9 @@ class AttributionSetupInput:
     prefix_view_length: int | None
 
     @classmethod
-    def resolve(cls, tokens: torch.Tensor, prefix_view_length: int | None) -> "AttributionSetupInput":
+    def resolve(
+        cls, tokens: torch.Tensor, prefix_view_length: int | None
+    ) -> "AttributionSetupInput":
         if tokens.ndim != 1:
             raise ValueError("Tokens must be a 1D tensor")
         prefix = None if prefix_view_length is None else int(prefix_view_length)
@@ -116,9 +119,7 @@ class EncoderResidencyPlan:
         resolved = cast(EncoderResidency, normalized)
         effective = resolved
         fallback_reason = None
-        supported = bool(
-            exact_chunked_decoder and capabilities.supports_exact_encoder_residency
-        )
+        supported = bool(exact_chunked_decoder and capabilities.supports_exact_encoder_residency)
         if effective != "lazy" and not supported:
             effective = "lazy"
             fallback_reason = (
@@ -149,6 +150,8 @@ class AttributionSetupOptions:
     resolved_dtype_map: dict[str, str] | None
     decoder_chunk_cache: object | None
     decoder_cache_fingerprint: object | None
+    decoder_active_row_residency: bool
+    decoder_active_row_max_bytes: int
 
 
 @dataclass(frozen=True)
@@ -182,11 +185,25 @@ class AttributionSetupOperation:
         }
         if exact_chunked:
             component_kwargs["materialize_encoder_vecs"] = residency.materialize_during_phase0
+        if get_transcoder_capabilities(transcoders).supports_active_decoder_row_residency:
+            component_kwargs["decoder_active_row_residency"] = (
+                self.options.decoder_active_row_residency
+            )
+            component_kwargs["decoder_active_row_max_bytes"] = (
+                self.options.decoder_active_row_max_bytes
+            )
         components = transcoders.compute_attribution_components(  # type: ignore[attr-defined]
             self.capture.mlp_inputs,
             model.zero_positions,  # type: ignore[attr-defined]
             **component_kwargs,
         )
+        if components.decoder_row_seed is not None:
+            components = replace(
+                components,
+                decoder_row_seed=replace(
+                    components.decoder_row_seed, source_fingerprint=provider_fingerprint(transcoders)
+                ),
+            )
         component_seconds = time.perf_counter() - component_start
         if callable(trace_event):
             trace_event(
@@ -250,6 +267,9 @@ class AttributionSetupOperation:
                 chunked_state=components.chunked_decoder_state,
                 chunk_cache=self.options.decoder_chunk_cache,
                 cache_fingerprint=self.options.decoder_cache_fingerprint,
+                decoder_row_seed=components.decoder_row_seed,
+                decoder_row_seed_refusal_reason=(components.decoder_row_seed_refusal_reason),
+                decoder_row_seed_estimated_bytes=(components.decoder_row_seed_estimated_bytes),
             ),
             numeric_policy=ContextNumericPolicy(
                 materialized_encoder_vectors_during_phase0=residency.materialize_during_phase0,
@@ -290,7 +310,9 @@ class AttributionSetupOperation:
             "exact_encoder_staging_destination": context.exact_encoder_staging_destination,
             "exact_encoder_materialized_during_phase0": residency.materialize_during_phase0,
             "active_encoder_shape": tuple(context.encoder_vecs.shape),
-            "active_encoder_bytes": int(context.encoder_vecs.numel() * context.encoder_vecs.element_size()),
+            "active_encoder_bytes": int(
+                context.encoder_vecs.numel() * context.encoder_vecs.element_size()
+            ),
             "exact_encoder_pinned_requested": context.exact_encoder_pinned_requested,
             "exact_encoder_pinned_effective": context.exact_encoder_pinned_effective,
             "exact_encoder_pinning_success": context.exact_encoder_pinning_success,

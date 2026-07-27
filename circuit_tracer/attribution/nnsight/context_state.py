@@ -7,6 +7,8 @@ from typing import Literal, cast
 
 import torch
 
+from circuit_tracer.transcoder.attribution_result import DecoderRowSeed
+
 from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
 
 
@@ -110,6 +112,9 @@ class DecoderRuntime:
     chunk_cache: object | None
     cache_fingerprint: object | None
     owns_cache: bool
+    decoder_row_seed: DecoderRowSeed | None
+    decoder_row_seed_refusal_reason: str | None
+    decoder_row_seed_estimated_bytes: int | None
 
     @classmethod
     def resolve(
@@ -119,6 +124,9 @@ class DecoderRuntime:
         chunked_state: dict[str, torch.Tensor] | None,
         chunk_cache: object | None = None,
         cache_fingerprint: object | None = None,
+        decoder_row_seed: DecoderRowSeed | None = None,
+        decoder_row_seed_refusal_reason: str | None = None,
+        decoder_row_seed_estimated_bytes: int | None = None,
     ) -> "DecoderRuntime":
         if chunked_state is None and provider is not None:
             raise ValueError("decoder provider requires chunked decoder state")
@@ -143,6 +151,9 @@ class DecoderRuntime:
             chunk_cache=chunk_cache,
             cache_fingerprint=cache_fingerprint,
             owns_cache=chunk_cache is None,
+            decoder_row_seed=decoder_row_seed,
+            decoder_row_seed_refusal_reason=decoder_row_seed_refusal_reason,
+            decoder_row_seed_estimated_bytes=decoder_row_seed_estimated_bytes,
         )
 
 

@@ -873,6 +873,9 @@ def test_execution_replans_immediately_before_phase3_and_phase4_grants() -> None
     execution.run_forward_pass = lambda: events.append("run:phase1")
     execution.setup_active_features_and_storage = lambda: events.append("run:phase2")
     execution.apply_phase3_entry_replan = lambda: events.append("replan:phase3")
+    execution.finalize_active_decoder_row_admission = lambda: events.append(
+        "admit:active_rows"
+    )
     execution.attribute_seed_nodes = lambda: events.append("run:phase3")
     execution.apply_phase4_entry_replan = lambda: events.append("replan:phase4")
     execution.expand_feature_frontier = lambda: events.append("run:phase4")
@@ -882,5 +885,8 @@ def test_execution_replans_immediately_before_phase3_and_phase4_grants() -> None
 
     phase3_replan = events.index("replan:phase3")
     phase4_replan = events.index("replan:phase4")
-    assert events[phase3_replan + 1] == "grant:phase3"
+    assert events[phase3_replan + 1 : phase3_replan + 3] == [
+        "admit:active_rows",
+        "grant:phase3",
+    ]
     assert events[phase4_replan + 1] == "grant:phase4"

@@ -23,6 +23,7 @@ from circuit_tracer.attribution.nnsight.phases.phase5 import (
     run_phase5,
 )
 import circuit_tracer.attribution.nnsight.phases.phase5_full as phase5_full
+import circuit_tracer.attribution.nnsight.phases.phase5_artifacts as phase5_artifacts
 import circuit_tracer.attribution.nnsight.phases.phase5_publication as phase5_publication
 import circuit_tracer.attribution.nnsight.phase_support as phase_support
 from circuit_tracer.observability.events import MemoryBoundary, RuntimeSnapshot, TraceEvent
@@ -99,9 +100,7 @@ def _config(*, compact_output: bool = True) -> Phase5Config:
         phase4_policy=Phase4PolicySummary(
             policy, policy, policy, policy, 0, 0, "off", "off", None, False
         ),
-        numerics=NumericExecutionSummary(
-            "fp32", {"edge_matrix": "float32"}, "fp32", "fp32", 123
-        ),
+        numerics=NumericExecutionSummary("fp32", {"edge_matrix": "float32"}, "fp32", "fp32", 123),
         phase4_work=Phase4WorkSummary(8, 4, 2, 2, 1, 3, 4, 5),
         phase4_timings=Phase4TimingSummary(6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0),
         provenance=RunProvenance(0.0, None, "context", None),
@@ -146,15 +145,21 @@ def _inputs(
             {"status": "native", "mode": "off"},
             {"status": "native", "mode": "off"},
             {"status": "native", "mode": "off"},
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
         ),
         diagnostics=DiagnosticArtifacts(
-            {"phase": 3}, {"phase": 4}, {"executor": "reference"},
-            None, None, None, None,
+            {"phase": 3},
+            {"phase": 4},
+            {"executor": "reference"},
+            None,
+            None,
+            None,
+            None,
         ),
-        output=GraphOutputOwnership(
-            None, published.append, lambda: released.append(True)
-        ),
+        output=GraphOutputOwnership(None, published.append, lambda: released.append(True)),
     )
 
 
@@ -177,6 +182,115 @@ def test_phase5_compact_result_preserves_identity_metadata_and_dense_release() -
     assert result.output["telemetry_max_events"] == 123
     assert result.output["target_logit_source"] == "context"
     assert observer.phases[0]["name"] == "phase5.packaging"
+
+
+def test_phase5_compact_result_publishes_active_row_mechanism_evidence() -> None:
+    inputs = _inputs(FakeObserver(), [], [])
+    inputs = replace(
+        inputs,
+        diagnostics=replace(
+            inputs.diagnostics,
+            phase4_execution_metadata={
+                "decoder_active_row_residency_requested": True,
+                "decoder_active_row_residency_effective": True,
+                "decoder_active_row_fallback_reason": None,
+                "decoder_active_row_max_bytes_requested": 1 << 30,
+                "decoder_active_row_max_bytes_effective": 1 << 30,
+                "decoder_active_row_count": 8192,
+                "decoder_active_row_bytes": 18_874_368,
+                "decoder_active_row_estimated_bytes": 18_874_368,
+                "decoder_active_row_residency_device": "cuda:0",
+                "decoder_active_row_owner_count": 1,
+                "decoder_active_row_build_count": 1,
+                "decoder_active_row_build_seconds": 1.25,
+                "decoder_active_row_build_traversal_bytes": 15_703_474_176,
+                "decoder_active_row_build_decoder_load_count": 104,
+                "decoder_active_row_build_decoder_load_bytes": 15_703_474_176,
+                "phase4_feature_vjp_actual_decoder_page_load_count_total": 0,
+                "phase4_feature_vjp_actual_decoder_load_bytes_total": 0,
+            },
+        ),
+    )
+
+    result = run_phase5(inputs=inputs, config=_config(compact_output=True))
+
+    assert result.output["decoder_active_row_residency"] == {
+        "requested": True,
+        "effective": True,
+        "fallback_reason": None,
+        "max_bytes_requested": 1 << 30,
+        "max_bytes_effective": 1 << 30,
+        "resident": {
+            "row_count": 8192,
+            "bytes": 18_874_368,
+            "estimated_bytes": 18_874_368,
+            "device": "cuda:0",
+            "owner_count": 1,
+        },
+        "build": {
+            "source": "page_scan",
+            "count": 1,
+            "seconds": 1.25,
+            "traversal_bytes": 15_703_474_176,
+            "decoder_page_load_count": 104,
+            "decoder_load_bytes": 15_703_474_176,
+        },
+        "seed": {
+            "capture_refusal_reason": None,
+            "phase0_estimated_bytes": 0,
+            "fallback_reason": None,
+            "source_mismatch": False,
+            "capture_seconds": None,
+            "shared_traversal_bytes": 0,
+            "shared_decoder_page_load_count": 0,
+            "shared_decoder_load_bytes": 0,
+            "unique_row_count": 0,
+            "bytes": 0,
+            "materialization_seconds": None,
+            "materialization_h2d_bytes": 0,
+            "missing_keys": 0,
+        },
+        "phase4": {
+            "decoder_page_load_count_delta": 0,
+            "decoder_load_bytes_delta": 0,
+        },
+    }
+
+
+def test_phase5_compact_result_keeps_active_row_refusal_visible() -> None:
+    inputs = _inputs(FakeObserver(), [], [])
+    inputs = replace(
+        inputs,
+        diagnostics=replace(
+            inputs.diagnostics,
+            phase4_execution_metadata={
+                "decoder_active_row_residency_requested": True,
+                "decoder_active_row_residency_effective": False,
+                "decoder_active_row_fallback_reason": "estimated_bytes_exceed_max",
+                "decoder_active_row_estimated_bytes": 4096,
+            },
+        ),
+    )
+
+    result = run_phase5(inputs=inputs, config=_config(compact_output=True))
+
+    diagnostics = result.output["decoder_active_row_residency"]
+    assert diagnostics["effective"] is False
+    assert diagnostics["fallback_reason"] == "estimated_bytes_exceed_max"
+    assert diagnostics["build"]["count"] == 0
+
+
+def test_active_row_publication_uses_explicit_build_count() -> None:
+    diagnostics = phase5_artifacts._active_decoder_row_residency(
+        {
+            "decoder_active_row_residency_requested": True,
+            "decoder_active_row_residency_effective": True,
+            "decoder_active_row_build_count": 2,
+            "decoder_active_row_build_seconds": 1.0,
+        }
+    )
+
+    assert diagnostics["build"]["count"] == 2
 
 
 def test_phase5_noncompact_returns_graph_output(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -265,9 +379,7 @@ def test_phase5_compact_row_stores_materialize_cpu_slices_and_validate_prefix(
         inputs=inputs,
         config=replace(
             _config(),
-            output_policy=replace(
-                _config().output_policy, use_compact_feature_row_store=True
-            ),
+            output_policy=replace(_config().output_policy, use_compact_feature_row_store=True),
         ),
     )
 
@@ -308,9 +420,7 @@ def test_phase5_annotates_descriptors_and_records_cross_cluster_checkpoints(
     def record_checkpoint(**kwargs: object) -> None:
         checkpoints.append({"name": kwargs["checkpoint_name"], "phase": kwargs["phase"]})
 
-    monkeypatch.setattr(
-        phase5_publication, "_record_cross_cluster_checkpoint", record_checkpoint
-    )
+    monkeypatch.setattr(phase5_publication, "_record_cross_cluster_checkpoint", record_checkpoint)
     inputs = _inputs(FakeObserver(), published, released)
     inputs = replace(
         inputs,
@@ -348,3 +458,79 @@ def test_phase5_annotates_descriptors_and_records_cross_cluster_checkpoints(
     ]
     assert result.output["cross_cluster_debug_summary"] is summary
     assert result.output["cross_cluster_debug_checkpoints"] is checkpoints
+
+
+def test_active_row_publication_preserves_fused_seed_evidence() -> None:
+    diagnostics = phase5_artifacts._active_decoder_row_residency(
+        {
+            "decoder_active_row_residency_requested": True,
+            "decoder_active_row_residency_effective": True,
+            "decoder_active_row_build_source": "phase0_fused_seed",
+            "decoder_active_row_build_count": 1,
+            "decoder_active_row_build_seconds": 0.75,
+            "decoder_active_row_build_traversal_bytes": 0,
+            "decoder_active_row_build_decoder_load_count": 0,
+            "decoder_active_row_build_decoder_load_bytes": 0,
+            "decoder_active_row_seed_capture_refusal_reason": None,
+            "decoder_active_row_seed_phase0_estimated_bytes": 152_428_032,
+            "decoder_active_row_seed_fallback_reason": None,
+            "decoder_active_row_seed_source_mismatch": False,
+            "decoder_active_row_seed_capture_seconds": 57.54,
+            "decoder_active_row_seed_shared_traversal_bytes": 15_703_474_176,
+            "decoder_active_row_seed_shared_decoder_load_count": 104,
+            "decoder_active_row_seed_shared_decoder_load_bytes": 15_703_474_176,
+            "decoder_active_row_seed_unique_row_count": 66_158,
+            "decoder_active_row_seed_bytes": 152_428_032,
+            "decoder_active_row_seed_materialization_seconds": 0.75,
+            "decoder_active_row_seed_materialization_h2d_bytes": 152_428_032,
+            "decoder_active_row_seed_missing_keys": 0,
+        }
+    )
+
+    assert diagnostics["build"] == {
+        "source": "phase0_fused_seed",
+        "count": 1,
+        "seconds": 0.75,
+        "traversal_bytes": 0,
+        "decoder_page_load_count": 0,
+        "decoder_load_bytes": 0,
+    }
+    assert diagnostics["seed"] == {
+        "capture_refusal_reason": None,
+        "phase0_estimated_bytes": 152_428_032,
+        "fallback_reason": None,
+        "source_mismatch": False,
+        "capture_seconds": 57.54,
+        "shared_traversal_bytes": 15_703_474_176,
+        "shared_decoder_page_load_count": 104,
+        "shared_decoder_load_bytes": 15_703_474_176,
+        "unique_row_count": 66_158,
+        "bytes": 152_428_032,
+        "materialization_seconds": 0.75,
+        "materialization_h2d_bytes": 152_428_032,
+        "missing_keys": 0,
+    }
+
+
+def test_active_row_publication_preserves_seed_miss_double_traversal() -> None:
+    diagnostics = phase5_artifacts._active_decoder_row_residency(
+        {
+            "decoder_active_row_build_source": "page_scan_after_seed_miss",
+            "decoder_active_row_build_count": 1,
+            "decoder_active_row_build_traversal_bytes": 15_703_474_176,
+            "decoder_active_row_build_decoder_load_count": 104,
+            "decoder_active_row_build_decoder_load_bytes": 15_703_474_176,
+            "decoder_active_row_seed_fallback_reason": "seed_missing_keys",
+            "decoder_active_row_seed_source_mismatch": False,
+            "decoder_active_row_seed_shared_traversal_bytes": 15_703_474_176,
+            "decoder_active_row_seed_shared_decoder_load_count": 104,
+            "decoder_active_row_seed_shared_decoder_load_bytes": 15_703_474_176,
+            "decoder_active_row_seed_missing_keys": 1,
+        }
+    )
+
+    assert diagnostics["build"]["source"] == "page_scan_after_seed_miss"
+    assert diagnostics["build"]["decoder_page_load_count"] == 104
+    assert diagnostics["seed"]["fallback_reason"] == "seed_missing_keys"
+    assert diagnostics["seed"]["shared_decoder_page_load_count"] == 104
+    assert diagnostics["seed"]["missing_keys"] == 1

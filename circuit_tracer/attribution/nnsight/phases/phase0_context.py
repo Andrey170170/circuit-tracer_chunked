@@ -23,6 +23,8 @@ class Phase0AttributionPolicy:
     resolved_dtype_map: dict[str, str]
     decoder_chunk_cache: Any | None
     decoder_cache_fingerprint: object | None
+    decoder_active_row_residency: bool
+    decoder_active_row_max_bytes: int
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,8 @@ def create_phase0_context(
         prefix_view_length=tokens.prefix_view_length,
         decoder_chunk_cache=policy.decoder_chunk_cache,
         decoder_cache_fingerprint=policy.decoder_cache_fingerprint,
+        decoder_active_row_residency=policy.decoder_active_row_residency,
+        decoder_active_row_max_bytes=policy.decoder_active_row_max_bytes,
         trace_observer=observer,
     )
 

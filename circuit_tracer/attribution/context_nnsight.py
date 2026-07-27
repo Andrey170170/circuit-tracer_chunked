@@ -12,6 +12,16 @@ import numpy as np
 import torch
 from einops import einsum
 
+from circuit_tracer.attribution.nnsight.active_decoder_contraction import (
+    contract_active_decoder_rows,
+)
+from circuit_tracer.attribution.nnsight.active_decoder_rows import (
+    ActiveDecoderRows,
+    build_active_decoder_rows,
+    decoder_state_signature,
+    estimate_active_decoder_row_bytes,
+    materialize_active_decoder_rows_from_seed,
+)
 from circuit_tracer.attribution.nnsight.batch_execution import (
     BatchAttributionRequest,
     execute_observed_batch,
@@ -162,6 +172,48 @@ class AttributionContext:
         self._compute_batch_call_index = 0
         self.decoder_page_prefetch_depth = 0
         self._decoder_page_prefetch: DecoderPagePrefetch | None = None
+        self._active_decoder_rows: ActiveDecoderRows | None = None
+        self._decoder_row_seed = decoder_runtime.decoder_row_seed
+        self._active_decoder_row_diagnostics: dict[str, object] = {
+            "decoder_active_row_residency_requested": False,
+            "decoder_active_row_residency_effective": False,
+            "decoder_active_row_max_bytes": 0,
+            "decoder_active_row_fallback_reason": "disabled",
+            "decoder_active_row_count": 0,
+            "decoder_active_row_bytes": 0,
+            "decoder_active_row_owner_count": 0,
+            "decoder_active_row_seed_available": self._decoder_row_seed is not None,
+            "decoder_active_row_seed_missing_keys": 0,
+            "decoder_active_row_seed_source_mismatch": False,
+            "decoder_active_row_seed_fallback_reason": None,
+            "decoder_active_row_seed_capture_refusal_reason": (
+                decoder_runtime.decoder_row_seed_refusal_reason
+            ),
+            "decoder_active_row_seed_phase0_estimated_bytes": (
+                decoder_runtime.decoder_row_seed_estimated_bytes
+            ),
+        }
+        if self._decoder_row_seed is not None:
+            self._active_decoder_row_diagnostics.update(
+                {
+                    "decoder_active_row_seed_capture_seconds": (
+                        self._decoder_row_seed.capture_seconds
+                    ),
+                    "decoder_active_row_seed_shared_traversal_bytes": (
+                        self._decoder_row_seed.shared_traversal_bytes
+                    ),
+                    "decoder_active_row_seed_shared_decoder_load_count": (
+                        self._decoder_row_seed.shared_decoder_load_count
+                    ),
+                    "decoder_active_row_seed_shared_decoder_load_bytes": (
+                        self._decoder_row_seed.shared_decoder_load_bytes
+                    ),
+                    "decoder_active_row_seed_unique_row_count": (
+                        self._decoder_row_seed.unique_row_count
+                    ),
+                    "decoder_active_row_seed_bytes": self._decoder_row_seed.seed_bytes,
+                }
+            )
         self._replay_model = None
         self._replay_trace_input_ids: torch.Tensor | None = None
         self._replay_trace_batch_size: int | None = None
@@ -403,6 +455,9 @@ class AttributionContext:
         if self._cleanup_complete:
             return
 
+        self.release_active_decoder_rows(reason="cleanup")
+        self._decoder_row_seed = None
+        self._active_decoder_row_diagnostics["decoder_active_row_seed_available"] = False
         self.clear_decoder_cache()
         self._clear_saved_grads()
         self._materialized_error_vector_layers.clear()
@@ -528,6 +583,7 @@ class AttributionContext:
         snapshot["exact_encoder_pinning_failure_reason"] = self.exact_encoder_pinning_failure_reason
         snapshot["internal_precision_requested"] = self.internal_precision_requested
         snapshot["resolved_dtype_map"] = self.resolved_dtype_map
+        snapshot.update(self._active_decoder_row_diagnostics)
         return snapshot
 
     def _add_stat(self, key: str, value: float) -> None:
@@ -605,6 +661,137 @@ class AttributionContext:
         if self._owns_decoder_chunk_cache:
             self.clear_decoder_cache()
             self.decoder_chunk_cache = self._create_decoder_cache()
+
+    def release_active_decoder_rows(self, *, reason: str) -> None:
+        owner = self._active_decoder_rows
+        if owner is not None:
+            diagnostics = owner.get_diagnostic_snapshot()
+            owner.release()
+            diagnostics.update(owner.get_diagnostic_snapshot())
+            self._active_decoder_row_diagnostics.update(diagnostics)
+        self._active_decoder_rows = None
+        self._active_decoder_row_diagnostics["decoder_active_row_residency_effective"] = False
+        self._active_decoder_row_diagnostics["decoder_active_row_fallback_reason"] = reason
+
+    def prepare_active_decoder_rows(
+        self,
+        *,
+        requested: bool,
+        enabled: bool,
+        max_bytes: int,
+        fallback_reason: str | None = None,
+        admitted_estimated_bytes: int | None = None,
+    ) -> bool:
+        self.release_active_decoder_rows(reason="reprepare")
+        self._active_decoder_row_diagnostics.update(
+            {
+                "decoder_active_row_residency_requested": bool(requested),
+                "decoder_active_row_residency_effective": False,
+                "decoder_active_row_max_bytes": int(max_bytes),
+                "decoder_active_row_fallback_reason": fallback_reason,
+            }
+        )
+        if not enabled:
+            self._decoder_row_seed = None
+            self._active_decoder_row_diagnostics["decoder_active_row_seed_available"] = False
+            return False
+        if self.chunked_decoder_state is None or self.decoder_provider is None:
+            raise RuntimeError(
+                "active decoder row admission requires chunked decoder state and provider"
+            )
+        if self._chunked_layer_spans is None:
+            raise RuntimeError("active decoder row admission requires layer spans")
+        estimated_bytes = self.estimate_active_decoder_row_bytes()
+        if admitted_estimated_bytes is not None and estimated_bytes != admitted_estimated_bytes:
+            raise RuntimeError("active decoder row byte estimate changed after Phase-3 admission")
+        self._active_decoder_row_diagnostics["decoder_active_row_estimated_bytes"] = estimated_bytes
+        if estimated_bytes > int(max_bytes):
+            self._decoder_row_seed = None
+            self._active_decoder_row_diagnostics["decoder_active_row_seed_available"] = False
+            self._active_decoder_row_diagnostics["decoder_active_row_fallback_reason"] = (
+                "estimated_bytes_exceed_max"
+            )
+            return False
+        owner = None
+        seed = self._decoder_row_seed
+        seed_fallback_reason = None
+        if seed is not None:
+            owner, missing_keys, source_mismatch = materialize_active_decoder_rows_from_seed(
+                seed=seed,
+                state=self.chunked_decoder_state,
+                layer_spans=self._chunked_layer_spans,
+                provider=self.decoder_provider,
+                estimated_bytes=estimated_bytes,
+                device=self._execution_device,
+            )
+            self._active_decoder_row_diagnostics["decoder_active_row_seed_missing_keys"] = (
+                missing_keys
+            )
+            self._active_decoder_row_diagnostics["decoder_active_row_seed_source_mismatch"] = (
+                source_mismatch
+            )
+            if source_mismatch:
+                seed_fallback_reason = "seed_source_mismatch"
+            elif missing_keys:
+                seed_fallback_reason = "seed_missing_keys"
+            self._active_decoder_row_diagnostics["decoder_active_row_seed_fallback_reason"] = (
+                seed_fallback_reason
+            )
+        self._decoder_row_seed = None
+        self._active_decoder_row_diagnostics["decoder_active_row_seed_available"] = False
+        if owner is None:
+            owner = build_active_decoder_rows(
+                state=self.chunked_decoder_state,
+                layer_spans=self._chunked_layer_spans,
+                provider=self.decoder_provider,
+                estimated_bytes=estimated_bytes,
+            )
+            if seed is not None:
+                owner.build_source = (
+                    "page_scan_after_seed_source_mismatch"
+                    if seed_fallback_reason == "seed_source_mismatch"
+                    else "page_scan_after_seed_miss"
+                )
+                owner.seed_capture_seconds = seed.capture_seconds
+                owner.seed_shared_traversal_bytes = seed.shared_traversal_bytes
+                owner.seed_shared_decoder_load_count = seed.shared_decoder_load_count
+                owner.seed_shared_decoder_load_bytes = seed.shared_decoder_load_bytes
+                owner.seed_unique_row_count = seed.unique_row_count
+                owner.seed_bytes = seed.seed_bytes
+                owner.seed_fallback_reason = seed_fallback_reason
+        if owner.active_row_bytes != estimated_bytes:
+            owner.release()
+            raise RuntimeError(
+                "active decoder row build size did not match the admitted byte estimate"
+            )
+        self._active_decoder_rows = owner
+        self._active_decoder_row_diagnostics.update(owner.get_diagnostic_snapshot())
+        self._active_decoder_row_diagnostics["decoder_active_row_residency_effective"] = True
+        self._active_decoder_row_diagnostics["decoder_active_row_fallback_reason"] = None
+        return True
+
+    def estimate_active_decoder_row_bytes(self) -> int:
+        """Return the exact compact residency size for the current active state."""
+
+        if self.chunked_decoder_state is None or self.decoder_provider is None:
+            raise RuntimeError(
+                "active decoder row admission requires chunked decoder state and provider"
+            )
+        if self._chunked_layer_spans is None:
+            raise RuntimeError("active decoder row admission requires layer spans")
+        return estimate_active_decoder_row_bytes(
+            layer_spans=self._chunked_layer_spans,
+            provider=self.decoder_provider,
+        )
+
+    def _validated_active_decoder_rows(self) -> ActiveDecoderRows | None:
+        owner = getattr(self, "_active_decoder_rows", None)
+        if owner is None or self.chunked_decoder_state is None:
+            return None
+        if owner.state_signature != decoder_state_signature(self.chunked_decoder_state):
+            self.release_active_decoder_rows(reason="state_signature_mismatch")
+            return None
+        return owner
 
     def derive_prefix_view_context(self, target_position: int) -> "AttributionContext":
         """Return a non-mutating causal prefix view of this Phase-0 state.
@@ -710,6 +897,17 @@ class AttributionContext:
                 chunked_state=chunked_decoder_state,
                 chunk_cache=shared_cache,
                 cache_fingerprint=self.decoder_cache_fingerprint,
+                decoder_row_seed=self._decoder_row_seed,
+                decoder_row_seed_refusal_reason=(
+                    self._active_decoder_row_diagnostics.get(
+                        "decoder_active_row_seed_capture_refusal_reason"
+                    )
+                ),
+                decoder_row_seed_estimated_bytes=(
+                    self._active_decoder_row_diagnostics.get(
+                        "decoder_active_row_seed_phase0_estimated_bytes"
+                    )
+                ),
             ),
             numeric_policy=ContextNumericPolicy(
                 materialized_encoder_vectors_during_phase0=self.exact_encoder_materialized_during_phase0,
@@ -722,6 +920,8 @@ class AttributionContext:
         total_active_feats = self.activation_matrix._nnz()
         if max_features >= total_active_feats:
             return total_active_feats, total_active_feats
+
+        self.release_active_decoder_rows(reason="diagnostic_feature_cap")
 
         selected = (
             torch.topk(self.activation_matrix.values().abs(), k=max_features, sorted=False)
@@ -777,6 +977,7 @@ class AttributionContext:
         self,
         activation_matrix: torch.Tensor,
     ) -> dict[str, int]:
+        self.release_active_decoder_rows(reason="phase0_state_replacement")
         activation_matrix = activation_matrix.coalesce()
         n_layers, n_pos, _ = activation_matrix.shape
 
@@ -910,12 +1111,11 @@ class AttributionContext:
         phase_label: str | None = None,
         batch_index: int | None = None,
     ) -> None:
+        active_decoder_rows = self._validated_active_decoder_rows()
         prefetch = self._decoder_page_prefetch
-        owns_prefetch = prefetch is None
-        if prefetch is None:
-            prefetch = self.open_decoder_page_prefetch(
-                depth=int(self.decoder_page_prefetch_depth)
-            )
+        owns_prefetch = prefetch is None and active_decoder_rows is None
+        if prefetch is None and active_decoder_rows is None:
+            prefetch = self.open_decoder_page_prefetch(depth=int(self.decoder_page_prefetch_depth))
         primary_error: BaseException | None = None
         try:
             self._compute_chunked_feature_attributions_from_grad_batches_impl(
@@ -928,6 +1128,7 @@ class AttributionContext:
             raise
         finally:
             if owns_prefetch:
+                assert prefetch is not None
                 try:
                     self.close_decoder_page_prefetch(prefetch)
                 except BaseException as cleanup_error:
@@ -970,6 +1171,17 @@ class AttributionContext:
         assert self.decoder_provider is not None
         assert self._chunked_layer_spans is not None
         if not grad_batches:
+            return
+
+        active_decoder_rows = self._validated_active_decoder_rows()
+        if active_decoder_rows is not None:
+            contract_active_decoder_rows(
+                self,
+                active_decoder_rows,
+                grad_batches,
+                phase_label=phase_label,
+                batch_index=batch_index,
+            )
             return
 
         positions = self.chunked_decoder_state["positions"]
@@ -1120,9 +1332,9 @@ class AttributionContext:
                             row_chunk_positions = chunk_positions[row_slice]
                             row_chunk_local_feat_ids = chunk_local_feat_ids[row_slice]
                             row_chunk_activations = chunk_activations[row_slice]
-                            selected_decoder_vectors = decoder_vectors[
-                                row_chunk_local_feat_ids
-                            ].to(dtype=batch_buffer.dtype)
+                            selected_decoder_vectors = decoder_vectors[row_chunk_local_feat_ids].to(
+                                dtype=batch_buffer.dtype
+                            )
                             scaled_decoders = selected_decoder_vectors * row_chunk_activations
                             selected_grads = typed_grads[:, row_chunk_positions]
                             write_rows = row_chunk_rows
@@ -1227,10 +1439,7 @@ class AttributionContext:
         if self._produced_feature_range is not None:
             raise RuntimeError("FeatureVjpTape does not support tiled feature ranges")
         self._compute_chunked_feature_attributions_from_grad_batches(
-            [
-                (entry.gradients, entry.row_buffer, entry.batch_call_index)
-                for entry in entries
-            ],
+            [(entry.gradients, entry.row_buffer, entry.batch_call_index) for entry in entries],
             phase_label=phase_label,
             batch_index=None,
         )

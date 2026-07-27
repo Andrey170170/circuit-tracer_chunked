@@ -1,6 +1,7 @@
 import gc
 import os
 import tempfile
+import weakref
 
 import pytest
 import torch
@@ -544,9 +545,7 @@ def test_transcoder_set_exact_plt_provider_components(create_test_transcoder_fil
     assert torch.equal(
         got.chunked_decoder_state["source_layers"], got.activation_matrix.indices()[0]
     )
-    assert torch.equal(
-        got.chunked_decoder_state["feature_ids"], got.activation_matrix.indices()[2]
-    )
+    assert torch.equal(got.chunked_decoder_state["feature_ids"], got.activation_matrix.indices()[2])
     assert torch.equal(
         got.chunked_decoder_state["activation_values"], got.activation_matrix.values()
     )
@@ -590,3 +589,109 @@ def test_transcoder_set_plt_provider_topology(create_test_transcoder_file):
     fp = provider_fingerprint(provider)
     assert fp["architecture"] == "plt"
     assert fp["decoder_output_topology"] == "same_layer"
+
+
+def test_exact_plt_phase0_seed_reuses_reconstruction_page_sequence(
+    create_test_transcoder_file,
+):
+    paths = {}
+    for layer in range(2):
+        path, _ = create_test_transcoder_file(d_model=5, d_sae=7)
+        paths[layer] = path
+    exact = load_transcoder_set(
+        paths,
+        "scan",
+        "in",
+        "out",
+        device=torch.device("cpu"),
+        lazy_encoder=True,
+        lazy_decoder=True,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    mlp_inputs = torch.randn(2, 4, 5)
+    original_get_chunk = exact.get_decoder_chunk
+    page_sequence = []
+
+    def tracked_get_chunk(layer, chunk_id, *args, **kwargs):
+        page_sequence.append((int(layer), int(chunk_id)))
+        return original_get_chunk(layer, chunk_id, *args, **kwargs)
+
+    exact.get_decoder_chunk = tracked_get_chunk
+    baseline = exact.compute_attribution_components(
+        mlp_inputs, zero_positions=slice(0, 1), materialize_encoder_vecs=False
+    )
+    baseline_sequence = list(page_sequence)
+    page_sequence.clear()
+    estimated_bytes = baseline.active_feature_count * exact.d_model * exact.dtype.itemsize
+    seeded = exact.compute_attribution_components(
+        mlp_inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=False,
+        decoder_active_row_residency=True,
+        decoder_active_row_max_bytes=estimated_bytes,
+    )
+
+    assert torch.equal(seeded.reconstruction, baseline.reconstruction)
+    assert page_sequence == baseline_sequence
+    assert seeded.decoder_row_seed is not None
+    assert seeded.decoder_row_seed.occurrence_estimated_bytes == estimated_bytes
+    assert seeded.decoder_row_seed.shared_decoder_load_count == len(page_sequence)
+    for seed_layer in seeded.decoder_row_seed.layers:
+        if seed_layer is None:
+            continue
+        expected_rows = []
+        for feature_id in seed_layer.feature_ids.tolist():
+            chunk_id, local_id = divmod(feature_id, exact.decoder_chunk_size)
+            expected_rows.append(original_get_chunk(seed_layer.source_layer, chunk_id)[local_id])
+        assert torch.equal(seed_layer.rows, torch.stack(expected_rows))
+
+    page_sequence.clear()
+    over_cap = exact.compute_attribution_components(
+        mlp_inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=False,
+        decoder_active_row_residency=True,
+        decoder_active_row_max_bytes=max(0, estimated_bytes - 1),
+    )
+    assert over_cap.decoder_row_seed is None
+    assert over_cap.decoder_row_seed_refusal_reason == ("phase0_occurrence_bytes_exceed_max")
+    assert over_cap.decoder_row_seed_estimated_bytes == estimated_bytes
+    assert page_sequence == baseline_sequence
+
+
+def test_exact_plt_phase0_seed_failure_releases_ephemeral_decoder_page(
+    create_test_transcoder_file,
+):
+    path, _ = create_test_transcoder_file(d_model=5, d_sae=7)
+    exact = load_transcoder_set(
+        {0: path},
+        "scan",
+        "in",
+        "out",
+        device=torch.device("cpu"),
+        lazy_encoder=True,
+        lazy_decoder=True,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    original_get_chunk = exact.get_decoder_chunk
+    page_refs = []
+
+    def failing_get_chunk(layer, chunk_id, *args, **kwargs):
+        if page_refs:
+            raise RuntimeError("synthetic Phase-0 decoder page failure")
+        page = original_get_chunk(layer, chunk_id, *args, **kwargs).clone()
+        page_refs.append(weakref.ref(page))
+        return page
+
+    exact.get_decoder_chunk = failing_get_chunk
+    sparse = torch.sparse_coo_tensor(
+        torch.tensor([[0, 1], [0, 4]]),
+        torch.tensor([1.0, 2.0]),
+        size=(2, 7),
+    ).coalesce()
+    with pytest.raises(RuntimeError, match="synthetic Phase-0 decoder page failure"):
+        exact._decode_sparse_with_decoder_chunks(0, sparse, capture_decoder_row_seed=True)
+    gc.collect()
+    assert page_refs and all(page_ref() is None for page_ref in page_refs)

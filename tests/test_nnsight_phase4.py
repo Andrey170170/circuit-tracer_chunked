@@ -186,6 +186,13 @@ def test_phase4_returns_boundary_state_without_replacing_owned_buffers() -> None
     assert result.st == 1
     assert result.phase4_frontier_buffer_metadata is inputs.phase4_frontier_buffer_metadata
     assert result.phase4_execution_metadata is inputs.phase4_execution_metadata
+    assert (
+        result.phase4_execution_metadata["phase4_feature_vjp_actual_decoder_page_load_count_total"]
+        == 0
+    )
+    assert (
+        result.phase4_execution_metadata["phase4_feature_vjp_actual_decoder_load_bytes_total"] == 0
+    )
     assert result.cross_cluster_debug_summary is inputs.cross_cluster_debug_summary
     assert result.cross_cluster_debug_checkpoints is inputs.cross_cluster_debug_checkpoints
     assert result.cross_cluster_debug_batches is inputs.cross_cluster_debug_batches
@@ -272,29 +279,16 @@ def test_phase4_closes_prefetch_before_terminal_lifecycle_telemetry() -> None:
         config=_config(),
     )
     depth_zero_phase = next(
-        item
-        for item in depth_zero_observer.phases
-        if item["name"] == "phase4.feature_attribution"
+        item for item in depth_zero_observer.phases if item["name"] == "phase4.feature_attribution"
     )
     depth_zero_attrs = depth_zero_phase["attrs"]
     assert (
-        depth_zero_attrs[
-            "phase4_feature_vjp_actual_decoder_prefetch_owner_open_count_total"
-        ]
-        == 0
+        depth_zero_attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_open_count_total"] == 0
     )
     assert (
-        depth_zero_attrs[
-            "phase4_feature_vjp_actual_decoder_prefetch_owner_close_count_total"
-        ]
-        == 0
+        depth_zero_attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_close_count_total"] == 0
     )
-    assert (
-        depth_zero_attrs[
-            "phase4_feature_vjp_actual_decoder_prefetch_owner_high_watermark"
-        ]
-        == 0
-    )
+    assert depth_zero_attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_high_watermark"] == 0
 
 
 def _nonzero_inputs(observer: FakeObserver) -> Phase4Inputs:
@@ -323,9 +317,7 @@ def test_phase4_nonzero_dense_execution_writes_rows_and_returns_owned_state(
 ) -> None:
     observer = FakeObserver()
     inputs = _nonzero_inputs(observer)
-    config = replace(
-        _config(), actual_max_feature_nodes=1, total_active_feats=1, logit_offset=2
-    )
+    config = replace(_config(), actual_max_feature_nodes=1, total_active_feats=1, logit_offset=2)
 
     result = run_phase4(inputs=inputs, config=config)
 
@@ -389,20 +381,14 @@ def test_phase4_nonzero_compact_execution_appends_partitioned_rows_to_owned_stor
         row_abs_max, row_l1_scaled = append_call["row_denominator_scaled_l1"]
         assert torch.equal(row_abs_max, torch.tensor([4.0]))
         assert torch.equal(row_l1_scaled, torch.tensor([1.75]))
-    assert torch.equal(
-        feature_row_store.append_calls[0]["feature_rows"], torch.tensor([[3.0]])
-    )
-    assert torch.equal(
-        nonfeature_row_store.append_calls[0]["feature_rows"], torch.tensor([[-4.0]])
-    )
+    assert torch.equal(feature_row_store.append_calls[0]["feature_rows"], torch.tensor([[3.0]]))
+    assert torch.equal(nonfeature_row_store.append_calls[0]["feature_rows"], torch.tensor([[-4.0]]))
 
 
 def test_phase4_propagates_failure_after_dense_write_without_finalizing(monkeypatch) -> None:
     observer = FakeObserver()
     inputs = _nonzero_inputs(observer)
-    config = replace(
-        _config(), actual_max_feature_nodes=1, total_active_feats=1, logit_offset=2
-    )
+    config = replace(_config(), actual_max_feature_nodes=1, total_active_feats=1, logit_offset=2)
     failure = RuntimeError("injected post-write phase4 failure")
 
     original_observe = observer.observe
@@ -435,7 +421,9 @@ def test_phase4_physical_microbatches_preserve_order_and_refresh_result(monkeypa
 
         return replace(
             _nonzero_inputs(observer),
-            ctx=SimpleNamespace(materialize_encoder_vectors=materialize, compute_batch=compute_batch),
+            ctx=SimpleNamespace(
+                materialize_encoder_vectors=materialize, compute_batch=compute_batch
+            ),
             edge_matrix=torch.zeros((4, 4)),
             feat_ids=torch.tensor([20, 21, 22]),
             feat_layers=torch.zeros(3, dtype=torch.long),
@@ -445,22 +433,33 @@ def test_phase4_physical_microbatches_preserve_order_and_refresh_result(monkeypa
 
     whole = run_phase4(
         inputs=inputs_for(FakeObserver()),
-        config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, execution_batch_max_rows=3),
+        config=replace(
+            _config(),
+            actual_max_feature_nodes=3,
+            total_active_feats=3,
+            logit_offset=4,
+            effective_feature_batch_size=3,
+            execution_batch_max_rows=3,
+        ),
     )
     split_observer = FakeObserver()
     split = run_phase4(
         inputs=inputs_for(split_observer),
-        config=replace(_config(), actual_max_feature_nodes=3, total_active_feats=3, logit_offset=4, effective_feature_batch_size=3, execution_batch_max_rows=2),
+        config=replace(
+            _config(),
+            actual_max_feature_nodes=3,
+            total_active_feats=3,
+            logit_offset=4,
+            effective_feature_batch_size=3,
+            execution_batch_max_rows=2,
+        ),
     )
 
     assert torch.equal(split.edge_matrix, whole.edge_matrix)
     assert torch.equal(split.row_to_node_index, whole.row_to_node_index)
     assert split.phase4_refresh_count == whole.phase4_refresh_count
     assert [batch["batch_index"] for batch in split_observer.batches] == [1, 2]
-    assert all(
-        batch["attrs"]["phase4_execution_batch_split"]
-        for batch in split_observer.batches
-    )
+    assert all(batch["attrs"]["phase4_execution_batch_split"] for batch in split_observer.batches)
 
 
 def test_phase4_coalesces_semantic_batches_without_changing_schedule_or_results() -> None:
@@ -580,9 +579,7 @@ def test_phase4_coalescing_never_crosses_refresh_frontiers() -> None:
             effective_feature_batch_size=1,
             execution_batch_max_rows=4,
             update_interval=2,
-            phase4_ranker_config=_policy(
-                requested_mode="argsort", effective_mode="argsort"
-            ),
+            phase4_ranker_config=_policy(requested_mode="argsort", effective_mode="argsort"),
         ),
     )
 
@@ -591,9 +588,7 @@ def test_phase4_coalescing_never_crosses_refresh_frontiers() -> None:
     assert result.phase4_execution_batch_count == 3
     assert [len(batch) for batch in materialized] == [2, 2, 1]
     attrs = [
-        batch["attrs"]
-        for batch in observer.batches
-        if batch["name"] == "phase4.feature_batch"
+        batch["attrs"] for batch in observer.batches if batch["name"] == "phase4.feature_batch"
     ]
     assert [batch["scheduler_refresh_index"] for batch in attrs] == [0, 1, 2]
     assert [batch["phase4_semantic_batch_rows"] for batch in attrs] == [
@@ -763,9 +758,7 @@ def _run_tape_phase4(
         model=SimpleNamespace(
             device=torch.device("cpu"),
             transcoders=(
-                transcoders
-                if transcoders is not None
-                else SimpleNamespace(decoder_chunk_size=2)
+                transcoders if transcoders is not None else SimpleNamespace(decoder_chunk_size=2)
             ),
         ),
         edge_matrix=torch.zeros((actual_features + 1, row_width)),
@@ -818,9 +811,7 @@ def test_phase4_feature_vjp_tape_window_two_matches_window_one_and_reuses_window
     assert torch.equal(taped.row_to_node_index, baseline.row_to_node_index)
     assert ctx.replay_windows == [[1, 2], [3, 4]]
     attrs = next(
-        event["attrs"]
-        for event in observer.phases
-        if event["name"] == "phase4.feature_attribution"
+        event["attrs"] for event in observer.phases if event["name"] == "phase4.feature_attribution"
     )
     assert attrs["phase4_feature_vjp_tape_window_count"] == 2
     assert attrs["phase4_feature_vjp_tape_batch_count"] == 4
@@ -830,14 +821,10 @@ def test_phase4_feature_vjp_tape_window_two_matches_window_one_and_reuses_window
 
 
 def test_phase4_tape_preserves_prefetch_deltas_and_high_watermarks() -> None:
-    _, observer, _ = _run_tape_phase4(
-        window=2, max_bytes=20, prefetch_diagnostics=True
-    )
+    _, observer, _ = _run_tape_phase4(window=2, max_bytes=20, prefetch_diagnostics=True)
 
     attrs = next(
-        event["attrs"]
-        for event in observer.phases
-        if event["name"] == "phase4.feature_attribution"
+        event["attrs"] for event in observer.phases if event["name"] == "phase4.feature_attribution"
     )
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_request_count_total"] == 4
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_load_count_total"] == 2
@@ -847,30 +834,28 @@ def test_phase4_tape_preserves_prefetch_deltas_and_high_watermarks() -> None:
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_host_wait_count_total"] == 2
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_host_wait_seconds_total"] == 0.5
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_in_flight_high_watermark"] == 2
-    assert attrs[
-        "phase4_feature_vjp_actual_decoder_prefetch_in_flight_bytes_high_watermark"
-    ] == 32
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_in_flight_bytes_high_watermark"] == 32
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_in_flight_count_final"] == 0
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_in_flight_bytes_final"] == 0
-    assert attrs[
-        "phase4_feature_vjp_actual_decoder_prefetch_consumer_retirement_count_total"
-    ] == 2
-    assert attrs[
-        "phase4_feature_vjp_actual_decoder_prefetch_consumer_backpressure_seconds_total"
-    ] == 1.0
-    assert attrs[
-        "phase4_feature_vjp_actual_decoder_prefetch_consumer_retained_bytes_high_watermark"
-    ] == 16
-    assert attrs[
-        "phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_high_watermark"
-    ] == 2
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_consumer_retirement_count_total"] == 2
+    assert (
+        attrs["phase4_feature_vjp_actual_decoder_prefetch_consumer_backpressure_seconds_total"]
+        == 1.0
+    )
+    assert (
+        attrs["phase4_feature_vjp_actual_decoder_prefetch_consumer_retained_bytes_high_watermark"]
+        == 16
+    )
+    assert (
+        attrs["phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_high_watermark"]
+        == 2
+    )
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_high_watermark"] == 2
-    assert attrs[
-        "phase4_feature_vjp_actual_decoder_prefetch_consumer_active_count_final"
-    ] == 0
-    assert attrs[
-        "phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_bytes_final"
-    ] == 0
+    assert attrs["phase4_feature_vjp_actual_decoder_prefetch_consumer_active_count_final"] == 0
+    assert (
+        attrs["phase4_feature_vjp_actual_decoder_prefetch_pipeline_owned_final_page_bytes_final"]
+        == 0
+    )
     assert attrs["phase4_feature_vjp_actual_decoder_prefetch_owner_count_final"] == 0
 
 

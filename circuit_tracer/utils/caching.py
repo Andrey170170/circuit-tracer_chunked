@@ -15,7 +15,11 @@ from circuit_tracer.transcoder.cross_layer_transcoder import (
     load_clt,
     load_gemma_scope_2_clt,
 )
-from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
+from circuit_tracer.transcoder.provider import (
+    get_transcoder_capabilities,
+    normalize_provider_fingerprints_for_comparison,
+    provider_fingerprint,
+)
 from circuit_tracer.transcoder.single_layer_transcoder import (
     load_transcoder_set,
     select_single_layer_transcoder_load_fn,
@@ -565,7 +569,10 @@ def load_transcoders_from_cache(
                 checkpoint_identity=provider_fp.get("checkpoint_identity"),
                 dtype=provider_fp.get("dtype"),
             )
-            if provider_fp != current_fp:
+            normalized_expected, normalized_current = (
+                normalize_provider_fingerprints_for_comparison(provider_fp, current_fp)
+            )
+            if normalized_expected != normalized_current:
                 raise ValueError(
                     "Cached transcoder_set provider fingerprint mismatch; clear and rebuild cache"
                 )
@@ -614,7 +621,10 @@ def load_transcoders_from_cache(
             checkpoint_identity=provider_fp.get("checkpoint_identity"),
             dtype=provider_fp.get("dtype"),
         )
-        if provider_fp != current_fp:
+        normalized_expected, normalized_current = normalize_provider_fingerprints_for_comparison(
+            provider_fp, current_fp
+        )
+        if normalized_expected != normalized_current:
             raise ValueError(
                 "Cached transcoder provider fingerprint mismatch; clear and rebuild cache"
             )

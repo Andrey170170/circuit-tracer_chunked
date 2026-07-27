@@ -9,9 +9,12 @@ from circuit_tracer.attribution.nnsight.preparation import (
     BatchMechanisms,
     FrontierMechanisms,
     NumericMechanisms,
+    PreparedBackend,
     ProviderMechanisms,
     ReplayMechanisms,
     _effective_execution_identity,
+    _finalize_active_decoder_row_frontier,
+    reprepare_after_active_universe,
 )
 from circuit_tracer.attribution.nnsight.session_controls import NNSightSessionControls
 from circuit_tracer.execution_identity import ExecutionIdentityState
@@ -35,6 +38,9 @@ def _identity(
     tape_window: int = 1,
     tape_bytes: int = 0,
     decoder_prefetch_depth: int = 0,
+    active_row_max_bytes: int = 0,
+    active_row_estimated_bytes: int | None = None,
+    return_components: bool = False,
 ):
     provider = ProviderMechanisms(
         capabilities=TranscoderCapabilities(
@@ -45,6 +51,7 @@ def _identity(
             supports_decoder_chunk_cache=True,
             supports_exact_encoder_residency=True,
             supports_decoder_page_prefetch=True,
+            supports_active_decoder_row_residency=True,
         ),
         exact_chunked=True,
         compact_row_store=compact_row_store,
@@ -110,25 +117,19 @@ def _identity(
             effective_version="locality_v1",
             effective_policy="fixed_frontier_locality",
         ),
-        refresh_optimization=SimpleNamespace(
-            effective_mode=mode, effective_version=f"{mode}_v1"
-        ),
+        refresh_optimization=SimpleNamespace(effective_mode=mode, effective_version=f"{mode}_v1"),
         refresh_policy=SimpleNamespace(
             effective_policy="standard",
             effective_interval_multiplier=1,
             fallback_reason=None,
         ),
         ranker=SimpleNamespace(effective_mode="argsort"),
-        row_executor=SimpleNamespace(
-            effective_mode="batched", effective_version="batched_v1"
-        ),
+        row_executor=SimpleNamespace(effective_mode="batched", effective_version="batched_v1"),
         row_reduction=SimpleNamespace(
             effective_mode="gpu_v1" if compact_row_store else "off",
             effective_version="gpu_v1_staged" if compact_row_store else "off_v1",
         ),
-        row_store_cache_control=SimpleNamespace(
-            effective_mode="off", fallback_reason=None
-        ),
+        row_store_cache_control=SimpleNamespace(effective_mode="off", fallback_reason=None),
         exact_encoder_residency=SimpleNamespace(
             effective_mode="active_cpu" if compact_row_store else "lazy",
             fallback_reason=None if compact_row_store else "unsupported provider",
@@ -150,16 +151,22 @@ def _identity(
             None
             if tape_window > 1 and row_backend == "full_file"
             else (
-                "requires_full_file_backend"
-                if tape_window > 1
-                else "window_one_streaming_fallback"
+                "requires_full_file_backend" if tape_window > 1 else "window_one_streaming_fallback"
             )
         ),
         decoder_page_prefetch_depth_effective=decoder_prefetch_depth,
-        decoder_page_prefetch_fallback_reason=(
-            None if decoder_prefetch_depth else "disabled"
-        ),
+        decoder_page_prefetch_fallback_reason=(None if decoder_prefetch_depth else "disabled"),
+        decoder_active_row_residency_requested=active_row_max_bytes > 0,
+        decoder_active_row_residency_effective=active_row_max_bytes > 0,
+        decoder_active_row_max_bytes_effective=active_row_max_bytes,
+        decoder_active_row_fallback_reason=(None if active_row_max_bytes > 0 else "disabled"),
     )
+    if active_row_estimated_bytes is not None:
+        frontier = _finalize_active_decoder_row_frontier(
+            frontier,
+            max_bytes=active_row_max_bytes,
+            estimated_bytes=active_row_estimated_bytes,
+        )
     plan = SimpleNamespace(
         execution=ExecutionConstraints(
             session=SessionPlan(
@@ -173,10 +180,23 @@ def _identity(
                 feature_vjp_tape_batch_window=tape_window,
                 feature_vjp_tape_max_bytes=tape_bytes,
                 decoder_page_prefetch_depth=decoder_prefetch_depth,
+                decoder_active_row_residency=active_row_max_bytes > 0,
+                decoder_active_row_max_bytes=active_row_max_bytes,
             ),
         )
     )
-    return _effective_execution_identity(provider, numerics, replay, batches, frontier, plan)
+    identity = _effective_execution_identity(provider, numerics, replay, batches, frontier, plan)
+    if return_components:
+        return SimpleNamespace(
+            identity=identity,
+            provider=provider,
+            numerics=numerics,
+            replay=replay,
+            batches=batches,
+            frontier=frontier,
+            plan=plan,
+        )
+    return identity
 
 
 def test_effective_execution_descriptor_is_stable_and_json_serializable() -> None:
@@ -266,6 +286,93 @@ def test_effective_identity_changes_with_decoder_page_prefetch_depth() -> None:
         ]
         == "unmeasured"
     )
+
+
+def test_over_cap_active_row_admission_changes_effective_identity_and_reason() -> None:
+    resident = _identity(
+        active_row_max_bytes=128,
+        active_row_estimated_bytes=96,
+    )
+    refused = _identity(
+        active_row_max_bytes=64,
+        active_row_estimated_bytes=96,
+    )
+
+    assert resident.fingerprint != refused.fingerprint
+    assert resident.descriptor is not None
+    assert refused.descriptor is not None
+    assert resident.descriptor.frontier["decoder_active_row_residency_effective"] is True
+    assert refused.descriptor.frontier["decoder_active_row_residency_effective"] is False
+    assert refused.descriptor.frontier["decoder_active_row_max_bytes_effective"] == 0
+    assert refused.descriptor.frontier["decoder_active_row_estimated_bytes"] == 96
+    assert (
+        refused.descriptor.frontier["decoder_active_row_fallback_reason"]
+        == "estimated_bytes_exceed_max"
+    )
+
+
+def test_phase4_reprepare_preserves_finalized_over_cap_admission(monkeypatch) -> None:
+    refused = _identity(
+        active_row_max_bytes=64,
+        active_row_estimated_bytes=96,
+        return_components=True,
+    )
+    preliminary = _identity(
+        active_row_max_bytes=64,
+        return_components=True,
+    )
+    prepared = PreparedBackend(
+        problem=None,
+        plan=refused.plan,
+        logger=None,
+        offload_handles=[],
+        forward_overrides=None,
+        prefix_view_metadata=None,
+        output_position=None,
+        provider=refused.provider,
+        numerics=refused.numerics,
+        replay=refused.replay,
+        batches=refused.batches,
+        frontier=refused.frontier,
+        diagnostics=SimpleNamespace(),
+        effective_execution=refused.identity,
+        start_time=0.0,
+    )
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.preparation._resolve_frontier",
+        lambda plan, provider: preliminary.frontier,
+    )
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.preparation._resolve_batches",
+        lambda *args, **kwargs: refused.batches,
+    )
+    captured: dict[str, FrontierMechanisms] = {}
+
+    def effective_identity(provider, numerics, replay, batches, frontier, plan):
+        del provider, numerics, replay, batches, plan
+        captured["frontier"] = frontier
+        return _effective_execution_identity(
+            refused.provider,
+            refused.numerics,
+            refused.replay,
+            refused.batches,
+            frontier,
+            refused.plan,
+        )
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.preparation._effective_execution_identity",
+        effective_identity,
+    )
+
+    phase4 = reprepare_after_active_universe(prepared, refused.plan)
+
+    assert phase4.frontier.decoder_active_row_residency_effective is False
+    assert phase4.frontier.decoder_active_row_estimated_bytes == 96
+    assert phase4.frontier.decoder_active_row_fallback_reason == "estimated_bytes_exceed_max"
+    assert captured["frontier"] == phase4.frontier
+    assert phase4.effective_execution.fingerprint == refused.identity.fingerprint
 
 
 def test_effective_identity_state_records_allowed_runtime_revisions() -> None:

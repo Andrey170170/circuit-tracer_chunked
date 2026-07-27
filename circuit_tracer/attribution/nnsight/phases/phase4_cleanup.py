@@ -8,6 +8,16 @@ from circuit_tracer.observability.events import PhaseMetrics, TraceEvent
 def finish_phase4(state):
     """Close progress and emit final Phase 4 metrics."""
     state.pbar.close()
+    state.phase4_execution_metadata.update(
+        {
+            "phase4_feature_vjp_actual_decoder_page_load_count_total": int(
+                state.phase4_feature_vjp_actual_decoder_counters["decoder_load_count"]
+            ),
+            "phase4_feature_vjp_actual_decoder_load_bytes_total": int(
+                state.phase4_feature_vjp_actual_decoder_counters["decoder_load_bytes"]
+            ),
+        }
+    )
     state.telemetry_observer.observe(
         PhaseMetrics(
             "Feature attributions",
@@ -36,15 +46,11 @@ def finish_phase4(state):
             attrs={
                 "selected_features": int(state.visited.sum().item()),
                 "feature_batch_size": int(state.phase4_feature_batch_size),
-                "phase4_semantic_batch_count": int(
-                    state.phase4_scheduler_reference_batch_count
-                ),
+                "phase4_semantic_batch_count": int(state.phase4_scheduler_reference_batch_count),
                 "phase4_semantic_rows": int(state.n_visited),
                 "phase4_execution_batch_count": int(state.phase4_execution_batch_count),
                 "phase4_execution_rows": int(state.n_visited),
-                "phase4_execution_batch_max_rows": int(
-                    state.phase4_execution_batch_max_rows
-                ),
+                "phase4_execution_batch_max_rows": int(state.phase4_execution_batch_max_rows),
                 "phase4_coalesced_execution_batch_count": int(
                     state.phase4_coalesced_execution_batch_count
                 ),
@@ -174,29 +180,19 @@ def finish_phase4(state):
                     state.phase4_feature_vjp_planned_decoder_traversal_denominator
                 ),
                 "phase4_feature_vjp_actual_decoder_page_load_count_total": int(
-                    state.phase4_feature_vjp_actual_decoder_counters[
-                        "decoder_load_count"
-                    ]
+                    state.phase4_feature_vjp_actual_decoder_counters["decoder_load_count"]
                 ),
                 "phase4_feature_vjp_actual_decoder_load_bytes_total": int(
-                    state.phase4_feature_vjp_actual_decoder_counters[
-                        "decoder_load_bytes"
-                    ]
+                    state.phase4_feature_vjp_actual_decoder_counters["decoder_load_bytes"]
                 ),
                 "phase4_feature_vjp_actual_decoder_request_count_total": int(
-                    state.phase4_feature_vjp_actual_decoder_counters[
-                        "decoder_chunk_request_count"
-                    ]
+                    state.phase4_feature_vjp_actual_decoder_counters["decoder_chunk_request_count"]
                 ),
                 "phase4_feature_vjp_actual_decoder_request_bytes_total": int(
-                    state.phase4_feature_vjp_actual_decoder_counters[
-                        "decoder_chunk_request_bytes"
-                    ]
+                    state.phase4_feature_vjp_actual_decoder_counters["decoder_chunk_request_bytes"]
                 ),
                 "phase4_feature_vjp_actual_decoder_cache_hit_count_total": int(
-                    state.phase4_feature_vjp_actual_decoder_counters[
-                        "decoder_cache_hit_count"
-                    ]
+                    state.phase4_feature_vjp_actual_decoder_counters["decoder_cache_hit_count"]
                 ),
                 "phase4_feature_vjp_actual_decoder_prefetch_request_count_total": int(
                     state.phase4_feature_vjp_actual_decoder_counters[
@@ -204,14 +200,10 @@ def finish_phase4(state):
                     ]
                 ),
                 "phase4_feature_vjp_actual_decoder_prefetch_load_count_total": int(
-                    state.phase4_feature_vjp_actual_decoder_counters[
-                        "decoder_prefetch_load_count"
-                    ]
+                    state.phase4_feature_vjp_actual_decoder_counters["decoder_prefetch_load_count"]
                 ),
                 "phase4_feature_vjp_actual_decoder_prefetch_load_bytes_total": int(
-                    state.phase4_feature_vjp_actual_decoder_counters[
-                        "decoder_prefetch_load_bytes"
-                    ]
+                    state.phase4_feature_vjp_actual_decoder_counters["decoder_prefetch_load_bytes"]
                 ),
                 "phase4_feature_vjp_actual_decoder_prefetch_cache_hit_count_total": int(
                     state.phase4_feature_vjp_actual_decoder_counters[

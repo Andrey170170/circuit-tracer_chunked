@@ -581,6 +581,8 @@ class NNSightReplacementModel(LanguageModel):
         prefix_view_length: int | None = None,
         decoder_chunk_cache=None,
         decoder_cache_fingerprint: object | None = None,
+        decoder_active_row_residency: bool = False,
+        decoder_active_row_max_bytes: int = 0,
         trace_observer: TraceObserver | None = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
@@ -627,6 +629,8 @@ class NNSightReplacementModel(LanguageModel):
                 resolved_dtype_map=resolved_dtype_map,
                 decoder_chunk_cache=decoder_chunk_cache,
                 decoder_cache_fingerprint=decoder_cache_fingerprint,
+                decoder_active_row_residency=decoder_active_row_residency,
+                decoder_active_row_max_bytes=decoder_active_row_max_bytes,
             ),
             setup_started_at=setup_start,
             phase0_input_fingerprints=phase0_pre_clt_input_fingerprints,

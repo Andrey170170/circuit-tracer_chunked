@@ -90,6 +90,8 @@ class Phase0Config:
     decoder_cache_fingerprint: object | None
     capture_phase3_gradient_bundle_enabled: bool
     diagnostic_feature_cap: int | None
+    decoder_active_row_residency: bool = False
+    decoder_active_row_max_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,8 @@ def _attribution_policy(config: Phase0Config) -> Phase0AttributionPolicy:
         resolved_dtype_map=config.resolved_dtype_map,
         decoder_chunk_cache=config.decoder_chunk_cache,
         decoder_cache_fingerprint=config.decoder_cache_fingerprint,
+        decoder_active_row_residency=config.decoder_active_row_residency,
+        decoder_active_row_max_bytes=config.decoder_active_row_max_bytes,
     )
 
 
