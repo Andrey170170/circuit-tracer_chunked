@@ -34,20 +34,29 @@ def test_phase0_probe_stops_before_all_later_phases_and_releases_session() -> No
             execution=SimpleNamespace(
                 diagnostic_stop=DiagnosticStopPolicy(mode="phase0_probe")
             )
-        )
+        ),
+        frontier=SimpleNamespace(execution_metadata={"mapped_rows": 11}),
     )
     execution.row_store_grant = None
     execution._grant = lambda phase: calls.append(f"grant:{phase.value}") or phase
     execution._release = lambda grant: calls.append(
         f"release:{getattr(grant, 'value', None)}"
     )
-    execution.run_phase0_preparation = lambda: calls.append("run:phase0")
+    def run_phase0() -> None:
+        calls.append("run:phase0")
+        execution.prepared.frontier.execution_metadata["mapped_rows"] = 12
+
+    execution.run_phase0_preparation = run_phase0
     execution.apply_active_universe_replan = lambda: calls.append("later")
     execution._run_with_grant = lambda phase, callback: callback()
 
     result = execution.run()
 
-    assert result == ProbeCompletion(mode="phase0_probe")
+    assert result == ProbeCompletion(
+        mode="phase0_probe", diagnostic_metadata={"mapped_rows": 12}
+    )
+    with pytest.raises(TypeError):
+        result.diagnostic_metadata["mapped_rows"] = 13  # type: ignore[index]
     assert calls == [
         "grant:session",
         "run:phase0",
@@ -61,7 +70,8 @@ def test_transition_probe_stops_after_declared_physical_batch_count() -> None:
     policy = DiagnosticStopPolicy(mode="transition_probe", phase4_batches=3)
     execution = object.__new__(AttributionExecution)
     execution.prepared = SimpleNamespace(
-        plan=SimpleNamespace(execution=SimpleNamespace(diagnostic_stop=policy))
+        plan=SimpleNamespace(execution=SimpleNamespace(diagnostic_stop=policy)),
+        frontier=SimpleNamespace(execution_metadata={"lifecycle_released": True}),
     )
     execution.row_store_grant = None
     execution._grant = lambda phase: phase
@@ -79,6 +89,7 @@ def test_transition_probe_stops_after_declared_physical_batch_count() -> None:
 
     def run_phase4() -> None:
         calls.append("phase4")
+        execution.prepared.frontier.execution_metadata["lifecycle_released"] = False
         execution.phase4 = SimpleNamespace(
             phase4_execution_batch_count=policy.phase4_batches
         )
@@ -89,7 +100,9 @@ def test_transition_probe_stops_after_declared_physical_batch_count() -> None:
     result = execution.run()
 
     assert result == ProbeCompletion(
-        mode="transition_probe", phase4_batches_completed=3
+        mode="transition_probe",
+        phase4_batches_completed=3,
+        diagnostic_metadata={"lifecycle_released": False},
     )
     assert calls == ["phase0", "phase1", "phase2", "phase3", "phase4"]
 

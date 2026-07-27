@@ -7,6 +7,7 @@ from dataclasses import replace
 import pytest
 
 from circuit_tracer.observability.events import TraceEvent
+from circuit_tracer.diagnostic import ProbeCompletion
 from circuit_tracer.tracing import (
     AttributionProblem,
     DecoderCachePolicy,
@@ -397,6 +398,44 @@ def test_canonical_observer_owns_telemetry_summary(monkeypatch) -> None:
         execution=ExecutionConstraints(observability=ObservabilityPolicy(profile=True))
     )
     assert trace_one(selected).telemetry_summary["event_count"] == 3
+
+
+def test_probe_completion_persists_namespaced_diagnostic_metadata(monkeypatch) -> None:
+    def execute(*_args, execution_identity, **_kwargs):
+        execution_identity.mark_requested_as_effective()
+        return ProbeCompletion(
+            mode="phase0_probe",
+            diagnostic_metadata={"mapped_row_bytes": 4096, "lifecycle": "sealed"},
+        )
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
+    )
+
+    result = trace_one(request())
+
+    assert result.status is TraceStatus.PROBE_COMPLETED
+    assert result.output is None
+    assert result.telemetry_summary["diagnostic_metadata"] == {
+        "mapped_row_bytes": 4096,
+        "lifecycle": "sealed",
+    }
+
+
+def test_successful_trace_does_not_add_probe_diagnostic_metadata(monkeypatch) -> None:
+    def execute(*_args, execution_identity, **_kwargs):
+        execution_identity.mark_requested_as_effective()
+        return {"graph": "unchanged"}
+
+    monkeypatch.setattr(
+        "circuit_tracer.attribution.nnsight.backend.run_nnsight_trace", execute
+    )
+
+    result = trace_one(request())
+
+    assert result.status is TraceStatus.SUCCEEDED
+    assert result.output == {"graph": "unchanged"}
+    assert "diagnostic_metadata" not in result.telemetry_summary
 
 
 def test_session_reuse_reset_close_and_failure_recovery(monkeypatch) -> None:

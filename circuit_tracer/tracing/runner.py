@@ -163,6 +163,7 @@ def run_trace(
         summary.update(
             diagnostic_stop_mode=output.mode,
             phase4_batches_completed=output.phase4_batches_completed,
+            diagnostic_metadata=dict(output.diagnostic_metadata),
         )
         return TraceResult(
             output=None,

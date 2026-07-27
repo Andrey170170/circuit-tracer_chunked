@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 from circuit_tracer.execution_identity import ExecutionIdentityState
 from circuit_tracer.governor.ledger import PhaseId, ResourceGrant
@@ -163,7 +164,10 @@ class AttributionExecution:
         try:
             self._run_with_grant(PhaseId.PHASE0, self.run_phase0_preparation)
             if self._diagnostic_stop_mode() == "phase0_probe":
-                return ProbeCompletion(mode="phase0_probe")
+                return ProbeCompletion(
+                    mode="phase0_probe",
+                    diagnostic_metadata=self._probe_diagnostic_metadata(),
+                )
             self.apply_active_universe_replan()
             self._run_with_grant(PhaseId.PHASE1, self.run_forward_pass)
             self.row_store_grant = self._grant(PhaseId.PHASE2)
@@ -186,6 +190,7 @@ class AttributionExecution:
                 return ProbeCompletion(
                     mode="transition_probe",
                     phase4_batches_completed=completed,
+                    diagnostic_metadata=self._probe_diagnostic_metadata(),
                 )
             return self._run_with_grant(PhaseId.PHASE5, self.assemble_graph)
         finally:
@@ -198,6 +203,13 @@ class AttributionExecution:
         execution = getattr(plan, "execution", None)
         policy = getattr(execution, "diagnostic_stop", None)
         return str(getattr(policy, "mode", "none"))
+
+    def _probe_diagnostic_metadata(self) -> Mapping[str, object]:
+        """Snapshot execution diagnostics before a probe releases its resources."""
+
+        frontier = getattr(getattr(self, "prepared", None), "frontier", None)
+        metadata = getattr(frontier, "execution_metadata", {})
+        return MappingProxyType(dict(metadata))
 
     def apply_active_universe_replan(self) -> None:
         if self.governor_runtime is None:
