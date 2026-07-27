@@ -67,10 +67,11 @@ class _CapturedExecutionBatch:
 
 
 def _start_cuda_kernel_timer(state):
+    runtime_device = getattr(getattr(state, "model", None), "device", None)
     if (
         state.config.diagnostic_stop_after_batches is None
         or not torch.cuda.is_available()
-        or state.encoder_vectors.device.type != "cuda"
+        or getattr(runtime_device, "type", None) != "cuda"
     ):
         return None
     start = torch.cuda.Event(enable_timing=True)
