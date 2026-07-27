@@ -25,6 +25,7 @@ class Phase0AttributionPolicy:
     decoder_cache_fingerprint: object | None
     decoder_active_row_residency: bool
     decoder_active_row_max_bytes: int
+    phase0_decoder_row_ranges: bool
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ def log_phase0_profile(
         f"stage_encoder_vecs_on_cpu={attribution.stage_encoder_vecs_on_cpu} | "
         f"stage_error_vectors_on_cpu={attribution.stage_error_vectors_on_cpu} | "
         f"row_subchunk_size={attribution.row_subchunk_size} | "
+        f"phase0_decoder_row_ranges={attribution.phase0_decoder_row_ranges} | "
         f"planner_enabled={settings.planner_enabled} | "
         f"feature_batch_size_max={settings.max_phase4_feature_batch_size} | "
         f"phase1_trace_batch_policy={settings.phase1_trace_batch_config.requested_policy} "
@@ -159,6 +161,7 @@ def create_phase0_context(
         decoder_cache_fingerprint=policy.decoder_cache_fingerprint,
         decoder_active_row_residency=policy.decoder_active_row_residency,
         decoder_active_row_max_bytes=policy.decoder_active_row_max_bytes,
+        phase0_decoder_row_ranges=policy.phase0_decoder_row_ranges,
         trace_observer=observer,
     )
 

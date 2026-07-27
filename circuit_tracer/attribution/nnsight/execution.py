@@ -255,6 +255,9 @@ class AttributionExecution:
                     decoder_active_row_max_bytes=int(
                         plan.execution.frontier.decoder_active_row_max_bytes
                     ),
+                    phase0_decoder_row_ranges=bool(
+                        plan.execution.frontier.phase0_decoder_row_ranges
+                    ),
                 ),
             )
         except Phase0ExecutionError as exc:

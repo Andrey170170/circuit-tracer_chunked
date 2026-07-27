@@ -6,6 +6,10 @@ from dataclasses import dataclass
 
 import torch
 
+from circuit_tracer.transcoder.phase0_decoder_ranges import (
+    Phase0DecoderRangeTelemetry,
+)
+
 
 @dataclass(frozen=True)
 class DecoderRowSeedLayer:
@@ -42,6 +46,7 @@ class DecoderRowSeed:
     shared_traversal_bytes: int
     shared_decoder_load_count: int
     shared_decoder_load_bytes: int
+    phase0_decoder_range_telemetry: Phase0DecoderRangeTelemetry | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_fingerprint", dict(self.source_fingerprint))

@@ -170,6 +170,7 @@ class FrontierExpansionPlan:
     decoder_page_prefetch_depth: int = 0
     decoder_active_row_residency: bool = False
     decoder_active_row_max_bytes: int = 0
+    phase0_decoder_row_ranges: bool = False
 
     def __post_init__(self) -> None:
         _nonnegative("refresh_prepared_chunk_cache_bytes", self.refresh_prepared_chunk_cache_bytes)

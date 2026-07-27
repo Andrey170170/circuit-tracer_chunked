@@ -152,6 +152,7 @@ class AttributionSetupOptions:
     decoder_cache_fingerprint: object | None
     decoder_active_row_residency: bool
     decoder_active_row_max_bytes: int
+    phase0_decoder_row_ranges: bool = False
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,10 @@ class AttributionSetupOperation:
             )
             component_kwargs["decoder_active_row_max_bytes"] = (
                 self.options.decoder_active_row_max_bytes
+            )
+        if get_transcoder_capabilities(transcoders).supports_phase0_decoder_row_ranges:
+            component_kwargs["phase0_decoder_row_ranges"] = (
+                self.options.phase0_decoder_row_ranges
             )
         components = transcoders.compute_attribution_components(  # type: ignore[attr-defined]
             self.capture.mlp_inputs,

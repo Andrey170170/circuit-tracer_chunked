@@ -25,6 +25,12 @@ from circuit_tracer.transcoder.attribution_result import (
     DecoderRowSeedLayer,
 )
 from circuit_tracer.transcoder.provider import TranscoderCapabilities, provider_fingerprint
+from circuit_tracer.transcoder.phase0_decoder_ranges import (
+    Phase0DecoderRangeTelemetry,
+    combine_phase0_decoder_range_telemetry,
+    load_decoder_row_ranges,
+    plan_decoder_row_ranges,
+)
 from circuit_tracer.utils import get_default_device
 
 
@@ -460,6 +466,10 @@ class TranscoderSet(nn.Module):
                 exact and any(t.lazy_decoder for t in self.transcoders)
             ),
             supports_active_decoder_row_residency=exact,
+            supports_phase0_decoder_row_ranges=bool(
+                exact
+                and all(t.lazy_decoder and t.transcoder_path for t in self.transcoders)
+            ),
             decoder_output_topology="same_layer",
             default_decoder_chunk_size=int(self.decoder_chunk_size),
             default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),
@@ -692,6 +702,171 @@ class TranscoderSet(nn.Module):
             **self._decoder_diagnostic_stats,
         }
 
+    def _decode_sparse_with_decoder_row_ranges(
+        self,
+        layer: int,
+        sparse_acts: torch.Tensor,
+        input_acts: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, DecoderRowSeedLayer | None, int, Phase0DecoderRangeTelemetry]:
+        """Selectively load unique rows, then replay the canonical chunk groups."""
+
+        sparse_acts = sparse_acts.coalesce()
+        pos_idx, feat_idx = sparse_acts.indices()
+        values = sparse_acts.values()
+        unique_feature_ids = torch.unique(feat_idx, sorted=True)
+        transcoder = cast(SingleLayerTranscoder, self.transcoders[layer])
+        assert transcoder.transcoder_path is not None
+        plan = plan_decoder_row_ranges(
+            unique_feature_ids,
+            d_model=self.d_model,
+            d_transcoder=transcoder.d_transcoder,
+            itemsize=int(self.dtype.itemsize),
+            decoder_chunk_size=self.decoder_chunk_size,
+            max_gap_rows=8,
+            max_overfetch_fraction=0.25,
+            max_range_count=4096,
+            max_singleton_range_fraction=0.5,
+            max_ranges_per_baseline_page=4,
+        )
+        if not plan.admitted:
+            reconstruct_started = time.perf_counter()
+            reconstruction, seed_layer, traversal_bytes = (
+                self._decode_sparse_with_decoder_chunks(
+                    layer,
+                    sparse_acts,
+                    input_acts,
+                    capture_decoder_row_seed=True,
+                )
+            )
+            reconstruction_seconds = time.perf_counter() - reconstruct_started
+            unique_bytes = int(unique_feature_ids.numel()) * self.d_model * int(
+                self.dtype.itemsize
+            )
+            return (
+                reconstruction,
+                seed_layer,
+                traversal_bytes,
+                Phase0DecoderRangeTelemetry(
+                    requested=True,
+                    effective=False,
+                    fallback_reason=plan.fallback_reason,
+                    planning_seconds=plan.planning_seconds,
+                    read_seconds=0.0,
+                    gather_seconds=0.0,
+                    reconstruction_seconds=reconstruction_seconds,
+                    seed_capture_seconds=0.0,
+                    unique_row_count=int(unique_feature_ids.numel()),
+                    unique_row_bytes=unique_bytes,
+                    range_request_count=0,
+                    range_rows=(),
+                    merged_gap_rows=plan.merged_gap_rows,
+                    overfetch_bytes=0,
+                    logical_requested_bytes=unique_bytes,
+                    logical_materialized_bytes=traversal_bytes,
+                    baseline_full_page_count=plan.baseline_full_page_count,
+                    baseline_full_page_bytes=plan.baseline_full_page_bytes,
+                ),
+            )
+
+        key = "w_dec" if transcoder.weight_format == "gemmascope2" else "W_dec"
+        compact_rows: torch.Tensor | None = None
+        decoder_vectors: torch.Tensor | None = None
+        scaled_decoders: torch.Tensor | None = None
+        try:
+            compact_rows, read_seconds, gather_seconds = load_decoder_row_ranges(
+                path=transcoder.transcoder_path,
+                key=key,
+                plan=plan,
+                dtype=self.dtype,
+            )
+            reconstruction = torch.zeros(
+                sparse_acts.shape[0],
+                self.d_model,
+                device=sparse_acts.device,
+                dtype=sparse_acts.dtype,
+            )
+            reconstruct_started = time.perf_counter()
+            if feat_idx.numel() > 0:
+                chunk_ids = torch.div(
+                    feat_idx, self.decoder_chunk_size, rounding_mode="floor"
+                )
+                unique_chunk_ids = torch.div(
+                    unique_feature_ids,
+                    self.decoder_chunk_size,
+                    rounding_mode="floor",
+                )
+                for chunk_id_tensor in torch.unique(chunk_ids, sorted=True):
+                    chunk_mask = chunk_ids == chunk_id_tensor
+                    unique_chunk_mask = unique_chunk_ids == chunk_id_tensor
+                    unique_destinations = unique_chunk_mask.nonzero(
+                        as_tuple=False
+                    ).flatten()
+                    chunk_feature_ids = unique_feature_ids[unique_chunk_mask]
+                    occurrence_rows = torch.searchsorted(
+                        chunk_feature_ids, feat_idx[chunk_mask]
+                    )
+                    decoder_vectors = compact_rows.index_select(
+                        0, unique_destinations.to(device="cpu")
+                    ).to(
+                        device=sparse_acts.device,
+                        dtype=sparse_acts.dtype,
+                    )
+                    scaled_decoders = (
+                        decoder_vectors[occurrence_rows] * values[chunk_mask, None]
+                    )
+                    reconstruction.index_add_(
+                        0, pos_idx[chunk_mask], scaled_decoders
+                    )
+            if transcoder.W_skip is not None:
+                assert input_acts is not None, (
+                    "Transcoder has skip connection but no input_acts were provided"
+                )
+                reconstruction = reconstruction + transcoder.compute_skip(input_acts)
+            reconstruction = reconstruction + transcoder.b_dec.to(
+                device=reconstruction.device,
+                dtype=reconstruction.dtype,
+            )
+            reconstruction_seconds = time.perf_counter() - reconstruct_started
+            seed_layer = None
+            if compact_rows.numel():
+                seed_layer = DecoderRowSeedLayer(
+                    source_layer=layer,
+                    output_layers=(layer,),
+                    feature_ids=plan.unique_feature_ids,
+                    rows=compact_rows.unsqueeze(1),
+                )
+            materialized_rows = sum(row_range.materialized_rows for row_range in plan.ranges)
+            materialized_bytes = materialized_rows * self.d_model * int(self.dtype.itemsize)
+            requested_bytes = int(unique_feature_ids.numel()) * self.d_model * int(
+                self.dtype.itemsize
+            )
+            telemetry = Phase0DecoderRangeTelemetry(
+                requested=True,
+                effective=True,
+                fallback_reason=None,
+                planning_seconds=plan.planning_seconds,
+                read_seconds=read_seconds,
+                gather_seconds=gather_seconds,
+                reconstruction_seconds=reconstruction_seconds,
+                seed_capture_seconds=0.0,
+                unique_row_count=int(unique_feature_ids.numel()),
+                unique_row_bytes=requested_bytes,
+                range_request_count=len(plan.ranges),
+                range_rows=tuple(row_range.materialized_rows for row_range in plan.ranges),
+                merged_gap_rows=plan.merged_gap_rows,
+                overfetch_bytes=materialized_bytes - requested_bytes,
+                logical_requested_bytes=requested_bytes,
+                logical_materialized_bytes=materialized_bytes,
+                baseline_full_page_count=plan.baseline_full_page_count,
+                baseline_full_page_bytes=plan.baseline_full_page_bytes,
+            )
+            return reconstruction, seed_layer, materialized_bytes, telemetry
+        except BaseException:
+            decoder_vectors = None
+            scaled_decoders = None
+            compact_rows = None
+            raise
+
     def _decode_sparse_with_decoder_chunks(
         self,
         layer: int,
@@ -848,6 +1023,7 @@ class TranscoderSet(nn.Module):
         *,
         materialize_encoder_vecs: bool = True,
         decoder_active_row_residency: bool = False,
+        phase0_decoder_row_ranges: bool = False,
         decoder_active_row_max_bytes: int = 0,
     ) -> AttributionComponents:
         """Extract active features and their encoder/decoder vectors for attribution.
@@ -904,6 +1080,7 @@ class TranscoderSet(nn.Module):
             load_bytes_before = int(self._decoder_diagnostic_stats["decoder_load_bytes"])
             seed_layers: list[DecoderRowSeedLayer | None] = []
             seed_traversal_bytes = 0
+            range_telemetry_layers: list[Phase0DecoderRangeTelemetry] = []
             for layer, transcoder in enumerate[SingleLayerTranscoder](self.transcoders):  # type: ignore
                 layer_mask = layer_ids == layer
                 layer_sparse = torch.sparse_coo_tensor(
@@ -913,25 +1090,36 @@ class TranscoderSet(nn.Module):
                     device=device,
                     dtype=activation_matrix.dtype,
                 ).coalesce()
-                layer_reconstruction, seed_layer, traversal_bytes = (
-                    self._decode_sparse_with_decoder_chunks(
-                        layer,
-                        layer_sparse,
-                        mlp_inputs[layer],
-                        capture_decoder_row_seed=capture_seed,
+                if capture_seed and phase0_decoder_row_ranges:
+                    layer_reconstruction, seed_layer, traversal_bytes, range_telemetry = (
+                        self._decode_sparse_with_decoder_row_ranges(
+                            layer,
+                            layer_sparse,
+                            mlp_inputs[layer],
+                        )
                     )
-                )
+                    range_telemetry_layers.append(range_telemetry)
+                else:
+                    layer_reconstruction, seed_layer, traversal_bytes = (
+                        self._decode_sparse_with_decoder_chunks(
+                            layer,
+                            layer_sparse,
+                            mlp_inputs[layer],
+                            capture_decoder_row_seed=capture_seed,
+                        )
+                    )
                 reconstruction[layer] = layer_reconstruction
                 seed_layers.append(seed_layer)
                 seed_traversal_bytes += traversal_bytes
 
             decoder_row_seed = None
             if capture_seed:
+                seed_capture_seconds = time.perf_counter() - seed_started
                 decoder_row_seed = DecoderRowSeed(
                     layers=tuple(seed_layers),
                     source_fingerprint=provider_fingerprint(self),
                     occurrence_estimated_bytes=seed_estimated_bytes,
-                    capture_seconds=time.perf_counter() - seed_started,
+                    capture_seconds=seed_capture_seconds,
                     shared_traversal_bytes=seed_traversal_bytes,
                     shared_decoder_load_count=(
                         int(self._decoder_diagnostic_stats["decoder_load_count"])
@@ -940,6 +1128,11 @@ class TranscoderSet(nn.Module):
                     shared_decoder_load_bytes=(
                         int(self._decoder_diagnostic_stats["decoder_load_bytes"])
                         - load_bytes_before
+                    ),
+                    phase0_decoder_range_telemetry=(
+                        combine_phase0_decoder_range_telemetry(
+                            range_telemetry_layers, seed_capture_seconds=seed_capture_seconds
+                        )
                     ),
                 )
 

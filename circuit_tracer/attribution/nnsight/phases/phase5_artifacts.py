@@ -29,12 +29,60 @@ def _active_decoder_row_residency(
     """Package active-row mechanism evidence for ordinary compact artifacts."""
 
     effective = bool(metadata.get("decoder_active_row_residency_effective", False))
-    return {
+    result = {
         "requested": bool(metadata.get("decoder_active_row_residency_requested", False)),
         "effective": effective,
         "fallback_reason": metadata.get("decoder_active_row_fallback_reason"),
         "max_bytes_requested": int(metadata.get("decoder_active_row_max_bytes_requested", 0) or 0),
         "max_bytes_effective": int(metadata.get("decoder_active_row_max_bytes_effective", 0) or 0),
+        "phase0_decoder_row_ranges": {
+            "requested": bool(metadata.get("phase0_decoder_row_ranges_requested", False)),
+            "effective": bool(metadata.get("phase0_decoder_row_ranges_effective", False)),
+            "fallback_reason": metadata.get("phase0_decoder_row_ranges_fallback_reason"),
+            "planning_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_planning_seconds", 0.0) or 0.0
+            ),
+            "read_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_read_seconds", 0.0) or 0.0
+            ),
+            "gather_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_gather_seconds", 0.0) or 0.0
+            ),
+            "reconstruction_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_reconstruction_seconds", 0.0) or 0.0
+            ),
+            "seed_capture_seconds": float(
+                metadata.get("phase0_decoder_row_ranges_seed_capture_seconds", 0.0) or 0.0
+            ),
+            "unique_row_count": int(
+                metadata.get("phase0_decoder_row_ranges_unique_row_count", 0) or 0
+            ),
+            "unique_row_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_unique_row_bytes", 0) or 0
+            ),
+            "range_request_count": int(
+                metadata.get("phase0_decoder_row_ranges_range_request_count", 0) or 0
+            ),
+            "range_rows": metadata.get("phase0_decoder_row_ranges_range_rows", ()),
+            "merged_gap_rows": int(
+                metadata.get("phase0_decoder_row_ranges_merged_gap_rows", 0) or 0
+            ),
+            "overfetch_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_overfetch_bytes", 0) or 0
+            ),
+            "logical_requested_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_logical_requested_bytes", 0) or 0
+            ),
+            "logical_materialized_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_logical_materialized_bytes", 0) or 0
+            ),
+            "baseline_full_page_count": int(
+                metadata.get("phase0_decoder_row_ranges_baseline_full_page_count", 0) or 0
+            ),
+            "baseline_full_page_bytes": int(
+                metadata.get("phase0_decoder_row_ranges_baseline_full_page_bytes", 0) or 0
+            ),
+        },
         "resident": {
             "row_count": int(metadata.get("decoder_active_row_count", 0) or 0),
             "bytes": int(metadata.get("decoder_active_row_bytes", 0) or 0),
@@ -96,6 +144,9 @@ def _active_decoder_row_residency(
             ),
         },
     }
+    if "phase0_decoder_row_ranges_requested" not in metadata:
+        del result["phase0_decoder_row_ranges"]
+    return result
 
 
 def package_compact_artifacts(

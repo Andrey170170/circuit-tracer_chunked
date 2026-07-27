@@ -92,6 +92,7 @@ class Phase0Config:
     diagnostic_feature_cap: int | None
     decoder_active_row_residency: bool = False
     decoder_active_row_max_bytes: int = 0
+    phase0_decoder_row_ranges: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ def _attribution_policy(config: Phase0Config) -> Phase0AttributionPolicy:
         decoder_cache_fingerprint=config.decoder_cache_fingerprint,
         decoder_active_row_residency=config.decoder_active_row_residency,
         decoder_active_row_max_bytes=config.decoder_active_row_max_bytes,
+        phase0_decoder_row_ranges=config.phase0_decoder_row_ranges,
     )
 
 

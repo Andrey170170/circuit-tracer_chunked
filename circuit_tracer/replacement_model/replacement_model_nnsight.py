@@ -583,6 +583,7 @@ class NNSightReplacementModel(LanguageModel):
         decoder_cache_fingerprint: object | None = None,
         decoder_active_row_residency: bool = False,
         decoder_active_row_max_bytes: int = 0,
+        phase0_decoder_row_ranges: bool = False,
         trace_observer: TraceObserver | None = None,
     ):
         """Precomputes the transcoder activations and error vectors, saving them and the
@@ -631,6 +632,7 @@ class NNSightReplacementModel(LanguageModel):
                 decoder_cache_fingerprint=decoder_cache_fingerprint,
                 decoder_active_row_residency=decoder_active_row_residency,
                 decoder_active_row_max_bytes=decoder_active_row_max_bytes,
+                phase0_decoder_row_ranges=phase0_decoder_row_ranges,
             ),
             setup_started_at=setup_start,
             phase0_input_fingerprints=phase0_pre_clt_input_fingerprints,

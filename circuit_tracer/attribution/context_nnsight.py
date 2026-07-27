@@ -214,6 +214,14 @@ class AttributionContext:
                     "decoder_active_row_seed_bytes": self._decoder_row_seed.seed_bytes,
                 }
             )
+            range_telemetry = self._decoder_row_seed.phase0_decoder_range_telemetry
+            if range_telemetry is not None:
+                self._active_decoder_row_diagnostics.update(
+                    {
+                        f"phase0_decoder_row_ranges_{key}": value
+                        for key, value in range_telemetry.as_dict().items()
+                    }
+                )
         self._replay_model = None
         self._replay_trace_input_ids: torch.Tensor | None = None
         self._replay_trace_batch_size: int | None = None
