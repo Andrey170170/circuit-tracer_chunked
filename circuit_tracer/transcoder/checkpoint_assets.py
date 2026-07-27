@@ -27,7 +27,7 @@ class CheckpointPageAdvice(str, Enum):
     RELEASE = "release"
 
 
-CheckpointPageOutcome = Literal["effective", "refused", "unavailable", "error"]
+CheckpointPageOutcome = Literal["issued", "refused", "unavailable", "error"]
 PosixFadvise = Callable[[int, int, int, int], object]
 
 
@@ -65,6 +65,9 @@ class CheckpointAsset:
     path: Path
     device: int
     inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
     scope: CheckpointAssetScope
     ranges: tuple[CheckpointRange, ...]
 
@@ -76,6 +79,8 @@ class CheckpointAsset:
         object.__setattr__(self, "ranges", tuple(self.ranges))
         if self.device < 0 or self.inode <= 0:
             raise ValueError("checkpoint asset device and inode must identify a real file")
+        if self.size < 0:
+            raise ValueError("checkpoint asset size must be non-negative")
         if not self.ranges:
             raise ValueError("checkpoint asset must own at least one byte range")
 
@@ -85,6 +90,10 @@ class CheckpointAsset:
             if item.asset_id != self.asset_id:
                 raise ValueError(
                     f"checkpoint range belongs to {item.asset_id!r}, not {self.asset_id!r}"
+                )
+            if item.end > self.size:
+                raise ValueError(
+                    f"checkpoint range {item.offset}:{item.end} exceeds file size {self.size}"
                 )
             if previous is not None and item.offset < previous.end:
                 raise ValueError(
@@ -103,14 +112,21 @@ class CheckpointAsset:
         ranges: tuple[CheckpointRange, ...],
     ) -> CheckpointAsset:
         normalized_path = Path(path)
-        stat = normalized_path.stat()
-        if not stat_module.S_ISREG(stat.st_mode):
-            raise ValueError(f"checkpoint asset is not a regular file: {normalized_path}")
+        fd = os.open(normalized_path, os.O_RDONLY)
+        try:
+            stat = os.fstat(fd)
+            if not stat_module.S_ISREG(stat.st_mode):
+                raise ValueError(f"checkpoint asset is not a regular file: {normalized_path}")
+        finally:
+            os.close(fd)
         return cls(
             asset_id=asset_id,
             path=normalized_path,
             device=int(stat.st_dev),
             inode=int(stat.st_ino),
+            size=int(stat.st_size),
+            mtime_ns=int(stat.st_mtime_ns),
+            ctime_ns=int(stat.st_ctime_ns),
             scope=scope,
             ranges=ranges,
         )
@@ -177,6 +193,7 @@ class CheckpointPageTelemetry:
     effective: bool
     refused: bool
     attempted: bool
+    issued: bool = False
     idempotent: bool = False
     reason: str | None = None
     error: str | None = None
@@ -317,6 +334,25 @@ class CheckpointPageLifecycle:
                     attempted=False,
                     reason="open_file_identity_does_not_match_manifest",
                 )
+            if (
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+                int(stat.st_ctime_ns),
+            ) != (
+                asset.size,
+                asset.mtime_ns,
+                asset.ctime_ns,
+            ):
+                return self._result(
+                    byte_range,
+                    advice,
+                    asset=asset,
+                    outcome="refused",
+                    supported=True,
+                    refused=True,
+                    attempted=False,
+                    reason="open_file_metadata_does_not_match_manifest",
+                )
             fadvise = self._posix_fadvise
             flag = self._flags[advice]
             assert fadvise is not None and flag is not None
@@ -347,10 +383,10 @@ class CheckpointPageLifecycle:
             byte_range,
             advice,
             asset=asset,
-            outcome="effective",
+            outcome="issued",
             supported=True,
-            effective=True,
             attempted=True,
+            issued=True,
         )
 
     def _platform_supported(self, advice: CheckpointPageAdvice) -> bool:
@@ -367,6 +403,7 @@ class CheckpointPageLifecycle:
         effective: bool = False,
         refused: bool = False,
         attempted: bool = False,
+        issued: bool = False,
         reason: str | None = None,
         error: str | None = None,
     ) -> CheckpointPageTelemetry:
@@ -384,6 +421,7 @@ class CheckpointPageLifecycle:
             effective=effective,
             refused=refused,
             attempted=attempted,
+            issued=issued,
             reason=reason,
             error=error,
         )

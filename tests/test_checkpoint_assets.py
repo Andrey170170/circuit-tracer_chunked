@@ -55,6 +55,14 @@ def test_asset_rejects_overlapping_and_wrong_owner_ranges(checkpoint_file: Path)
         )
 
 
+def test_asset_rejects_range_past_end_of_file(checkpoint_file: Path) -> None:
+    with pytest.raises(ValueError, match="exceeds file size"):
+        _asset(
+            checkpoint_file,
+            ranges=(CheckpointRange("weights", "decoder", 48, 17),),
+        )
+
+
 def test_manifest_rejects_duplicate_inode_even_through_hard_link(
     checkpoint_file: Path,
     tmp_path: Path,
@@ -91,8 +99,11 @@ def test_mixed_role_file_uses_only_exact_target_ranges(checkpoint_file: Path) ->
     )
 
     assert asset.has_mixed_roles
-    assert lifecycle.prefault(encoder).effective
-    assert lifecycle.release(decoder).effective
+    prefault = lifecycle.prefault(encoder)
+    release = lifecycle.release(decoder)
+    assert prefault.outcome == "issued" and prefault.issued
+    assert release.outcome == "issued" and release.issued
+    assert not prefault.effective and not release.effective
     assert calls == [(0, 8, 11), (16, 24, 12)]
     assert all(length > 0 for _, length, _ in calls)
 
@@ -150,6 +161,39 @@ def test_stale_inode_refuses_advice(checkpoint_file: Path, tmp_path: Path) -> No
     assert calls == 0
 
 
+@pytest.mark.parametrize("mutation", ["rewrite", "truncate"])
+def test_same_inode_mutation_refuses_advice(checkpoint_file: Path, mutation: str) -> None:
+    byte_range = CheckpointRange("weights", "decoder", 8, 16)
+    asset = _asset(checkpoint_file, ranges=(byte_range,))
+    original_inode = checkpoint_file.stat().st_ino
+    with checkpoint_file.open("r+b") as handle:
+        if mutation == "rewrite":
+            handle.seek(0)
+            handle.write(b"x" * 64)
+        else:
+            handle.truncate(48)
+        handle.flush()
+        os.fsync(handle.fileno())
+    assert checkpoint_file.stat().st_ino == original_inode
+    calls = 0
+
+    def fadvise(*_args: object) -> None:
+        nonlocal calls
+        calls += 1
+
+    event = CheckpointPageLifecycle(
+        CheckpointManifest((asset,)),
+        posix_fadvise=fadvise,
+        prefault_flag=11,
+        release_flag=12,
+    ).release(byte_range)
+
+    assert event.outcome == "refused"
+    assert event.reason == "open_file_metadata_does_not_match_manifest"
+    assert not event.attempted
+    assert calls == 0
+
+
 def test_forged_partial_range_is_refused(checkpoint_file: Path) -> None:
     owned = CheckpointRange("weights", "decoder", 8, 16)
     asset = _asset(checkpoint_file, ranges=(owned,))
@@ -194,7 +238,8 @@ def test_prefault_release_and_advice_are_idempotent(checkpoint_file: Path) -> No
     first_release = lifecycle.release(byte_range)
     second_release = lifecycle.release(byte_range)
 
-    assert first_prefault.effective and first_release.effective
+    assert first_prefault.issued and first_release.issued
+    assert not first_prefault.effective and not first_release.effective
     assert second_prefault.idempotent and not second_prefault.attempted
     assert second_release.idempotent and not second_release.attempted
     assert calls == [(8, 16, 11), (8, 16, 12)]
