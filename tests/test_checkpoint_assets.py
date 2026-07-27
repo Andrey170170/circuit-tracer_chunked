@@ -205,6 +205,15 @@ def test_same_inode_mutation_refuses_advice(checkpoint_file: Path, mutation: str
             handle.truncate(48)
         handle.flush()
         os.fsync(handle.fileno())
+    # A fast same-size rewrite can share a coarse filesystem timestamp with the
+    # manifest capture. Make the metadata-identity change explicit so this test
+    # exercises the guard rather than the timestamp resolution of its temp FS.
+    before_utime = checkpoint_file.stat()
+    os.utime(
+        checkpoint_file,
+        ns=(before_utime.st_atime_ns, before_utime.st_mtime_ns + 1_000_000_000),
+    )
+    assert checkpoint_file.stat().st_mtime_ns != asset.mtime_ns
     assert checkpoint_file.stat().st_ino == original_inode
     calls = 0
 
