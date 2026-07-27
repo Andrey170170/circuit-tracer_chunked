@@ -77,6 +77,7 @@ class ActiveDecoderRows:
     seed_materialization_h2d_bytes: int = 0
     seed_fallback_reason: str | None = None
     released: bool = False
+    sealed: bool = False
 
     @property
     def active_row_count(self) -> int:
@@ -106,6 +107,42 @@ class ActiveDecoderRows:
             return
         self.layers = tuple(None for _ in self.layers)
         self.released = True
+
+    def seal(
+        self,
+        *,
+        state: Mapping[str, torch.Tensor],
+        layer_spans: list[tuple[int, int] | None],
+        provider: object,
+    ) -> None:
+        """Coverage-check every admitted active row before raw assets release."""
+
+        if self.released:
+            raise RuntimeError("released active decoder rows cannot be sealed")
+        if self.state_signature != decoder_state_signature(state):
+            raise RuntimeError("active decoder row state changed before sealing")
+        if len(self.layers) != len(layer_spans):
+            raise RuntimeError("active decoder row layer coverage is incomplete")
+        for source_layer, (span, layer) in enumerate(zip(layer_spans, self.layers, strict=True)):
+            if span is None:
+                if layer is not None:
+                    raise RuntimeError("inactive source layer unexpectedly owns decoder rows")
+                continue
+            if layer is None:
+                raise RuntimeError("active source layer is missing decoder row coverage")
+            expected_outputs = tuple(
+                int(output)
+                for output in provider.decoder_output_layers_for_source(source_layer, None)
+            )
+            if (
+                layer.source_layer != source_layer
+                or (layer.global_row_start, layer.global_row_end) != span
+                or layer.output_layers != expected_outputs
+            ):
+                raise RuntimeError("active decoder row coverage does not match provider topology")
+        if self.active_row_bytes != self.estimated_bytes:
+            raise RuntimeError("active decoder row bytes changed before sealing")
+        self.sealed = True
 
     def get_diagnostic_snapshot(self) -> dict[str, object]:
         return {
@@ -138,6 +175,7 @@ class ActiveDecoderRows:
                 self.residency_device if not self.released else None
             ),
             "decoder_active_row_owner_count": 0 if self.released else 1,
+            "decoder_active_row_sealed": bool(self.sealed and not self.released),
         }
 
 

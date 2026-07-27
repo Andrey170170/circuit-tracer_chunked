@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 from safetensors import safe_open
 
+from circuit_tracer.transcoder.checkpoint_assets import CheckpointAssetScope
+from circuit_tracer.transcoder.checkpoint_manifest import build_checkpoint_manifest
+from circuit_tracer.transcoder.checkpoint_working_set import ProviderCheckpointLifecycle
 from circuit_tracer.utils import get_default_device
 
 if TYPE_CHECKING:
@@ -29,6 +32,8 @@ def load_clt(
     exact_chunked_decoder: bool = False,
     decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
     cross_batch_decoder_cache_bytes: int | None = None,
+    checkpoint_asset_scope: CheckpointAssetScope = CheckpointAssetScope.SHARED,
+    checkpoint_prefault_budget_bytes: int = 0,
 ) -> CrossLayerTranscoder:
     """Load a cross-layer transcoder from safetensors files.
 
@@ -59,6 +64,20 @@ def load_clt(
 
     act_fn = "jump_relu" if "activation_function.threshold" in state_dict else "relu"
 
+    manifest_discovery = build_checkpoint_manifest(
+        "clt",
+        _standard_clt_checkpoint_paths(clt_path),
+        scope=checkpoint_asset_scope,
+    )
+    checkpoint_lifecycle = (
+        ProviderCheckpointLifecycle(
+            manifest_discovery.manifest,
+            prefault_budget_bytes=checkpoint_prefault_budget_bytes,
+        )
+        if manifest_discovery.manifest is not None
+        else None
+    )
+
     # Create instance and load state dict
     with torch.device("meta"):
         instance = CrossLayerTranscoder(
@@ -78,9 +97,11 @@ def load_clt(
             exact_chunked_decoder=exact_chunked_decoder,
             decoder_chunk_size=decoder_chunk_size,
             cross_batch_decoder_cache_bytes=cross_batch_decoder_cache_bytes,
+            checkpoint_lifecycle=checkpoint_lifecycle,
         )
 
     instance.load_state_dict(state_dict, assign=True)
+    instance.checkpoint_manifest_diagnostics = manifest_discovery.diagnostics
 
     return instance
 
@@ -96,6 +117,8 @@ def load_gemma_scope_2_clt(
     lazy_encoder: bool = False,
     decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
     cross_batch_decoder_cache_bytes: int | None = None,
+    checkpoint_asset_scope: CheckpointAssetScope = CheckpointAssetScope.SHARED,
+    checkpoint_prefault_budget_bytes: int = 0,
 ) -> CrossLayerTranscoder:
     """Load a CrossLayerTranscoder from a GemmaScope2 JumpReLUMultiLayerSAE checkpoint.
 
@@ -168,6 +191,20 @@ def load_gemma_scope_2_clt(
             if has_skip:
                 state_dict["W_skip"][i] = f.get_tensor("affine_skip_connection").to(dtype=dtype)
 
+    manifest_discovery = build_checkpoint_manifest(
+        "clt",
+        paths,
+        scope=checkpoint_asset_scope,
+    )
+    checkpoint_lifecycle = (
+        ProviderCheckpointLifecycle(
+            manifest_discovery.manifest,
+            prefault_budget_bytes=checkpoint_prefault_budget_bytes,
+        )
+        if manifest_discovery.manifest is not None
+        else None
+    )
+
     # Create instance
     with torch.device("meta"):
         instance = CrossLayerTranscoder(
@@ -188,11 +225,21 @@ def load_gemma_scope_2_clt(
             exact_chunked_decoder=True,
             decoder_chunk_size=decoder_chunk_size,
             cross_batch_decoder_cache_bytes=cross_batch_decoder_cache_bytes,
+            checkpoint_lifecycle=checkpoint_lifecycle,
         )
 
     instance.load_state_dict(state_dict, assign=True)
+    instance.checkpoint_manifest_diagnostics = manifest_discovery.diagnostics
 
     return instance
+
+
+def _standard_clt_checkpoint_paths(clt_path: str) -> tuple[str, ...]:
+    """Return only the exact local safetensors files owned by a standard CLT."""
+
+    encoders = sorted(glob.glob(os.path.join(clt_path, "W_enc_*.safetensors")))
+    decoders = sorted(glob.glob(os.path.join(clt_path, "W_dec_*.safetensors")))
+    return tuple((*encoders, *decoders))
 
 
 def _load_state_dict(

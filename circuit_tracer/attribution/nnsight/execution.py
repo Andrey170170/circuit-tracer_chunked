@@ -71,6 +71,12 @@ from circuit_tracer.attribution.nnsight.run_scope import AttributionRunScope
 from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.observability.events import MemoryDelta, MemorySnapshot, TraceEvent
 from circuit_tracer.diagnostic import ProbeCompletion
+from circuit_tracer.transcoder.checkpoint_assets import (
+    CheckpointPageLifecycle,
+    CheckpointPageTelemetry,
+)
+from circuit_tracer.transcoder.checkpoint_working_set import PhaseWorkingSetPlan
+from circuit_tracer.transcoder.provider import get_checkpoint_lifecycle_provider
 
 
 def _decoder_row_execution_metadata(snapshot: dict[str, object]) -> dict[str, object]:
@@ -82,6 +88,46 @@ def _decoder_row_execution_metadata(snapshot: dict[str, object]) -> dict[str, ob
         for key, value in snapshot.items()
         if key.startswith(prefixes)
     }
+
+
+def _memory_headroom_bytes(snapshot: object) -> int | None:
+    if not isinstance(snapshot, dict):
+        return None
+    raw = snapshot.get("cgroup_memory_headroom_gib")
+    if not isinstance(raw, (int, float)):
+        return None
+    return max(0, int(float(raw) * 1024**3))
+
+
+def _checkpoint_page_trace_event(event: CheckpointPageTelemetry) -> TraceEvent:
+    return TraceEvent(
+        scope="op",
+        name=f"checkpoint.page.{event.advice.value}",
+        phase="phase3",
+        attrs={
+            "outcome": event.outcome,
+            "asset_id": event.asset_id,
+            "path": event.path,
+            "device": event.device,
+            "inode": event.inode,
+            "asset_role": event.role,
+            "offset": event.offset,
+            "requested_bytes": event.length,
+            "page_size": event.page_size,
+            "page_span_offset": event.page_span_offset,
+            "page_span_length": event.page_span_length,
+            "kernel_effect_granularity": event.kernel_effect_granularity,
+            "kernel_effect_verified": event.kernel_effect_verified,
+            "supported": event.supported,
+            "effective": event.effective,
+            "issued": event.issued,
+            "refused": event.refused,
+            "attempted": event.attempted,
+            "idempotent": event.idempotent,
+            "reason": event.reason,
+            "error": event.error,
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -116,7 +162,7 @@ class AttributionExecution:
         session_grant = self._grant(PhaseId.SESSION)
         try:
             self._run_with_grant(PhaseId.PHASE0, self.run_phase0_preparation)
-            if self.prepared.plan.execution.diagnostic_stop.mode == "phase0_probe":
+            if self._diagnostic_stop_mode() == "phase0_probe":
                 return ProbeCompletion(mode="phase0_probe")
             self.apply_active_universe_replan()
             self._run_with_grant(PhaseId.PHASE1, self.run_forward_pass)
@@ -125,17 +171,33 @@ class AttributionExecution:
             self.apply_phase3_entry_replan()
             self.finalize_active_decoder_row_admission()
             self._run_with_grant(PhaseId.PHASE3, self.attribute_seed_nodes)
+            self.apply_checkpoint_working_set_transition()
             self.apply_phase4_entry_replan()
             self._run_with_grant(PhaseId.PHASE4, self.expand_feature_frontier)
-            if self.prepared.plan.execution.diagnostic_stop.mode == "transition_probe":
+            if self._diagnostic_stop_mode() == "transition_probe":
+                completed = self._phase4().phase4_execution_batch_count
+                requested = self.prepared.plan.execution.diagnostic_stop.phase4_batches
+                if requested is None or completed != requested:
+                    raise RuntimeError(
+                        "transition probe incomplete: "
+                        f"requested {requested} physical Phase 4 batches, "
+                        f"completed {completed}"
+                    )
                 return ProbeCompletion(
                     mode="transition_probe",
-                    phase4_batches_completed=self._phase4().phase4_execution_batch_count,
+                    phase4_batches_completed=completed,
                 )
             return self._run_with_grant(PhaseId.PHASE5, self.assemble_graph)
         finally:
             self._release(self.row_store_grant)
             self._release(session_grant)
+
+    def _diagnostic_stop_mode(self) -> str:
+        prepared = getattr(self, "prepared", None)
+        plan = getattr(prepared, "plan", None)
+        execution = getattr(plan, "execution", None)
+        policy = getattr(execution, "diagnostic_stop", None)
+        return str(getattr(policy, "mode", "none"))
 
     def apply_active_universe_replan(self) -> None:
         if self.governor_runtime is None:
@@ -181,6 +243,124 @@ class AttributionExecution:
         if self.execution_identity is not None:
             self.execution_identity.revise_effective(self.prepared.effective_execution)
 
+    def apply_checkpoint_working_set_transition(self) -> None:
+        """Safely replace raw decoder assets with sealed active-row residency."""
+
+        # Some compatibility seams construct a partial execution to exercise
+        # orchestration only. A real transition is possible only after Phase 0.
+        if getattr(self, "phase0", None) is None:
+            return
+        ctx = self._phase0().ctx
+        provider = get_checkpoint_lifecycle_provider(
+            getattr(ctx, "decoder_provider", None)
+        )
+        observer = self.prepared.diagnostics.observer
+        if provider is None:
+            observer.observe(
+                TraceEvent(
+                    scope="op",
+                    name="checkpoint.working_set.skipped",
+                    phase="phase3",
+                    attrs={"reason": "provider_lifecycle_unavailable"},
+                )
+            )
+            return
+
+        try:
+            active_row_bytes = int(
+                ctx.seal_active_decoder_rows_for_checkpoint_transition()
+            )
+        except RuntimeError as exc:
+            observer.observe(
+                TraceEvent(
+                    scope="op",
+                    name="checkpoint.working_set.refused",
+                    phase="phase3",
+                    attrs={
+                        "reason": "active_decoder_rows_not_sealed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            )
+            return
+
+        before = observer.observe(MemorySnapshot(device=None))
+        try:
+            ctx.close_owned_decoder_resources_for_checkpoint_transition()
+            provider.close_decoder_checkpoint_handles()
+        except Exception as exc:
+            observer.observe(
+                TraceEvent(
+                    scope="op",
+                    name="checkpoint.working_set.refused",
+                    phase="phase3",
+                    attrs={
+                        "reason": "owned_decoder_resource_close_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            )
+            return
+
+        snapshot = ctx.get_diagnostic_snapshot()
+        retain_bytes = active_row_bytes + int(snapshot.get("active_encoder_bytes", 0))
+        lifecycle_capability = provider.checkpoint_lifecycle
+        plan = PhaseWorkingSetPlan.admit(
+            lifecycle_capability.manifest,
+            retain_bytes=retain_bytes,
+            byte_budget=lifecycle_capability.prefault_budget_bytes,
+            available_headroom_bytes=_memory_headroom_bytes(before),
+        )
+        observer.observe(
+            TraceEvent(
+                scope="op",
+                name="checkpoint.working_set.admitted",
+                phase="phase3",
+                attrs={
+                    "retain_bytes": plan.retain_bytes,
+                    "release_requested_bytes": sum(item.length for item in plan.release),
+                    "prefault_requested_bytes": plan.prefault_requested_bytes,
+                    "prefault_admitted_bytes": plan.prefault_admitted_bytes,
+                    "prefault_refused_bytes": plan.prefault_refused_bytes,
+                    "byte_budget": plan.byte_budget,
+                    "available_headroom_bytes": plan.available_headroom_bytes,
+                    "fallback_reason": plan.fallback_reason,
+                },
+            )
+        )
+
+        page_lifecycle = CheckpointPageLifecycle(
+            lifecycle_capability.manifest,
+            telemetry=lambda event: observer.observe(
+                _checkpoint_page_trace_event(event)
+            ),
+        )
+        for byte_range in plan.release:
+            page_lifecycle.release(byte_range)
+        for byte_range in plan.prefault:
+            page_lifecycle.prefault(byte_range)
+
+        after = observer.observe(MemorySnapshot(device=None))
+        delta = observer.observe(
+            MemoryDelta(
+                before=before if isinstance(before, dict) else {},
+                after=after if isinstance(after, dict) else {},
+            )
+        )
+        observer.observe(
+            TraceEvent(
+                scope="op",
+                name="checkpoint.working_set.transitioned",
+                phase="phase3",
+                attrs={
+                    "release_range_count": len(plan.release),
+                    "prefault_range_count": len(plan.prefault),
+                    **(delta if isinstance(delta, dict) else {}),
+                },
+            )
+        )
+        self._refresh_active_decoder_row_execution_metadata()
+
     def _apply_governor_revision(self, revision: PlanRevision) -> None:
         from circuit_tracer.tracing.governor_bridge import recompile_governed_plan
 
@@ -210,54 +390,23 @@ class AttributionExecution:
 
     def _run_with_grant(self, phase: PhaseId, callback: Callable[[], Any]) -> Any:
         grant = self._grant(phase)
-        observer = self.prepared.diagnostics.observer
-        before = observer.observe(MemorySnapshot(device=None))
-        asset_role = {
-            PhaseId.PHASE0: "decoder",
-            PhaseId.PHASE1: "model_forward",
-            PhaseId.PHASE2: "row_storage",
-            PhaseId.PHASE3: "encoder_and_model",
-            PhaseId.PHASE4: "decoder_encoder_model",
-            PhaseId.PHASE5: "graph_assembly",
-        }.get(phase, "runtime")
-        context = self.prepared.plan.execution.observability.telemetry_context
-        cache_state = context.get("cache_state", "unavailable")
-        observer.observe(
-            TraceEvent(
-                scope="phase",
-                name=f"{phase.value}.resource_interval.start",
-                phase=phase.value,
-                attrs={
-                    "asset_role": asset_role,
-                    "cache_state": cache_state,
-                    "cache_state_provenance": (
-                        "telemetry_context" if "cache_state" in context else "unavailable"
-                    ),
-                },
-            )
-        )
+        primary_error: BaseException | None = None
         try:
-            result = callback()
-        except BaseException as primary_error:
-            try:
-                self._release(grant)
-            except BaseException as cleanup_error:
-                primary_error.add_note(
-                    f"governor {phase.value} release also failed: {cleanup_error!r}"
-                )
-            raise
-        else:
-            after = observer.observe(MemorySnapshot(device=None))
-            delta = observer.observe(
-                MemoryDelta(
-                    before=before if isinstance(before, dict) else {},
-                    after=after if isinstance(after, dict) else {},
-                )
-            )
-            observer.observe(
+            before = self._observe_diagnostic(MemorySnapshot(device=None))
+            asset_role = {
+                PhaseId.PHASE0: "decoder",
+                PhaseId.PHASE1: "model_forward",
+                PhaseId.PHASE2: "row_storage",
+                PhaseId.PHASE3: "encoder_and_model",
+                PhaseId.PHASE4: "decoder_encoder_model",
+                PhaseId.PHASE5: "graph_assembly",
+            }.get(phase, "runtime")
+            context = self.prepared.plan.execution.observability.telemetry_context
+            cache_state = context.get("cache_state", "unavailable")
+            self._observe_diagnostic(
                 TraceEvent(
                     scope="phase",
-                    name=f"{phase.value}.resource_interval.done",
+                    name=f"{phase.value}.resource_interval.start",
                     phase=phase.value,
                     attrs={
                         "asset_role": asset_role,
@@ -267,12 +416,104 @@ class AttributionExecution:
                             if "cache_state" in context
                             else "unavailable"
                         ),
-                        **(delta if isinstance(delta, dict) else {}),
                     },
                 )
             )
-            self._release(grant)
-            return result
+            try:
+                result = callback()
+            except BaseException as error:
+                primary_error = error
+                self._record_resource_interval_end(
+                    phase=phase,
+                    status="failed",
+                    before=before,
+                    asset_role=asset_role,
+                    cache_state=cache_state,
+                    cache_state_provenance=(
+                        "telemetry_context"
+                        if "cache_state" in context
+                        else "unavailable"
+                    ),
+                    error=error,
+                )
+                raise
+            else:
+                self._record_resource_interval_end(
+                    phase=phase,
+                    status="done",
+                    before=before,
+                    asset_role=asset_role,
+                    cache_state=cache_state,
+                    cache_state_provenance=(
+                        "telemetry_context"
+                        if "cache_state" in context
+                        else "unavailable"
+                    ),
+                )
+                return result
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                self._release(grant)
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    f"governor {phase.value} release also failed: {cleanup_error!r}"
+                )
+
+    def _record_resource_interval_end(
+        self,
+        *,
+        phase: PhaseId,
+        status: str,
+        before: object,
+        asset_role: str,
+        cache_state: object,
+        cache_state_provenance: str,
+        error: BaseException | None = None,
+    ) -> None:
+        after = self._observe_diagnostic(MemorySnapshot(device=None))
+        delta = self._observe_diagnostic(
+            MemoryDelta(
+                before=before if isinstance(before, dict) else {},
+                after=after if isinstance(after, dict) else {},
+            )
+        )
+        attrs: dict[str, object] = {
+            "asset_role": asset_role,
+            "cache_state": cache_state,
+            "cache_state_provenance": cache_state_provenance,
+            **(delta if isinstance(delta, dict) else {}),
+        }
+        if error is not None:
+            attrs.update(
+                error_type=type(error).__name__,
+                error_message=str(error),
+            )
+        self._observe_diagnostic(
+            TraceEvent(
+                scope="phase",
+                name=f"{phase.value}.resource_interval.{status}",
+                phase=phase.value,
+                attrs=attrs,
+            )
+        )
+
+    def _observe_diagnostic(self, observation: object) -> object | None:
+        """Keep Stage-B diagnostic sampling best-effort and non-semantic."""
+
+        try:
+            return self.prepared.diagnostics.observer.observe(observation)
+        except Exception as error:
+            self.prepared.logger.warning(
+                "Diagnostic resource observation failed: %s: %s",
+                type(error).__name__,
+                error,
+            )
+            return None
 
     def run_phase0_preparation(self) -> None:
         p = self.prepared

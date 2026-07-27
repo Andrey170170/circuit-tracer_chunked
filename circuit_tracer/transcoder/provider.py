@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
 from circuit_tracer.transcoder.attribution_result import AttributionComponents
+from circuit_tracer.transcoder.checkpoint_working_set import ProviderCheckpointLifecycle
 
 
 TranscoderArchitecture = Literal["clt", "plt"]
@@ -57,6 +58,29 @@ class ExactChunkedProvider(Protocol):
     def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None): ...
 
     def clear_decoder_block_cache(self, cache) -> None: ...
+
+
+@runtime_checkable
+class CheckpointLifecycleProvider(Protocol):
+    """Optional provider capability for safe checkpoint-page lifecycle control."""
+
+    checkpoint_lifecycle: ProviderCheckpointLifecycle
+
+    def close_decoder_checkpoint_handles(self) -> None: ...
+
+
+def get_checkpoint_lifecycle_provider(
+    obj: object | None,
+) -> CheckpointLifecycleProvider | None:
+    """Return only an explicit, fully typed lifecycle provider capability."""
+
+    if obj is None:
+        return None
+    lifecycle = getattr(obj, "checkpoint_lifecycle", None)
+    close_handles = getattr(obj, "close_decoder_checkpoint_handles", None)
+    if not isinstance(lifecycle, ProviderCheckpointLifecycle) or not callable(close_handles):
+        return None
+    return obj  # type: ignore[return-value]
 
 
 def get_transcoder_capabilities(obj: object) -> TranscoderCapabilities:

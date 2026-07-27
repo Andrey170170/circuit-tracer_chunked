@@ -318,6 +318,8 @@ def _resolve_cgroup_memory_dir() -> str | None:
 def _get_cgroup_memory_snapshot_gib() -> dict[str, float | None]:
     snapshot: dict[str, float | None] = {
         "cgroup_memory_current_gib": None,
+        "cgroup_memory_limit_gib": None,
+        "cgroup_memory_headroom_gib": None,
         "cgroup_memory_peak_gib": None,
         "cgroup_memory_anon_gib": None,
         "cgroup_memory_file_gib": None,
@@ -331,8 +333,14 @@ def _get_cgroup_memory_snapshot_gib() -> dict[str, float | None]:
     if cgroup_dir is None:
         return snapshot
 
-    snapshot["cgroup_memory_current_gib"] = _bytes_to_gib(
-        _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.current"))
+    current_bytes = _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.current"))
+    limit_bytes = _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.max"))
+    snapshot["cgroup_memory_current_gib"] = _bytes_to_gib(current_bytes)
+    snapshot["cgroup_memory_limit_gib"] = _bytes_to_gib(limit_bytes)
+    snapshot["cgroup_memory_headroom_gib"] = _bytes_to_gib(
+        max(limit_bytes - current_bytes, 0)
+        if current_bytes is not None and limit_bytes is not None
+        else None
     )
     snapshot["cgroup_memory_peak_gib"] = _bytes_to_gib(
         _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.peak"))
@@ -417,6 +425,8 @@ def get_memory_snapshot(device: torch.device | None = None) -> dict[str, object]
         "proc_rss_file_gib": None,
         "proc_rss_shmem_gib": None,
         "cgroup_memory_current_gib": None,
+        "cgroup_memory_limit_gib": None,
+        "cgroup_memory_headroom_gib": None,
         "cgroup_memory_peak_gib": None,
         "cgroup_memory_anon_gib": None,
         "cgroup_memory_file_gib": None,

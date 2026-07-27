@@ -229,6 +229,8 @@ class DiagnosticStopPolicy:
     phase4_batches: int | None = None
 
     def __post_init__(self) -> None:
+        if self.mode not in {"none", "phase0_probe", "transition_probe"}:
+            raise ValueError(f"unsupported diagnostic stop mode: {self.mode!r}")
         if self.mode == "transition_probe":
             if self.phase4_batches is None or self.phase4_batches <= 0:
                 raise ValueError(

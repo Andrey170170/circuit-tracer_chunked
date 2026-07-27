@@ -25,6 +25,7 @@ from circuit_tracer.transcoder.loaders import (
     load_gemma_scope_2_clt as load_gemma_scope_2_clt,
 )
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
+from circuit_tracer.transcoder.checkpoint_working_set import ProviderCheckpointLifecycle
 from circuit_tracer.transcoder.attribution_result import AttributionComponents
 from circuit_tracer.utils import get_default_device
 
@@ -85,6 +86,7 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
         exact_chunked_decoder: bool = False,
         decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
         cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
+        checkpoint_lifecycle: ProviderCheckpointLifecycle | None = None,
     ):
         super().__init__()
 
@@ -104,6 +106,7 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
         if cross_batch_decoder_cache_bytes is None:
             cross_batch_decoder_cache_bytes = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES
         self.cross_batch_decoder_cache_bytes = max(0, int(cross_batch_decoder_cache_bytes))
+        self.checkpoint_lifecycle = checkpoint_lifecycle
         self._diagnostic_stats = self._make_empty_diagnostic_stats()
         self._trace_logger = None
         self._trace_observer = None
@@ -188,6 +191,14 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
             default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),
             legacy_exact_chunked_decoder=bool(self.exact_chunked_decoder),
         )
+
+    def close_decoder_checkpoint_handles(self) -> None:
+        """Close provider-owned decoder mappings before page advice.
+
+        Current safetensors accesses are context-managed per request, so there
+        are no persistent handles to close. This explicit hook keeps the runtime
+        transition fail-closed if a future loader introduces owned mappings.
+        """
 
     def decoder_output_layers_for_source(
         self, source_layer: int, active_output_layers: list[int] | None = None

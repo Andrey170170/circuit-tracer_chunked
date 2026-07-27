@@ -24,6 +24,9 @@ from circuit_tracer.transcoder.attribution_result import (
     DecoderRowSeed,
     DecoderRowSeedLayer,
 )
+from circuit_tracer.transcoder.checkpoint_working_set import ProviderCheckpointLifecycle
+from circuit_tracer.transcoder.checkpoint_assets import CheckpointAssetScope
+from circuit_tracer.transcoder.checkpoint_manifest import build_checkpoint_manifest
 from circuit_tracer.transcoder.provider import TranscoderCapabilities, provider_fingerprint
 from circuit_tracer.transcoder.phase0_decoder_ranges import (
     Phase0DecoderRangeTelemetry,
@@ -364,6 +367,7 @@ class TranscoderSet(nn.Module):
         exact_chunked_provider: bool = False,
         decoder_chunk_size: int = 1024,
         cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
+        checkpoint_lifecycle: ProviderCheckpointLifecycle | None = None,
     ):
         super().__init__()
         if exact_chunked_provider:
@@ -397,6 +401,7 @@ class TranscoderSet(nn.Module):
             if cross_batch_decoder_cache_bytes is None
             else int(cross_batch_decoder_cache_bytes)
         )
+        self.checkpoint_lifecycle = checkpoint_lifecycle
         self._decoder_diagnostic_stats = {
             "decoder_chunk_request_count": 0,
             "decoder_chunk_request_bytes": 0,
@@ -475,6 +480,13 @@ class TranscoderSet(nn.Module):
             default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),
             legacy_exact_chunked_decoder=False,
         )
+
+    def close_decoder_checkpoint_handles(self) -> None:
+        """Close provider-owned decoder mappings before page advice.
+
+        Single-layer safetensors loads currently use short-lived context
+        managers and therefore own no persistent mappings.
+        """
 
     def decoder_output_layers_for_source(
         self, source_layer: int, active_output_layers=None
@@ -1379,6 +1391,8 @@ def load_transcoder_set(
     exact_chunked_provider: bool = False,
     decoder_chunk_size: int = 1024,
     cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
+    checkpoint_asset_scope: CheckpointAssetScope = CheckpointAssetScope.SHARED,
+    checkpoint_prefault_budget_bytes: int = 0,
 ) -> TranscoderSet:
     if device is None:
         device = get_default_device()
@@ -1419,7 +1433,20 @@ def load_transcoder_set(
         f"{set(transcoders.keys())}"
     )
 
-    return TranscoderSet(
+    manifest_discovery = build_checkpoint_manifest(
+        "plt",
+        transcoder_paths,
+        scope=checkpoint_asset_scope,
+    )
+    checkpoint_lifecycle = (
+        ProviderCheckpointLifecycle(
+            manifest_discovery.manifest,
+            prefault_budget_bytes=checkpoint_prefault_budget_bytes,
+        )
+        if manifest_discovery.manifest is not None
+        else None
+    )
+    provider = TranscoderSet(
         transcoders,
         feature_input_hook=feature_input_hook,
         feature_output_hook=feature_output_hook,
@@ -1427,4 +1454,7 @@ def load_transcoder_set(
         exact_chunked_provider=exact_chunked_provider,
         decoder_chunk_size=decoder_chunk_size,
         cross_batch_decoder_cache_bytes=cross_batch_decoder_cache_bytes,
+        checkpoint_lifecycle=checkpoint_lifecycle,
     )
+    provider.checkpoint_manifest_diagnostics = manifest_discovery.diagnostics
+    return provider

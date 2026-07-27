@@ -247,6 +247,11 @@ def produce_feature_batch(state, *, defer_feature_vjps: bool = False):
         )
     state.cuda_kernel_elapsed_ms = _finish_cuda_kernel_timer(cuda_kernel_timer)
     state.cuda_kernel_timing_available = state.cuda_kernel_elapsed_ms is not None
+    state.cuda_kernel_timing_unavailable_reason = (
+        None
+        if state.cuda_kernel_timing_available
+        else "cuda_unavailable_or_not_diagnostic"
+    )
     state.executor_compute_batch_elapsed_ms = (
         time.perf_counter() - state.compute_batch_start
     ) * 1000.0
@@ -289,6 +294,7 @@ _CAPTURED_BATCH_ATTRS = (
     "tiled_feature_telemetry",
     "cuda_kernel_elapsed_ms",
     "cuda_kernel_timing_available",
+    "cuda_kernel_timing_unavailable_reason",
 )
 
 
@@ -439,6 +445,11 @@ def _finish_captured_window(
         captured.clear()
         raise
     replay_elapsed_ms = (time.perf_counter() - replay_started) * 1000.0
+    _record_replay_cuda_window(
+        state,
+        elapsed_ms=replay_cuda_elapsed_ms,
+        batch_count=len(captured),
+    )
     decoder_counters_after = _decoder_counters(state.model.transcoders)
     decoder_prefetch_after = _decoder_prefetch_snapshot(state.model.transcoders)
     if decoder_counters_before is not None and decoder_counters_after is not None:
@@ -471,8 +482,11 @@ def _finish_captured_window(
     try:
         for item, rows in zip(captured, rows_by_batch, strict=True):
             _restore_batch_attrs(state, item.attrs)
-            state.cuda_kernel_elapsed_ms = replay_cuda_elapsed_ms
-            state.cuda_kernel_timing_available = replay_cuda_elapsed_ms is not None
+            state.cuda_kernel_elapsed_ms = None
+            state.cuda_kernel_timing_available = False
+            state.cuda_kernel_timing_unavailable_reason = (
+                "reported_at_feature_vjp_tape_window_scope"
+            )
             state.rows = rows
             state.batch_start = time.perf_counter()
             reduce_feature_rows(state)
@@ -540,6 +554,31 @@ def _finish_captured_window(
     rows_by_batch.clear()
     tape.clear()
     captured.clear()
+
+
+def _record_replay_cuda_window(state, *, elapsed_ms: float | None, batch_count: int) -> None:
+    """Emit one CUDA duration for one physical tape replay window."""
+
+    state.telemetry_observer.observe(
+        TraceEvent(
+            scope="op",
+            name="phase4.feature_vjp_tape_window",
+            phase="phase4",
+            elapsed_ms=elapsed_ms,
+            attrs={
+                "asset_role": "decoder_encoder_model",
+                "cache_state": state.config.cache_state,
+                "cache_state_provenance": state.config.cache_state_provenance,
+                "physical_batch_count": batch_count,
+                "cuda_kernel_elapsed_ms": elapsed_ms,
+                "cuda_kernel_timing_available": elapsed_ms is not None,
+                "cuda_kernel_timing_unavailable_reason": (
+                    None if elapsed_ms is not None else "cuda_unavailable"
+                ),
+            },
+            wall_clock=False,
+        )
+    )
 
 
 def record_feature_batch_evidence(state):
@@ -652,9 +691,7 @@ def record_feature_batch_evidence(state):
                 "cuda_kernel_elapsed_ms": state.cuda_kernel_elapsed_ms,
                 "cuda_kernel_timing_available": state.cuda_kernel_timing_available,
                 "cuda_kernel_timing_unavailable_reason": (
-                    None
-                    if state.cuda_kernel_timing_available
-                    else "cuda_unavailable_or_not_diagnostic"
+                    state.cuda_kernel_timing_unavailable_reason
                 ),
                 "batch_rows": int(state.row_count),
                 "visited_features": int(state.n_visited),

@@ -182,6 +182,7 @@ class AttributionContext:
             "decoder_active_row_count": 0,
             "decoder_active_row_bytes": 0,
             "decoder_active_row_owner_count": 0,
+            "decoder_active_row_sealed": False,
             "decoder_active_row_seed_available": self._decoder_row_seed is not None,
             "decoder_active_row_seed_missing_keys": 0,
             "decoder_active_row_seed_source_mismatch": False,
@@ -791,6 +792,44 @@ class AttributionContext:
             layer_spans=self._chunked_layer_spans,
             provider=self.decoder_provider,
         )
+
+    def seal_active_decoder_rows_for_checkpoint_transition(self) -> int:
+        """Seal complete active-row coverage before releasing decoder assets."""
+
+        owner = self._validated_active_decoder_rows()
+        if owner is None:
+            raise RuntimeError(
+                "checkpoint transition requires admitted active decoder row residency"
+            )
+        if self.chunked_decoder_state is None or self._chunked_layer_spans is None:
+            raise RuntimeError("checkpoint transition requires fixed Phase-0 decoder state")
+        owner.seal(
+            state=self.chunked_decoder_state,
+            layer_spans=self._chunked_layer_spans,
+            provider=self.decoder_provider,
+        )
+        self._active_decoder_row_diagnostics.update(owner.get_diagnostic_snapshot())
+        self._record_telemetry_event(
+            scope="op",
+            name="checkpoint.active_decoder_rows.sealed",
+            phase="phase3",
+            attrs={
+                "active_row_bytes": owner.active_row_bytes,
+                "active_row_count": owner.active_row_count,
+            },
+        )
+        return owner.active_row_bytes
+
+    def close_owned_decoder_resources_for_checkpoint_transition(self) -> None:
+        """Close in-flight decoder ownership and clear only context-owned caches."""
+
+        owner = self._validated_active_decoder_rows()
+        if owner is None or not owner.sealed:
+            raise RuntimeError("decoder resources cannot close before active rows are sealed")
+        prefetch = self._decoder_page_prefetch
+        if prefetch is not None:
+            self.close_decoder_page_prefetch(prefetch)
+        self.clear_decoder_cache()
 
     def _validated_active_decoder_rows(self) -> ActiveDecoderRows | None:
         owner = getattr(self, "_active_decoder_rows", None)
