@@ -64,10 +64,22 @@ from circuit_tracer.attribution.nnsight.phases.phase5 import (
 from circuit_tracer.attribution.nnsight.preparation import (
     PreparedBackend,
     finalize_active_decoder_row_admission,
+    finalize_phase0_decoder_row_range_execution,
     reprepare_after_active_universe,
 )
 from circuit_tracer.attribution.nnsight.run_scope import AttributionRunScope
 from circuit_tracer.utils.disk_offload import offload_modules
+
+
+def _decoder_row_execution_metadata(snapshot: dict[str, object]) -> dict[str, object]:
+    """Keep active-row and Phase-0 range evidence in final execution metadata."""
+
+    prefixes = ("decoder_active_row_", "phase0_decoder_row_ranges_")
+    return {
+        key: value
+        for key, value in snapshot.items()
+        if key.startswith(prefixes)
+    }
 
 
 @dataclass(frozen=True)
@@ -151,9 +163,14 @@ class AttributionExecution:
         if self.phase0 is None:
             return
         snapshot = self.phase0.ctx.get_diagnostic_snapshot()
-        self.prepared.frontier.execution_metadata.update(
-            {key: value for key, value in snapshot.items() if key.startswith("decoder_active_row_")}
+        diagnostics = _decoder_row_execution_metadata(snapshot)
+        self.prepared.frontier.execution_metadata.update(diagnostics)
+        self.prepared = finalize_phase0_decoder_row_range_execution(
+            self.prepared,
+            diagnostics=diagnostics,
         )
+        if self.execution_identity is not None:
+            self.execution_identity.revise_effective(self.prepared.effective_execution)
 
     def _apply_governor_revision(self, revision: PlanRevision) -> None:
         from circuit_tracer.tracing.governor_bridge import recompile_governed_plan
@@ -256,7 +273,7 @@ class AttributionExecution:
                         plan.execution.frontier.decoder_active_row_max_bytes
                     ),
                     phase0_decoder_row_ranges=bool(
-                        plan.execution.frontier.phase0_decoder_row_ranges
+                        p.frontier.phase0_decoder_row_ranges_effective
                     ),
                 ),
             )
@@ -264,6 +281,7 @@ class AttributionExecution:
             self.scope.ctx = exc.ctx
             raise exc.cause
         self.scope.ctx = self.phase0.ctx
+        self._refresh_active_decoder_row_execution_metadata()
 
     def run_forward_pass(self) -> None:
         p = self.prepared

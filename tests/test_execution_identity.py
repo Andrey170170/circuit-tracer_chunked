@@ -14,6 +14,7 @@ from circuit_tracer.attribution.nnsight.preparation import (
     ReplayMechanisms,
     _effective_execution_identity,
     _finalize_active_decoder_row_frontier,
+    finalize_phase0_decoder_row_range_execution,
     reprepare_after_active_universe,
 )
 from circuit_tracer.attribution.nnsight.session_controls import NNSightSessionControls
@@ -40,6 +41,7 @@ def _identity(
     decoder_prefetch_depth: int = 0,
     active_row_max_bytes: int = 0,
     active_row_estimated_bytes: int | None = None,
+    phase0_decoder_row_ranges: bool = False,
     return_components: bool = False,
 ):
     provider = ProviderMechanisms(
@@ -52,6 +54,7 @@ def _identity(
             supports_exact_encoder_residency=True,
             supports_decoder_page_prefetch=True,
             supports_active_decoder_row_residency=True,
+            supports_phase0_decoder_row_ranges=True,
         ),
         exact_chunked=True,
         compact_row_store=compact_row_store,
@@ -160,6 +163,19 @@ def _identity(
         decoder_active_row_residency_effective=active_row_max_bytes > 0,
         decoder_active_row_max_bytes_effective=active_row_max_bytes,
         decoder_active_row_fallback_reason=(None if active_row_max_bytes > 0 else "disabled"),
+        phase0_decoder_row_ranges_requested=phase0_decoder_row_ranges,
+        phase0_decoder_row_ranges_effective=(
+            phase0_decoder_row_ranges and active_row_max_bytes > 0
+        ),
+        phase0_decoder_row_ranges_fallback_reason=(
+            None
+            if phase0_decoder_row_ranges and active_row_max_bytes > 0
+            else (
+                "requires_active_decoder_row_residency"
+                if phase0_decoder_row_ranges
+                else "disabled"
+            )
+        ),
     )
     if active_row_estimated_bytes is not None:
         frontier = _finalize_active_decoder_row_frontier(
@@ -182,6 +198,7 @@ def _identity(
                 decoder_page_prefetch_depth=decoder_prefetch_depth,
                 decoder_active_row_residency=active_row_max_bytes > 0,
                 decoder_active_row_max_bytes=active_row_max_bytes,
+                phase0_decoder_row_ranges=phase0_decoder_row_ranges,
             ),
         )
     )
@@ -285,6 +302,73 @@ def test_effective_identity_changes_with_decoder_page_prefetch_depth() -> None:
             "decoder_page_prefetch_loader_dtype_conversion_transient_bytes"
         ]
         == "unmeasured"
+    )
+
+
+def test_effective_identity_distinguishes_phase0_decoder_range_execution() -> None:
+    full_pages = _identity(active_row_max_bytes=128)
+    selective_ranges = _identity(
+        active_row_max_bytes=128,
+        phase0_decoder_row_ranges=True,
+    )
+
+    assert full_pages.fingerprint != selective_ranges.fingerprint
+    assert full_pages.descriptor is not None
+    assert selective_ranges.descriptor is not None
+    assert (
+        full_pages.descriptor.frontier["phase0_decoder_row_ranges_effective"]
+        is False
+    )
+    assert (
+        selective_ranges.descriptor.frontier["phase0_decoder_row_ranges_requested"]
+        is True
+    )
+    assert (
+        selective_ranges.descriptor.frontier["phase0_decoder_row_ranges_effective"]
+        is True
+    )
+    assert (
+        selective_ranges.descriptor.frontier[
+            "phase0_decoder_row_ranges_fallback_reason"
+        ]
+        is None
+    )
+
+
+def test_missing_phase0_range_telemetry_records_seed_capture_refusal() -> None:
+    components = _identity(
+        active_row_max_bytes=128,
+        phase0_decoder_row_ranges=True,
+        return_components=True,
+    )
+    prepared = PreparedBackend(
+        problem=None,
+        plan=components.plan,
+        logger=None,
+        offload_handles=[],
+        forward_overrides=None,
+        prefix_view_metadata=None,
+        output_position=None,
+        provider=components.provider,
+        numerics=components.numerics,
+        replay=components.replay,
+        frontier=components.frontier,
+        batches=components.batches,
+        diagnostics=None,
+        effective_execution=components.identity,
+        start_time=0.0,
+    )
+
+    refused = finalize_phase0_decoder_row_range_execution(
+        prepared,
+        diagnostics={},
+    )
+
+    assert refused.effective_execution.fingerprint != components.identity.fingerprint
+    assert refused.frontier.phase0_decoder_row_ranges_effective is False
+    assert (
+        refused.frontier.phase0_decoder_row_ranges_fallback_reason
+        == "seed_capture_refused"
     )
 
 

@@ -166,6 +166,9 @@ class FrontierMechanisms:
     decoder_active_row_estimated_bytes: int | None = None
     decoder_active_row_admission_finalized: bool = False
     decoder_active_row_fallback_reason: str | None = "disabled"
+    phase0_decoder_row_ranges_requested: bool = False
+    phase0_decoder_row_ranges_effective: bool = False
+    phase0_decoder_row_ranges_fallback_reason: str | None = "disabled"
 
 
 @dataclass
@@ -467,6 +470,22 @@ def _resolve_frontier(
         "decoder_active_row_max_bytes_effective": active_rows_max_bytes_effective,
         "decoder_active_row_fallback_reason": active_rows_fallback_reason,
     }
+    phase0_ranges_requested = bool(frontier.phase0_decoder_row_ranges)
+    phase0_ranges_fallback_reason = None
+    if not phase0_ranges_requested:
+        phase0_ranges_fallback_reason = "disabled"
+    elif not active_rows_effective:
+        phase0_ranges_fallback_reason = "requires_active_row_residency"
+    elif not bool(
+        getattr(provider.capabilities, "supports_phase0_decoder_row_ranges", False)
+    ):
+        phase0_ranges_fallback_reason = "provider_capability_unavailable"
+    phase0_ranges_effective = phase0_ranges_fallback_reason is None
+    phase0_ranges_metadata = {
+        "phase0_decoder_row_ranges_requested": phase0_ranges_requested,
+        "phase0_decoder_row_ranges_effective": phase0_ranges_effective,
+        "phase0_decoder_row_ranges_fallback_reason": phase0_ranges_fallback_reason,
+    }
     metadata = {
         **_build_phase4_scheduler_metadata(scheduler),
         **refresh_metadata,
@@ -479,6 +498,7 @@ def _resolve_frontier(
         **tape_metadata,
         **prefetch_metadata,
         **active_rows_metadata,
+        **phase0_ranges_metadata,
     }
     return FrontierMechanisms(
         scheduler=scheduler,
@@ -507,6 +527,9 @@ def _resolve_frontier(
         decoder_active_row_estimated_bytes=None,
         decoder_active_row_admission_finalized=False,
         decoder_active_row_fallback_reason=active_rows_fallback_reason,
+        phase0_decoder_row_ranges_requested=phase0_ranges_requested,
+        phase0_decoder_row_ranges_effective=phase0_ranges_effective,
+        phase0_decoder_row_ranges_fallback_reason=phase0_ranges_fallback_reason,
     )
 
 
@@ -860,6 +883,15 @@ def _effective_execution_identity(
             ),
             "decoder_active_row_estimated_bytes": (frontier.decoder_active_row_estimated_bytes),
             "decoder_active_row_fallback_reason": frontier.decoder_active_row_fallback_reason,
+            "phase0_decoder_row_ranges_requested": (
+                frontier.phase0_decoder_row_ranges_requested
+            ),
+            "phase0_decoder_row_ranges_effective": (
+                frontier.phase0_decoder_row_ranges_effective
+            ),
+            "phase0_decoder_row_ranges_fallback_reason": (
+                frontier.phase0_decoder_row_ranges_fallback_reason
+            ),
         },
         decoder={
             "fetch_chunk_size": plan.execution.decoder.fetch_chunk_size,
@@ -953,6 +985,32 @@ def reprepare_after_active_universe(
     controls are rebuilt from the final governed plan.
     """
     frontier = _resolve_frontier(plan, prepared.provider)
+    prior_range_metadata = {
+        key: value
+        for key, value in prepared.frontier.execution_metadata.items()
+        if key.startswith("phase0_decoder_row_ranges_")
+    }
+    range_execution_observed = (
+        "phase0_decoder_row_ranges_planning_seconds" in prior_range_metadata
+        or prepared.frontier.phase0_decoder_row_ranges_fallback_reason
+        == "seed_capture_refused"
+    )
+    if range_execution_observed:
+        execution_metadata = dict(frontier.execution_metadata)
+        execution_metadata.update(prior_range_metadata)
+        frontier = replace(
+            frontier,
+            execution_metadata=execution_metadata,
+            phase0_decoder_row_ranges_requested=(
+                prepared.frontier.phase0_decoder_row_ranges_requested
+            ),
+            phase0_decoder_row_ranges_effective=(
+                prepared.frontier.phase0_decoder_row_ranges_effective
+            ),
+            phase0_decoder_row_ranges_fallback_reason=(
+                prepared.frontier.phase0_decoder_row_ranges_fallback_reason
+            ),
+        )
     if prepared.frontier.decoder_active_row_admission_finalized:
         estimated_bytes = prepared.frontier.decoder_active_row_estimated_bytes
         if estimated_bytes is None:
@@ -1055,4 +1113,60 @@ def finalize_active_decoder_row_admission(
         prepared,
         frontier=frontier,
         effective_execution=effective,
+    )
+
+
+def finalize_phase0_decoder_row_range_execution(
+    prepared: PreparedBackend,
+    *,
+    diagnostics: dict[str, object],
+) -> PreparedBackend:
+    """Bind requested range execution to observed Phase-0 seed capture."""
+
+    frontier = prepared.frontier
+    if not frontier.phase0_decoder_row_ranges_requested:
+        return prepared
+    if (
+        not frontier.phase0_decoder_row_ranges_effective
+        and frontier.phase0_decoder_row_ranges_fallback_reason
+        != "seed_capture_refused"
+    ):
+        return prepared
+    observed = "phase0_decoder_row_ranges_requested" in diagnostics
+    effective = bool(
+        diagnostics.get("phase0_decoder_row_ranges_effective", False)
+    ) if observed else False
+    fallback_reason = (
+        diagnostics.get("phase0_decoder_row_ranges_fallback_reason")
+        if observed
+        else "seed_capture_refused"
+    )
+    metadata = dict(frontier.execution_metadata)
+    metadata.update(
+        {
+            "phase0_decoder_row_ranges_requested": True,
+            "phase0_decoder_row_ranges_effective": effective,
+            "phase0_decoder_row_ranges_fallback_reason": fallback_reason,
+        }
+    )
+    frontier = replace(
+        frontier,
+        execution_metadata=metadata,
+        phase0_decoder_row_ranges_effective=effective,
+        phase0_decoder_row_ranges_fallback_reason=(
+            None if fallback_reason is None else str(fallback_reason)
+        ),
+    )
+    identity = _effective_execution_identity(
+        prepared.provider,
+        prepared.numerics,
+        prepared.replay,
+        prepared.batches,
+        frontier,
+        prepared.plan,
+    )
+    return replace(
+        prepared,
+        frontier=frontier,
+        effective_execution=identity,
     )

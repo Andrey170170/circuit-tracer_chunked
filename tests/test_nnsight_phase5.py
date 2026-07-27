@@ -26,6 +26,9 @@ import circuit_tracer.attribution.nnsight.phases.phase5_full as phase5_full
 import circuit_tracer.attribution.nnsight.phases.phase5_artifacts as phase5_artifacts
 import circuit_tracer.attribution.nnsight.phases.phase5_publication as phase5_publication
 import circuit_tracer.attribution.nnsight.phase_support as phase_support
+from circuit_tracer.attribution.nnsight.execution import (
+    _decoder_row_execution_metadata,
+)
 from circuit_tracer.observability.events import MemoryBoundary, RuntimeSnapshot, TraceEvent
 
 
@@ -510,6 +513,53 @@ def test_active_row_publication_preserves_fused_seed_evidence() -> None:
         "materialization_h2d_bytes": 152_428_032,
         "missing_keys": 0,
     }
+
+
+def test_phase0_decoder_range_diagnostics_survive_refresh_and_packaging() -> None:
+    flattened = _decoder_row_execution_metadata(
+        {
+            "phase0_decoder_row_ranges_requested": True,
+            "phase0_decoder_row_ranges_effective": True,
+            "phase0_decoder_row_ranges_fallback_reason": None,
+            "phase0_decoder_row_ranges_range_request_count": 7,
+            "phase0_decoder_row_ranges_range_rows": (3, 5, 2),
+            "phase0_decoder_row_ranges_unique_row_count": 10,
+            "phase0_decoder_row_ranges_merged_gap_rows": 2,
+            "phase0_decoder_row_ranges_overfetch_bytes": 24,
+            "phase0_decoder_row_ranges_logical_requested_bytes": 120,
+            "phase0_decoder_row_ranges_logical_materialized_bytes": 144,
+            "decoder_active_row_seed_shared_traversal_bytes": 144,
+            "decoder_active_row_seed_shared_decoder_load_count": 0,
+            "decoder_active_row_seed_shared_decoder_load_bytes": 0,
+            "unrelated_diagnostic": "drop",
+        }
+    )
+    packaged = phase5_artifacts._active_decoder_row_residency(flattened)
+
+    assert "unrelated_diagnostic" not in flattened
+    assert packaged["phase0_decoder_row_ranges"] == {
+        "requested": True,
+        "effective": True,
+        "fallback_reason": None,
+        "planning_seconds": 0.0,
+        "read_seconds": 0.0,
+        "gather_seconds": 0.0,
+        "reconstruction_seconds": 0.0,
+        "seed_capture_seconds": 0.0,
+        "unique_row_count": 10,
+        "unique_row_bytes": 0,
+        "range_request_count": 7,
+        "range_rows": (3, 5, 2),
+        "merged_gap_rows": 2,
+        "overfetch_bytes": 24,
+        "logical_requested_bytes": 120,
+        "logical_materialized_bytes": 144,
+        "baseline_full_page_count": 0,
+        "baseline_full_page_bytes": 0,
+    }
+    assert packaged["seed"]["shared_traversal_bytes"] == 144
+    assert packaged["seed"]["shared_decoder_page_load_count"] == 0
+    assert packaged["seed"]["shared_decoder_load_bytes"] == 0
 
 
 def test_active_row_publication_preserves_seed_miss_double_traversal() -> None:

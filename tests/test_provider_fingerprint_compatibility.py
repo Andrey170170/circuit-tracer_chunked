@@ -26,6 +26,7 @@ def _legacy_fingerprint(provider: object, *, checkpoint_identity: str) -> dict[s
         checkpoint_identity=checkpoint_identity,
     )
     fingerprint.pop("supports_active_decoder_row_residency")
+    fingerprint.pop("supports_phase0_decoder_row_ranges")
     return fingerprint
 
 
@@ -44,6 +45,7 @@ def test_legacy_normalization_ignores_only_missing_active_row_capability() -> No
     )
     assert normalized_legacy == normalized_current
     assert normalized_legacy["supports_active_decoder_row_residency"] is False
+    assert normalized_legacy["supports_phase0_decoder_row_ranges"] is False
 
     explicit_false = {
         **legacy,
