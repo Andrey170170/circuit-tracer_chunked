@@ -25,6 +25,14 @@ _DEFAULT_MEMORY_ATTR_KEYS: tuple[str, ...] = (
     "cgroup_memory_file_gib",
     "cuda_allocated_gib",
     "cuda_reserved_gib",
+    "proc_minor_faults",
+    "proc_major_faults",
+    "proc_read_bytes",
+    "proc_read_syscalls",
+    "proc_write_bytes",
+    "proc_write_syscalls",
+    "proc_smaps_anonymous_bytes",
+    "proc_smaps_file_backed_bytes",
 )
 
 def _format_optional_gib(value: float | None) -> str:
@@ -85,6 +93,118 @@ def _read_memory_stat_file(path: str) -> dict[str, int]:
     except (FileNotFoundError, OSError):
         return {}
     return stats
+
+
+def _read_key_value_file(path: str) -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if ":" in line:
+                    key, raw = line.split(":", 1)
+                else:
+                    parts = line.split()
+                    if len(parts) != 2:
+                        continue
+                    key, raw = parts
+                token = raw.strip().split()[0] if raw.strip() else ""
+                try:
+                    values[key] = int(token)
+                except ValueError:
+                    continue
+    except (FileNotFoundError, OSError):
+        pass
+    return values
+
+
+def _get_linux_resource_snapshot(
+    *,
+    proc_self_dir: str = "/proc/self",
+    cgroup_dir: str | None = None,
+    cgroup_version: int | None = None,
+) -> dict[str, object]:
+    """Collect versioned fault, I/O, mapping, and cgroup counters with provenance."""
+
+    unavailable: list[str] = []
+    snapshot: dict[str, object] = {"resource_snapshot_schema_version": 1}
+    stat = _read_file_first_line(os.path.join(proc_self_dir, "stat"))
+    tail = stat[stat.rfind(")") + 2 :].split() if stat and ")" in stat else []
+    for key, index in (("proc_minor_faults", 7), ("proc_major_faults", 9)):
+        try:
+            snapshot[key] = int(tail[index])
+        except (IndexError, ValueError):
+            snapshot[key] = None
+            unavailable.append(key)
+
+    io = _read_key_value_file(os.path.join(proc_self_dir, "io"))
+    for source, target in (
+        ("read_bytes", "proc_read_bytes"),
+        ("syscr", "proc_read_syscalls"),
+        ("write_bytes", "proc_write_bytes"),
+        ("syscw", "proc_write_syscalls"),
+    ):
+        snapshot[target] = io.get(source)
+        if source not in io:
+            unavailable.append(target)
+
+    smaps = _read_key_value_file(os.path.join(proc_self_dir, "smaps_rollup"))
+    anonymous_kib = smaps.get("Anonymous")
+    rss_kib = smaps.get("Rss")
+    snapshot["proc_smaps_anonymous_bytes"] = (
+        anonymous_kib * 1024 if anonymous_kib is not None else None
+    )
+    snapshot["proc_smaps_file_backed_bytes"] = (
+        max(rss_kib - anonymous_kib, 0) * 1024
+        if rss_kib is not None and anonymous_kib is not None
+        else None
+    )
+    for key in ("proc_smaps_anonymous_bytes", "proc_smaps_file_backed_bytes"):
+        if snapshot[key] is None:
+            unavailable.append(key)
+
+    resolved = cgroup_dir if cgroup_dir is not None else _resolve_cgroup_memory_dir()
+    if cgroup_version is None and resolved is not None:
+        if os.path.isfile(os.path.join(resolved, "memory.current")):
+            cgroup_version = 2
+        elif os.path.isfile(os.path.join(resolved, "memory.usage_in_bytes")):
+            cgroup_version = 1
+    snapshot["cgroup_version"] = cgroup_version
+    snapshot["cgroup_source"] = resolved
+    cgroup_fields: dict[str, int | None] = {}
+    if resolved is None or cgroup_version not in {1, 2}:
+        unavailable.append("cgroup")
+    elif cgroup_version == 1:
+        stats = _read_memory_stat_file(os.path.join(resolved, "memory.stat"))
+        for key in (
+            "total_rss",
+            "total_cache",
+            "pgfault",
+            "pgmajfault",
+            "pgpgin",
+            "pgpgout",
+        ):
+            cgroup_fields[f"cgroup_v1_{key}"] = stats.get(key)
+        cgroup_fields["cgroup_v1_memory_failcnt"] = _read_memory_bytes_file(
+            os.path.join(resolved, "memory.failcnt")
+        )
+    else:
+        stats = _read_memory_stat_file(os.path.join(resolved, "memory.stat"))
+        selected = ("anon", "file") + tuple(
+            key
+            for key in stats
+            if key.startswith("workingset_")
+            or key.startswith("pgscan")
+            or key.startswith("pgsteal")
+        )
+        for key in dict.fromkeys(selected):
+            cgroup_fields[f"cgroup_v2_{key}"] = stats.get(key)
+    snapshot.update(cgroup_fields)
+    for key, value in cgroup_fields.items():
+        if value is None:
+            unavailable.append(key)
+    snapshot["resource_unavailable_fields"] = tuple(sorted(set(unavailable)))
+    snapshot["resource_snapshot_available"] = not unavailable
+    return snapshot
 
 
 def _get_current_rss_gib_from_proc() -> float | None:
@@ -284,7 +404,7 @@ def build_memory_before_after_attrs(
     return attrs
 
 
-def get_memory_snapshot(device: torch.device | None = None) -> dict[str, float | None]:
+def get_memory_snapshot(device: torch.device | None = None) -> dict[str, object]:
     rss_current_gib = _get_current_rss_gib_from_proc()
     rss_gib = None
     if resource is not None:
@@ -312,6 +432,7 @@ def get_memory_snapshot(device: torch.device | None = None) -> dict[str, float |
     }
     snapshot.update(_get_process_status_memory_gib_from_proc())
     snapshot.update(_get_cgroup_memory_snapshot_gib())
+    snapshot.update(_get_linux_resource_snapshot())
 
     if device is not None and device.type == "cuda" and torch.cuda.is_available():
         snapshot.update(

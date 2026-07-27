@@ -9,6 +9,7 @@ from circuit_tracer.execution_identity import EffectiveExecutionDescriptor
 
 class TraceStatus(str, Enum):
     SUCCEEDED = "succeeded"
+    PROBE_COMPLETED = "probe_completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
     REFUSED = "refused"

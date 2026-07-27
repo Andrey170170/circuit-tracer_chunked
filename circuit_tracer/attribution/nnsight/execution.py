@@ -69,6 +69,8 @@ from circuit_tracer.attribution.nnsight.preparation import (
 )
 from circuit_tracer.attribution.nnsight.run_scope import AttributionRunScope
 from circuit_tracer.utils.disk_offload import offload_modules
+from circuit_tracer.observability.events import MemoryDelta, MemorySnapshot, TraceEvent
+from circuit_tracer.diagnostic import ProbeCompletion
 
 
 def _decoder_row_execution_metadata(snapshot: dict[str, object]) -> dict[str, object]:
@@ -114,6 +116,8 @@ class AttributionExecution:
         session_grant = self._grant(PhaseId.SESSION)
         try:
             self._run_with_grant(PhaseId.PHASE0, self.run_phase0_preparation)
+            if self.prepared.plan.execution.diagnostic_stop.mode == "phase0_probe":
+                return ProbeCompletion(mode="phase0_probe")
             self.apply_active_universe_replan()
             self._run_with_grant(PhaseId.PHASE1, self.run_forward_pass)
             self.row_store_grant = self._grant(PhaseId.PHASE2)
@@ -123,6 +127,11 @@ class AttributionExecution:
             self._run_with_grant(PhaseId.PHASE3, self.attribute_seed_nodes)
             self.apply_phase4_entry_replan()
             self._run_with_grant(PhaseId.PHASE4, self.expand_feature_frontier)
+            if self.prepared.plan.execution.diagnostic_stop.mode == "transition_probe":
+                return ProbeCompletion(
+                    mode="transition_probe",
+                    phase4_batches_completed=self._phase4().phase4_execution_batch_count,
+                )
             return self._run_with_grant(PhaseId.PHASE5, self.assemble_graph)
         finally:
             self._release(self.row_store_grant)
@@ -201,6 +210,32 @@ class AttributionExecution:
 
     def _run_with_grant(self, phase: PhaseId, callback: Callable[[], Any]) -> Any:
         grant = self._grant(phase)
+        observer = self.prepared.diagnostics.observer
+        before = observer.observe(MemorySnapshot(device=None))
+        asset_role = {
+            PhaseId.PHASE0: "decoder",
+            PhaseId.PHASE1: "model_forward",
+            PhaseId.PHASE2: "row_storage",
+            PhaseId.PHASE3: "encoder_and_model",
+            PhaseId.PHASE4: "decoder_encoder_model",
+            PhaseId.PHASE5: "graph_assembly",
+        }.get(phase, "runtime")
+        context = self.prepared.plan.execution.observability.telemetry_context
+        cache_state = context.get("cache_state", "unavailable")
+        observer.observe(
+            TraceEvent(
+                scope="phase",
+                name=f"{phase.value}.resource_interval.start",
+                phase=phase.value,
+                attrs={
+                    "asset_role": asset_role,
+                    "cache_state": cache_state,
+                    "cache_state_provenance": (
+                        "telemetry_context" if "cache_state" in context else "unavailable"
+                    ),
+                },
+            )
+        )
         try:
             result = callback()
         except BaseException as primary_error:
@@ -212,6 +247,30 @@ class AttributionExecution:
                 )
             raise
         else:
+            after = observer.observe(MemorySnapshot(device=None))
+            delta = observer.observe(
+                MemoryDelta(
+                    before=before if isinstance(before, dict) else {},
+                    after=after if isinstance(after, dict) else {},
+                )
+            )
+            observer.observe(
+                TraceEvent(
+                    scope="phase",
+                    name=f"{phase.value}.resource_interval.done",
+                    phase=phase.value,
+                    attrs={
+                        "asset_role": asset_role,
+                        "cache_state": cache_state,
+                        "cache_state_provenance": (
+                            "telemetry_context"
+                            if "cache_state" in context
+                            else "unavailable"
+                        ),
+                        **(delta if isinstance(delta, dict) else {}),
+                    },
+                )
+            )
             self._release(grant)
             return result
 
@@ -562,6 +621,17 @@ class AttributionExecution:
                 feature_vjp_tape_enabled=p.frontier.feature_vjp_tape_enabled,
                 feature_vjp_tape_fallback_reason=(p.frontier.feature_vjp_tape_fallback_reason),
                 decoder_page_prefetch_depth=(p.frontier.decoder_page_prefetch_depth_effective),
+                diagnostic_stop_after_batches=(
+                    plan.execution.diagnostic_stop.phase4_batches
+                    if plan.execution.diagnostic_stop.mode == "transition_probe"
+                    else None
+                ),
+                cache_state=str(policy.telemetry_context.get("cache_state", "unavailable")),
+                cache_state_provenance=(
+                    "telemetry_context"
+                    if "cache_state" in policy.telemetry_context
+                    else "unavailable"
+                ),
                 exact_encoder_residency_config=p.frontier.exact_encoder_residency,
                 profile=policy.profile,
                 profile_log_interval=policy.profile_log_interval,

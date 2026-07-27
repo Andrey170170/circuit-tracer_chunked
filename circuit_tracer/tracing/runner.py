@@ -19,6 +19,7 @@ from circuit_tracer.execution_identity import ExecutionIdentityState
 from .plan import ResolvedTracePlan
 from .problem import AttributionProblem
 from .result import TraceResult, TraceStatus
+from circuit_tracer.diagnostic import ProbeCompletion
 
 
 def run_trace(
@@ -156,6 +157,32 @@ def run_trace(
         raise
     if governor_runtime is not None:
         governor_runtime.close()
+    if isinstance(output, ProbeCompletion):
+        evidence = scope.close(None, terminal_status="probe_completed")
+        summary = dict(evidence.summary)
+        summary.update(
+            diagnostic_stop_mode=output.mode,
+            phase4_batches_completed=output.phase4_batches_completed,
+        )
+        return TraceResult(
+            output=None,
+            semantic_fingerprint=plan.semantic_fingerprint,
+            requested_execution_fingerprint=plan.requested_execution_fingerprint,
+            effective_execution_fingerprint=execution_identity.effective_fingerprint,
+            effective_execution=(
+                None
+                if execution_identity.effective is None
+                else execution_identity.effective.descriptor
+            ),
+            status=TraceStatus.PROBE_COMPLETED,
+            telemetry_summary=summary,
+            telemetry_events=evidence.events,
+            admission_report=(
+                plan.admission_report
+                if governor_runtime is None
+                else governor_runtime.current_plan.admission
+            ),
+        )
     evidence = scope.close(None)
     return TraceResult(
         output=output,

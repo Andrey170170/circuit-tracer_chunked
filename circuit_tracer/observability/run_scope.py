@@ -43,12 +43,13 @@ class TraceRunScope:
         elapsed_ms = (time.perf_counter() - self.started_at) * 1000.0
         if terminal_status is None:
             terminal_status = "succeeded" if primary_error is None else "failed"
-        if terminal_status not in {"succeeded", "failed", "refused"}:
+        if terminal_status not in {"succeeded", "probe_completed", "failed", "refused"}:
             raise ValueError(f"unsupported terminal status: {terminal_status!r}")
         if primary_error is not None and terminal_status != "failed":
             raise ValueError("a primary error requires terminal_status='failed'")
         name = {
             "succeeded": "attribute.done",
+            "probe_completed": "attribute.probe_completed",
             "failed": "attribute.failed",
             "refused": "attribute.refused",
         }[terminal_status]

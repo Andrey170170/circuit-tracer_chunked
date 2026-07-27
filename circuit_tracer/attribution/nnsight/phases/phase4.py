@@ -92,6 +92,9 @@ class Phase4Config:
     feature_vjp_tape_enabled: bool = False
     feature_vjp_tape_fallback_reason: str | None = "window_one_streaming_fallback"
     decoder_page_prefetch_depth: int = 0
+    diagnostic_stop_after_batches: int | None = None
+    cache_state: str = "unavailable"
+    cache_state_provenance: str = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,12 @@ def run_phase4(*, inputs: Phase4Inputs, config: Phase4Config) -> Phase4Result:
         while state.n_visited < state.actual_max_feature_nodes:
             prepare_feature_frontier(state)
             execute_pending_frontier(state)
+            if (
+                config.diagnostic_stop_after_batches is not None
+                and state.phase4_execution_batch_count
+                >= config.diagnostic_stop_after_batches
+            ):
+                break
     except BaseException as error:
         primary_error = error
         raise

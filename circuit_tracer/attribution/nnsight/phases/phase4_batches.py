@@ -66,6 +66,28 @@ class _CapturedExecutionBatch:
     attrs: dict[str, object]
 
 
+def _start_cuda_kernel_timer(state):
+    if (
+        state.config.diagnostic_stop_after_batches is None
+        or not torch.cuda.is_available()
+        or state.encoder_vectors.device.type != "cuda"
+    ):
+        return None
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    return start, end
+
+
+def _finish_cuda_kernel_timer(timer) -> float | None:
+    if timer is None:
+        return None
+    start, end = timer
+    end.record()
+    end.synchronize()
+    return float(start.elapsed_time(end))
+
+
 def _pack_semantic_batches(
     semantic_batches: list[_SemanticBatch], *, execution_batch_max_rows: int
 ) -> list[_ExecutionBatch]:
@@ -169,6 +191,7 @@ def produce_feature_batch(state, *, defer_feature_vjps: bool = False):
     if state.encoder_vectors_source_device == "cpu" and state.encoder_vectors.device.type == "cuda":
         state.phase4_cpu_to_gpu_bytes_total += int(state.encoder_vectors_transfer_bytes)
     state.compute_batch_start = time.perf_counter()
+    cuda_kernel_timer = _start_cuda_kernel_timer(state)
     state.no_retention = state.config.feature_row_retention == "none_recompute"
     state.tiled_production = (
         state.config.full_retention_backend == "column_tiled_v1" or state.no_retention
@@ -222,6 +245,8 @@ def produce_feature_batch(state, *, defer_feature_vjps: bool = False):
             retain_graph=state.n_visited < state.actual_max_feature_nodes,
             phase_label="phase4_features",
         )
+    state.cuda_kernel_elapsed_ms = _finish_cuda_kernel_timer(cuda_kernel_timer)
+    state.cuda_kernel_timing_available = state.cuda_kernel_elapsed_ms is not None
     state.executor_compute_batch_elapsed_ms = (
         time.perf_counter() - state.compute_batch_start
     ) * 1000.0
@@ -262,6 +287,8 @@ _CAPTURED_BATCH_ATTRS = (
     "no_retention",
     "tiled_production",
     "tiled_feature_telemetry",
+    "cuda_kernel_elapsed_ms",
+    "cuda_kernel_timing_available",
 )
 
 
@@ -393,10 +420,20 @@ def _finish_captured_window(
     decoder_prefetch_before = _decoder_prefetch_snapshot(state.model.transcoders)
     replay_started = time.perf_counter()
     try:
+        replay_cuda_timer = None
+        if (
+            state.config.diagnostic_stop_after_batches is not None
+            and torch.cuda.is_available()
+        ):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            replay_cuda_timer = (start, end)
         rows_by_batch = state.ctx.replay_feature_vjp_tape(
             tuple(item.entry for item in captured),
             phase_label="phase4_features",
         )
+        replay_cuda_elapsed_ms = _finish_cuda_kernel_timer(replay_cuda_timer)
     except BaseException:
         tape.clear()
         captured.clear()
@@ -434,6 +471,8 @@ def _finish_captured_window(
     try:
         for item, rows in zip(captured, rows_by_batch, strict=True):
             _restore_batch_attrs(state, item.attrs)
+            state.cuda_kernel_elapsed_ms = replay_cuda_elapsed_ms
+            state.cuda_kernel_timing_available = replay_cuda_elapsed_ms is not None
             state.rows = rows
             state.batch_start = time.perf_counter()
             reduce_feature_rows(state)
@@ -607,6 +646,16 @@ def record_feature_batch_evidence(state):
             batch_index=state.batch_number,
             elapsed_ms=state.batch_elapsed_ms,
             attrs={
+                "asset_role": "decoder_encoder_model",
+                "cache_state": state.config.cache_state,
+                "cache_state_provenance": state.config.cache_state_provenance,
+                "cuda_kernel_elapsed_ms": state.cuda_kernel_elapsed_ms,
+                "cuda_kernel_timing_available": state.cuda_kernel_timing_available,
+                "cuda_kernel_timing_unavailable_reason": (
+                    None
+                    if state.cuda_kernel_timing_available
+                    else "cuda_unavailable_or_not_diagnostic"
+                ),
                 "batch_rows": int(state.row_count),
                 "visited_features": int(state.n_visited),
                 "target_feature_count": int(state.actual_max_feature_nodes),
@@ -733,6 +782,12 @@ def execute_pending_frontier(state):
     )
     captured: list[_CapturedExecutionBatch] = []
     for execution_batch in execution_batches:
+        if (
+            state.config.diagnostic_stop_after_batches is not None
+            and state.phase4_execution_batch_count
+            >= state.config.diagnostic_stop_after_batches
+        ):
+            break
         first_semantic = execution_batch.semantic_batches[0]
         last_semantic = execution_batch.semantic_batches[-1]
         state.phase4_scheduler_reference_batch_count = last_semantic.index + 1

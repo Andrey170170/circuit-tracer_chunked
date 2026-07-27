@@ -222,6 +222,23 @@ class ObservabilityPolicy:
 
 
 @dataclass(frozen=True)
+class DiagnosticStopPolicy:
+    """Diagnostic-only termination contract; never produces a scientific graph."""
+
+    mode: Literal["none", "phase0_probe", "transition_probe"] = "none"
+    phase4_batches: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode == "transition_probe":
+            if self.phase4_batches is None or self.phase4_batches <= 0:
+                raise ValueError(
+                    "transition_probe requires a positive phase4_batches count"
+                )
+        elif self.phase4_batches is not None:
+            raise ValueError("phase4_batches is valid only for transition_probe")
+
+
+@dataclass(frozen=True)
 class ExecutionConstraints:
     """Explicit physical restrictions, grouped by their mechanism owners."""
 
@@ -231,6 +248,7 @@ class ExecutionConstraints:
     replay: ReplayPlan = field(default_factory=ReplayPlan)
     frontier: FrontierExpansionPlan = field(default_factory=FrontierExpansionPlan)
     observability: ObservabilityPolicy = field(default_factory=ObservabilityPolicy)
+    diagnostic_stop: DiagnosticStopPolicy = field(default_factory=DiagnosticStopPolicy)
     offload: Literal["cpu", "disk", None] = None
     compact_output: bool = False
 

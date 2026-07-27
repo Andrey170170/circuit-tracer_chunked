@@ -24,6 +24,7 @@ from circuit_tracer.execution_identity import (
 from .plan import (
     DecoderCachePolicy,
     DecoderPlan,
+    DiagnosticStopPolicy,
     ExecutionConstraints,
     FrontierExpansionPlan,
     ObservabilityPolicy,
@@ -47,6 +48,7 @@ __all__ = [
     "AdmissionMode",
     "DecoderCachePolicy",
     "DecoderPlan",
+    "DiagnosticStopPolicy",
     "ExecutionConstraints",
     "FidelityMode",
     "FidelityBudget",
