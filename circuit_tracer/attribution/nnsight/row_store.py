@@ -1336,11 +1336,6 @@ class _GpuResidentFeatureRowStore:
             result = source[row_start:row_end].to(
                 device=destination_device, dtype=dtype, non_blocking=False
             )
-            if source is self._prepared_host_rows:
-                # Match the authoritative file path's fresh contiguous CPU
-                # allocation. A zero-copy view can select a different CPU
-                # matmul reduction path based on storage offset/alignment.
-                result = result.clone(memory_format=torch.contiguous_format)
             transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
             self._record_resident_read(
                 row_count,
