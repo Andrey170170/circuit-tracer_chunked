@@ -951,10 +951,9 @@ class _GpuResidentFeatureRowStore:
 
     File storage remains authoritative. The CUDA tier is used only for Phase-4
     reads whose complete canonical row range has been committed successfully.
-    Ordinary signed reads preserve the backing store's device contract. Exact
-    Phase-4 reads use a full-residency absolute-value host mirror populated once
-    from the same canonical append, avoiding repeated file reads, fine-grained
-    CUDA-to-host transfers, and repeated absolute-value passes without moving
+    Ordinary reads preserve the backing store's device contract through an exact
+    host mirror populated from the same canonical append. This avoids both file
+    reads and fine-grained CUDA-to-host transfers without silently moving
     influence arithmetic from CPU to CUDA. Prepared reads may remain on CUDA when
     their caller explicitly requests that device.
     Any refusal or resident-copy failure disables the tier atomically and leaves
@@ -984,7 +983,7 @@ class _GpuResidentFeatureRowStore:
         self._device = torch.device(device)
         self._allocator = allocator or torch.empty
         self._resident_rows: torch.Tensor | None = None
-        self._prepared_host_rows: torch.Tensor | None = None
+        self._exact_host_rows: torch.Tensor | None = None
         self._committed_rows = bytearray(self.n_rows)
         self._closed = False
         self._high_water_row = 0
@@ -999,7 +998,7 @@ class _GpuResidentFeatureRowStore:
             "gpu_row_tier_allocated_bytes_delta": 0,
             "gpu_row_tier_reserved_bytes_delta": 0,
             "gpu_row_tier_owned_bytes": 0,
-            "gpu_row_tier_prepared_host_mirror_owned_bytes": 0,
+            "gpu_row_tier_host_mirror_owned_bytes": 0,
             "gpu_row_tier_high_water_row": 0,
             "gpu_row_tier_high_water_bytes": 0,
             "gpu_row_tier_append_calls": 0,
@@ -1014,7 +1013,7 @@ class _GpuResidentFeatureRowStore:
             "gpu_row_tier_avoided_file_read_bytes": 0,
             "gpu_row_tier_avoided_h2d_bytes": 0,
             "gpu_row_tier_d2h_bytes": 0,
-            "gpu_row_tier_prepared_host_mirror_read_bytes": 0,
+            "gpu_row_tier_host_mirror_read_bytes": 0,
             "gpu_row_tier_read_transfer_elapsed_ms": 0.0,
             "gpu_row_tier_copy_failures": 0,
             "gpu_row_tier_cleanup_count": 0,
@@ -1040,10 +1039,6 @@ class _GpuResidentFeatureRowStore:
         # Preserve the wrapped row store's arithmetic-device contract. Merely
         # enabling a storage tier must not switch exact CPU reductions to CUDA.
         return self.row_abs_max.device
-
-    @property
-    def phase4_prepared_read_available(self) -> bool:
-        return self._prepared_host_rows is not None
 
     @property
     def row_denominator_scaled_l1(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1104,7 +1099,7 @@ class _GpuResidentFeatureRowStore:
                 if resident.dtype != self._dtype or resident.device != self._device:
                     raise RuntimeError("GPU row-tier allocator returned an unexpected dtype/device")
                 self._resident_rows = resident
-                self._prepared_host_rows = torch.empty(
+                self._exact_host_rows = torch.empty(
                     (self.n_rows, self.n_feature_columns),
                     dtype=self._dtype,
                     device="cpu",
@@ -1115,15 +1110,12 @@ class _GpuResidentFeatureRowStore:
                 self._diagnostic_stats["gpu_row_tier_owned_bytes"] = int(
                     resident.numel() * resident.element_size()
                 )
-                self._diagnostic_stats[
-                    "gpu_row_tier_prepared_host_mirror_owned_bytes"
-                ] = int(
-                    self._prepared_host_rows.numel()
-                    * self._prepared_host_rows.element_size()
+                self._diagnostic_stats["gpu_row_tier_host_mirror_owned_bytes"] = int(
+                    self._exact_host_rows.numel() * self._exact_host_rows.element_size()
                 )
             except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
                 self._resident_rows = None
-                self._prepared_host_rows = None
+                self._exact_host_rows = None
                 reason = f"allocation_failed:{type(exc).__name__}"
 
         admitted = self._resident_rows is not None
@@ -1151,17 +1143,17 @@ class _GpuResidentFeatureRowStore:
 
     def _disable_resident_tier(self, reason: str) -> None:
         self._resident_rows = None
-        self._prepared_host_rows = None
+        self._exact_host_rows = None
         self._committed_rows = bytearray(self.n_rows)
         self._diagnostic_stats["gpu_row_tier_admitted"] = 0
         self._diagnostic_stats["gpu_row_tier_reason"] = reason
         self._diagnostic_stats["gpu_row_tier_owned_bytes"] = 0
-        self._diagnostic_stats["gpu_row_tier_prepared_host_mirror_owned_bytes"] = 0
+        self._diagnostic_stats["gpu_row_tier_host_mirror_owned_bytes"] = 0
 
     def _range_is_resident(self, row_start: int, row_end: int) -> bool:
         return (
             self._resident_rows is not None
-            and self._prepared_host_rows is not None
+            and self._exact_host_rows is not None
             and row_end >= row_start
             and all(self._committed_rows[row_start:row_end])
         )
@@ -1237,11 +1229,10 @@ class _GpuResidentFeatureRowStore:
                 source.detach().to(device=resident.device, dtype=resident.dtype),
                 non_blocking=False,
             )
-            assert self._prepared_host_rows is not None
-            canonical_host_rows = feature_rows.detach().to(device="cpu", dtype=self._dtype)
-            torch.abs(
-                canonical_host_rows,
-                out=self._prepared_host_rows[row_start:row_end],
+            assert self._exact_host_rows is not None
+            self._exact_host_rows[row_start:row_end].copy_(
+                feature_rows.detach().to(device="cpu", dtype=self._dtype),
+                non_blocking=False,
             )
         except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError) as exc:
             self._diagnostic_stats["gpu_row_tier_copy_failures"] = (
@@ -1294,18 +1285,22 @@ class _GpuResidentFeatureRowStore:
         row_count = int(row_end - row_start)
         if phase == "phase4" and self._range_is_resident(row_start, row_end):
             assert self._resident_rows is not None
+            assert self._exact_host_rows is not None
             destination_device = self.row_abs_max.device
             transfer_start = time.perf_counter()
-            result = self._resident_rows[row_start:row_end].to(
-                device=destination_device,
-                non_blocking=False,
-            )
+            result = self._exact_host_rows[row_start:row_end]
+            if result.device != destination_device:
+                result = result.to(device=destination_device, non_blocking=False)
             transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
             self._record_resident_read(
                 row_count,
-                source_device=self._resident_rows.device,
+                source_device=self._exact_host_rows.device,
                 destination_device=destination_device,
                 transfer_elapsed_ms=transfer_elapsed_ms,
+            )
+            self._diagnostic_stats["gpu_row_tier_host_mirror_read_bytes"] = (
+                int(self._diagnostic_stats["gpu_row_tier_host_mirror_read_bytes"])
+                + int(row_count * self.n_feature_columns * self._dtype.itemsize)
             )
             return result
         if phase == "phase4":
@@ -1325,13 +1320,13 @@ class _GpuResidentFeatureRowStore:
         row_count = int(row_end - row_start)
         if phase == "phase4" and self._range_is_resident(row_start, row_end):
             assert self._resident_rows is not None
-            assert self._prepared_host_rows is not None
+            assert self._exact_host_rows is not None
             destination_device = torch.device(device)
             transfer_start = time.perf_counter()
             source = (
                 self._resident_rows
                 if destination_device == self._resident_rows.device
-                else self._prepared_host_rows
+                else self._exact_host_rows
             )
             result = source[row_start:row_end].to(
                 device=destination_device, dtype=dtype, non_blocking=False
@@ -1343,16 +1338,11 @@ class _GpuResidentFeatureRowStore:
                 destination_device=destination_device,
                 transfer_elapsed_ms=transfer_elapsed_ms,
             )
-            if source is self._prepared_host_rows:
-                self._diagnostic_stats["gpu_row_tier_prepared_host_mirror_read_bytes"] = (
-                    int(
-                        self._diagnostic_stats[
-                            "gpu_row_tier_prepared_host_mirror_read_bytes"
-                        ]
-                    )
+            if source is self._exact_host_rows:
+                self._diagnostic_stats["gpu_row_tier_host_mirror_read_bytes"] = (
+                    int(self._diagnostic_stats["gpu_row_tier_host_mirror_read_bytes"])
                     + int(row_count * self.n_feature_columns * self._dtype.itemsize)
                 )
-                return result
             return result.abs()
         if phase == "phase4":
             self._record_fallback_read(row_count)
@@ -1380,10 +1370,10 @@ class _GpuResidentFeatureRowStore:
             return
         self._closed = True
         self._resident_rows = None
-        self._prepared_host_rows = None
+        self._exact_host_rows = None
         self._committed_rows = bytearray()
         self._diagnostic_stats["gpu_row_tier_owned_bytes"] = 0
-        self._diagnostic_stats["gpu_row_tier_prepared_host_mirror_owned_bytes"] = 0
+        self._diagnostic_stats["gpu_row_tier_host_mirror_owned_bytes"] = 0
         self._diagnostic_stats["gpu_row_tier_cleanup_count"] = (
             int(self._diagnostic_stats["gpu_row_tier_cleanup_count"]) + 1
         )

@@ -65,7 +65,6 @@ def recompute_feature_influences(state):
         )
         state.refresh_prepared_row_reader = bool(
             state.phase4_refresh_prepared_chunk_cache_bytes_effective > 0
-            or getattr(state.feature_row_store, "phase4_prepared_read_available", False)
         )
         if state.refresh_prepared_row_reader:
 

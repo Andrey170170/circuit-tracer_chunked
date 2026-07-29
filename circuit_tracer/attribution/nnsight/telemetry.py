@@ -229,8 +229,8 @@ def _build_phase4_refresh_substage_telemetry(
                     "feature_row_store_gpu_tier_avoided_h2d_bytes"
                 ),
                 "gpu_row_tier_d2h_bytes": "feature_row_store_gpu_tier_d2h_bytes",
-                "gpu_row_tier_prepared_host_mirror_read_bytes": (
-                    "feature_row_store_gpu_tier_prepared_host_mirror_read_bytes"
+                "gpu_row_tier_host_mirror_read_bytes": (
+                    "feature_row_store_gpu_tier_host_mirror_read_bytes"
                 ),
                 "gpu_row_tier_copy_failures": "feature_row_store_gpu_tier_copy_failures",
                 "gpu_row_tier_append_calls": "feature_row_store_gpu_tier_append_calls",
@@ -238,8 +238,8 @@ def _build_phase4_refresh_substage_telemetry(
                 "gpu_row_tier_append_bytes": "feature_row_store_gpu_tier_append_bytes",
                 "gpu_row_tier_high_water_bytes": "feature_row_store_gpu_tier_high_water_bytes",
                 "gpu_row_tier_owned_bytes": "feature_row_store_gpu_tier_owned_bytes",
-                "gpu_row_tier_prepared_host_mirror_owned_bytes": (
-                    "feature_row_store_gpu_tier_prepared_host_mirror_owned_bytes"
+                "gpu_row_tier_host_mirror_owned_bytes": (
+                    "feature_row_store_gpu_tier_host_mirror_owned_bytes"
                 ),
             }.items():
                 payload[telemetry_key] = _safe_int(feature_row_store_read_stats.get(source_key))

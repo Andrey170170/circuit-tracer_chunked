@@ -194,7 +194,7 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
             "gpu_row_tier_avoided_file_read_bytes": 14,
             "gpu_row_tier_avoided_h2d_bytes": 15,
             "gpu_row_tier_d2h_bytes": 21,
-            "gpu_row_tier_prepared_host_mirror_read_bytes": 23,
+            "gpu_row_tier_host_mirror_read_bytes": 23,
             "gpu_row_tier_read_transfer_elapsed_ms": 22.5,
             "gpu_row_tier_copy_failures": 0,
             "gpu_row_tier_append_calls": 16,
@@ -202,7 +202,7 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
             "gpu_row_tier_append_bytes": 18,
             "gpu_row_tier_high_water_bytes": 19,
             "gpu_row_tier_owned_bytes": 20,
-            "gpu_row_tier_prepared_host_mirror_owned_bytes": 24,
+            "gpu_row_tier_host_mirror_owned_bytes": 24,
         },
     )
 
@@ -213,12 +213,12 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
     assert payload["feature_row_store_gpu_tier_avoided_file_read_bytes"] == 14
     assert payload["feature_row_store_gpu_tier_avoided_h2d_bytes"] == 15
     assert payload["feature_row_store_gpu_tier_d2h_bytes"] == 21
-    assert payload["feature_row_store_gpu_tier_prepared_host_mirror_read_bytes"] == 23
+    assert payload["feature_row_store_gpu_tier_host_mirror_read_bytes"] == 23
     assert payload["feature_row_store_gpu_tier_read_transfer_elapsed_ms"] == 22.5
     assert payload["feature_row_store_gpu_tier_copy_failures"] == 0
     assert payload["feature_row_store_gpu_tier_append_bytes"] == 18
     assert payload["feature_row_store_gpu_tier_owned_bytes"] == 20
-    assert payload["feature_row_store_gpu_tier_prepared_host_mirror_owned_bytes"] == 24
+    assert payload["feature_row_store_gpu_tier_host_mirror_owned_bytes"] == 24
 
 
 def test_file_backed_feature_row_store_temp_root_default_and_explicit(tmp_path) -> None:
