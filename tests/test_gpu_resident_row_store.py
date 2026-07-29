@@ -157,9 +157,11 @@ def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
         assert stats["gpu_row_tier_read_hits"] == 3
         assert stats["gpu_row_tier_read_fallbacks"] == 1
         assert stats["gpu_row_tier_avoided_file_read_bytes"] == (2 + 4 + 3) * 4 * 4
-        assert stats["gpu_row_tier_d2h_bytes"] == (2 + 4) * 4 * 4
+        assert stats["gpu_row_tier_d2h_bytes"] == 0
         assert stats["gpu_row_tier_avoided_h2d_bytes"] == 3 * 4 * 4
         assert stats["gpu_row_tier_owned_bytes"] == 5 * 4 * 4
+        assert stats["gpu_row_tier_host_mirror_owned_bytes"] == 5 * 4 * 4
+        assert stats["gpu_row_tier_host_mirror_read_bytes"] == (2 + 4) * 4 * 4
         del resident, fallback, all_rows, expected, prepared
     finally:
         store.cleanup()
