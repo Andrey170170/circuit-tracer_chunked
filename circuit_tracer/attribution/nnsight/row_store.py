@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Literal, Protocol, cast
+from typing import Callable, Iterator, Literal, Protocol, cast
 
 import numpy as np
 import torch
@@ -68,6 +68,8 @@ class GpuRowTierAdmission:
     window_budget_bytes: int = 0
     window_rows: int = 0
     window_bytes: int = 0
+    window_buffer_count: int = 0
+    pinned_host_bytes: int = 0
 
 
 def estimate_gpu_row_tier_capacity(
@@ -1008,7 +1010,13 @@ class _GpuResidentFeatureRowStore:
         self._host_rows: torch.Tensor | None = None
         self._prepared_host_rows: torch.Tensor | None = None
         self._window_rows: torch.Tensor | None = None
+        self._pinned_window_rows: torch.Tensor | None = None
         self._window_row_capacity = 0
+        self._window_buffer_count = 0
+        self._window_copy_stream: torch.cuda.Stream | None = None
+        self._window_copy_ready_events: list[torch.cuda.Event] = []
+        self._window_compute_done_events: list[torch.cuda.Event] = []
+        self._window_slot_initialized: list[bool] = []
         self._committed_rows = bytearray(self.n_rows)
         self._closed = False
         self._high_water_row = 0
@@ -1025,6 +1033,12 @@ class _GpuResidentFeatureRowStore:
             "gpu_row_tier_required_bytes": 0,
             "gpu_row_tier_window_rows": 0,
             "gpu_row_tier_window_bytes": 0,
+            "gpu_row_tier_window_buffer_count": 0,
+            "gpu_row_tier_pinned_host_bytes": 0,
+            "gpu_row_tier_window_prefetch_calls": 0,
+            "gpu_row_tier_window_stream_wait_count": 0,
+            "gpu_row_tier_window_sync_elapsed_ms": 0.0,
+            "gpu_row_tier_window_host_stage_elapsed_ms": 0.0,
             "gpu_row_tier_allocated_bytes_delta": 0,
             "gpu_row_tier_reserved_bytes_delta": 0,
             "gpu_row_tier_owned_bytes": 0,
@@ -1196,11 +1210,14 @@ class _GpuResidentFeatureRowStore:
 
         if mode == "cuda_windowed" or (mode == "auto" and self._resolved_mode == "cpu_exact"):
             row_bytes = int(self.n_feature_columns * capacity.element_size)
-            window_rows = min(
-                self.n_rows,
+            total_window_rows = min(
+                self.n_rows * 2,
                 int(window_max_bytes // row_bytes) if row_bytes > 0 else self.n_rows,
             )
-            window_bytes = int(window_rows * row_bytes)
+            window_buffer_count = 2
+            window_rows = int(total_window_rows // window_buffer_count)
+            allocated_window_rows = int(window_rows * window_buffer_count)
+            window_bytes = int(allocated_window_rows * row_bytes)
             refusal = self._cuda_refusal_reason(
                 required_bytes=window_bytes,
                 budget_bytes=window_max_bytes,
@@ -1208,7 +1225,7 @@ class _GpuResidentFeatureRowStore:
                 free_bytes=free_bytes,
             )
             if window_rows <= 0:
-                refusal = "window_budget_below_one_row"
+                refusal = "window_budget_below_two_buffers"
             if refusal is None:
                 try:
                     self._host_rows = torch.empty(
@@ -1216,14 +1233,38 @@ class _GpuResidentFeatureRowStore:
                         dtype=self._dtype,
                         device="cpu",
                     )
-                    self._window_rows = self._allocate_cuda_rows(window_rows)
+                    self._window_rows = self._allocate_cuda_rows(allocated_window_rows)
+                    self._pinned_window_rows = torch.empty(
+                        (allocated_window_rows, self.n_feature_columns),
+                        dtype=self._dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
                     self._window_row_capacity = int(window_rows)
+                    self._window_buffer_count = int(window_buffer_count)
+                    with torch.cuda.device(self._device):
+                        self._window_copy_stream = torch.cuda.Stream(device=self._device)
+                        self._window_copy_ready_events = [
+                            torch.cuda.Event(enable_timing=False)
+                            for _ in range(self._window_buffer_count)
+                        ]
+                        self._window_compute_done_events = [
+                            torch.cuda.Event(enable_timing=False)
+                            for _ in range(self._window_buffer_count)
+                        ]
+                    self._window_slot_initialized = [False] * self._window_buffer_count
                     self._resolved_mode = "cuda_windowed"
                     reason = "admitted_cuda_windowed"
                 except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
                     self._host_rows = None
                     self._window_rows = None
+                    self._pinned_window_rows = None
                     self._window_row_capacity = 0
+                    self._window_buffer_count = 0
+                    self._window_copy_stream = None
+                    self._window_copy_ready_events = []
+                    self._window_compute_done_events = []
+                    self._window_slot_initialized = []
                     reason = f"cuda_windowed_allocation_failed:{type(exc).__name__}"
             else:
                 reason = f"cuda_windowed_{refusal}"
@@ -1250,6 +1291,11 @@ class _GpuResidentFeatureRowStore:
             if self._window_rows is not None
             else 0
         )
+        pinned_host_bytes = (
+            int(self._pinned_window_rows.numel() * self._pinned_window_rows.element_size())
+            if self._pinned_window_rows is not None
+            else 0
+        )
         admitted = self._resolved_mode != "cpu_exact"
         self._diagnostic_stats.update(
             {
@@ -1258,6 +1304,8 @@ class _GpuResidentFeatureRowStore:
                 "gpu_row_tier_reason": reason,
                 "gpu_row_tier_window_rows": self._window_row_capacity,
                 "gpu_row_tier_window_bytes": window_bytes,
+                "gpu_row_tier_window_buffer_count": self._window_buffer_count,
+                "gpu_row_tier_pinned_host_bytes": pinned_host_bytes,
                 "gpu_row_tier_allocated_bytes_delta": int(allocated_delta),
                 "gpu_row_tier_reserved_bytes_delta": int(reserved_delta),
                 "gpu_row_tier_owned_bytes": gpu_owned_bytes,
@@ -1282,6 +1330,8 @@ class _GpuResidentFeatureRowStore:
             window_budget_bytes=window_max_bytes,
             window_rows=self._window_row_capacity,
             window_bytes=window_bytes,
+            window_buffer_count=self._window_buffer_count,
+            pinned_host_bytes=pinned_host_bytes,
         )
 
     def _require_open(self) -> None:
@@ -1293,7 +1343,13 @@ class _GpuResidentFeatureRowStore:
         self._host_rows = None
         self._prepared_host_rows = None
         self._window_rows = None
+        self._pinned_window_rows = None
         self._window_row_capacity = 0
+        self._window_buffer_count = 0
+        self._window_copy_stream = None
+        self._window_copy_ready_events = []
+        self._window_compute_done_events = []
+        self._window_slot_initialized = []
         self._resolved_mode = "cpu_exact"
         self._committed_rows = bytearray(self.n_rows)
         self._diagnostic_stats.update(
@@ -1306,6 +1362,8 @@ class _GpuResidentFeatureRowStore:
                 "gpu_row_tier_prepared_host_mirror_owned_bytes": 0,
                 "gpu_row_tier_window_rows": 0,
                 "gpu_row_tier_window_bytes": 0,
+                "gpu_row_tier_window_buffer_count": 0,
+                "gpu_row_tier_pinned_host_bytes": 0,
             }
         )
 
@@ -1319,6 +1377,104 @@ class _GpuResidentFeatureRowStore:
         if self._resolved_mode == "cpu_prepared":
             return self._prepared_host_rows is not None
         return False
+
+    def _window_slot(
+        self,
+        tensor: torch.Tensor,
+        slot: int,
+        row_count: int,
+    ) -> torch.Tensor:
+        start = int(slot * self._window_row_capacity)
+        return tensor[start : start + row_count]
+
+    def _stage_window_range(
+        self,
+        *,
+        slot: int,
+        row_start: int,
+        row_end: int,
+    ) -> torch.Tensor:
+        assert self._host_rows is not None
+        assert self._window_rows is not None
+        assert self._pinned_window_rows is not None
+        assert self._window_copy_stream is not None
+        row_count = int(row_end - row_start)
+        if row_count > self._window_row_capacity:
+            raise RuntimeError("Phase-4 row request exceeds admitted CUDA window capacity")
+
+        sync_elapsed_ms = 0.0
+        if self._window_slot_initialized[slot]:
+            sync_start = time.perf_counter()
+            self._window_copy_ready_events[slot].synchronize()
+            sync_elapsed_ms = (time.perf_counter() - sync_start) * 1000.0
+        pinned = self._window_slot(self._pinned_window_rows, slot, row_count)
+        host_stage_start = time.perf_counter()
+        pinned.copy_(self._host_rows[row_start:row_end], non_blocking=False)
+        host_stage_elapsed_ms = (time.perf_counter() - host_stage_start) * 1000.0
+        result = self._window_slot(self._window_rows, slot, row_count)
+        dispatch_start = time.perf_counter()
+        with torch.cuda.stream(self._window_copy_stream):
+            if self._window_slot_initialized[slot]:
+                self._window_copy_stream.wait_event(self._window_compute_done_events[slot])
+            result.copy_(pinned, non_blocking=True)
+            self._window_copy_ready_events[slot].record(self._window_copy_stream)
+        dispatch_elapsed_ms = (time.perf_counter() - dispatch_start) * 1000.0
+        self._window_slot_initialized[slot] = True
+        self._record_accelerated_read(
+            row_count,
+            source_device=torch.device("cpu"),
+            destination_device=self._device,
+            transfer_elapsed_ms=host_stage_elapsed_ms + dispatch_elapsed_ms,
+        )
+        nbytes = int(row_count * self.n_feature_columns * self._dtype.itemsize)
+        for key, delta in (
+            ("gpu_row_tier_window_read_calls", 1),
+            ("gpu_row_tier_window_read_rows", row_count),
+            ("gpu_row_tier_window_read_bytes", nbytes),
+            ("gpu_row_tier_host_mirror_read_bytes", nbytes),
+            ("gpu_row_tier_window_prefetch_calls", 1),
+        ):
+            self._diagnostic_stats[key] = int(self._diagnostic_stats[key]) + delta
+        self._diagnostic_stats["gpu_row_tier_window_sync_elapsed_ms"] = (
+            float(self._diagnostic_stats["gpu_row_tier_window_sync_elapsed_ms"]) + sync_elapsed_ms
+        )
+        self._diagnostic_stats["gpu_row_tier_window_host_stage_elapsed_ms"] = (
+            float(self._diagnostic_stats["gpu_row_tier_window_host_stage_elapsed_ms"])
+            + host_stage_elapsed_ms
+        )
+        return result
+
+    def iter_phase4_feature_rows(
+        self,
+        ranges: list[tuple[int, int]],
+    ) -> Iterator[torch.Tensor]:
+        """Yield ordered CUDA windows with one-range-ahead transfer overlap."""
+
+        self._require_open()
+        if self._resolved_mode != "cuda_windowed":
+            for row_start, row_end in ranges:
+                yield self.read_feature_rows(row_start, row_end, phase="phase4")
+            return
+        assert self._window_buffer_count == 2
+        with torch.cuda.device(self._device):
+            compute_stream = torch.cuda.current_stream(self._device)
+            for index, (row_start, row_end) in enumerate(ranges):
+                if row_start < 0 or row_end < row_start or row_end > self.n_rows:
+                    raise ValueError("requested row slice is out of bounds for accelerated store")
+                if not self._range_is_ready(row_start, row_end):
+                    raise RuntimeError("batched CUDA window requested an uncommitted row range")
+                slot = int(index % self._window_buffer_count)
+                result = self._stage_window_range(
+                    slot=slot,
+                    row_start=row_start,
+                    row_end=row_end,
+                )
+                compute_stream.wait_event(self._window_copy_ready_events[slot])
+                self._diagnostic_stats["gpu_row_tier_window_stream_wait_count"] = (
+                    int(self._diagnostic_stats["gpu_row_tier_window_stream_wait_count"]) + 1
+                )
+                yield result
+                self._window_compute_done_events[slot].record(compute_stream)
 
     def _record_accelerated_read(
         self,
@@ -1466,15 +1622,26 @@ class _GpuResidentFeatureRowStore:
                 )
                 return result
             if self._resolved_mode == "cuda_windowed":
-                assert self._host_rows is not None and self._window_rows is not None
+                assert self._host_rows is not None
+                assert self._window_rows is not None
+                assert self._pinned_window_rows is not None
                 if row_count > self._window_row_capacity:
                     raise RuntimeError("Phase-4 row request exceeds admitted CUDA window capacity")
+                if any(self._window_slot_initialized):
+                    torch.cuda.synchronize(self._device)
+                    self._window_slot_initialized = [False] * self._window_buffer_count
+                pinned = self._window_slot(
+                    self._pinned_window_rows,
+                    0,
+                    row_count,
+                )
                 transfer_start = time.perf_counter()
-                result = self._window_rows[:row_count]
-                result.copy_(
+                pinned.copy_(
                     self._host_rows[row_start:row_end],
                     non_blocking=False,
                 )
+                result = self._window_slot(self._window_rows, 0, row_count)
+                result.copy_(pinned, non_blocking=False)
                 transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
                 self._record_accelerated_read(
                     row_count,
@@ -1564,13 +1731,21 @@ class _GpuResidentFeatureRowStore:
         self._host_rows = None
         self._prepared_host_rows = None
         self._window_rows = None
+        self._pinned_window_rows = None
         self._window_row_capacity = 0
+        self._window_buffer_count = 0
+        self._window_copy_stream = None
+        self._window_copy_ready_events = []
+        self._window_compute_done_events = []
+        self._window_slot_initialized = []
         self._committed_rows = bytearray()
         self._diagnostic_stats["gpu_row_tier_owned_bytes"] = 0
         self._diagnostic_stats["gpu_row_tier_host_mirror_owned_bytes"] = 0
         self._diagnostic_stats["gpu_row_tier_prepared_host_mirror_owned_bytes"] = 0
         self._diagnostic_stats["gpu_row_tier_window_rows"] = 0
         self._diagnostic_stats["gpu_row_tier_window_bytes"] = 0
+        self._diagnostic_stats["gpu_row_tier_window_buffer_count"] = 0
+        self._diagnostic_stats["gpu_row_tier_pinned_host_bytes"] = 0
         self._diagnostic_stats["gpu_row_tier_cleanup_count"] = (
             int(self._diagnostic_stats["gpu_row_tier_cleanup_count"]) + 1
         )

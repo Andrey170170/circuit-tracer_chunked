@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import NamedTuple
 import time
 import warnings
@@ -707,6 +707,7 @@ def compute_partial_feature_influences_streaming(
     active_row_only_chunks: bool = False,
     row_reader_returns_prepared: bool = False,
     active_row_accumulation: str = "zero_fill",
+    row_batch_reader: (Callable[[list[tuple[int, int]]], Iterator[torch.Tensor]] | None) = None,
 ) -> torch.Tensor:
     """Compute feature-only partial influences from streamed dense row chunks.
 
@@ -737,6 +738,9 @@ def compute_partial_feature_influences_streaming(
         active_row_only_chunks: When ``True``, preserve fixed row-chunk windows but
             read only contiguous non-zero subranges inside each active chunk.
             Default ``False`` preserves legacy fixed-chunk behavior.
+        row_batch_reader: Optional ordered range iterator used by direct active-row
+            accumulation. This lets a row store pipeline transfer of range ``N+1``
+            while range ``N`` is consumed without changing accumulation order.
 
     Returns:
         Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
@@ -780,6 +784,8 @@ def compute_partial_feature_influences_streaming(
         raise ValueError("active_row_accumulation must be 'zero_fill' or 'direct_v1'")
     if active_row_accumulation == "direct_v1" and not active_row_only_chunks:
         raise ValueError("active_row_accumulation='direct_v1' requires active_row_only_chunks=True")
+    if row_batch_reader is not None and active_row_accumulation != "direct_v1":
+        raise ValueError("row_batch_reader requires active_row_accumulation='direct_v1'")
 
     if isinstance(row_abs_sums, torch.Tensor):
         row_denominator_device = row_abs_sums.device
@@ -986,7 +992,76 @@ def compute_partial_feature_influences_streaming(
                 next_feature_prod += normalized_row_weights @ chunk
                 matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
         else:
-            for start in range(0, n_rows, row_chunk_size):
+            if row_batch_reader is not None:
+                iteration_ranges: list[tuple[int, int]] = []
+                for start in range(0, n_rows, row_chunk_size):
+                    end = min(start + row_chunk_size, n_rows)
+                    active_row_scan_start = time.perf_counter()
+                    active_row_subranges = list(_iter_active_row_subranges(start, end, row_weights))
+                    active_row_scan_elapsed_ms_total += (
+                        time.perf_counter() - active_row_scan_start
+                    ) * 1000.0
+                    if not active_row_subranges:
+                        continue
+                    active_row_chunk_count += 1
+                    active_row_range_count += len(active_row_subranges)
+                    chunk_request_count += 1
+                    chunk_cache_miss_count += 1
+                    iteration_ranges.extend(active_row_subranges)
+
+                batch_iterator = iter(row_batch_reader(iteration_ranges))
+                for sub_start, sub_end in iteration_ranges:
+                    row_reader_start = time.perf_counter()
+                    try:
+                        subchunk = next(batch_iterator)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "row_batch_reader returned fewer tensors than requested ranges"
+                        ) from exc
+                    row_reader_elapsed_ms_total += (time.perf_counter() - row_reader_start) * 1000.0
+                    row_reader_call_count += 1
+                    row_reader_row_count += int(sub_end - sub_start)
+                    if subchunk.ndim != 2 or subchunk.shape != (
+                        sub_end - sub_start,
+                        n_feature_nodes,
+                    ):
+                        raise ValueError(
+                            "row_batch_reader must return shape "
+                            f"({sub_end - sub_start}, {n_feature_nodes}) for rows "
+                            f"[{sub_start}, {sub_end})"
+                        )
+                    subchunk = _prepare_chunk(subchunk)
+                    normalization_start = time.perf_counter()
+                    sub_weights = _normalize_row_weights_from_denominator(
+                        row_weights[sub_start:sub_end],
+                        denom_mode=denom_mode,
+                        denom_primary=denom_primary[sub_start:sub_end],
+                        denom_secondary=(
+                            denom_secondary[sub_start:sub_end]
+                            if denom_secondary is not None
+                            else None
+                        ),
+                    )
+                    normalization_elapsed_ms_total += (
+                        time.perf_counter() - normalization_start
+                    ) * 1000.0
+                    direct_start = time.perf_counter()
+                    next_feature_prod += sub_weights @ subchunk
+                    direct_accumulation_elapsed_ms_total += (
+                        time.perf_counter() - direct_start
+                    ) * 1000.0
+                    direct_accumulation_subrange_count += 1
+                try:
+                    next(batch_iterator)
+                except StopIteration:
+                    pass
+                else:
+                    raise ValueError("row_batch_reader returned more tensors than requested ranges")
+            for start in (
+                ()
+                if row_batch_reader is not None and iteration_ranges
+                else range(0, n_rows, row_chunk_size)
+            ):
                 end = min(start + row_chunk_size, n_rows)
                 chunk_row_weights = row_weights[start:end]
                 active_row_scan_start = time.perf_counter()

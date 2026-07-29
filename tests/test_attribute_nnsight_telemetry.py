@@ -218,6 +218,12 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
             "gpu_row_tier_window_read_bytes": 30,
             "gpu_row_tier_window_rows": 31,
             "gpu_row_tier_window_bytes": 32,
+            "gpu_row_tier_window_buffer_count": 2,
+            "gpu_row_tier_pinned_host_bytes": 37,
+            "gpu_row_tier_window_prefetch_calls": 38,
+            "gpu_row_tier_window_stream_wait_count": 39,
+            "gpu_row_tier_window_sync_elapsed_ms": 40.5,
+            "gpu_row_tier_window_host_stage_elapsed_ms": 41.5,
         },
     )
 
@@ -248,6 +254,12 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
     assert payload["feature_row_store_gpu_tier_window_read_bytes"] == 30
     assert payload["feature_row_store_gpu_tier_window_rows"] == 31
     assert payload["feature_row_store_gpu_tier_window_bytes"] == 32
+    assert payload["feature_row_store_gpu_tier_window_buffer_count"] == 2
+    assert payload["feature_row_store_gpu_tier_pinned_host_bytes"] == 37
+    assert payload["feature_row_store_gpu_tier_window_prefetch_calls"] == 38
+    assert payload["feature_row_store_gpu_tier_window_stream_wait_count"] == 39
+    assert payload["feature_row_store_gpu_tier_window_sync_elapsed_ms"] == 40.5
+    assert payload["feature_row_store_gpu_tier_window_host_stage_elapsed_ms"] == 41.5
 
 
 def test_file_backed_feature_row_store_temp_root_default_and_explicit(tmp_path) -> None:

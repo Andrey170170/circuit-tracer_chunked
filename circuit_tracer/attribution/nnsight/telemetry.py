@@ -251,6 +251,16 @@ def _build_phase4_refresh_substage_telemetry(
                 "gpu_row_tier_window_read_bytes": ("feature_row_store_gpu_tier_window_read_bytes"),
                 "gpu_row_tier_window_rows": "feature_row_store_gpu_tier_window_rows",
                 "gpu_row_tier_window_bytes": "feature_row_store_gpu_tier_window_bytes",
+                "gpu_row_tier_window_buffer_count": (
+                    "feature_row_store_gpu_tier_window_buffer_count"
+                ),
+                "gpu_row_tier_pinned_host_bytes": ("feature_row_store_gpu_tier_pinned_host_bytes"),
+                "gpu_row_tier_window_prefetch_calls": (
+                    "feature_row_store_gpu_tier_window_prefetch_calls"
+                ),
+                "gpu_row_tier_window_stream_wait_count": (
+                    "feature_row_store_gpu_tier_window_stream_wait_count"
+                ),
                 "gpu_row_tier_budget_bytes": "feature_row_store_gpu_tier_budget_bytes",
                 "gpu_row_tier_window_budget_bytes": (
                     "feature_row_store_gpu_tier_window_budget_bytes"
@@ -272,6 +282,12 @@ def _build_phase4_refresh_substage_telemetry(
             )
             payload["feature_row_store_gpu_tier_read_transfer_elapsed_ms"] = _safe_float(
                 feature_row_store_read_stats.get("gpu_row_tier_read_transfer_elapsed_ms")
+            )
+            payload["feature_row_store_gpu_tier_window_sync_elapsed_ms"] = _safe_float(
+                feature_row_store_read_stats.get("gpu_row_tier_window_sync_elapsed_ms")
+            )
+            payload["feature_row_store_gpu_tier_window_host_stage_elapsed_ms"] = _safe_float(
+                feature_row_store_read_stats.get("gpu_row_tier_window_host_stage_elapsed_ms")
             )
             payload["feature_row_store_prepared_read_cache_prepare_elapsed_ms"] = _safe_float(
                 feature_row_store_read_stats.get("prepared_read_cache_prepare_elapsed_ms_total")

@@ -70,6 +70,20 @@ def recompute_feature_influences(state):
         state.refresh_influence_row_chunk_size = int(
             getattr(state.feature_row_store, "influence_row_chunk_size", 4096)
         )
+        state.refresh_row_batch_reader = (
+            getattr(
+                state.feature_row_store,
+                "iter_phase4_feature_rows",
+                None,
+            )
+            if getattr(
+                state.feature_row_store,
+                "resolved_influence_mode",
+                None,
+            )
+            == "cuda_windowed"
+            else None
+        )
         if state.refresh_prepared_row_reader:
 
             def refresh_row_reader(row_start: int, row_end: int) -> torch.Tensor:
@@ -120,6 +134,7 @@ def recompute_feature_influences(state):
                 active_row_only_chunks=state.refresh_active_row_only_chunks,
                 row_reader_returns_prepared=state.refresh_prepared_row_reader,
                 active_row_accumulation=state.phase4_refresh_active_row_accumulation_effective,
+                row_batch_reader=state.refresh_row_batch_reader,
             )
         state.refresh_row_store_read_elapsed_ms = _safe_float(
             state.streaming_chunk_reuse_stats.get("row_reader_elapsed_ms_total")
@@ -368,12 +383,14 @@ def rank_feature_frontier(state):
             "gpu_row_tier_required_bytes",
             "gpu_row_tier_window_rows",
             "gpu_row_tier_window_bytes",
+            "gpu_row_tier_window_buffer_count",
+            "gpu_row_tier_pinned_host_bytes",
             "gpu_row_tier_owned_bytes",
             "gpu_row_tier_host_mirror_owned_bytes",
             "gpu_row_tier_prepared_host_mirror_owned_bytes",
         ):
-            state.feature_row_store_read_stats[key] = (
-                state.feature_row_store_snapshot_after.get(key)
+            state.feature_row_store_read_stats[key] = state.feature_row_store_snapshot_after.get(
+                key
             )
     state.refresh_rank_topk_elapsed_ms = (time.perf_counter() - state.rank_topk_start) * 1000.0
     state.phase4_refresh_rank_topk_elapsed_ms_total += state.refresh_rank_topk_elapsed_ms

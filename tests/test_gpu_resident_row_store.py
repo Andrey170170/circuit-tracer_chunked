@@ -301,7 +301,7 @@ def test_cuda_windowed_mode_bounds_hbm_and_streams_host_rows() -> None:
         backing_store=backing,
         mode="cuda_windowed",
         max_bytes=0,
-        window_max_bytes=2 * 4 * 4,
+        window_max_bytes=4 * 4 * 4,
         safety_margin_bytes=0,
         device=device,
     )
@@ -318,7 +318,9 @@ def test_cuda_windowed_mode_bounds_hbm_and_streams_host_rows() -> None:
             store.read_feature_rows(0, 3, phase="phase4")
 
         stats = store.get_diagnostic_snapshot()
-        assert stats["gpu_row_tier_owned_bytes"] == 2 * 4 * 4
+        assert stats["gpu_row_tier_owned_bytes"] == 4 * 4 * 4
+        assert stats["gpu_row_tier_pinned_host_bytes"] == 4 * 4 * 4
+        assert stats["gpu_row_tier_window_buffer_count"] == 2
         assert stats["gpu_row_tier_host_mirror_owned_bytes"] == 5 * 4 * 4
         assert stats["gpu_row_tier_h2d_bytes"] == 2 * 4 * 4
         assert stats["gpu_row_tier_window_read_calls"] == 1
@@ -339,7 +341,7 @@ def test_auto_mode_falls_from_full_residency_to_cuda_window() -> None:
         backing_store=backing,
         mode="auto",
         max_bytes=5 * 4 * 4 - 1,
-        window_max_bytes=2 * 4 * 4,
+        window_max_bytes=4 * 4 * 4,
         safety_margin_bytes=0,
         device=device,
     )
@@ -348,6 +350,7 @@ def test_auto_mode_falls_from_full_residency_to_cuda_window() -> None:
         assert store.admission.requested_mode == "auto"
         assert store.admission.resolved_mode == "cuda_windowed"
         assert store.admission.window_rows == 2
+        assert store.admission.window_buffer_count == 2
     finally:
         store.cleanup()
 
@@ -371,7 +374,7 @@ def test_cuda_windowed_solver_matches_cuda_full_with_fixed_chunk_geometry() -> N
     try:
         for mode, full_bytes, window_bytes in (
             ("cuda_full", 1024, 0),
-            ("cuda_windowed", 0, 2 * 4 * 4),
+            ("cuda_windowed", 0, 4 * 4 * 4),
         ):
             backing = _FileBackedFeatureRowStore(
                 n_rows=3,
@@ -406,6 +409,11 @@ def test_cuda_windowed_solver_matches_cuda_full_with_fixed_chunk_geometry() -> N
                 row_chunk_size=2,
                 active_row_only_chunks=True,
                 active_row_accumulation="direct_v1",
+                row_batch_reader=(
+                    store.iter_phase4_feature_rows
+                    if store.resolved_influence_mode == "cuda_windowed"
+                    else None
+                ),
             )
             for store in stores
         ]
@@ -414,6 +422,11 @@ def test_cuda_windowed_solver_matches_cuda_full_with_fixed_chunk_geometry() -> N
         window_stats = stores[1].get_diagnostic_snapshot()
         assert window_stats["gpu_row_tier_h2d_bytes"] > 0
         assert window_stats["gpu_row_tier_window_read_calls"] > 1
+        assert window_stats["gpu_row_tier_window_prefetch_calls"] > 1
+        assert (
+            window_stats["gpu_row_tier_window_stream_wait_count"]
+            == window_stats["gpu_row_tier_window_prefetch_calls"]
+        )
     finally:
         for store in stores:
             store.cleanup()
