@@ -228,6 +228,7 @@ def _build_phase4_refresh_substage_telemetry(
                 "gpu_row_tier_avoided_h2d_bytes": (
                     "feature_row_store_gpu_tier_avoided_h2d_bytes"
                 ),
+                "gpu_row_tier_d2h_bytes": "feature_row_store_gpu_tier_d2h_bytes",
                 "gpu_row_tier_copy_failures": "feature_row_store_gpu_tier_copy_failures",
                 "gpu_row_tier_append_calls": "feature_row_store_gpu_tier_append_calls",
                 "gpu_row_tier_append_rows": "feature_row_store_gpu_tier_append_rows",
@@ -236,6 +237,9 @@ def _build_phase4_refresh_substage_telemetry(
                 "gpu_row_tier_owned_bytes": "feature_row_store_gpu_tier_owned_bytes",
             }.items():
                 payload[telemetry_key] = _safe_int(feature_row_store_read_stats.get(source_key))
+            payload["feature_row_store_gpu_tier_read_transfer_elapsed_ms"] = _safe_float(
+                feature_row_store_read_stats.get("gpu_row_tier_read_transfer_elapsed_ms")
+            )
             payload["feature_row_store_prepared_read_cache_prepare_elapsed_ms"] = _safe_float(
                 feature_row_store_read_stats.get("prepared_read_cache_prepare_elapsed_ms_total")
             )

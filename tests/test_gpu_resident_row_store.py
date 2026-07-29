@@ -133,8 +133,8 @@ def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
         _append(store, first, row_start=0)
 
         resident = store.read_feature_rows(0, 2, phase="phase4")
-        assert resident.device.type == "cuda"
-        assert torch.equal(resident, first)
+        assert resident.device.type == "cpu"
+        assert torch.equal(resident, first.cpu())
 
         fallback = store.read_feature_rows(0, 3, phase="phase4")
         assert fallback.device.type == "cpu"
@@ -142,7 +142,7 @@ def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
 
         _append(store, second, row_start=2)
         all_rows = store.read_feature_rows(0, 4, phase="phase4")
-        expected = torch.cat((first, second), dim=0)
+        expected = torch.cat((first, second), dim=0).cpu()
         assert torch.equal(all_rows, expected)
 
         prepared = store.read_prepared_feature_rows(
@@ -152,11 +152,13 @@ def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
             dtype=torch.float32,
             phase="phase4",
         )
-        assert torch.equal(prepared, expected[1:4].abs())
+        assert torch.equal(prepared.cpu(), expected[1:4].abs())
         stats = store.get_diagnostic_snapshot()
         assert stats["gpu_row_tier_read_hits"] == 3
         assert stats["gpu_row_tier_read_fallbacks"] == 1
         assert stats["gpu_row_tier_avoided_file_read_bytes"] == (2 + 4 + 3) * 4 * 4
+        assert stats["gpu_row_tier_d2h_bytes"] == (2 + 4) * 4 * 4
+        assert stats["gpu_row_tier_avoided_h2d_bytes"] == 3 * 4 * 4
         assert stats["gpu_row_tier_owned_bytes"] == 5 * 4 * 4
         del resident, fallback, all_rows, expected, prepared
     finally:
@@ -214,12 +216,13 @@ def test_gpu_row_tier_streaming_solver_matches_file_reference() -> None:
             row_to_node_index,
             n_feature_nodes=4,
             n_logits=1,
-            device=device,
+            device=store.influence_device,
             compute_dtype=torch.float32,
             active_row_only_chunks=True,
             active_row_accumulation="direct_v1",
         )
 
-        assert torch.equal(candidate.cpu(), reference)
+        assert candidate.device.type == "cpu"
+        assert torch.equal(candidate, reference)
     finally:
         store.cleanup()

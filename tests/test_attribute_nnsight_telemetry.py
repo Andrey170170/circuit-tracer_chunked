@@ -193,6 +193,8 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
             "gpu_row_tier_read_fallback_rows": 0,
             "gpu_row_tier_avoided_file_read_bytes": 14,
             "gpu_row_tier_avoided_h2d_bytes": 15,
+            "gpu_row_tier_d2h_bytes": 21,
+            "gpu_row_tier_read_transfer_elapsed_ms": 22.5,
             "gpu_row_tier_copy_failures": 0,
             "gpu_row_tier_append_calls": 16,
             "gpu_row_tier_append_rows": 17,
@@ -208,6 +210,8 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
     assert payload["feature_row_store_gpu_tier_read_fallbacks"] == 0
     assert payload["feature_row_store_gpu_tier_avoided_file_read_bytes"] == 14
     assert payload["feature_row_store_gpu_tier_avoided_h2d_bytes"] == 15
+    assert payload["feature_row_store_gpu_tier_d2h_bytes"] == 21
+    assert payload["feature_row_store_gpu_tier_read_transfer_elapsed_ms"] == 22.5
     assert payload["feature_row_store_gpu_tier_copy_failures"] == 0
     assert payload["feature_row_store_gpu_tier_append_bytes"] == 18
     assert payload["feature_row_store_gpu_tier_owned_bytes"] == 20

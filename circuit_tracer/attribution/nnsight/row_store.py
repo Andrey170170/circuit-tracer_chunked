@@ -951,6 +951,9 @@ class _GpuResidentFeatureRowStore:
 
     File storage remains authoritative. The CUDA tier is used only for Phase-4
     reads whose complete canonical row range has been committed successfully.
+    Ordinary reads preserve the backing store's device contract, so enabling the
+    tier cannot silently move influence arithmetic from CPU to CUDA. Prepared
+    reads may remain on CUDA when their caller explicitly requests that device.
     Any refusal or resident-copy failure disables the tier atomically and leaves
     the file-backed path available.
     """
@@ -1005,6 +1008,8 @@ class _GpuResidentFeatureRowStore:
             "gpu_row_tier_read_fallback_rows": 0,
             "gpu_row_tier_avoided_file_read_bytes": 0,
             "gpu_row_tier_avoided_h2d_bytes": 0,
+            "gpu_row_tier_d2h_bytes": 0,
+            "gpu_row_tier_read_transfer_elapsed_ms": 0.0,
             "gpu_row_tier_copy_failures": 0,
             "gpu_row_tier_cleanup_count": 0,
             "gpu_row_tier_device": str(self._device),
@@ -1026,8 +1031,8 @@ class _GpuResidentFeatureRowStore:
 
     @property
     def influence_device(self) -> torch.device:
-        if self._resident_rows is not None:
-            return self._resident_rows.device
+        # Preserve the wrapped row store's arithmetic-device contract. Merely
+        # enabling a storage tier must not switch exact CPU reductions to CUDA.
         return self.row_abs_max.device
 
     @property
@@ -1136,7 +1141,13 @@ class _GpuResidentFeatureRowStore:
             and all(self._committed_rows[row_start:row_end])
         )
 
-    def _record_resident_read(self, row_count: int) -> None:
+    def _record_resident_read(
+        self,
+        row_count: int,
+        *,
+        destination_device: torch.device,
+        transfer_elapsed_ms: float,
+    ) -> None:
         nbytes = int(row_count * self.n_feature_columns * self._dtype.itemsize)
         self._diagnostic_stats["gpu_row_tier_read_hits"] = (
             int(self._diagnostic_stats["gpu_row_tier_read_hits"]) + 1
@@ -1150,8 +1161,17 @@ class _GpuResidentFeatureRowStore:
         self._diagnostic_stats["gpu_row_tier_avoided_file_read_bytes"] = (
             int(self._diagnostic_stats["gpu_row_tier_avoided_file_read_bytes"]) + nbytes
         )
-        self._diagnostic_stats["gpu_row_tier_avoided_h2d_bytes"] = (
-            int(self._diagnostic_stats["gpu_row_tier_avoided_h2d_bytes"]) + nbytes
+        if destination_device == self._device:
+            self._diagnostic_stats["gpu_row_tier_avoided_h2d_bytes"] = (
+                int(self._diagnostic_stats["gpu_row_tier_avoided_h2d_bytes"]) + nbytes
+            )
+        elif self._device.type == "cuda" and destination_device.type == "cpu":
+            self._diagnostic_stats["gpu_row_tier_d2h_bytes"] = (
+                int(self._diagnostic_stats["gpu_row_tier_d2h_bytes"]) + nbytes
+            )
+        self._diagnostic_stats["gpu_row_tier_read_transfer_elapsed_ms"] = (
+            float(self._diagnostic_stats["gpu_row_tier_read_transfer_elapsed_ms"])
+            + float(transfer_elapsed_ms)
         )
 
     def _record_fallback_read(self, row_count: int) -> None:
@@ -1242,8 +1262,19 @@ class _GpuResidentFeatureRowStore:
         row_count = int(row_end - row_start)
         if phase == "phase4" and self._range_is_resident(row_start, row_end):
             assert self._resident_rows is not None
-            self._record_resident_read(row_count)
-            return self._resident_rows[row_start:row_end]
+            destination_device = self.row_abs_max.device
+            transfer_start = time.perf_counter()
+            result = self._resident_rows[row_start:row_end].to(
+                device=destination_device,
+                non_blocking=False,
+            )
+            transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
+            self._record_resident_read(
+                row_count,
+                destination_device=destination_device,
+                transfer_elapsed_ms=transfer_elapsed_ms,
+            )
+            return result
         if phase == "phase4":
             self._record_fallback_read(row_count)
         return self._backing_store.read_feature_rows(row_start, row_end, phase=phase)
@@ -1261,8 +1292,20 @@ class _GpuResidentFeatureRowStore:
         row_count = int(row_end - row_start)
         if phase == "phase4" and self._range_is_resident(row_start, row_end):
             assert self._resident_rows is not None
-            self._record_resident_read(row_count)
-            return self._resident_rows[row_start:row_end].to(device=device, dtype=dtype).abs()
+            destination_device = torch.device(device)
+            transfer_start = time.perf_counter()
+            result = self._resident_rows[row_start:row_end].to(
+                device=destination_device,
+                dtype=dtype,
+                non_blocking=False,
+            )
+            transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
+            self._record_resident_read(
+                row_count,
+                destination_device=destination_device,
+                transfer_elapsed_ms=transfer_elapsed_ms,
+            )
+            return result.abs()
         if phase == "phase4":
             self._record_fallback_read(row_count)
         return self._backing_store.read_prepared_feature_rows(
