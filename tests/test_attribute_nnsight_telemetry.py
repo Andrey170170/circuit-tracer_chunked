@@ -186,6 +186,13 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
         row_reader_row_count=9,
         solver_iteration_count=10,
         feature_row_store_read_stats={
+            "feature_row_influence_mode_requested": "auto",
+            "feature_row_influence_mode_resolved": "cuda_windowed",
+            "gpu_row_tier_reason": "admitted_cuda_windowed",
+            "gpu_row_tier_budget_bytes": 33,
+            "gpu_row_tier_window_budget_bytes": 34,
+            "gpu_row_tier_safety_margin_bytes": 35,
+            "gpu_row_tier_required_bytes": 36,
             "gpu_row_tier_read_hits": 11,
             "gpu_row_tier_read_hit_rows": 12,
             "gpu_row_tier_read_hit_bytes": 13,
@@ -193,6 +200,7 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
             "gpu_row_tier_read_fallback_rows": 0,
             "gpu_row_tier_avoided_file_read_bytes": 14,
             "gpu_row_tier_avoided_h2d_bytes": 15,
+            "gpu_row_tier_h2d_bytes": 25,
             "gpu_row_tier_d2h_bytes": 21,
             "gpu_row_tier_host_mirror_read_bytes": 23,
             "gpu_row_tier_read_transfer_elapsed_ms": 22.5,
@@ -203,15 +211,30 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
             "gpu_row_tier_high_water_bytes": 19,
             "gpu_row_tier_owned_bytes": 20,
             "gpu_row_tier_host_mirror_owned_bytes": 24,
+            "gpu_row_tier_prepared_host_mirror_read_bytes": 26,
+            "gpu_row_tier_prepared_host_mirror_owned_bytes": 27,
+            "gpu_row_tier_window_read_calls": 28,
+            "gpu_row_tier_window_read_rows": 29,
+            "gpu_row_tier_window_read_bytes": 30,
+            "gpu_row_tier_window_rows": 31,
+            "gpu_row_tier_window_bytes": 32,
         },
     )
 
+    assert payload["feature_row_influence_mode_requested"] == "auto"
+    assert payload["feature_row_influence_mode_resolved"] == "cuda_windowed"
+    assert payload["feature_row_store_gpu_tier_reason"] == "admitted_cuda_windowed"
+    assert payload["feature_row_store_gpu_tier_budget_bytes"] == 33
+    assert payload["feature_row_store_gpu_tier_window_budget_bytes"] == 34
+    assert payload["feature_row_store_gpu_tier_safety_margin_bytes"] == 35
+    assert payload["feature_row_store_gpu_tier_required_bytes"] == 36
     assert payload["feature_row_store_gpu_tier_read_hits"] == 11
     assert payload["feature_row_store_gpu_tier_read_hit_rows"] == 12
     assert payload["feature_row_store_gpu_tier_read_hit_bytes"] == 13
     assert payload["feature_row_store_gpu_tier_read_fallbacks"] == 0
     assert payload["feature_row_store_gpu_tier_avoided_file_read_bytes"] == 14
     assert payload["feature_row_store_gpu_tier_avoided_h2d_bytes"] == 15
+    assert payload["feature_row_store_gpu_tier_h2d_bytes"] == 25
     assert payload["feature_row_store_gpu_tier_d2h_bytes"] == 21
     assert payload["feature_row_store_gpu_tier_host_mirror_read_bytes"] == 23
     assert payload["feature_row_store_gpu_tier_read_transfer_elapsed_ms"] == 22.5
@@ -219,6 +242,12 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
     assert payload["feature_row_store_gpu_tier_append_bytes"] == 18
     assert payload["feature_row_store_gpu_tier_owned_bytes"] == 20
     assert payload["feature_row_store_gpu_tier_host_mirror_owned_bytes"] == 24
+    assert payload["feature_row_store_gpu_tier_prepared_host_mirror_owned_bytes"] == 27
+    assert payload["feature_row_store_gpu_tier_window_read_calls"] == 28
+    assert payload["feature_row_store_gpu_tier_window_read_rows"] == 29
+    assert payload["feature_row_store_gpu_tier_window_read_bytes"] == 30
+    assert payload["feature_row_store_gpu_tier_window_rows"] == 31
+    assert payload["feature_row_store_gpu_tier_window_bytes"] == 32
 
 
 def test_file_backed_feature_row_store_temp_root_default_and_explicit(tmp_path) -> None:
@@ -588,9 +617,7 @@ def test_canonical_execution_policy_type_hints_include_supported_modes() -> None
     assert "deferred_v1" in get_args(semantics_hints["refresh_policy"])
     assert "topk_v1" in get_args(semantics_hints["ranker"])
     assert "fadvise_dontneed_after_append_v1" in get_args(storage_hints["cache_control"])
-    assert "fadvise_dontneed_after_append_and_read_v1" in get_args(
-        storage_hints["cache_control"]
-    )
+    assert "fadvise_dontneed_after_append_and_read_v1" in get_args(storage_hints["cache_control"])
     assert "active_pinned_cpu" in get_args(storage_hints["exact_encoder_residency"])
 
 

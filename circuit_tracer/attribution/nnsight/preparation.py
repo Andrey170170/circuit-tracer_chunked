@@ -476,9 +476,7 @@ def _resolve_frontier(
         phase0_ranges_fallback_reason = "disabled"
     elif not active_rows_effective:
         phase0_ranges_fallback_reason = "requires_active_row_residency"
-    elif not bool(
-        getattr(provider.capabilities, "supports_phase0_decoder_row_ranges", False)
-    ):
+    elif not bool(getattr(provider.capabilities, "supports_phase0_decoder_row_ranges", False)):
         phase0_ranges_fallback_reason = "provider_capability_unavailable"
     phase0_ranges_effective = phase0_ranges_fallback_reason is None
     phase0_ranges_metadata = {
@@ -883,12 +881,8 @@ def _effective_execution_identity(
             ),
             "decoder_active_row_estimated_bytes": (frontier.decoder_active_row_estimated_bytes),
             "decoder_active_row_fallback_reason": frontier.decoder_active_row_fallback_reason,
-            "phase0_decoder_row_ranges_requested": (
-                frontier.phase0_decoder_row_ranges_requested
-            ),
-            "phase0_decoder_row_ranges_effective": (
-                frontier.phase0_decoder_row_ranges_effective
-            ),
+            "phase0_decoder_row_ranges_requested": (frontier.phase0_decoder_row_ranges_requested),
+            "phase0_decoder_row_ranges_effective": (frontier.phase0_decoder_row_ranges_effective),
             "phase0_decoder_row_ranges_fallback_reason": (
                 frontier.phase0_decoder_row_ranges_fallback_reason
             ),
@@ -908,6 +902,12 @@ def _effective_execution_identity(
             "temp_root_policy": plan.execution.storage.temp_root_policy,
             "preallocate": plan.execution.storage.preallocate,
             "replay_tile_cache_bytes": plan.execution.storage.replay_tile_cache_bytes,
+            "feature_row_influence_mode": (plan.execution.storage.feature_row_influence_mode),
+            "gpu_resident_max_bytes": plan.execution.storage.gpu_resident_max_bytes,
+            "gpu_window_max_bytes": plan.execution.storage.gpu_window_max_bytes,
+            "gpu_resident_safety_margin_bytes": (
+                plan.execution.storage.gpu_resident_safety_margin_bytes
+            ),
             "exact_encoder_residency": plan.execution.storage.exact_encoder_residency,
             "placement": (
                 None
@@ -992,8 +992,7 @@ def reprepare_after_active_universe(
     }
     range_execution_observed = (
         "phase0_decoder_row_ranges_planning_seconds" in prior_range_metadata
-        or prepared.frontier.phase0_decoder_row_ranges_fallback_reason
-        == "seed_capture_refused"
+        or prepared.frontier.phase0_decoder_row_ranges_fallback_reason == "seed_capture_refused"
     )
     if range_execution_observed:
         execution_metadata = dict(frontier.execution_metadata)
@@ -1128,14 +1127,13 @@ def finalize_phase0_decoder_row_range_execution(
         return prepared
     if (
         not frontier.phase0_decoder_row_ranges_effective
-        and frontier.phase0_decoder_row_ranges_fallback_reason
-        != "seed_capture_refused"
+        and frontier.phase0_decoder_row_ranges_fallback_reason != "seed_capture_refused"
     ):
         return prepared
     observed = "phase0_decoder_row_ranges_requested" in diagnostics
-    effective = bool(
-        diagnostics.get("phase0_decoder_row_ranges_effective", False)
-    ) if observed else False
+    effective = (
+        bool(diagnostics.get("phase0_decoder_row_ranges_effective", False)) if observed else False
+    )
     fallback_reason = (
         diagnostics.get("phase0_decoder_row_ranges_fallback_reason")
         if observed

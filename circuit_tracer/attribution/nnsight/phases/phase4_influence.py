@@ -65,6 +65,10 @@ def recompute_feature_influences(state):
         )
         state.refresh_prepared_row_reader = bool(
             state.phase4_refresh_prepared_chunk_cache_bytes_effective > 0
+            or getattr(state.feature_row_store, "phase4_prepared_read_available", False)
+        )
+        state.refresh_influence_row_chunk_size = int(
+            getattr(state.feature_row_store, "influence_row_chunk_size", 4096)
         )
         if state.refresh_prepared_row_reader:
 
@@ -110,6 +114,7 @@ def recompute_feature_influences(state):
                 n_feature_nodes=state.total_active_feats,
                 n_logits=state.n_logits,
                 device=state.influence_device,
+                row_chunk_size=state.refresh_influence_row_chunk_size,
                 chunk_reuse_stats=state.streaming_chunk_reuse_stats,
                 compute_dtype=state.influence_compute_dtype,
                 active_row_only_chunks=state.refresh_active_row_only_chunks,
@@ -349,5 +354,26 @@ def rank_feature_frontier(state):
         if state.feature_row_store_snapshot_after is not None
         else None
     )
+    if (
+        state.feature_row_store_read_stats is not None
+        and state.feature_row_store_snapshot_after is not None
+    ):
+        for key in (
+            "feature_row_influence_mode_requested",
+            "feature_row_influence_mode_resolved",
+            "gpu_row_tier_reason",
+            "gpu_row_tier_budget_bytes",
+            "gpu_row_tier_window_budget_bytes",
+            "gpu_row_tier_safety_margin_bytes",
+            "gpu_row_tier_required_bytes",
+            "gpu_row_tier_window_rows",
+            "gpu_row_tier_window_bytes",
+            "gpu_row_tier_owned_bytes",
+            "gpu_row_tier_host_mirror_owned_bytes",
+            "gpu_row_tier_prepared_host_mirror_owned_bytes",
+        ):
+            state.feature_row_store_read_stats[key] = (
+                state.feature_row_store_snapshot_after.get(key)
+            )
     state.refresh_rank_topk_elapsed_ms = (time.perf_counter() - state.rank_topk_start) * 1000.0
     state.phase4_refresh_rank_topk_elapsed_ms_total += state.refresh_rank_topk_elapsed_ms

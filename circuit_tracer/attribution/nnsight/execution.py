@@ -84,11 +84,7 @@ def _decoder_row_execution_metadata(snapshot: dict[str, object]) -> dict[str, ob
     """Keep active-row and Phase-0 range evidence in final execution metadata."""
 
     prefixes = ("decoder_active_row_", "phase0_decoder_row_ranges_")
-    return {
-        key: value
-        for key, value in snapshot.items()
-        if key.startswith(prefixes)
-    }
+    return {key: value for key, value in snapshot.items() if key.startswith(prefixes)}
 
 
 def _memory_headroom_bytes(snapshot: object) -> int | None:
@@ -263,9 +259,7 @@ class AttributionExecution:
         if getattr(self, "phase0", None) is None:
             return
         ctx = self._phase0().ctx
-        provider = get_checkpoint_lifecycle_provider(
-            getattr(ctx, "decoder_provider", None)
-        )
+        provider = get_checkpoint_lifecycle_provider(getattr(ctx, "decoder_provider", None))
         observer = self.prepared.diagnostics.observer
         if provider is None:
             observer.observe(
@@ -279,9 +273,7 @@ class AttributionExecution:
             return
 
         try:
-            active_row_bytes = int(
-                ctx.seal_active_decoder_rows_for_checkpoint_transition()
-            )
+            active_row_bytes = int(ctx.seal_active_decoder_rows_for_checkpoint_transition())
         except RuntimeError as exc:
             observer.observe(
                 TraceEvent(
@@ -343,9 +335,7 @@ class AttributionExecution:
 
         page_lifecycle = CheckpointPageLifecycle(
             lifecycle_capability.manifest,
-            telemetry=lambda event: observer.observe(
-                _checkpoint_page_trace_event(event)
-            ),
+            telemetry=lambda event: observer.observe(_checkpoint_page_trace_event(event)),
         )
         for byte_range in plan.release:
             page_lifecycle.release(byte_range)
@@ -424,9 +414,7 @@ class AttributionExecution:
                         "asset_role": asset_role,
                         "cache_state": cache_state,
                         "cache_state_provenance": (
-                            "telemetry_context"
-                            if "cache_state" in context
-                            else "unavailable"
+                            "telemetry_context" if "cache_state" in context else "unavailable"
                         ),
                     },
                 )
@@ -442,9 +430,7 @@ class AttributionExecution:
                     asset_role=asset_role,
                     cache_state=cache_state,
                     cache_state_provenance=(
-                        "telemetry_context"
-                        if "cache_state" in context
-                        else "unavailable"
+                        "telemetry_context" if "cache_state" in context else "unavailable"
                     ),
                     error=error,
                 )
@@ -457,9 +443,7 @@ class AttributionExecution:
                     asset_role=asset_role,
                     cache_state=cache_state,
                     cache_state_provenance=(
-                        "telemetry_context"
-                        if "cache_state" in context
-                        else "unavailable"
+                        "telemetry_context" if "cache_state" in context else "unavailable"
                     ),
                 )
                 return result
@@ -584,9 +568,7 @@ class AttributionExecution:
                     decoder_active_row_max_bytes=int(
                         plan.execution.frontier.decoder_active_row_max_bytes
                     ),
-                    phase0_decoder_row_ranges=bool(
-                        p.frontier.phase0_decoder_row_ranges_effective
-                    ),
+                    phase0_decoder_row_ranges=bool(p.frontier.phase0_decoder_row_ranges_effective),
                 ),
             )
         except Phase0ExecutionError as exc:
@@ -691,10 +673,10 @@ class AttributionExecution:
                     preallocate=storage.preallocate,
                     prepared_chunk_cache_bytes=(p.frontier.prepared_chunk_cache_bytes_effective),
                     replay_tile_cache_bytes=int(storage.replay_tile_cache_bytes or 0),
+                    feature_row_influence_mode=storage.feature_row_influence_mode,
                     gpu_resident_max_bytes=storage.gpu_resident_max_bytes,
-                    gpu_resident_safety_margin_bytes=(
-                        storage.gpu_resident_safety_margin_bytes
-                    ),
+                    gpu_window_max_bytes=storage.gpu_window_max_bytes,
+                    gpu_resident_safety_margin_bytes=(storage.gpu_resident_safety_margin_bytes),
                     gpu_resident_device=p.problem.model.device,
                 ),
                 execution=Phase2ExecutionPolicy(

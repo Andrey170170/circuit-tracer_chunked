@@ -84,6 +84,7 @@ class SessionPlan:
         ):
             raise ValueError("capped Phase-1 batching requires phase1_trace_batch_size_max")
 
+
 @dataclass(frozen=True)
 class RowStoragePlan:
     """Attribution-row retention, layout, cache, and staging policy."""
@@ -102,12 +103,30 @@ class RowStoragePlan:
     temp_root: str | PathLike[str] | None = None
     preallocate: bool = True
     replay_tile_cache_bytes: int | None = None
+    feature_row_influence_mode: Literal[
+        "cpu_exact",
+        "cpu_prepared",
+        "cuda_full",
+        "cuda_windowed",
+        "auto",
+    ] = "cpu_exact"
     gpu_resident_max_bytes: int = 0
+    gpu_window_max_bytes: int = 0
     gpu_resident_safety_margin_bytes: int = 0
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy"
     placement: StorageTier | None = None
 
     def __post_init__(self) -> None:
+        allowed_influence_modes = {
+            "cpu_exact",
+            "cpu_prepared",
+            "cuda_full",
+            "cuda_windowed",
+            "auto",
+        }
+        if self.feature_row_influence_mode not in allowed_influence_modes:
+            allowed = ", ".join(sorted(allowed_influence_modes))
+            raise ValueError(f"feature_row_influence_mode must be one of: {allowed}")
         for name in (
             "feature_column_tile_size",
             "influence_row_tile_size",
@@ -116,10 +135,21 @@ class RowStoragePlan:
             _positive(name, getattr(self, name))
         _nonnegative("replay_tile_cache_bytes", self.replay_tile_cache_bytes)
         _nonnegative("gpu_resident_max_bytes", self.gpu_resident_max_bytes)
+        _nonnegative("gpu_window_max_bytes", self.gpu_window_max_bytes)
         _nonnegative(
             "gpu_resident_safety_margin_bytes",
             self.gpu_resident_safety_margin_bytes,
         )
+        if self.feature_row_influence_mode == "cuda_full" and self.gpu_resident_max_bytes == 0:
+            raise ValueError("cuda_full feature-row influence requires gpu_resident_max_bytes")
+        if self.feature_row_influence_mode == "cuda_windowed" and self.gpu_window_max_bytes == 0:
+            raise ValueError("cuda_windowed feature-row influence requires gpu_window_max_bytes")
+        if self.feature_row_influence_mode == "auto" and (
+            self.gpu_resident_max_bytes == 0 or self.gpu_window_max_bytes == 0
+        ):
+            raise ValueError(
+                "auto feature-row influence requires full-resident and window byte budgets"
+            )
         if self.temp_root is not None and self.temp_root_policy != "default":
             raise ValueError("an explicit temp_root cannot be combined with temp_root_policy")
 
@@ -189,8 +219,7 @@ class FrontierExpansionPlan:
         _nonnegative("decoder_active_row_max_bytes", self.decoder_active_row_max_bytes)
         if self.feature_vjp_tape_batch_window > 1 and self.feature_vjp_tape_max_bytes == 0:
             raise ValueError(
-                "feature_vjp_tape_batch_window > 1 requires "
-                "feature_vjp_tape_max_bytes > 0"
+                "feature_vjp_tape_batch_window > 1 requires feature_vjp_tape_max_bytes > 0"
             )
         for name in (
             "feature_batch_target_reserved_fraction",
@@ -240,9 +269,7 @@ class DiagnosticStopPolicy:
             raise ValueError(f"unsupported diagnostic stop mode: {self.mode!r}")
         if self.mode == "transition_probe":
             if self.phase4_batches is None or self.phase4_batches <= 0:
-                raise ValueError(
-                    "transition_probe requires a positive phase4_batches count"
-                )
+                raise ValueError("transition_probe requires a positive phase4_batches count")
         elif self.phase4_batches is not None:
             raise ValueError("phase4_batches is valid only for transition_probe")
 

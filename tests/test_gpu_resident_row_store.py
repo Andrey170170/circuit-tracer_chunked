@@ -14,6 +14,7 @@ from circuit_tracer.attribution.nnsight.row_store import (
     estimate_gpu_row_tier_capacity,
 )
 from circuit_tracer.graph import compute_partial_feature_influences_streaming
+from circuit_tracer.tracing.plan import RowStoragePlan
 
 
 def _append(
@@ -46,6 +47,26 @@ def test_gpu_row_tier_capacity_is_exact() -> None:
     assert capacity.required_bytes == capacity.logical_bytes
 
 
+def test_feature_row_influence_modes_require_their_byte_budgets() -> None:
+    with pytest.raises(ValueError, match="cuda_full"):
+        RowStoragePlan(feature_row_influence_mode="cuda_full")
+    with pytest.raises(ValueError, match="cuda_windowed"):
+        RowStoragePlan(feature_row_influence_mode="cuda_windowed")
+    with pytest.raises(ValueError, match="full-resident and window"):
+        RowStoragePlan(
+            feature_row_influence_mode="auto",
+            gpu_resident_max_bytes=1024,
+        )
+
+    assert (
+        RowStoragePlan(
+            feature_row_influence_mode="cuda_full",
+            gpu_resident_max_bytes=1024,
+        ).feature_row_influence_mode
+        == "cuda_full"
+    )
+
+
 def test_gpu_row_tier_refuses_before_allocation_and_falls_back() -> None:
     backing = _FileBackedFeatureRowStore(
         n_rows=3,
@@ -65,7 +86,7 @@ def test_gpu_row_tier_refuses_before_allocation_and_falls_back() -> None:
 
         assert torch.equal(restored, rows)
         assert not store.admission.admitted
-        assert store.admission.reason == "device_not_cuda"
+        assert store.admission.reason == "cuda_full_device_not_cuda"
         stats = store.get_diagnostic_snapshot()
         assert stats["gpu_row_tier_read_fallbacks"] == 1
         assert stats["gpu_row_tier_read_hits"] == 0
@@ -96,14 +117,14 @@ def test_gpu_row_tier_allocation_failure_preserves_file_path() -> None:
         _append(store, rows)
 
         assert not store.admission.admitted
-        assert store.admission.reason == "allocation_failed:RuntimeError"
+        assert store.admission.reason == "cuda_full_allocation_failed:RuntimeError"
         assert torch.equal(store.read_feature_rows(0, 2, phase="phase4"), rows)
     finally:
         store.cleanup()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
+def test_cuda_full_row_tier_ranges_prepared_reads_and_cleanup() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.empty_cache()
     allocated_before = torch.cuda.memory_allocated(device)
@@ -133,8 +154,8 @@ def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
         _append(store, first, row_start=0)
 
         resident = store.read_feature_rows(0, 2, phase="phase4")
-        assert resident.device.type == "cpu"
-        assert torch.equal(resident, first.cpu())
+        assert resident.device.type == "cuda"
+        assert torch.equal(resident, first)
 
         fallback = store.read_feature_rows(0, 3, phase="phase4")
         assert fallback.device.type == "cpu"
@@ -142,7 +163,7 @@ def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
 
         _append(store, second, row_start=2)
         all_rows = store.read_feature_rows(0, 4, phase="phase4")
-        expected = torch.cat((first, second), dim=0).cpu()
+        expected = torch.cat((first, second), dim=0)
         assert torch.equal(all_rows, expected)
 
         prepared = store.read_prepared_feature_rows(
@@ -152,16 +173,16 @@ def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
             dtype=torch.float32,
             phase="phase4",
         )
-        assert torch.equal(prepared.cpu(), expected[1:4].abs())
+        assert torch.equal(prepared.cpu(), expected[1:4].abs().cpu())
         stats = store.get_diagnostic_snapshot()
         assert stats["gpu_row_tier_read_hits"] == 3
         assert stats["gpu_row_tier_read_fallbacks"] == 1
         assert stats["gpu_row_tier_avoided_file_read_bytes"] == (2 + 4 + 3) * 4 * 4
         assert stats["gpu_row_tier_d2h_bytes"] == 0
-        assert stats["gpu_row_tier_avoided_h2d_bytes"] == 3 * 4 * 4
+        assert stats["gpu_row_tier_avoided_h2d_bytes"] == (2 + 4 + 3) * 4 * 4
         assert stats["gpu_row_tier_owned_bytes"] == 5 * 4 * 4
-        assert stats["gpu_row_tier_host_mirror_owned_bytes"] == 5 * 4 * 4
-        assert stats["gpu_row_tier_host_mirror_read_bytes"] == (2 + 4) * 4 * 4
+        assert stats["gpu_row_tier_host_mirror_owned_bytes"] == 0
+        assert stats["feature_row_influence_mode_resolved"] == "cuda_full"
         del resident, fallback, all_rows, expected, prepared
     finally:
         store.cleanup()
@@ -224,7 +245,175 @@ def test_gpu_row_tier_streaming_solver_matches_file_reference() -> None:
             active_row_accumulation="direct_v1",
         )
 
-        assert candidate.device.type == "cpu"
-        assert torch.equal(candidate, reference)
+        assert candidate.device.type == "cuda"
+        assert torch.equal(candidate.cpu(), reference)
     finally:
         store.cleanup()
+
+
+def test_cpu_prepared_mode_serves_precomputed_absolute_rows() -> None:
+    backing = _FileBackedFeatureRowStore(
+        n_rows=4,
+        n_feature_columns=3,
+        dtype=torch.float32,
+    )
+    store = _GpuResidentFeatureRowStore(
+        backing_store=backing,
+        mode="cpu_prepared",
+        max_bytes=0,
+        safety_margin_bytes=0,
+        device="cpu",
+    )
+    rows = torch.tensor(
+        [[-1.0, 2.0, -3.0], [4.0, -5.0, 6.0], [-7.0, 8.0, -9.0]],
+        dtype=torch.float32,
+    )
+    try:
+        _append(store, rows)
+
+        assert store.resolved_influence_mode == "cpu_prepared"
+        assert store.phase4_prepared_read_available
+        prepared = store.read_prepared_feature_rows(
+            1,
+            3,
+            device="cpu",
+            dtype=torch.float32,
+            phase="phase4",
+        )
+        assert torch.equal(prepared, rows[1:3].abs())
+        stats = store.get_diagnostic_snapshot()
+        assert stats["gpu_row_tier_prepared_host_mirror_owned_bytes"] == 4 * 3 * 4
+        assert stats["gpu_row_tier_prepared_host_mirror_read_bytes"] == 2 * 3 * 4
+        assert stats["gpu_row_tier_avoided_file_read_bytes"] == 2 * 3 * 4
+    finally:
+        store.cleanup()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_windowed_mode_bounds_hbm_and_streams_host_rows() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    backing = _FileBackedFeatureRowStore(
+        n_rows=5,
+        n_feature_columns=4,
+        dtype=torch.float32,
+    )
+    store = _GpuResidentFeatureRowStore(
+        backing_store=backing,
+        mode="cuda_windowed",
+        max_bytes=0,
+        window_max_bytes=2 * 4 * 4,
+        safety_margin_bytes=0,
+        device=device,
+    )
+    rows = torch.arange(16, dtype=torch.float32, device=device).reshape(4, 4) - 8
+    try:
+        assert store.resolved_influence_mode == "cuda_windowed"
+        assert store.influence_row_chunk_size == 2
+        _append(store, rows)
+
+        streamed = store.read_feature_rows(1, 3, phase="phase4")
+        assert streamed.device.type == "cuda"
+        assert torch.equal(streamed, rows[1:3])
+        with pytest.raises(RuntimeError, match="exceeds admitted CUDA window"):
+            store.read_feature_rows(0, 3, phase="phase4")
+
+        stats = store.get_diagnostic_snapshot()
+        assert stats["gpu_row_tier_owned_bytes"] == 2 * 4 * 4
+        assert stats["gpu_row_tier_host_mirror_owned_bytes"] == 5 * 4 * 4
+        assert stats["gpu_row_tier_h2d_bytes"] == 2 * 4 * 4
+        assert stats["gpu_row_tier_window_read_calls"] == 1
+        assert stats["gpu_row_tier_window_read_rows"] == 2
+    finally:
+        store.cleanup()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_auto_mode_falls_from_full_residency_to_cuda_window() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    backing = _FileBackedFeatureRowStore(
+        n_rows=5,
+        n_feature_columns=4,
+        dtype=torch.float32,
+    )
+    store = _GpuResidentFeatureRowStore(
+        backing_store=backing,
+        mode="auto",
+        max_bytes=5 * 4 * 4 - 1,
+        window_max_bytes=2 * 4 * 4,
+        safety_margin_bytes=0,
+        device=device,
+    )
+    try:
+        assert store.resolved_influence_mode == "cuda_windowed"
+        assert store.admission.requested_mode == "auto"
+        assert store.admission.resolved_mode == "cuda_windowed"
+        assert store.admission.window_rows == 2
+    finally:
+        store.cleanup()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_windowed_solver_matches_cuda_full_with_fixed_chunk_geometry() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows = torch.tensor(
+        [
+            [0.0, 2.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    denominators = torch.ones(rows.shape[0], dtype=torch.float32)
+    row_to_node_index = torch.tensor([4, 1, 0], dtype=torch.int32)
+    logit_p = torch.tensor([1.0], dtype=torch.float32)
+    stores: list[_GpuResidentFeatureRowStore] = []
+    try:
+        for mode, full_bytes, window_bytes in (
+            ("cuda_full", 1024, 0),
+            ("cuda_windowed", 0, 2 * 4 * 4),
+        ):
+            backing = _FileBackedFeatureRowStore(
+                n_rows=3,
+                n_feature_columns=4,
+                dtype=torch.float32,
+            )
+            store = _GpuResidentFeatureRowStore(
+                backing_store=backing,
+                mode=mode,
+                max_bytes=full_bytes,
+                window_max_bytes=window_bytes,
+                safety_margin_bytes=0,
+                device=device,
+            )
+            _append(store, rows)
+            stores.append(store)
+
+        results = [
+            compute_partial_feature_influences_streaming(
+                lambda start, end, active_store=store: active_store.read_feature_rows(
+                    start,
+                    end,
+                    phase="phase4",
+                ),
+                denominators,
+                logit_p,
+                row_to_node_index,
+                n_feature_nodes=4,
+                n_logits=1,
+                device=device,
+                compute_dtype=torch.float32,
+                row_chunk_size=2,
+                active_row_only_chunks=True,
+                active_row_accumulation="direct_v1",
+            )
+            for store in stores
+        ]
+
+        assert torch.equal(results[0], results[1])
+        window_stats = stores[1].get_diagnostic_snapshot()
+        assert window_stats["gpu_row_tier_h2d_bytes"] > 0
+        assert window_stats["gpu_row_tier_window_read_calls"] > 1
+    finally:
+        for store in stores:
+            store.cleanup()

@@ -191,8 +191,7 @@ def commit_feature_rows(state):
         assert state.nonfeature_row_store is not None
         state.row_store_write_start = time.perf_counter()
         feature_append_kwargs = {}
-        admission = getattr(state.feature_row_store, "admission", None)
-        if admission is not None and bool(getattr(admission, "admitted", False)):
+        if bool(getattr(state.feature_row_store, "accepts_resident_feature_rows", False)):
             feature_append_kwargs["resident_feature_rows"] = state.rows[
                 :, : state.total_active_feats
             ]

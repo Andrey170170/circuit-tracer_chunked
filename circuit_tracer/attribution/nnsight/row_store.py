@@ -63,6 +63,11 @@ class GpuRowTierAdmission:
     allocated_bytes_delta: int
     reserved_bytes_delta: int
     device: str
+    requested_mode: str = "cuda_full"
+    resolved_mode: str = "cpu_exact"
+    window_budget_bytes: int = 0
+    window_rows: int = 0
+    window_bytes: int = 0
 
 
 def estimate_gpu_row_tier_capacity(
@@ -946,18 +951,30 @@ class _FileBackedFeatureRowStore:
             pass
 
 
-class _GpuResidentFeatureRowStore:
-    """Exact full-residency CUDA tier over a canonical file-backed store.
+_FeatureRowInfluenceMode = Literal[
+    "cpu_exact",
+    "cpu_prepared",
+    "cuda_full",
+    "cuda_windowed",
+    "auto",
+]
+_FEATURE_ROW_INFLUENCE_MODES = {
+    "cpu_exact",
+    "cpu_prepared",
+    "cuda_full",
+    "cuda_windowed",
+    "auto",
+}
 
-    File storage remains authoritative. The CUDA tier is used only for Phase-4
-    reads whose complete canonical row range has been committed successfully.
-    Ordinary reads preserve the backing store's device contract through an exact
-    host mirror populated from the same canonical append. This avoids both file
-    reads and fine-grained CUDA-to-host transfers without silently moving
-    influence arithmetic from CPU to CUDA. Prepared reads may remain on CUDA when
-    their caller explicitly requests that device.
-    Any refusal or resident-copy failure disables the tier atomically and leaves
-    the file-backed path available.
+
+class _GpuResidentFeatureRowStore:
+    """Selectable Phase-4 row consumer over canonical signed file backing.
+
+    ``cuda_full`` retains the complete signed matrix on CUDA. ``cuda_windowed``
+    retains signed rows on the host and copies bounded row windows into a reusable
+    CUDA buffer. ``cpu_prepared`` retains an absolute-value host mirror. Any
+    admission or append failure resolves atomically to the canonical ``cpu_exact``
+    file-backed path.
     """
 
     def __init__(
@@ -967,12 +984,15 @@ class _GpuResidentFeatureRowStore:
         max_bytes: int,
         safety_margin_bytes: int,
         device: torch.device | str,
+        mode: _FeatureRowInfluenceMode = "cuda_full",
+        window_max_bytes: int = 0,
         allocator: Callable[..., torch.Tensor] | None = None,
     ) -> None:
-        if max_bytes < 0:
-            raise ValueError("GPU row-tier max_bytes must be non-negative")
-        if safety_margin_bytes < 0:
-            raise ValueError("GPU row-tier safety_margin_bytes must be non-negative")
+        if mode not in _FEATURE_ROW_INFLUENCE_MODES:
+            allowed = ", ".join(sorted(_FEATURE_ROW_INFLUENCE_MODES))
+            raise ValueError(f"feature-row influence mode must be one of: {allowed}")
+        if min(max_bytes, window_max_bytes, safety_margin_bytes) < 0:
+            raise ValueError("feature-row acceleration byte budgets must be non-negative")
 
         self._backing_store = backing_store
         self.n_rows = backing_store.n_rows
@@ -982,23 +1002,34 @@ class _GpuResidentFeatureRowStore:
         self._dtype = backing_store._dtype
         self._device = torch.device(device)
         self._allocator = allocator or torch.empty
+        self._requested_mode = mode
+        self._resolved_mode: _FeatureRowInfluenceMode = "cpu_exact"
         self._resident_rows: torch.Tensor | None = None
-        self._exact_host_rows: torch.Tensor | None = None
+        self._host_rows: torch.Tensor | None = None
+        self._prepared_host_rows: torch.Tensor | None = None
+        self._window_rows: torch.Tensor | None = None
+        self._window_row_capacity = 0
         self._committed_rows = bytearray(self.n_rows)
         self._closed = False
         self._high_water_row = 0
         self._diagnostic_stats: dict[str, object] = {
-            "gpu_row_tier_requested": int(max_bytes > 0),
+            "feature_row_influence_mode_requested": mode,
+            "feature_row_influence_mode_resolved": "cpu_exact",
+            "gpu_row_tier_requested": int(mode in {"cuda_full", "cuda_windowed", "auto"}),
             "gpu_row_tier_admitted": 0,
             "gpu_row_tier_reason": "not_evaluated",
             "gpu_row_tier_budget_bytes": int(max_bytes),
+            "gpu_row_tier_window_budget_bytes": int(window_max_bytes),
             "gpu_row_tier_safety_margin_bytes": int(safety_margin_bytes),
             "gpu_row_tier_logical_bytes": 0,
             "gpu_row_tier_required_bytes": 0,
+            "gpu_row_tier_window_rows": 0,
+            "gpu_row_tier_window_bytes": 0,
             "gpu_row_tier_allocated_bytes_delta": 0,
             "gpu_row_tier_reserved_bytes_delta": 0,
             "gpu_row_tier_owned_bytes": 0,
             "gpu_row_tier_host_mirror_owned_bytes": 0,
+            "gpu_row_tier_prepared_host_mirror_owned_bytes": 0,
             "gpu_row_tier_high_water_row": 0,
             "gpu_row_tier_high_water_bytes": 0,
             "gpu_row_tier_append_calls": 0,
@@ -1012,8 +1043,13 @@ class _GpuResidentFeatureRowStore:
             "gpu_row_tier_read_fallback_rows": 0,
             "gpu_row_tier_avoided_file_read_bytes": 0,
             "gpu_row_tier_avoided_h2d_bytes": 0,
+            "gpu_row_tier_h2d_bytes": 0,
             "gpu_row_tier_d2h_bytes": 0,
             "gpu_row_tier_host_mirror_read_bytes": 0,
+            "gpu_row_tier_prepared_host_mirror_read_bytes": 0,
+            "gpu_row_tier_window_read_calls": 0,
+            "gpu_row_tier_window_read_rows": 0,
+            "gpu_row_tier_window_read_bytes": 0,
             "gpu_row_tier_read_transfer_elapsed_ms": 0.0,
             "gpu_row_tier_copy_failures": 0,
             "gpu_row_tier_cleanup_count": 0,
@@ -1022,7 +1058,9 @@ class _GpuResidentFeatureRowStore:
             "gpu_row_tier_total_bytes": None,
         }
         self.admission = self._admit(
+            mode=mode,
             max_bytes=int(max_bytes),
+            window_max_bytes=int(window_max_bytes),
             safety_margin_bytes=int(safety_margin_bytes),
         )
 
@@ -1035,10 +1073,28 @@ class _GpuResidentFeatureRowStore:
         return self._backing_store.nbytes
 
     @property
+    def resolved_influence_mode(self) -> str:
+        return self._resolved_mode
+
+    @property
+    def accepts_resident_feature_rows(self) -> bool:
+        return self._resolved_mode == "cuda_full" and self._resident_rows is not None
+
+    @property
+    def phase4_prepared_read_available(self) -> bool:
+        return self._resolved_mode == "cpu_prepared" and self._prepared_host_rows is not None
+
+    @property
     def influence_device(self) -> torch.device:
-        # Preserve the wrapped row store's arithmetic-device contract. Merely
-        # enabling a storage tier must not switch exact CPU reductions to CUDA.
+        if self._resolved_mode in {"cuda_full", "cuda_windowed"}:
+            return self._device
         return self.row_abs_max.device
+
+    @property
+    def influence_row_chunk_size(self) -> int:
+        if self._resolved_mode == "cuda_windowed":
+            return self._window_row_capacity
+        return 4096
 
     @property
     def row_denominator_scaled_l1(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1057,7 +1113,47 @@ class _GpuResidentFeatureRowStore:
             reserved = torch.cuda.memory_reserved(self._device)
         return int(free_bytes), int(total_bytes), int(allocated), int(reserved)
 
-    def _admit(self, *, max_bytes: int, safety_margin_bytes: int) -> GpuRowTierAdmission:
+    def _cuda_refusal_reason(
+        self,
+        *,
+        required_bytes: int,
+        budget_bytes: int,
+        safety_margin_bytes: int,
+        free_bytes: int | None,
+    ) -> str | None:
+        if self._device.type != "cuda":
+            return "device_not_cuda"
+        if not torch.cuda.is_available():
+            return "cuda_unavailable"
+        if required_bytes > budget_bytes:
+            return "capacity_exceeds_budget"
+        if free_bytes is None:
+            return "cuda_memory_info_unavailable"
+        if required_bytes + safety_margin_bytes > free_bytes:
+            return "insufficient_free_memory_with_safety_margin"
+        return None
+
+    def _allocate_cuda_rows(self, rows: int) -> torch.Tensor:
+        result = self._allocator(
+            (rows, self.n_feature_columns),
+            dtype=self._dtype,
+            device=self._device,
+        )
+        expected_shape = (rows, self.n_feature_columns)
+        if result.shape != expected_shape:
+            raise RuntimeError("GPU row-tier allocator returned an unexpected shape")
+        if result.dtype != self._dtype or result.device != self._device:
+            raise RuntimeError("GPU row-tier allocator returned an unexpected dtype/device")
+        return result
+
+    def _admit(
+        self,
+        *,
+        mode: _FeatureRowInfluenceMode,
+        max_bytes: int,
+        window_max_bytes: int,
+        safety_margin_bytes: int,
+    ) -> GpuRowTierAdmission:
         capacity = estimate_gpu_row_tier_capacity(
             n_rows=self.n_rows,
             n_feature_columns=self.n_feature_columns,
@@ -1065,66 +1161,112 @@ class _GpuResidentFeatureRowStore:
         )
         self._diagnostic_stats["gpu_row_tier_logical_bytes"] = capacity.logical_bytes
         self._diagnostic_stats["gpu_row_tier_required_bytes"] = capacity.required_bytes
-
         free_bytes, total_bytes, allocated_before, reserved_before = self._cuda_memory_snapshot()
         self._diagnostic_stats["gpu_row_tier_free_bytes_before"] = free_bytes
         self._diagnostic_stats["gpu_row_tier_total_bytes"] = total_bytes
 
-        reason = "admitted"
-        requested = max_bytes > 0
-        if not requested:
-            reason = "disabled"
-        elif self._device.type != "cuda":
-            reason = "device_not_cuda"
-        elif not torch.cuda.is_available():
-            reason = "cuda_unavailable"
-        elif capacity.required_bytes > max_bytes:
-            reason = "capacity_exceeds_budget"
-        elif free_bytes is None:
-            reason = "cuda_memory_info_unavailable"
-        elif capacity.required_bytes + safety_margin_bytes > free_bytes:
-            reason = "insufficient_free_memory_with_safety_margin"
-
-        allocated_delta = 0
-        reserved_delta = 0
-        if reason == "admitted":
+        reason = "cpu_exact_requested"
+        if mode == "cpu_prepared":
             try:
-                resident = self._allocator(
-                    (self.n_rows, self.n_feature_columns),
-                    dtype=self._dtype,
-                    device=self._device,
-                )
-                if resident.shape != (self.n_rows, self.n_feature_columns):
-                    raise RuntimeError("GPU row-tier allocator returned an unexpected shape")
-                if resident.dtype != self._dtype or resident.device != self._device:
-                    raise RuntimeError("GPU row-tier allocator returned an unexpected dtype/device")
-                self._resident_rows = resident
-                self._exact_host_rows = torch.empty(
+                self._prepared_host_rows = torch.empty(
                     (self.n_rows, self.n_feature_columns),
                     dtype=self._dtype,
                     device="cpu",
                 )
-                _, _, allocated_after, reserved_after = self._cuda_memory_snapshot()
-                allocated_delta = max(0, allocated_after - allocated_before)
-                reserved_delta = max(0, reserved_after - reserved_before)
-                self._diagnostic_stats["gpu_row_tier_owned_bytes"] = int(
-                    resident.numel() * resident.element_size()
-                )
-                self._diagnostic_stats["gpu_row_tier_host_mirror_owned_bytes"] = int(
-                    self._exact_host_rows.numel() * self._exact_host_rows.element_size()
-                )
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
-                self._resident_rows = None
-                self._exact_host_rows = None
-                reason = f"allocation_failed:{type(exc).__name__}"
+                self._resolved_mode = "cpu_prepared"
+                reason = "admitted_cpu_prepared"
+            except RuntimeError as exc:
+                reason = f"cpu_prepared_allocation_failed:{type(exc).__name__}"
+        elif mode in {"cuda_full", "auto"}:
+            refusal = self._cuda_refusal_reason(
+                required_bytes=capacity.required_bytes,
+                budget_bytes=max_bytes,
+                safety_margin_bytes=safety_margin_bytes,
+                free_bytes=free_bytes,
+            )
+            if refusal is None:
+                try:
+                    self._resident_rows = self._allocate_cuda_rows(self.n_rows)
+                    self._resolved_mode = "cuda_full"
+                    reason = "admitted_cuda_full"
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+                    reason = f"cuda_full_allocation_failed:{type(exc).__name__}"
+            else:
+                reason = f"cuda_full_{refusal}"
 
-        admitted = self._resident_rows is not None
-        self._diagnostic_stats["gpu_row_tier_admitted"] = int(admitted)
-        self._diagnostic_stats["gpu_row_tier_reason"] = reason
-        self._diagnostic_stats["gpu_row_tier_allocated_bytes_delta"] = int(allocated_delta)
-        self._diagnostic_stats["gpu_row_tier_reserved_bytes_delta"] = int(reserved_delta)
+        if mode == "cuda_windowed" or (mode == "auto" and self._resolved_mode == "cpu_exact"):
+            row_bytes = int(self.n_feature_columns * capacity.element_size)
+            window_rows = min(
+                self.n_rows,
+                int(window_max_bytes // row_bytes) if row_bytes > 0 else self.n_rows,
+            )
+            window_bytes = int(window_rows * row_bytes)
+            refusal = self._cuda_refusal_reason(
+                required_bytes=window_bytes,
+                budget_bytes=window_max_bytes,
+                safety_margin_bytes=safety_margin_bytes,
+                free_bytes=free_bytes,
+            )
+            if window_rows <= 0:
+                refusal = "window_budget_below_one_row"
+            if refusal is None:
+                try:
+                    self._host_rows = torch.empty(
+                        (self.n_rows, self.n_feature_columns),
+                        dtype=self._dtype,
+                        device="cpu",
+                    )
+                    self._window_rows = self._allocate_cuda_rows(window_rows)
+                    self._window_row_capacity = int(window_rows)
+                    self._resolved_mode = "cuda_windowed"
+                    reason = "admitted_cuda_windowed"
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+                    self._host_rows = None
+                    self._window_rows = None
+                    self._window_row_capacity = 0
+                    reason = f"cuda_windowed_allocation_failed:{type(exc).__name__}"
+            else:
+                reason = f"cuda_windowed_{refusal}"
+
+        _, _, allocated_after, reserved_after = self._cuda_memory_snapshot()
+        allocated_delta = max(0, allocated_after - allocated_before)
+        reserved_delta = max(0, reserved_after - reserved_before)
+        gpu_tensor = self._resident_rows if self._resident_rows is not None else self._window_rows
+        gpu_owned_bytes = (
+            int(gpu_tensor.numel() * gpu_tensor.element_size()) if gpu_tensor is not None else 0
+        )
+        host_owned_bytes = (
+            int(self._host_rows.numel() * self._host_rows.element_size())
+            if self._host_rows is not None
+            else 0
+        )
+        prepared_owned_bytes = (
+            int(self._prepared_host_rows.numel() * self._prepared_host_rows.element_size())
+            if self._prepared_host_rows is not None
+            else 0
+        )
+        window_bytes = (
+            int(self._window_rows.numel() * self._window_rows.element_size())
+            if self._window_rows is not None
+            else 0
+        )
+        admitted = self._resolved_mode != "cpu_exact"
+        self._diagnostic_stats.update(
+            {
+                "feature_row_influence_mode_resolved": self._resolved_mode,
+                "gpu_row_tier_admitted": int(admitted),
+                "gpu_row_tier_reason": reason,
+                "gpu_row_tier_window_rows": self._window_row_capacity,
+                "gpu_row_tier_window_bytes": window_bytes,
+                "gpu_row_tier_allocated_bytes_delta": int(allocated_delta),
+                "gpu_row_tier_reserved_bytes_delta": int(reserved_delta),
+                "gpu_row_tier_owned_bytes": gpu_owned_bytes,
+                "gpu_row_tier_host_mirror_owned_bytes": host_owned_bytes,
+                "gpu_row_tier_prepared_host_mirror_owned_bytes": prepared_owned_bytes,
+            }
+        )
         return GpuRowTierAdmission(
-            requested=requested,
+            requested=mode != "cpu_exact",
             admitted=admitted,
             reason=reason,
             capacity=capacity,
@@ -1135,30 +1277,50 @@ class _GpuResidentFeatureRowStore:
             allocated_bytes_delta=int(allocated_delta),
             reserved_bytes_delta=int(reserved_delta),
             device=str(self._device),
+            requested_mode=mode,
+            resolved_mode=self._resolved_mode,
+            window_budget_bytes=window_max_bytes,
+            window_rows=self._window_row_capacity,
+            window_bytes=window_bytes,
         )
 
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("feature row store has been cleaned up")
 
-    def _disable_resident_tier(self, reason: str) -> None:
+    def _disable_acceleration(self, reason: str) -> None:
         self._resident_rows = None
-        self._exact_host_rows = None
+        self._host_rows = None
+        self._prepared_host_rows = None
+        self._window_rows = None
+        self._window_row_capacity = 0
+        self._resolved_mode = "cpu_exact"
         self._committed_rows = bytearray(self.n_rows)
-        self._diagnostic_stats["gpu_row_tier_admitted"] = 0
-        self._diagnostic_stats["gpu_row_tier_reason"] = reason
-        self._diagnostic_stats["gpu_row_tier_owned_bytes"] = 0
-        self._diagnostic_stats["gpu_row_tier_host_mirror_owned_bytes"] = 0
-
-    def _range_is_resident(self, row_start: int, row_end: int) -> bool:
-        return (
-            self._resident_rows is not None
-            and self._exact_host_rows is not None
-            and row_end >= row_start
-            and all(self._committed_rows[row_start:row_end])
+        self._diagnostic_stats.update(
+            {
+                "feature_row_influence_mode_resolved": "cpu_exact",
+                "gpu_row_tier_admitted": 0,
+                "gpu_row_tier_reason": reason,
+                "gpu_row_tier_owned_bytes": 0,
+                "gpu_row_tier_host_mirror_owned_bytes": 0,
+                "gpu_row_tier_prepared_host_mirror_owned_bytes": 0,
+                "gpu_row_tier_window_rows": 0,
+                "gpu_row_tier_window_bytes": 0,
+            }
         )
 
-    def _record_resident_read(
+    def _range_is_ready(self, row_start: int, row_end: int) -> bool:
+        if row_end < row_start or not all(self._committed_rows[row_start:row_end]):
+            return False
+        if self._resolved_mode == "cuda_full":
+            return self._resident_rows is not None
+        if self._resolved_mode == "cuda_windowed":
+            return self._host_rows is not None and self._window_rows is not None
+        if self._resolved_mode == "cpu_prepared":
+            return self._prepared_host_rows is not None
+        return False
+
+    def _record_accelerated_read(
         self,
         row_count: int,
         *,
@@ -1167,30 +1329,28 @@ class _GpuResidentFeatureRowStore:
         transfer_elapsed_ms: float,
     ) -> None:
         nbytes = int(row_count * self.n_feature_columns * self._dtype.itemsize)
-        self._diagnostic_stats["gpu_row_tier_read_hits"] = (
-            int(self._diagnostic_stats["gpu_row_tier_read_hits"]) + 1
-        )
-        self._diagnostic_stats["gpu_row_tier_read_hit_rows"] = (
-            int(self._diagnostic_stats["gpu_row_tier_read_hit_rows"]) + row_count
-        )
-        self._diagnostic_stats["gpu_row_tier_read_hit_bytes"] = (
-            int(self._diagnostic_stats["gpu_row_tier_read_hit_bytes"]) + nbytes
-        )
-        self._diagnostic_stats["gpu_row_tier_avoided_file_read_bytes"] = (
-            int(self._diagnostic_stats["gpu_row_tier_avoided_file_read_bytes"]) + nbytes
-        )
+        for key, delta in (
+            ("gpu_row_tier_read_hits", 1),
+            ("gpu_row_tier_read_hit_rows", row_count),
+            ("gpu_row_tier_read_hit_bytes", nbytes),
+            ("gpu_row_tier_avoided_file_read_bytes", nbytes),
+        ):
+            self._diagnostic_stats[key] = int(self._diagnostic_stats[key]) + delta
         if source_device == self._device and destination_device == self._device:
             self._diagnostic_stats["gpu_row_tier_avoided_h2d_bytes"] = (
                 int(self._diagnostic_stats["gpu_row_tier_avoided_h2d_bytes"]) + nbytes
+            )
+        elif source_device.type == "cpu" and destination_device.type == "cuda":
+            self._diagnostic_stats["gpu_row_tier_h2d_bytes"] = (
+                int(self._diagnostic_stats["gpu_row_tier_h2d_bytes"]) + nbytes
             )
         elif source_device.type == "cuda" and destination_device.type == "cpu":
             self._diagnostic_stats["gpu_row_tier_d2h_bytes"] = (
                 int(self._diagnostic_stats["gpu_row_tier_d2h_bytes"]) + nbytes
             )
-        self._diagnostic_stats["gpu_row_tier_read_transfer_elapsed_ms"] = (
-            float(self._diagnostic_stats["gpu_row_tier_read_transfer_elapsed_ms"])
-            + float(transfer_elapsed_ms)
-        )
+        self._diagnostic_stats["gpu_row_tier_read_transfer_elapsed_ms"] = float(
+            self._diagnostic_stats["gpu_row_tier_read_transfer_elapsed_ms"]
+        ) + float(transfer_elapsed_ms)
 
     def _record_fallback_read(self, row_count: int) -> None:
         self._diagnostic_stats["gpu_row_tier_read_fallbacks"] = (
@@ -1214,52 +1374,63 @@ class _GpuResidentFeatureRowStore:
             feature_rows=feature_rows,
             **kwargs,
         )
-        resident = self._resident_rows
-        if resident is None:
+        if self._resolved_mode == "cpu_exact":
             return telemetry
 
-        source = feature_rows if resident_feature_rows is None else resident_feature_rows
         row_count = int(feature_rows.shape[0])
         row_end = int(row_start + row_count)
         copy_start = time.perf_counter()
         try:
-            if source.shape != feature_rows.shape:
-                raise ValueError("resident_feature_rows must match canonical feature_rows shape")
-            resident[row_start:row_end].copy_(
-                source.detach().to(device=resident.device, dtype=resident.dtype),
-                non_blocking=False,
-            )
-            assert self._exact_host_rows is not None
-            self._exact_host_rows[row_start:row_end].copy_(
-                feature_rows.detach().to(device="cpu", dtype=self._dtype),
-                non_blocking=False,
-            )
+            if self._resolved_mode == "cuda_full":
+                assert self._resident_rows is not None
+                source = feature_rows if resident_feature_rows is None else resident_feature_rows
+                if source.shape != feature_rows.shape:
+                    raise ValueError(
+                        "resident_feature_rows must match canonical feature_rows shape"
+                    )
+                self._resident_rows[row_start:row_end].copy_(
+                    source.detach().to(
+                        device=self._resident_rows.device,
+                        dtype=self._resident_rows.dtype,
+                    ),
+                    non_blocking=False,
+                )
+            elif self._resolved_mode == "cuda_windowed":
+                assert self._host_rows is not None
+                self._host_rows[row_start:row_end].copy_(
+                    feature_rows.detach().to(device="cpu", dtype=self._dtype),
+                    non_blocking=False,
+                )
+            elif self._resolved_mode == "cpu_prepared":
+                assert self._prepared_host_rows is not None
+                canonical_host = feature_rows.detach().to(device="cpu", dtype=self._dtype)
+                torch.abs(
+                    canonical_host,
+                    out=self._prepared_host_rows[row_start:row_end],
+                )
         except (RuntimeError, ValueError, torch.cuda.OutOfMemoryError) as exc:
             self._diagnostic_stats["gpu_row_tier_copy_failures"] = (
                 int(self._diagnostic_stats["gpu_row_tier_copy_failures"]) + 1
             )
-            self._disable_resident_tier(f"append_copy_failed:{type(exc).__name__}")
+            self._disable_acceleration(f"append_copy_failed:{type(exc).__name__}")
             return telemetry
 
         elapsed_ms = (time.perf_counter() - copy_start) * 1000.0
         self._committed_rows[row_start:row_end] = b"\x01" * row_count
         self._high_water_row = max(self._high_water_row, row_end)
-        append_bytes = int(row_count * self.n_feature_columns * resident.element_size())
-        self._diagnostic_stats["gpu_row_tier_append_calls"] = (
-            int(self._diagnostic_stats["gpu_row_tier_append_calls"]) + 1
-        )
-        self._diagnostic_stats["gpu_row_tier_append_rows"] = (
-            int(self._diagnostic_stats["gpu_row_tier_append_rows"]) + row_count
-        )
-        self._diagnostic_stats["gpu_row_tier_append_bytes"] = (
-            int(self._diagnostic_stats["gpu_row_tier_append_bytes"]) + append_bytes
-        )
+        append_bytes = int(row_count * self.n_feature_columns * self._dtype.itemsize)
+        for key, delta in (
+            ("gpu_row_tier_append_calls", 1),
+            ("gpu_row_tier_append_rows", row_count),
+            ("gpu_row_tier_append_bytes", append_bytes),
+        ):
+            self._diagnostic_stats[key] = int(self._diagnostic_stats[key]) + delta
         self._diagnostic_stats["gpu_row_tier_append_elapsed_ms"] = (
             float(self._diagnostic_stats["gpu_row_tier_append_elapsed_ms"]) + elapsed_ms
         )
         self._diagnostic_stats["gpu_row_tier_high_water_row"] = self._high_water_row
         self._diagnostic_stats["gpu_row_tier_high_water_bytes"] = int(
-            self._high_water_row * self.n_feature_columns * resident.element_size()
+            self._high_water_row * self.n_feature_columns * self._dtype.itemsize
         )
         telemetry = dict(telemetry)
         telemetry["gpu_row_tier_append_elapsed_ms"] = float(elapsed_ms)
@@ -1281,28 +1452,45 @@ class _GpuResidentFeatureRowStore:
     ) -> torch.Tensor:
         self._require_open()
         if row_start < 0 or row_end < row_start or row_end > self.n_rows:
-            raise ValueError("requested row slice is out of bounds for GPU-tier store")
+            raise ValueError("requested row slice is out of bounds for accelerated store")
         row_count = int(row_end - row_start)
-        if phase == "phase4" and self._range_is_resident(row_start, row_end):
-            assert self._resident_rows is not None
-            assert self._exact_host_rows is not None
-            destination_device = self.row_abs_max.device
-            transfer_start = time.perf_counter()
-            result = self._exact_host_rows[row_start:row_end]
-            if result.device != destination_device:
-                result = result.to(device=destination_device, non_blocking=False)
-            transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
-            self._record_resident_read(
-                row_count,
-                source_device=self._exact_host_rows.device,
-                destination_device=destination_device,
-                transfer_elapsed_ms=transfer_elapsed_ms,
-            )
-            self._diagnostic_stats["gpu_row_tier_host_mirror_read_bytes"] = (
-                int(self._diagnostic_stats["gpu_row_tier_host_mirror_read_bytes"])
-                + int(row_count * self.n_feature_columns * self._dtype.itemsize)
-            )
-            return result
+        if phase == "phase4" and self._range_is_ready(row_start, row_end):
+            if self._resolved_mode == "cuda_full":
+                assert self._resident_rows is not None
+                result = self._resident_rows[row_start:row_end]
+                self._record_accelerated_read(
+                    row_count,
+                    source_device=self._device,
+                    destination_device=self._device,
+                    transfer_elapsed_ms=0.0,
+                )
+                return result
+            if self._resolved_mode == "cuda_windowed":
+                assert self._host_rows is not None and self._window_rows is not None
+                if row_count > self._window_row_capacity:
+                    raise RuntimeError("Phase-4 row request exceeds admitted CUDA window capacity")
+                transfer_start = time.perf_counter()
+                result = self._window_rows[:row_count]
+                result.copy_(
+                    self._host_rows[row_start:row_end],
+                    non_blocking=False,
+                )
+                transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
+                self._record_accelerated_read(
+                    row_count,
+                    source_device=torch.device("cpu"),
+                    destination_device=self._device,
+                    transfer_elapsed_ms=transfer_elapsed_ms,
+                )
+                nbytes = int(row_count * self.n_feature_columns * self._dtype.itemsize)
+                for key, delta in (
+                    ("gpu_row_tier_window_read_calls", 1),
+                    ("gpu_row_tier_window_read_rows", row_count),
+                    ("gpu_row_tier_window_read_bytes", nbytes),
+                    ("gpu_row_tier_host_mirror_read_bytes", nbytes),
+                ):
+                    self._diagnostic_stats[key] = int(self._diagnostic_stats[key]) + delta
+                return result
         if phase == "phase4":
             self._record_fallback_read(row_count)
         return self._backing_store.read_feature_rows(row_start, row_end, phase=phase)
@@ -1317,33 +1505,36 @@ class _GpuResidentFeatureRowStore:
         phase: str | None = None,
     ) -> torch.Tensor:
         self._require_open()
+        if row_start < 0 or row_end < row_start or row_end > self.n_rows:
+            raise ValueError("requested row slice is out of bounds for accelerated store")
         row_count = int(row_end - row_start)
-        if phase == "phase4" and self._range_is_resident(row_start, row_end):
-            assert self._resident_rows is not None
-            assert self._exact_host_rows is not None
+        if (
+            phase == "phase4"
+            and self._resolved_mode == "cpu_prepared"
+            and self._range_is_ready(row_start, row_end)
+        ):
+            assert self._prepared_host_rows is not None
             destination_device = torch.device(device)
             transfer_start = time.perf_counter()
-            source = (
-                self._resident_rows
-                if destination_device == self._resident_rows.device
-                else self._exact_host_rows
-            )
-            result = source[row_start:row_end].to(
-                device=destination_device, dtype=dtype, non_blocking=False
+            result = self._prepared_host_rows[row_start:row_end].to(
+                device=destination_device,
+                dtype=dtype,
+                non_blocking=False,
             )
             transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
-            self._record_resident_read(
+            self._record_accelerated_read(
                 row_count,
-                source_device=source.device,
+                source_device=torch.device("cpu"),
                 destination_device=destination_device,
                 transfer_elapsed_ms=transfer_elapsed_ms,
             )
-            if source is self._exact_host_rows:
-                self._diagnostic_stats["gpu_row_tier_host_mirror_read_bytes"] = (
-                    int(self._diagnostic_stats["gpu_row_tier_host_mirror_read_bytes"])
-                    + int(row_count * self.n_feature_columns * self._dtype.itemsize)
-                )
-            return result.abs()
+            nbytes = int(row_count * self.n_feature_columns * self._dtype.itemsize)
+            self._diagnostic_stats["gpu_row_tier_prepared_host_mirror_read_bytes"] = (
+                int(self._diagnostic_stats["gpu_row_tier_prepared_host_mirror_read_bytes"]) + nbytes
+            )
+            return result
+        if phase == "phase4" and self._resolved_mode in {"cuda_full", "cuda_windowed"}:
+            return self.read_feature_rows(row_start, row_end, phase=phase).to(dtype=dtype).abs()
         if phase == "phase4":
             self._record_fallback_read(row_count)
         return self._backing_store.read_prepared_feature_rows(
@@ -1370,10 +1561,16 @@ class _GpuResidentFeatureRowStore:
             return
         self._closed = True
         self._resident_rows = None
-        self._exact_host_rows = None
+        self._host_rows = None
+        self._prepared_host_rows = None
+        self._window_rows = None
+        self._window_row_capacity = 0
         self._committed_rows = bytearray()
         self._diagnostic_stats["gpu_row_tier_owned_bytes"] = 0
         self._diagnostic_stats["gpu_row_tier_host_mirror_owned_bytes"] = 0
+        self._diagnostic_stats["gpu_row_tier_prepared_host_mirror_owned_bytes"] = 0
+        self._diagnostic_stats["gpu_row_tier_window_rows"] = 0
+        self._diagnostic_stats["gpu_row_tier_window_bytes"] = 0
         self._diagnostic_stats["gpu_row_tier_cleanup_count"] = (
             int(self._diagnostic_stats["gpu_row_tier_cleanup_count"]) + 1
         )
@@ -1562,7 +1759,10 @@ class _ColumnTiledFeatureRowStore:
             raise ValueError("requested column slice is out of bounds for column-tiled store")
         if self._max_request_rows is not None and row_end - row_start > self._max_request_rows:
             raise ValueError("tile request exceeds configured row bound")
-        if self._max_request_columns is not None and column_end - column_start > self._max_request_columns:
+        if (
+            self._max_request_columns is not None
+            and column_end - column_start > self._max_request_columns
+        ):
             raise ValueError("tile request exceeds configured column bound")
         if column_start == column_end:
             return torch.empty((row_end - row_start, 0), dtype=self._dtype)
@@ -1595,7 +1795,9 @@ class _ColumnTiledFeatureRowStore:
         row_step = self._max_request_rows or max(row_end - row_start, 1)
         for source_column in selected.tolist():
             if source_column < 0 or source_column >= self.n_feature_columns:
-                raise ValueError("selected feature column indices must be in [0, n_feature_columns)")
+                raise ValueError(
+                    "selected feature column indices must be in [0, n_feature_columns)"
+                )
         for chunk_start in range(row_start, row_end, row_step):
             chunk_end = min(chunk_start + row_step, row_end)
             output_start = chunk_start - row_start

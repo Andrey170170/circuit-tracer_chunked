@@ -225,9 +225,8 @@ def _build_phase4_refresh_substage_telemetry(
                 "gpu_row_tier_avoided_file_read_bytes": (
                     "feature_row_store_gpu_tier_avoided_file_read_bytes"
                 ),
-                "gpu_row_tier_avoided_h2d_bytes": (
-                    "feature_row_store_gpu_tier_avoided_h2d_bytes"
-                ),
+                "gpu_row_tier_avoided_h2d_bytes": ("feature_row_store_gpu_tier_avoided_h2d_bytes"),
+                "gpu_row_tier_h2d_bytes": "feature_row_store_gpu_tier_h2d_bytes",
                 "gpu_row_tier_d2h_bytes": "feature_row_store_gpu_tier_d2h_bytes",
                 "gpu_row_tier_host_mirror_read_bytes": (
                     "feature_row_store_gpu_tier_host_mirror_read_bytes"
@@ -241,8 +240,36 @@ def _build_phase4_refresh_substage_telemetry(
                 "gpu_row_tier_host_mirror_owned_bytes": (
                     "feature_row_store_gpu_tier_host_mirror_owned_bytes"
                 ),
+                "gpu_row_tier_prepared_host_mirror_read_bytes": (
+                    "feature_row_store_gpu_tier_prepared_host_mirror_read_bytes"
+                ),
+                "gpu_row_tier_prepared_host_mirror_owned_bytes": (
+                    "feature_row_store_gpu_tier_prepared_host_mirror_owned_bytes"
+                ),
+                "gpu_row_tier_window_read_calls": ("feature_row_store_gpu_tier_window_read_calls"),
+                "gpu_row_tier_window_read_rows": ("feature_row_store_gpu_tier_window_read_rows"),
+                "gpu_row_tier_window_read_bytes": ("feature_row_store_gpu_tier_window_read_bytes"),
+                "gpu_row_tier_window_rows": "feature_row_store_gpu_tier_window_rows",
+                "gpu_row_tier_window_bytes": "feature_row_store_gpu_tier_window_bytes",
+                "gpu_row_tier_budget_bytes": "feature_row_store_gpu_tier_budget_bytes",
+                "gpu_row_tier_window_budget_bytes": (
+                    "feature_row_store_gpu_tier_window_budget_bytes"
+                ),
+                "gpu_row_tier_safety_margin_bytes": (
+                    "feature_row_store_gpu_tier_safety_margin_bytes"
+                ),
+                "gpu_row_tier_required_bytes": "feature_row_store_gpu_tier_required_bytes",
             }.items():
                 payload[telemetry_key] = _safe_int(feature_row_store_read_stats.get(source_key))
+            payload["feature_row_influence_mode_requested"] = feature_row_store_read_stats.get(
+                "feature_row_influence_mode_requested"
+            )
+            payload["feature_row_influence_mode_resolved"] = feature_row_store_read_stats.get(
+                "feature_row_influence_mode_resolved"
+            )
+            payload["feature_row_store_gpu_tier_reason"] = feature_row_store_read_stats.get(
+                "gpu_row_tier_reason"
+            )
             payload["feature_row_store_gpu_tier_read_transfer_elapsed_ms"] = _safe_float(
                 feature_row_store_read_stats.get("gpu_row_tier_read_transfer_elapsed_ms")
             )
@@ -377,7 +404,5 @@ def _build_cross_cluster_runtime_snapshot(
 ) -> tuple[dict[str, object], dict[str, object]]:
     return cast(
         tuple[dict[str, object], dict[str, object]],
-        observer.observe(
-            RuntimeSnapshot(device=device, context=ctx, transcoder=transcoder)
-        ),
+        observer.observe(RuntimeSnapshot(device=device, context=ctx, transcoder=transcoder)),
     )
