@@ -217,6 +217,23 @@ def _build_phase4_refresh_substage_telemetry(
                 "prepared_read_cache_store_skip_too_large_count": "feature_row_store_prepared_read_cache_store_skip_too_large",
                 "prepared_read_cache_entry_count": "feature_row_store_prepared_read_cache_entry_count",
                 "prepared_read_cache_nbytes": "feature_row_store_prepared_read_cache_nbytes",
+                "gpu_row_tier_read_hits": "feature_row_store_gpu_tier_read_hits",
+                "gpu_row_tier_read_hit_rows": "feature_row_store_gpu_tier_read_hit_rows",
+                "gpu_row_tier_read_hit_bytes": "feature_row_store_gpu_tier_read_hit_bytes",
+                "gpu_row_tier_read_fallbacks": "feature_row_store_gpu_tier_read_fallbacks",
+                "gpu_row_tier_read_fallback_rows": "feature_row_store_gpu_tier_read_fallback_rows",
+                "gpu_row_tier_avoided_file_read_bytes": (
+                    "feature_row_store_gpu_tier_avoided_file_read_bytes"
+                ),
+                "gpu_row_tier_avoided_h2d_bytes": (
+                    "feature_row_store_gpu_tier_avoided_h2d_bytes"
+                ),
+                "gpu_row_tier_copy_failures": "feature_row_store_gpu_tier_copy_failures",
+                "gpu_row_tier_append_calls": "feature_row_store_gpu_tier_append_calls",
+                "gpu_row_tier_append_rows": "feature_row_store_gpu_tier_append_rows",
+                "gpu_row_tier_append_bytes": "feature_row_store_gpu_tier_append_bytes",
+                "gpu_row_tier_high_water_bytes": "feature_row_store_gpu_tier_high_water_bytes",
+                "gpu_row_tier_owned_bytes": "feature_row_store_gpu_tier_owned_bytes",
             }.items():
                 payload[telemetry_key] = _safe_int(feature_row_store_read_stats.get(source_key))
             payload["feature_row_store_prepared_read_cache_prepare_elapsed_ms"] = _safe_float(

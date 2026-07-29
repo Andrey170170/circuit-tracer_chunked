@@ -19,7 +19,10 @@ from circuit_tracer.attribution.nnsight.replay import (
 from circuit_tracer.attribution.nnsight.row_store import (
     _FileBackedFeatureRowStore,
 )
-from circuit_tracer.attribution.nnsight.telemetry import _build_row_transfer_telemetry
+from circuit_tracer.attribution.nnsight.telemetry import (
+    _build_phase4_refresh_substage_telemetry,
+    _build_row_transfer_telemetry,
+)
 from circuit_tracer.observability.exception_export import _attach_telemetry_export_to_exception
 from circuit_tracer.observability.lifecycle import TelemetryObserver
 from circuit_tracer.tracing import (
@@ -167,6 +170,47 @@ def test_file_backed_feature_row_store_prepared_cache_hits_invalidates_and_skips
         assert tiny_stats["prepared_read_cache_entry_count"] == 0
     finally:
         tiny_store.cleanup()
+
+
+def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
+    payload = _build_phase4_refresh_substage_telemetry(
+        telemetry_detail="normal",
+        partial_influence_elapsed_ms=1.0,
+        rank_topk_elapsed_ms=2.0,
+        frontier_plan_elapsed_ms=3.0,
+        row_store_read_elapsed_ms=4.0,
+        influence_normalization_elapsed_ms=5.0,
+        influence_matmul_elapsed_ms=6.0,
+        chunk_request_count=7,
+        active_row_chunk_count=8,
+        row_reader_row_count=9,
+        solver_iteration_count=10,
+        feature_row_store_read_stats={
+            "gpu_row_tier_read_hits": 11,
+            "gpu_row_tier_read_hit_rows": 12,
+            "gpu_row_tier_read_hit_bytes": 13,
+            "gpu_row_tier_read_fallbacks": 0,
+            "gpu_row_tier_read_fallback_rows": 0,
+            "gpu_row_tier_avoided_file_read_bytes": 14,
+            "gpu_row_tier_avoided_h2d_bytes": 15,
+            "gpu_row_tier_copy_failures": 0,
+            "gpu_row_tier_append_calls": 16,
+            "gpu_row_tier_append_rows": 17,
+            "gpu_row_tier_append_bytes": 18,
+            "gpu_row_tier_high_water_bytes": 19,
+            "gpu_row_tier_owned_bytes": 20,
+        },
+    )
+
+    assert payload["feature_row_store_gpu_tier_read_hits"] == 11
+    assert payload["feature_row_store_gpu_tier_read_hit_rows"] == 12
+    assert payload["feature_row_store_gpu_tier_read_hit_bytes"] == 13
+    assert payload["feature_row_store_gpu_tier_read_fallbacks"] == 0
+    assert payload["feature_row_store_gpu_tier_avoided_file_read_bytes"] == 14
+    assert payload["feature_row_store_gpu_tier_avoided_h2d_bytes"] == 15
+    assert payload["feature_row_store_gpu_tier_copy_failures"] == 0
+    assert payload["feature_row_store_gpu_tier_append_bytes"] == 18
+    assert payload["feature_row_store_gpu_tier_owned_bytes"] == 20
 
 
 def test_file_backed_feature_row_store_temp_root_default_and_explicit(tmp_path) -> None:
