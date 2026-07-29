@@ -58,6 +58,11 @@ def recompute_feature_influences(state):
             state.feature_row_store.row_abs_max[: state.st],
             state.feature_row_store.row_l1_scaled[: state.st],
         )
+        state.influence_device = getattr(
+            state.feature_row_store,
+            "influence_device",
+            state.feature_row_store.row_abs_max.device,
+        )
         state.refresh_prepared_row_reader = bool(
             state.phase4_refresh_prepared_chunk_cache_bytes_effective > 0
         )
@@ -67,7 +72,7 @@ def recompute_feature_influences(state):
                 return state.feature_row_store.read_prepared_feature_rows(
                     row_start,
                     row_end,
-                    device=state.feature_row_store.row_abs_max.device,
+                    device=state.influence_device,
                     dtype=state.influence_compute_dtype,
                     phase="phase4",
                 )
@@ -92,7 +97,7 @@ def recompute_feature_influences(state):
                 n_logits=state.n_logits,
                 row_tile_size=state.config.influence_row_tile_size,
                 column_tile_size=state.config.influence_column_tile_size,
-                device=state.feature_row_store.row_abs_max.device,
+                device=state.influence_device,
                 compute_dtype=state.influence_compute_dtype,
                 telemetry=state.streaming_chunk_reuse_stats,
             )
@@ -104,7 +109,7 @@ def recompute_feature_influences(state):
                 state.row_to_node_index[: state.st],
                 n_feature_nodes=state.total_active_feats,
                 n_logits=state.n_logits,
-                device=state.feature_row_store.row_abs_max.device,
+                device=state.influence_device,
                 chunk_reuse_stats=state.streaming_chunk_reuse_stats,
                 compute_dtype=state.influence_compute_dtype,
                 active_row_only_chunks=state.refresh_active_row_only_chunks,

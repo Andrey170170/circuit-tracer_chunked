@@ -691,6 +691,11 @@ class AttributionExecution:
                     preallocate=storage.preallocate,
                     prepared_chunk_cache_bytes=(p.frontier.prepared_chunk_cache_bytes_effective),
                     replay_tile_cache_bytes=int(storage.replay_tile_cache_bytes or 0),
+                    gpu_resident_max_bytes=storage.gpu_resident_max_bytes,
+                    gpu_resident_safety_margin_bytes=(
+                        storage.gpu_resident_safety_margin_bytes
+                    ),
+                    gpu_resident_device=p.problem.model.device,
                 ),
                 execution=Phase2ExecutionPolicy(
                     offload=plan.execution.offload,

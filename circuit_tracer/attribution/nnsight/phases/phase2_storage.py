@@ -22,6 +22,7 @@ from circuit_tracer.attribution.nnsight.row_store import (
     FeatureRowStore,
     _ColumnTiledFeatureRowStore,
     _FileBackedFeatureRowStore,
+    _GpuResidentFeatureRowStore,
 )
 from circuit_tracer.transcoder.provider import provider_fingerprint
 from circuit_tracer.utils.disk_offload import offload_modules
@@ -72,9 +73,17 @@ class RowStoreRuntime:
     preallocate: bool
     prepared_chunk_cache_bytes: int
     replay_tile_cache_bytes: int
+    gpu_resident_max_bytes: int = 0
+    gpu_resident_safety_margin_bytes: int = 0
+    gpu_resident_device: torch.device = torch.device("cpu")
 
     def __post_init__(self) -> None:
-        if self.prepared_chunk_cache_bytes < 0 or self.replay_tile_cache_bytes < 0:
+        if (
+            self.prepared_chunk_cache_bytes < 0
+            or self.replay_tile_cache_bytes < 0
+            or self.gpu_resident_max_bytes < 0
+            or self.gpu_resident_safety_margin_bytes < 0
+        ):
             raise ValueError("row-store cache sizes must be non-negative")
 
 
@@ -278,6 +287,16 @@ def _open_file_stores(
         n_feature_columns=plan.total_active_feats,
         prepared_read_cache_bytes=runtime.prepared_chunk_cache_bytes, **common,
     ))
+    if runtime.gpu_resident_max_bytes > 0:
+        if layout.backend != "full_file":
+            raise ValueError("GPU full-residency tier requires full_file row storage")
+        assert isinstance(feature_store, _FileBackedFeatureRowStore)
+        feature_store = _GpuResidentFeatureRowStore(
+            backing_store=feature_store,
+            max_bytes=runtime.gpu_resident_max_bytes,
+            safety_margin_bytes=runtime.gpu_resident_safety_margin_bytes,
+            device=runtime.gpu_resident_device,
+        )
     owner.feature_row_store = feature_store
     nonfeature_store = cast(FeatureRowStore, store_class(
         n_feature_columns=plan.logit_offset - plan.total_active_feats,

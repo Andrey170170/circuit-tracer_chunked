@@ -190,11 +190,18 @@ def commit_feature_rows(state):
         assert state.feature_row_store is not None
         assert state.nonfeature_row_store is not None
         state.row_store_write_start = time.perf_counter()
+        feature_append_kwargs = {}
+        admission = getattr(state.feature_row_store, "admission", None)
+        if admission is not None and bool(getattr(admission, "admitted", False)):
+            feature_append_kwargs["resident_feature_rows"] = state.rows[
+                :, : state.total_active_feats
+            ]
         state.row_store_append_telemetry = state.feature_row_store.append_rows(
             row_start=state.st,
             feature_rows=state.feature_row_slice,
             row_denominator_scaled_l1=state.row_denominator_scaled_l1,
             phase="phase4",
+            **feature_append_kwargs,
         )
         state.nonfeature_row_store.append_rows(
             row_start=state.st,

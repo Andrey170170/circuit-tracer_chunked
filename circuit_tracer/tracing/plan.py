@@ -102,6 +102,8 @@ class RowStoragePlan:
     temp_root: str | PathLike[str] | None = None
     preallocate: bool = True
     replay_tile_cache_bytes: int | None = None
+    gpu_resident_max_bytes: int = 0
+    gpu_resident_safety_margin_bytes: int = 0
     exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy"
     placement: StorageTier | None = None
 
@@ -113,6 +115,11 @@ class RowStoragePlan:
         ):
             _positive(name, getattr(self, name))
         _nonnegative("replay_tile_cache_bytes", self.replay_tile_cache_bytes)
+        _nonnegative("gpu_resident_max_bytes", self.gpu_resident_max_bytes)
+        _nonnegative(
+            "gpu_resident_safety_margin_bytes",
+            self.gpu_resident_safety_margin_bytes,
+        )
         if self.temp_root is not None and self.temp_root_policy != "default":
             raise ValueError("an explicit temp_root cannot be combined with temp_root_policy")
 
