@@ -153,16 +153,25 @@ def test_gpu_row_tier_exact_ranges_prepared_reads_and_cleanup() -> None:
             phase="phase4",
         )
         assert torch.equal(prepared.cpu(), expected[1:4].abs())
+        prepared_cpu = store.read_prepared_feature_rows(
+            1,
+            4,
+            device="cpu",
+            dtype=torch.float32,
+            phase="phase4",
+        )
+        assert prepared_cpu.storage_offset() == 0
+        assert torch.equal(prepared_cpu, expected[1:4].abs())
         stats = store.get_diagnostic_snapshot()
-        assert stats["gpu_row_tier_read_hits"] == 3
+        assert stats["gpu_row_tier_read_hits"] == 4
         assert stats["gpu_row_tier_read_fallbacks"] == 1
-        assert stats["gpu_row_tier_avoided_file_read_bytes"] == (2 + 4 + 3) * 4 * 4
+        assert stats["gpu_row_tier_avoided_file_read_bytes"] == (2 + 4 + 3 + 3) * 4 * 4
         assert stats["gpu_row_tier_d2h_bytes"] == (2 + 4) * 4 * 4
         assert stats["gpu_row_tier_avoided_h2d_bytes"] == 3 * 4 * 4
         assert stats["gpu_row_tier_owned_bytes"] == 5 * 4 * 4
         assert stats["gpu_row_tier_prepared_host_mirror_owned_bytes"] == 5 * 4 * 4
-        assert stats["gpu_row_tier_prepared_host_mirror_read_bytes"] == 0
-        del resident, fallback, all_rows, expected, prepared
+        assert stats["gpu_row_tier_prepared_host_mirror_read_bytes"] == 3 * 4 * 4
+        del resident, fallback, all_rows, expected, prepared, prepared_cpu
     finally:
         store.cleanup()
         del first, second
