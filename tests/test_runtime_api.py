@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from circuit_tracer.observability.events import TraceEvent
+from circuit_tracer.observability.events import DiagnosticSnapshot, TraceEvent
 from circuit_tracer.diagnostic import ProbeCompletion
 from circuit_tracer.tracing import (
     AttributionProblem,
@@ -263,6 +263,7 @@ def test_explicit_telemetry_disable_overrides_compact_output_default() -> None:
     )
     observer, _ = _open_observability(plan)
     observer.observe(TraceEvent(scope="op", name="should.not.record"))
+    assert observer.observe(DiagnosticSnapshot(object())) == {}
     export = observer.close_export()
     assert export["summary"]["enabled"] is False
     assert export["summary"]["event_count"] == 0

@@ -78,9 +78,16 @@ class TelemetryRecorderLike(Protocol):
 class TelemetryObserver:
     """Own paired lifecycle events, export, and terminal attachments."""
 
-    def __init__(self, recorder: TelemetryRecorderLike, *, logger: Any = None) -> None:
+    def __init__(
+        self,
+        recorder: TelemetryRecorderLike,
+        *,
+        logger: Any = None,
+        enabled: bool = True,
+    ) -> None:
         self._recorder = recorder
         self.logger = logger
+        self._enabled = bool(enabled)
 
     @classmethod
     def create(
@@ -100,10 +107,26 @@ class TelemetryObserver:
                 static_context=static_context,
             ),
             logger=logger,
+            enabled=enabled,
         )
 
     def observe(self, observation: Observation) -> object | None:
         """Adapt one typed domain observation to recording, sampling, or rendering."""
+        if not self._enabled:
+            if isinstance(observation, RuntimeSnapshot):
+                return {}, {}
+            if isinstance(
+                observation,
+                (
+                    DiagnosticSnapshot,
+                    MemorySnapshot,
+                    MemorySnapshotAttrs,
+                    MemoryDelta,
+                    NumericDelta,
+                ),
+            ):
+                return {}
+            return None
         if isinstance(observation, TraceEvent):
             self.event(
                 scope=observation.scope,
