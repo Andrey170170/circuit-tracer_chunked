@@ -30,6 +30,7 @@ from circuit_tracer.tracing import (
     trace_one,
 )
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
+from circuit_tracer.tracing.runner import _open_observability
 
 
 class FakeModel:
@@ -248,6 +249,24 @@ def test_observability_sink_output_fields_do_not_change_execution_fingerprint() 
     )
     assert base.execution_fingerprint == sink_only.execution_fingerprint
     assert base.execution_fingerprint != behavior.execution_fingerprint
+
+
+def test_explicit_telemetry_disable_overrides_compact_output_default() -> None:
+    plan = resolve_trace_request(
+        request(
+            4,
+            execution=ExecutionConstraints(
+                compact_output=True,
+                observability=ObservabilityPolicy(telemetry_enabled=False),
+            ),
+        )
+    )
+    observer, _ = _open_observability(plan)
+    observer.observe(TraceEvent(scope="op", name="should.not.record"))
+    export = observer.close_export()
+    assert export["summary"]["enabled"] is False
+    assert export["summary"]["event_count"] == 0
+    assert export["events"] == []
 
 
 def test_decoder_cache_policy_changes_only_execution_fingerprint() -> None:

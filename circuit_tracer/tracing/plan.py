@@ -234,6 +234,7 @@ class FrontierExpansionPlan:
 class ObservabilityPolicy:
     """Telemetry sinks, human rendering, diagnostics, and artifact capture."""
 
+    telemetry_enabled: bool | None = None
     verbose: bool = False
     profile: bool = False
     profile_log_interval: int = 1

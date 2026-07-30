@@ -252,14 +252,20 @@ def _open_observability(plan: ResolvedTracePlan) -> tuple[TelemetryObserver, log
         if policy.telemetry_max_events is not None and policy.telemetry_max_events > 0
         else 20_000
     )
+    default_enabled = bool(
+        policy.profile
+        or plan.execution.compact_output
+        or policy.phase4_anomaly_debug
+        or plan.planning_trace_plan is not None
+    )
+    enabled = (
+        default_enabled
+        if policy.telemetry_enabled is None
+        else bool(policy.telemetry_enabled)
+    )
     return (
         TelemetryObserver.create(
-            enabled=bool(
-                policy.profile
-                or plan.execution.compact_output
-                or policy.phase4_anomaly_debug
-                or plan.planning_trace_plan is not None
-            ),
+            enabled=enabled,
             max_events=max_events,
             jsonl_path=policy.telemetry_jsonl_path,
             static_context=context,
