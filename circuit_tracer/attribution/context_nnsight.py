@@ -170,6 +170,7 @@ class AttributionContext:
         self.phase3_gradient_replay_status = "disabled"
         self.phase3_gradient_replay_column_offset = 0
         self._compute_batch_call_index = 0
+        self._resource_sample_count_by_phase: dict[str, int] = {}
         self.decoder_page_prefetch_depth = 0
         self._decoder_page_prefetch: DecoderPagePrefetch | None = None
         self._active_decoder_rows: ActiveDecoderRows | None = None

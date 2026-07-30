@@ -40,6 +40,25 @@ _PIN_MEMORY_FALLBACK_MARKERS = (
     "cuda error",
 )
 
+_PHASE4_DENSE_RESOURCE_SAMPLES = 3
+_PHASE4_RESOURCE_SAMPLE_INTERVAL = 32
+
+
+def should_sample_batch_resources(
+    *,
+    phase_label: str,
+    phase_batch_index: int,
+    retain_graph: bool,
+) -> bool:
+    """Keep transition evidence dense without sampling /proc on every hot-path batch."""
+    if phase_label != "phase4_features":
+        return True
+    return (
+        phase_batch_index <= _PHASE4_DENSE_RESOURCE_SAMPLES
+        or phase_batch_index % _PHASE4_RESOURCE_SAMPLE_INTERVAL == 0
+        or not retain_graph
+    )
+
 
 def _is_expected_pin_memory_failure(error: RuntimeError) -> bool:
     message = str(error).lower()
@@ -119,6 +138,7 @@ class BatchExecutionHost(Protocol):
     _produce_nonfeature: bool
     _diagnostic_stats: dict[str, object]
     _trace_observer: TraceObserver | None
+    _resource_sample_count_by_phase: dict[str, int]
 
     def _clear_saved_grads(self) -> None: ...
     def _materialize_tensor(self, tensor, *, device=None, dtype=None): ...
@@ -323,9 +343,16 @@ def execute_observed_batch(
     )
     execution_device = host._resid_activations[0].device
     observer = host._trace_observer
+    phase_batch_index = host._resource_sample_count_by_phase.get(request.phase_label, 0) + 1
+    host._resource_sample_count_by_phase[request.phase_label] = phase_batch_index
+    resource_sampled = should_sample_batch_resources(
+        phase_label=request.phase_label,
+        phase_batch_index=phase_batch_index,
+        retain_graph=request.retain_graph,
+    )
     memory_before = (
         cast(dict[str, object], observer.observe(MemorySnapshot(execution_device)))
-        if observer is not None
+        if observer is not None and resource_sampled
         else {}
     )
     started = time.perf_counter()
@@ -342,6 +369,8 @@ def execute_observed_batch(
     host._emit_trace(
         "compute_batch.start",
         phase=request.phase_label,
+        phase_batch_index=phase_batch_index,
+        resource_sampled=resource_sampled,
         batch_nodes=batch_size,
         unique_layers=unique_layers,
         retain_graph=request.retain_graph,
@@ -357,7 +386,7 @@ def execute_observed_batch(
                     )
                 ),
             )
-            if observer is not None
+            if observer is not None and resource_sampled
             else {}
         ),
     )
@@ -370,7 +399,7 @@ def execute_observed_batch(
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     memory_after = (
         cast(dict[str, object], observer.observe(MemorySnapshot(execution_device)))
-        if observer is not None
+        if observer is not None and resource_sampled
         else {}
     )
     if host.diagnostic_mode:
@@ -388,7 +417,7 @@ def execute_observed_batch(
                 MemoryDelta(before=memory_before, after=memory_after, keys=_MEMORY_ATTR_KEYS)
             ),
         )
-        if observer is not None
+        if observer is not None and resource_sampled
         else {}
     )
     host._record_telemetry_event(
@@ -400,6 +429,8 @@ def execute_observed_batch(
         attrs={
             "batch_nodes": batch_size,
             "batch_size": batch_size,
+            "phase_batch_index": phase_batch_index,
+            "resource_sampled": resource_sampled,
             "row_size": int(host._row_size),
             "unique_layers": len(result.layers_in_batch),
             "retain_graph": request.retain_graph,
@@ -416,6 +447,8 @@ def execute_observed_batch(
     host._emit_trace(
         "compute_batch.done",
         phase=request.phase_label,
+        phase_batch_index=phase_batch_index,
+        resource_sampled=resource_sampled,
         batch_nodes=batch_size,
         unique_layers=unique_layers,
         retain_graph=request.retain_graph,
