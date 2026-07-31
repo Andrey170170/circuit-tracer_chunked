@@ -319,3 +319,21 @@ def test_gather_encoder_vectors_preserves_sparse_order(create_test_clt_files):
         expected[idx] = clt._get_encoder_weights(layer_id)[feat_id]
 
     assert torch.allclose(gathered, expected)
+
+    duplicate_layers = torch.tensor([2, 0, 2, 1, 0])
+    duplicate_features = torch.tensor([7, 3, 7, 5, 3])
+    direct_cpu = clt.materialize_encoder_rows(
+        duplicate_layers,
+        duplicate_features,
+        device=torch.device("cpu"),
+    )
+    expected_cpu = torch.stack(
+        [
+            clt._get_encoder_weights(layer)[feature]
+            for layer, feature in zip(
+                duplicate_layers.tolist(), duplicate_features.tolist(), strict=True
+            )
+        ]
+    )
+    assert direct_cpu.device.type == "cpu"
+    assert torch.equal(direct_cpu, expected_cpu)

@@ -687,26 +687,35 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
         self,
         layer_id: int,
         feat_ids: torch.Tensor,
+        *,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
+        target_device = self.device if device is None else torch.device(device)
         feat_ids = feat_ids.reshape(-1).to(device="cpu", dtype=torch.long)
         if feat_ids.numel() == 0:
-            return torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+            return torch.empty((0, self.d_model), device=target_device, dtype=self.dtype)
 
         if not self.lazy_encoder:
             assert self.W_enc is not None, "Encoder weights are not set"
-            return self.W_enc[layer_id][feat_ids.to(device=self.W_enc.device)].to(dtype=self.dtype)
+            return self.W_enc[layer_id][feat_ids.to(device=self.W_enc.device)].to(
+                device=target_device,
+                dtype=self.dtype,
+            )
 
         start = time.perf_counter()
         if self.layer_paths is not None:
             path = self.layer_paths[layer_id]
             with safe_open(path, framework="pt", device="cpu") as f:
                 encoder_rows = f.get_slice("w_enc")[:, feat_ids].transpose(0, 1).contiguous()
-                result = self._move_lazy_slice_to_device(encoder_rows)
+                result = encoder_rows.to(device=target_device, dtype=self.dtype)
         else:
             assert self.clt_path is not None, "CLT path is not set"
             path = os.path.join(self.clt_path, f"W_enc_{layer_id}.safetensors")
             with safe_open(path, framework="pt", device="cpu") as f:
-                result = self._move_lazy_slice_to_device(f.get_slice(f"W_enc_{layer_id}")[feat_ids])
+                result = f.get_slice(f"W_enc_{layer_id}")[feat_ids].to(
+                    device=target_device,
+                    dtype=self.dtype,
+                )
 
         elapsed = time.perf_counter() - start
         self._add_diagnostic_value("encoder_load_count", 1)
@@ -724,6 +733,8 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
         self,
         source_layers: torch.Tensor,
         feature_ids: torch.Tensor,
+        *,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
         """Materialize encoder rows for specific (layer, feature) pairs.
 
@@ -741,12 +752,13 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
         if source_layers.numel() != feature_ids.numel():
             raise ValueError("source_layers and feature_ids must have matching lengths")
 
+        target_device = self.device if device is None else torch.device(device)
         if source_layers.numel() == 0:
-            return torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+            return torch.empty((0, self.d_model), device=target_device, dtype=self.dtype)
 
         active_encoders = torch.empty(
             (source_layers.numel(), self.d_model),
-            device=self.device,
+            device=target_device,
             dtype=self.dtype,
         )
         for layer_id in torch.unique(source_layers, sorted=True).tolist():
@@ -755,11 +767,17 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
             if layer_rows.numel() == 0:
                 continue
 
-            layer_feat_ids = feature_ids[layer_rows]
-            active_encoders[layer_rows.to(device=self.device)] = self._get_encoder_rows_for_layer(
-                layer_id,
-                layer_feat_ids,
+            unique_feature_ids, inverse = torch.unique(
+                feature_ids[layer_rows], sorted=True, return_inverse=True
             )
+            unique_rows = self._get_encoder_rows_for_layer(
+                layer_id,
+                unique_feature_ids,
+                device=target_device,
+            )
+            active_encoders[layer_rows.to(device=target_device)] = unique_rows[
+                inverse.to(device=target_device)
+            ]
 
         return active_encoders
 

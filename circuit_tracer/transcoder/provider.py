@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
+import torch
+
 from circuit_tracer.transcoder.attribution_result import AttributionComponents
 from circuit_tracer.transcoder.checkpoint_working_set import ProviderCheckpointLifecycle
 
@@ -54,7 +56,13 @@ class ExactChunkedProvider(Protocol):
 
     def compute_attribution_components(self, *args, **kwargs) -> AttributionComponents: ...
 
-    def materialize_encoder_rows(self, source_layers, feature_ids): ...
+    def materialize_encoder_rows(
+        self,
+        source_layers,
+        feature_ids,
+        *,
+        device: torch.device | None = None,
+    ): ...
 
     def create_decoder_block_cache(self, max_bytes=None, *, fingerprint=None): ...
 

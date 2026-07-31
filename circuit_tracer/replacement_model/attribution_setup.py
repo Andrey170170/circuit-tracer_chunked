@@ -185,7 +185,11 @@ class AttributionSetupOperation:
             "sparsification": self.options.sparsification,
         }
         if exact_chunked:
-            component_kwargs["materialize_encoder_vecs"] = residency.materialize_during_phase0
+            # Keep the Phase-0/Phase-3 CUDA allocation history identical to lazy
+            # residency. Active encoders are selected directly into their owned
+            # host tier below instead of first building a full occurrence table
+            # on CUDA and copying it back to CPU.
+            component_kwargs["materialize_encoder_vecs"] = False
         if get_transcoder_capabilities(transcoders).supports_active_decoder_row_residency:
             component_kwargs["decoder_active_row_residency"] = (
                 self.options.decoder_active_row_residency
@@ -202,6 +206,23 @@ class AttributionSetupOperation:
             model.zero_positions,  # type: ignore[attr-defined]
             **component_kwargs,
         )
+        if residency.materialize_during_phase0:
+            if components.chunked_decoder_state is None:
+                raise RuntimeError("active encoder residency requires chunked decoder state")
+            materialize_rows = getattr(transcoders, "materialize_encoder_rows", None)
+            if not callable(materialize_rows):
+                raise RuntimeError(
+                    "active encoder residency requires provider encoder-row materialization"
+                )
+            chunked_state = components.chunked_decoder_state
+            components = replace(
+                components,
+                encoder_vectors=materialize_rows(
+                    chunked_state["source_layers"],
+                    chunked_state["feature_ids"],
+                    device=torch.device("cpu"),
+                ),
+            )
         if components.decoder_row_seed is not None:
             components = replace(
                 components,

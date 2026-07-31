@@ -207,20 +207,26 @@ class SingleLayerTranscoder(nn.Module):
                 return f.get_slice(key)[to_read].to(self.dtype)
             return _slice_rows(f.get_slice(key), to_read, device=self.device).to(self.dtype)
 
-    def materialize_encoder_rows(self, feature_ids) -> torch.Tensor:
+    def materialize_encoder_rows(
+        self,
+        feature_ids,
+        *,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        target_device = self.device if device is None else torch.device(device)
         if isinstance(feature_ids, torch.Tensor):
             feature_ids_read = feature_ids.detach().cpu()
         else:
             feature_ids_read = feature_ids
         if not self.lazy_encoder:
-            return self.W_enc[feature_ids].to(dtype=self.dtype)
+            return self.W_enc[feature_ids].to(device=target_device, dtype=self.dtype)
         assert self.transcoder_path is not None
-        with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
+        with safe_open(self.transcoder_path, framework="pt", device=str(target_device)) as f:
             if self.weight_format == "gemmascope2":
                 return _slice_columns_transposed(
-                    f.get_slice("w_enc"), feature_ids_read, device=self.device
+                    f.get_slice("w_enc"), feature_ids_read, device=target_device
                 ).to(self.dtype)
-            return _slice_rows(f.get_slice("W_enc"), feature_ids_read, device=self.device).to(
+            return _slice_rows(f.get_slice("W_enc"), feature_ids_read, device=target_device).to(
                 self.dtype
             )
 
@@ -560,27 +566,41 @@ class TranscoderSet(nn.Module):
             )
         return 0
 
-    def materialize_encoder_rows(self, source_layers, feature_ids):
+    def materialize_encoder_rows(
+        self,
+        source_layers,
+        feature_ids,
+        *,
+        device: torch.device | None = None,
+    ):
         source_layers = torch.as_tensor(source_layers, dtype=torch.long).reshape(-1).cpu()
         feature_ids = torch.as_tensor(feature_ids, dtype=torch.long).reshape(-1).cpu()
         if source_layers.numel() != feature_ids.numel():
             raise ValueError("source_layers and feature_ids must have matching lengths")
 
         first = cast(SingleLayerTranscoder, self.transcoders[0])
+        target_device = first.device if device is None else torch.device(device)
         if source_layers.numel() == 0:
-            return torch.empty((0, self.d_model), device=first.device, dtype=first.dtype)
+            return torch.empty((0, self.d_model), device=target_device, dtype=first.dtype)
 
         active_encoders = torch.empty(
             (source_layers.numel(), self.d_model),
-            device=first.device,
+            device=target_device,
             dtype=first.dtype,
         )
         for layer_id in torch.unique(source_layers, sorted=True).tolist():
             layer_mask = source_layers == int(layer_id)
             layer_rows = torch.nonzero(layer_mask, as_tuple=False).squeeze(-1)
             transcoder = cast(SingleLayerTranscoder, self.transcoders[int(layer_id)])
+            unique_feature_ids, inverse = torch.unique(
+                feature_ids[layer_rows], sorted=True, return_inverse=True
+            )
+            unique_rows = transcoder.materialize_encoder_rows(
+                unique_feature_ids,
+                device=target_device,
+            )
             active_encoders[layer_rows.to(device=active_encoders.device)] = (
-                transcoder.materialize_encoder_rows(feature_ids[layer_rows]).to(
+                unique_rows[inverse.to(device=unique_rows.device)].to(
                     device=active_encoders.device, dtype=active_encoders.dtype
                 )
             )

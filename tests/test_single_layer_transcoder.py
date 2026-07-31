@@ -557,6 +557,23 @@ def test_transcoder_set_exact_plt_provider_components(create_test_transcoder_fil
     idx = got.activation_matrix.indices()
     rows = exact.materialize_encoder_rows(idx[0].tolist(), idx[2].tolist())
     assert torch.allclose(rows, base.encoder_vectors)
+    duplicate_probe = torch.tensor([3, 1, 3, 0], dtype=torch.long)
+    duplicate_layers = torch.tensor([1, 0, 1, 0], dtype=torch.long)
+    cpu_rows = exact.materialize_encoder_rows(
+        duplicate_layers,
+        duplicate_probe,
+        device=torch.device("cpu"),
+    )
+    assert cpu_rows.device.type == "cpu"
+    expected_rows = torch.stack(
+        [
+            eager.transcoders[int(layer)].W_enc[int(feature)]
+            for layer, feature in zip(
+                duplicate_layers.tolist(), duplicate_probe.tolist(), strict=True
+            )
+        ]
+    )
+    assert torch.equal(cpu_rows, expected_rows)
 
 
 def test_transcoder_set_rejects_non_positive_decoder_chunk_size(
