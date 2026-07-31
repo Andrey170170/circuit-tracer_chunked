@@ -223,9 +223,20 @@ class SingleLayerTranscoder(nn.Module):
         assert self.transcoder_path is not None
         with safe_open(self.transcoder_path, framework="pt", device=str(target_device)) as f:
             if self.weight_format == "gemmascope2":
+                if target_device.type == "cpu":
+                    # One tensor view plus one duplicate-aware advanced gather is
+                    # dramatically more cache-friendly than thousands of tiny
+                    # safetensors slice calls on networked checkpoints.
+                    return (
+                        f.get_tensor("w_enc")[:, feature_ids_read]
+                        .T.contiguous()
+                        .to(dtype=self.dtype)
+                    )
                 return _slice_columns_transposed(
                     f.get_slice("w_enc"), feature_ids_read, device=target_device
                 ).to(self.dtype)
+            if target_device.type == "cpu":
+                return f.get_tensor("W_enc")[feature_ids_read].contiguous().to(dtype=self.dtype)
             return _slice_rows(f.get_slice("W_enc"), feature_ids_read, device=target_device).to(
                 self.dtype
             )
