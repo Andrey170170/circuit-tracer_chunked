@@ -333,8 +333,39 @@ def _get_cgroup_memory_snapshot_gib() -> dict[str, float | None]:
     if cgroup_dir is None:
         return snapshot
 
-    current_bytes = _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.current"))
-    limit_bytes = _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.max"))
+    is_v2 = os.path.isfile(os.path.join(cgroup_dir, "memory.current"))
+    is_v1 = os.path.isfile(os.path.join(cgroup_dir, "memory.usage_in_bytes"))
+    if is_v2:
+        current_bytes = _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.current"))
+        limit_bytes = _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.max"))
+        peak_bytes = _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.peak"))
+    elif is_v1:
+        current_bytes = _read_memory_bytes_file(
+            os.path.join(cgroup_dir, "memory.usage_in_bytes")
+        )
+        peak_bytes = _read_memory_bytes_file(
+            os.path.join(cgroup_dir, "memory.max_usage_in_bytes")
+        )
+        # Slurm commonly leaves the leaf task cgroup effectively unlimited and
+        # applies the allocation limit at the enclosing step/job cgroup.
+        # Resolve the smallest finite inherited limit instead of reporting the
+        # kernel's huge v1 unlimited sentinel as real headroom.
+        finite_limits: list[int] = []
+        current_dir = os.path.abspath(cgroup_dir)
+        while True:
+            candidate = _read_memory_bytes_file(
+                os.path.join(current_dir, "memory.limit_in_bytes")
+            )
+            if candidate is not None and candidate < 1 << 60:
+                finite_limits.append(candidate)
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir:
+                break
+            current_dir = parent
+        limit_bytes = min(finite_limits) if finite_limits else None
+    else:
+        return snapshot
+
     snapshot["cgroup_memory_current_gib"] = _bytes_to_gib(current_bytes)
     snapshot["cgroup_memory_limit_gib"] = _bytes_to_gib(limit_bytes)
     snapshot["cgroup_memory_headroom_gib"] = _bytes_to_gib(
@@ -342,22 +373,34 @@ def _get_cgroup_memory_snapshot_gib() -> dict[str, float | None]:
         if current_bytes is not None and limit_bytes is not None
         else None
     )
-    snapshot["cgroup_memory_peak_gib"] = _bytes_to_gib(
-        _read_memory_bytes_file(os.path.join(cgroup_dir, "memory.peak"))
-    )
+    snapshot["cgroup_memory_peak_gib"] = _bytes_to_gib(peak_bytes)
 
     memory_stats = _read_memory_stat_file(os.path.join(cgroup_dir, "memory.stat"))
-    stat_keys = {
-        "anon": "cgroup_memory_anon_gib",
-        "file": "cgroup_memory_file_gib",
-        "active_file": "cgroup_memory_active_file_gib",
-        "inactive_file": "cgroup_memory_inactive_file_gib",
-        "shmem": "cgroup_memory_shmem_gib",
-        "slab_reclaimable": "cgroup_memory_slab_reclaimable_gib",
-        "slab_unreclaimable": "cgroup_memory_slab_unreclaimable_gib",
-    }
-    for stat_key, attr_name in stat_keys.items():
-        snapshot[attr_name] = _bytes_to_gib(memory_stats.get(stat_key))
+    if is_v2:
+        stat_keys = {
+            "anon": "cgroup_memory_anon_gib",
+            "file": "cgroup_memory_file_gib",
+            "active_file": "cgroup_memory_active_file_gib",
+            "inactive_file": "cgroup_memory_inactive_file_gib",
+            "shmem": "cgroup_memory_shmem_gib",
+            "slab_reclaimable": "cgroup_memory_slab_reclaimable_gib",
+            "slab_unreclaimable": "cgroup_memory_slab_unreclaimable_gib",
+        }
+        for stat_key, attr_name in stat_keys.items():
+            snapshot[attr_name] = _bytes_to_gib(memory_stats.get(stat_key))
+    else:
+        stat_keys = {
+            "rss": "cgroup_memory_anon_gib",
+            "cache": "cgroup_memory_file_gib",
+            "active_file": "cgroup_memory_active_file_gib",
+            "inactive_file": "cgroup_memory_inactive_file_gib",
+            "shmem": "cgroup_memory_shmem_gib",
+            "slab_reclaimable": "cgroup_memory_slab_reclaimable_gib",
+            "slab_unreclaimable": "cgroup_memory_slab_unreclaimable_gib",
+        }
+        for stat_key, attr_name in stat_keys.items():
+            value = memory_stats.get(f"total_{stat_key}", memory_stats.get(stat_key))
+            snapshot[attr_name] = _bytes_to_gib(value)
 
     return snapshot
 
