@@ -14,3 +14,6 @@ class ProbeCompletion:
     diagnostic_metadata: Mapping[str, object] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    diagnostic_artifacts: Mapping[str, object] = field(
+        default_factory=lambda: MappingProxyType({})
+    )

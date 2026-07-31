@@ -166,7 +166,7 @@ def run_trace(
             diagnostic_metadata=dict(output.diagnostic_metadata),
         )
         return TraceResult(
-            output=None,
+            output=dict(output.diagnostic_artifacts) or None,
             semantic_fingerprint=plan.semantic_fingerprint,
             requested_execution_fingerprint=plan.requested_execution_fingerprint,
             effective_execution_fingerprint=execution_identity.effective_fingerprint,

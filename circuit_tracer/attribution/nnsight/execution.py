@@ -187,6 +187,7 @@ class AttributionExecution:
                     mode="transition_probe",
                     phase4_batches_completed=completed,
                     diagnostic_metadata=self._probe_diagnostic_metadata(),
+                    diagnostic_artifacts=self._probe_diagnostic_artifacts(),
                 )
             return self._run_with_grant(PhaseId.PHASE5, self.assemble_graph)
         finally:
@@ -206,6 +207,28 @@ class AttributionExecution:
         frontier = getattr(getattr(self, "prepared", None), "frontier", None)
         metadata = getattr(frontier, "execution_metadata", {})
         return MappingProxyType(dict(metadata))
+
+    def _probe_diagnostic_artifacts(self) -> Mapping[str, object]:
+        """Retain requested bounded captures when a probe skips Phase 5."""
+
+        phase2 = self._phase2()
+        phase3 = self._phase3()
+        candidates = {
+            "phase0_donor_bundle": phase2.phase0_donor_bundle_payload,
+            "phase3_seed_bundle": phase3.phase3_seed_bundle_payload,
+            "phase3_gradient_bundle": phase3.phase3_gradient_bundle_payload,
+            "phase3_row_bundle": phase3.phase3_row_bundle_payload,
+            "feature_semantic_descriptors": (
+                phase3.feature_semantic_descriptors_payload
+            ),
+        }
+        return MappingProxyType(
+            {
+                name: payload
+                for name, payload in candidates.items()
+                if payload is not None
+            }
+        )
 
     def apply_active_universe_replan(self) -> None:
         if self.governor_runtime is None:

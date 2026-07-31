@@ -94,6 +94,14 @@ def test_transition_probe_stops_after_declared_physical_batch_count() -> None:
             phase4_execution_batch_count=policy.phase4_batches
         )
 
+    execution.phase2 = SimpleNamespace(phase0_donor_bundle_payload={"donor": 1})
+    execution.phase3 = SimpleNamespace(
+        phase3_seed_bundle_payload={"seed": 2},
+        phase3_gradient_bundle_payload=None,
+        phase3_row_bundle_payload={"row": 3},
+        feature_semantic_descriptors_payload=None,
+    )
+
     execution.expand_feature_frontier = run_phase4
     execution.assemble_graph = lambda: calls.append("phase5")
 
@@ -103,6 +111,11 @@ def test_transition_probe_stops_after_declared_physical_batch_count() -> None:
         mode="transition_probe",
         phase4_batches_completed=3,
         diagnostic_metadata={"lifecycle_released": False},
+        diagnostic_artifacts={
+            "phase0_donor_bundle": {"donor": 1},
+            "phase3_seed_bundle": {"seed": 2},
+            "phase3_row_bundle": {"row": 3},
+        },
     )
     assert calls == ["phase0", "phase1", "phase2", "phase3", "phase4"]
 
