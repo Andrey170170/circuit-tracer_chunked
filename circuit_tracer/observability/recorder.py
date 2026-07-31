@@ -15,6 +15,8 @@ import torch
 
 TelemetryScalar = str | int | float | bool | None
 _ALLOWED_TELEMETRY_SCOPES = {"run", "phase", "batch", "op"}
+_DEFAULT_SINK_FLUSH_INTERVAL_EVENTS = 64
+_SINK_BUFFER_BYTES = 256 * 1024
 
 
 def _truncate_text(value: str, *, max_length: int = 256) -> str:
@@ -137,6 +139,7 @@ class TelemetryRecorder:
         max_events: int = 20000,
         jsonl_path: str | os.PathLike[str] | None = None,
         static_context: Mapping[str, object] | None = None,
+        sink_flush_interval_events: int = _DEFAULT_SINK_FLUSH_INTERVAL_EVENTS,
     ) -> None:
         self.enabled = bool(enabled)
         self.max_events = max(0, int(max_events))
@@ -161,6 +164,10 @@ class TelemetryRecorder:
         self._sink: TextIO | None = None
         self._sink_status = "disabled" if self._jsonl_path is None else "pending"
         self._sink_event_count = 0
+        self._sink_flush_interval_events = max(1, int(sink_flush_interval_events))
+        self._sink_flush_count = 0
+        self._sink_pending_event_count = 0
+        self._sink_max_pending_event_count = 0
         self._sink_error_count = 0
         self._sink_last_error: str | None = None
         if self._jsonl_path is not None:
@@ -179,7 +186,12 @@ class TelemetryRecorder:
         if self._jsonl_path is None or self._sink is not None:
             return
         try:
-            self._sink = open(self._jsonl_path, "a", encoding="utf-8", buffering=1)
+            self._sink = open(
+                self._jsonl_path,
+                "a",
+                encoding="utf-8",
+                buffering=_SINK_BUFFER_BYTES,
+            )
             self._sink_status = "open"
         except Exception as exc:  # pragma: no cover - filesystem dependent
             self._record_sink_error(exc)
@@ -195,10 +207,27 @@ class TelemetryRecorder:
         }
         try:
             self._sink.write(json.dumps(record, separators=(",", ":")) + "\n")
-            self._sink.flush()
             self._sink_event_count += 1
+            self._sink_pending_event_count += 1
+            self._sink_max_pending_event_count = max(
+                self._sink_max_pending_event_count,
+                self._sink_pending_event_count,
+            )
+            terminal_or_boundary = event.get("scope") in {"run", "phase"}
+            if (
+                self._sink_pending_event_count >= self._sink_flush_interval_events
+                or terminal_or_boundary
+            ):
+                self._flush_sink()
         except Exception as exc:  # pragma: no cover - filesystem dependent
             self._record_sink_error(exc)
+
+    def _flush_sink(self) -> None:
+        if self._sink is None or self._sink_pending_event_count <= 0:
+            return
+        self._sink.flush()
+        self._sink_flush_count += 1
+        self._sink_pending_event_count = 0
 
     def close(self) -> None:
         if self._sink is None:
@@ -206,7 +235,10 @@ class TelemetryRecorder:
         sink = self._sink
         self._sink = None
         try:
-            sink.flush()
+            if self._sink_pending_event_count > 0:
+                sink.flush()
+                self._sink_flush_count += 1
+                self._sink_pending_event_count = 0
             sink.close()
             if self._sink_status != "error":
                 self._sink_status = "closed"
@@ -355,6 +387,13 @@ class TelemetryRecorder:
             "sink_path": self._jsonl_path,
             "sink_status": self._sink_status,
             "sink_event_count": int(self._sink_event_count),
+            "sink_flush_interval_events": int(self._sink_flush_interval_events),
+            "sink_flush_count": int(self._sink_flush_count),
+            "sink_pending_event_count": int(self._sink_pending_event_count),
+            "sink_max_pending_event_count": int(self._sink_max_pending_event_count),
+            "sink_max_crash_loss_events": int(
+                max(self._sink_flush_interval_events - 1, 0)
+            ),
             "sink_error_count": int(self._sink_error_count),
             "sink_last_error": self._sink_last_error,
             "counts_by_scope": dict(sorted(self._counts_by_scope.items())),

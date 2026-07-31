@@ -143,6 +143,7 @@ def record_refresh_trace(state):
             elapsed_ms=state.refresh_elapsed_ms,
             attrs={
                 "refresh_index": state.refresh_index,
+                "resource_sampled": state.refresh_resource_sampled,
                 "stored_rows": int(state.st),
                 "visited_features": int(state.n_visited),
                 "frontier_candidate_count": int(state.rank_selection.candidate_count),
@@ -350,7 +351,8 @@ def _record_cross_cluster_refresh_debug(state):
                     (state.feature_row_store_read_stats or {}).get("read_row_count")
                 ),
                 "refresh_elapsed_ms": float(state.refresh_elapsed_ms),
-                **state.memory_snapshot(),
+                "resource_sampled": state.refresh_resource_sampled,
+                **state.refresh_memory_after,
             },
         )
 

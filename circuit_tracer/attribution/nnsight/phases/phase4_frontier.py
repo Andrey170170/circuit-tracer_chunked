@@ -393,7 +393,9 @@ def plan_feature_frontier(state):
         streaming_chunk_reuse_stats=state.streaming_chunk_reuse_stats,
         feature_row_store_read_stats=state.feature_row_store_read_stats,
     )
-    state.refresh_memory_after = state.memory_snapshot()
+    state.refresh_memory_after = (
+        state.memory_snapshot() if state.refresh_resource_sampled else {}
+    )
     state.refresh_elapsed_ms = (time.perf_counter() - state.refresh_start) * 1000.0
     state.phase4_refresh_elapsed_ms_total += state.refresh_elapsed_ms
 

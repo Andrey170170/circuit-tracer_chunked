@@ -27,6 +27,9 @@ from circuit_tracer.attribution.nnsight.feature_vjp_tape import (
     FeatureVjpTape,
     FeatureVjpTapeEntry,
 )
+from circuit_tracer.attribution.nnsight.resource_sampling import (
+    should_sample_phase4_resources,
+)
 from circuit_tracer.observability.events import BatchProfile, TraceEvent
 from circuit_tracer.attribution.nnsight.phases.phase4_storage import (
     commit_feature_rows,
@@ -156,7 +159,13 @@ def produce_feature_batch(state, *, defer_feature_vjps: bool = False):
         state.diagnostic_snapshot(state.model.transcoders) if state.profile else None
     )
     state.batch_start = time.perf_counter()
-    state.batch_memory_before = state.memory_snapshot()
+    state.batch_resource_sampled = should_sample_phase4_resources(
+        sample_index=state.execution_batch_index,
+        final=state.n_visited >= state.actual_max_feature_nodes,
+    )
+    state.batch_memory_before = (
+        state.memory_snapshot() if state.batch_resource_sampled else {}
+    )
     state.encoder_vectors_source_device = None
     state.encoder_vectors_source_dtype = None
     if getattr(state.ctx, "encoder_vecs", None) is not None and state.ctx.encoder_vecs.numel() > 0:
@@ -282,6 +291,7 @@ _CAPTURED_BATCH_ATTRS = (
     "ctx_before",
     "transcoder_before",
     "batch_memory_before",
+    "batch_resource_sampled",
     "encoder_vectors_source_device",
     "encoder_vectors_source_dtype",
     "encoder_vectors_transfer_bytes",
@@ -612,7 +622,9 @@ def record_feature_batch_evidence(state):
             )
     state.batch_number = state.execution_batch_index
     state.batch_elapsed_ms = (time.perf_counter() - state.batch_start) * 1000.0
-    state.batch_memory_after = state.memory_snapshot()
+    state.batch_memory_after = (
+        state.memory_snapshot() if state.batch_resource_sampled else {}
+    )
     state.phase4_feature_batch_elapsed_ms_total += state.batch_elapsed_ms
     state.phase4_executor_encoder_materialize_elapsed_ms_total += (
         state.executor_encoder_materialize_elapsed_ms
@@ -700,6 +712,7 @@ def record_feature_batch_evidence(state):
                 **state.phase4_execution_metadata,
                 **state.executor_batch_telemetry,
                 "scheduler_refresh_index": state.pending_refresh_index,
+                "resource_sampled": state.batch_resource_sampled,
                 **state.executor_streaming_telemetry,
                 **state.batch_locality_summary,
                 **state.executor_substage_telemetry,
@@ -744,7 +757,8 @@ def record_feature_batch_evidence(state):
                     state.row_abs_sum_stats["effectively_all_zero"]
                 ),
                 "batch_elapsed_ms": float(state.batch_elapsed_ms),
-                **state.memory_snapshot(),
+                "resource_sampled": state.batch_resource_sampled,
+                **state.batch_memory_after,
             },
         )
     state.chunk_pending_start = state.chunk_pending_end

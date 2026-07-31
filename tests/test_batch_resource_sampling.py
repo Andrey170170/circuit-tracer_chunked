@@ -1,5 +1,6 @@
-from circuit_tracer.attribution.nnsight.batch_execution import (
+from circuit_tracer.attribution.nnsight.resource_sampling import (
     should_sample_batch_resources,
+    should_sample_phase4_resources,
 )
 
 
@@ -25,3 +26,13 @@ def test_non_phase4_batches_retain_full_resource_sampling() -> None:
         phase_batch_index=17,
         retain_graph=True,
     )
+
+
+def test_phase4_refresh_sampling_covers_transition_and_periodic_evidence() -> None:
+    assert [
+        should_sample_phase4_resources(sample_index=index)
+        for index in range(1, 5)
+    ] == [True, True, True, False]
+    assert should_sample_phase4_resources(sample_index=32)
+    assert should_sample_phase4_resources(sample_index=33) is False
+    assert should_sample_phase4_resources(sample_index=33, final=True)

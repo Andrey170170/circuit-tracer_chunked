@@ -15,6 +15,9 @@ from circuit_tracer.attribution.nnsight.phase_support import (
     _build_phase4_normalization_stats,
     _build_vector_stats,
 )
+from circuit_tracer.attribution.nnsight.resource_sampling import (
+    should_sample_phase4_resources,
+)
 from circuit_tracer.attribution.nnsight.telemetry import _safe_float, _safe_int
 from circuit_tracer.graph import (
     compute_partial_feature_influences_streaming,
@@ -28,7 +31,12 @@ def recompute_feature_influences(state):
     state.refresh_index = int(state.phase4_refresh_count)
     state.pending_refresh_index = state.refresh_index
     state.refresh_start = time.perf_counter()
-    state.refresh_memory_before = state.memory_snapshot()
+    state.refresh_resource_sampled = should_sample_phase4_resources(
+        sample_index=state.refresh_index + 1,
+    )
+    state.refresh_memory_before = (
+        state.memory_snapshot() if state.refresh_resource_sampled else {}
+    )
     state.feature_row_store_snapshot_before = (
         state.feature_row_store.get_diagnostic_snapshot()
         if state.use_compact_feature_row_store and state.feature_row_store is not None

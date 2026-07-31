@@ -18,6 +18,9 @@ from circuit_tracer.attribution.nnsight.feature_vjp_tape import (
     FeatureVjpTapeEntry,
     tensor_nbytes,
 )
+from circuit_tracer.attribution.nnsight.resource_sampling import (
+    should_sample_batch_resources,
+)
 
 
 _MEMORY_ATTR_KEYS: tuple[str, ...] = (
@@ -39,26 +42,6 @@ _PIN_MEMORY_FALLBACK_MARKERS = (
     "cuda driver",
     "cuda error",
 )
-
-_PHASE4_DENSE_RESOURCE_SAMPLES = 3
-_PHASE4_RESOURCE_SAMPLE_INTERVAL = 32
-
-
-def should_sample_batch_resources(
-    *,
-    phase_label: str,
-    phase_batch_index: int,
-    retain_graph: bool,
-) -> bool:
-    """Keep transition evidence dense without sampling /proc on every hot-path batch."""
-    if phase_label != "phase4_features":
-        return True
-    return (
-        phase_batch_index <= _PHASE4_DENSE_RESOURCE_SAMPLES
-        or phase_batch_index % _PHASE4_RESOURCE_SAMPLE_INTERVAL == 0
-        or not retain_graph
-    )
-
 
 def _is_expected_pin_memory_failure(error: RuntimeError) -> bool:
     message = str(error).lower()
