@@ -113,7 +113,7 @@ class RowStoragePlan:
     gpu_resident_max_bytes: int = 0
     gpu_window_max_bytes: int = 0
     gpu_resident_safety_margin_bytes: int = 0
-    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy"
+    exact_encoder_residency: Literal["lazy", "active_cpu"] = "lazy"
     placement: StorageTier | None = None
 
     def __post_init__(self) -> None:

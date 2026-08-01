@@ -12,7 +12,7 @@ from circuit_tracer.transcoder.attribution_result import DecoderRowSeed
 from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
 
 
-EncoderResidency = Literal["lazy", "active_cpu", "active_pinned_cpu"]
+EncoderResidency = Literal["lazy", "active_cpu"]
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ class ContextExecutionPolicy:
         row_subchunk_size: int | None,
     ) -> "ContextExecutionPolicy":
         normalized = str(exact_encoder_residency).strip().lower()
-        allowed = {"lazy", "active_cpu", "active_pinned_cpu"}
+        allowed = {"lazy", "active_cpu"}
         if normalized not in allowed:
             raise ValueError(
                 "exact_encoder_residency must be one of: "

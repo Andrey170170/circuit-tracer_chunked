@@ -148,7 +148,6 @@ _EXACT_ENCODER_RESIDENCY_DEFAULT: Literal["lazy"] = "lazy"
 _EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE: dict[str, str] = {
     "lazy": "lazy",
     "active_cpu": "active_cpu",
-    "active_pinned_cpu": "active_pinned_cpu",
 }
 
 
@@ -234,8 +233,8 @@ class _Phase4RankerConfig:
 
 @dataclass(frozen=True)
 class _ExactEncoderResidencyConfig:
-    requested_mode: Literal["lazy", "active_cpu", "active_pinned_cpu"]
-    effective_mode: Literal["lazy", "active_cpu", "active_pinned_cpu"]
+    requested_mode: Literal["lazy", "active_cpu"]
+    effective_mode: Literal["lazy", "active_cpu"]
     default_mode: Literal["lazy"]
     mode_applicable: bool
     effective_behavior: Literal["requested", "lazy_reference_execution"]
@@ -1133,15 +1132,15 @@ def _select_phase4_frontier_rank_selection(
 
 def _resolve_exact_encoder_residency(
     exact_encoder_residency: str,
-) -> Literal["lazy", "active_cpu", "active_pinned_cpu"]:
+) -> Literal["lazy", "active_cpu"]:
     normalized = str(exact_encoder_residency).strip().lower()
-    allowed_values = {"lazy", "active_cpu", "active_pinned_cpu"}
+    allowed_values = {"lazy", "active_cpu"}
     if normalized not in allowed_values:
         allowed = ", ".join(sorted(allowed_values))
         raise ValueError(
             f"exact_encoder_residency must be one of: {allowed} (got {exact_encoder_residency!r})"
         )
-    return cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], normalized)
+    return cast(Literal["lazy", "active_cpu"], normalized)
 
 
 def _resolve_exact_encoder_residency_config(
@@ -1153,14 +1152,14 @@ def _resolve_exact_encoder_residency_config(
     mode_applicable = bool(supports_exact_encoder_residency)
     fallback_reason: str | None = None
     if requested_mode != "lazy" and not mode_applicable:
-        effective_mode = cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], "lazy")
+        effective_mode = cast(Literal["lazy", "active_cpu"], "lazy")
         fallback_reason = (
             "active encoder residency requires exact encoder-residency provider support; "
             "falling back to lazy execution"
         )
     else:
         effective_mode = cast(
-            Literal["lazy", "active_cpu", "active_pinned_cpu"],
+            Literal["lazy", "active_cpu"],
             _EXACT_ENCODER_RESIDENCY_EFFECTIVE_MODE_BY_MODE[requested_mode],
         )
     effective_behavior: Literal["requested", "lazy_reference_execution"] = (
@@ -1192,14 +1191,10 @@ def _build_exact_encoder_residency_metadata(
         "exact_encoder_residency_fallback_reason": exact_encoder_residency_config.fallback_reason,
         "exact_encoder_materialize_phase0": bool(effective_mode != "lazy"),
         "exact_encoder_staging_destination_planned": (
-            "none"
-            if effective_mode == "lazy"
-            else ("pinned_cpu" if effective_mode == "active_pinned_cpu" else "cpu")
+            "none" if effective_mode == "lazy" else "cpu"
         ),
-        "exact_encoder_pinned_requested": bool(
-            exact_encoder_residency_config.requested_mode == "active_pinned_cpu"
-        ),
-        "exact_encoder_pinned_planned": bool(effective_mode == "active_pinned_cpu"),
+        "exact_encoder_pinned_requested": False,
+        "exact_encoder_pinned_planned": False,
         "exact_encoder_pinned_effective": None,
         "exact_encoder_pinning_success": None,
         "exact_encoder_pinning_failure_reason": None,
@@ -2380,7 +2375,7 @@ def _plan_phase4_feature_batch_size_preflight(
     stage_encoder_vecs_on_cpu: bool | None = None,
     stage_error_vectors_on_cpu: bool | None = None,
     row_subchunk_size: int | None = None,
-    exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
+    exact_encoder_residency: Literal["lazy", "active_cpu"] = "lazy",
     diagnostic_feature_cap: int | None = None,
     feature_batch_target_reserved_fraction: float = 0.9,
     feature_batch_min_free_fraction: float = 0.05,

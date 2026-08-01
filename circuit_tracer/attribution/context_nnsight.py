@@ -107,9 +107,7 @@ class AttributionContext:
         self.exact_encoder_materialized_during_phase0 = bool(
             numeric_policy.materialized_encoder_vectors_during_phase0
         )
-        self.exact_encoder_pinned_requested = bool(
-            policy.encoder_residency_effective == "active_pinned_cpu"
-        )
+        self.exact_encoder_pinned_requested = False
         self.exact_encoder_pinned_effective = False
         self.exact_encoder_pinning_success: bool | None = None
         self.exact_encoder_pinning_failure_reason: str | None = None
@@ -133,15 +131,7 @@ class AttributionContext:
         self.token_vectors = tensors.token_vectors
         self.decoder_vecs = tensors.decoder_vectors
         if self._stage_encoder_vecs_on_cpu:
-            self.encoder_vecs, pinning_success, pinning_failure_reason = self._stage_encoder_tensor(
-                tensors.encoder_vectors,
-                pin_memory=self.exact_encoder_pinned_requested,
-            )
-            self.exact_encoder_pinning_success = pinning_success
-            self.exact_encoder_pinning_failure_reason = pinning_failure_reason
-            self.exact_encoder_pinned_effective = bool(
-                self.exact_encoder_pinned_requested and self.encoder_vecs.is_pinned()
-            )
+            self.encoder_vecs = self._stage_tensor_on_cpu(tensors.encoder_vectors)
         else:
             self.encoder_vecs = tensors.encoder_vectors
         self.exact_encoder_staging_destination = self._resolve_encoder_staging_destination(
@@ -262,42 +252,25 @@ class AttributionContext:
         return staged
 
     @staticmethod
-    def _stage_encoder_tensor(
-        tensor: torch.Tensor,
-        *,
-        pin_memory: bool,
-    ) -> tuple[torch.Tensor, bool | None, str | None]:
-        staged = AttributionContext._stage_tensor_on_cpu(tensor)
-        if not pin_memory:
-            return staged, None, None
-        try:
-            pinned = staged.pin_memory()
-        except Exception as exc:  # pragma: no cover - platform dependent
-            return staged, False, f"{type(exc).__name__}: {exc}"
-        if not pinned.is_pinned():
-            return pinned, False, "pin_memory returned a non-pinned tensor"
-        return pinned, True, None
-
-    @staticmethod
     def _normalize_exact_encoder_residency(
         exact_encoder_residency: str,
-    ) -> Literal["lazy", "active_cpu", "active_pinned_cpu"]:
+    ) -> Literal["lazy", "active_cpu"]:
         normalized = str(exact_encoder_residency).strip().lower()
-        allowed_values = {"lazy", "active_cpu", "active_pinned_cpu"}
+        allowed_values = {"lazy", "active_cpu"}
         if normalized not in allowed_values:
             allowed = ", ".join(sorted(allowed_values))
             raise ValueError(
                 "exact_encoder_residency must be one of: "
                 f"{allowed} (got {exact_encoder_residency!r})"
             )
-        return cast(Literal["lazy", "active_cpu", "active_pinned_cpu"], normalized)
+        return cast(Literal["lazy", "active_cpu"], normalized)
 
     @staticmethod
     def _resolve_encoder_staging_destination(
         encoder_vecs: torch.Tensor,
         *,
         exact_chunked_mode: bool,
-        encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"],
+        encoder_residency: Literal["lazy", "active_cpu"],
     ) -> str:
         if encoder_residency == "lazy":
             if exact_chunked_mode and encoder_vecs.numel() == 0:

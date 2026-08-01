@@ -26,7 +26,7 @@ from circuit_tracer.transcoder.provider import (
 )
 
 
-EncoderResidency = Literal["lazy", "active_cpu", "active_pinned_cpu"]
+EncoderResidency = Literal["lazy", "active_cpu"]
 
 
 @dataclass(frozen=True)
@@ -110,7 +110,7 @@ class EncoderResidencyPlan:
         stage_on_cpu: bool | None,
     ) -> "EncoderResidencyPlan":
         normalized = str(requested).strip().lower()
-        allowed = {"lazy", "active_cpu", "active_pinned_cpu"}
+        allowed = {"lazy", "active_cpu"}
         if normalized not in allowed:
             raise ValueError(
                 f"exact_encoder_residency must be one of: {', '.join(sorted(allowed))} "

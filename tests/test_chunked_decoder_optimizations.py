@@ -1272,58 +1272,6 @@ def test_exact_chunked_active_cpu_encoder_residency_stages_materialized_table() 
     assert ctx.exact_encoder_pinned_effective is False
 
 
-def test_exact_chunked_active_pinned_cpu_encoder_residency_falls_back_to_cpu(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    activation_matrix = torch.sparse_coo_tensor(
-        indices=torch.tensor([[0, 0, 1], [0, 1, 1], [0, 1, 0]]),
-        values=torch.tensor([1.0, 2.0, 3.0]),
-        size=(2, 2, 2),
-        check_invariants=True,
-    ).coalesce()
-    encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-
-    def _stage_with_forced_pin_failure(tensor: torch.Tensor, *, pin_memory: bool):
-        staged = NNSightAttributionContext._stage_tensor_on_cpu(tensor)
-        assert pin_memory is True
-        return staged, False, "RuntimeError: pinning unavailable"
-
-    monkeypatch.setattr(
-        NNSightAttributionContext,
-        "_stage_encoder_tensor",
-        staticmethod(_stage_with_forced_pin_failure),
-    )
-
-    ctx = _make_nnsight_context(
-        activation_matrix=activation_matrix,
-        error_vectors=torch.zeros(2, 2, 4),
-        token_vectors=torch.zeros(2, 4),
-        decoder_vecs=torch.empty((0, 4)),
-        encoder_vecs=encoder_vecs,
-        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
-        decoder_locations=torch.empty((2, 0), dtype=torch.long),
-        logits=torch.zeros(1, 1, 5),
-        decoder_provider=FakeDecoderProvider({0: torch.zeros(2, 2, 4), 1: torch.zeros(1, 1, 4)}),
-        chunked_decoder_state={
-            "source_layers": activation_matrix.indices()[0],
-            "positions": activation_matrix.indices()[1],
-            "feature_ids": activation_matrix.indices()[2],
-            "activation_values": activation_matrix.values(),
-        },
-        exact_encoder_residency="active_pinned_cpu",
-        materialized_encoder_vecs_during_phase0=True,
-    )
-
-    assert ctx.encoder_vecs.device.type == "cpu"
-    assert ctx.exact_encoder_residency_requested == "active_pinned_cpu"
-    assert ctx.exact_encoder_residency_effective == "active_pinned_cpu"
-    assert ctx.exact_encoder_pinned_requested is True
-    assert ctx.exact_encoder_pinned_effective is False
-    assert ctx.exact_encoder_pinning_success is False
-    assert ctx.exact_encoder_pinning_failure_reason is not None
-    assert ctx.exact_encoder_staging_destination == "cpu"
-
-
 def test_stage_tensor_on_cpu_preserves_existing_cpu_layout() -> None:
     source = torch.arange(24, dtype=torch.float32, requires_grad=True).reshape(4, 6).transpose(0, 1)
     assert source.device.type == "cpu"
@@ -1886,30 +1834,31 @@ def test_row_store_cache_control_config_validates_and_tracks_effective_mode() ->
 def test_exact_encoder_residency_config_validates_tracks_effective_mode_and_fallback() -> None:
     assert _resolve_exact_encoder_residency("lazy") == "lazy"
     assert _resolve_exact_encoder_residency("active_cpu") == "active_cpu"
-    assert _resolve_exact_encoder_residency("active_pinned_cpu") == "active_pinned_cpu"
     with pytest.raises(ValueError, match="exact_encoder_residency must be one of"):
         _resolve_exact_encoder_residency("active")
+    with pytest.raises(ValueError, match="exact_encoder_residency must be one of"):
+        _resolve_exact_encoder_residency("active_pinned_cpu")
 
     config = _resolve_exact_encoder_residency_config(
-        "active_pinned_cpu",
+        "active_cpu",
         supports_exact_encoder_residency=True,
     )
     metadata = _build_exact_encoder_residency_metadata(config)
-    assert metadata["exact_encoder_residency_requested"] == "active_pinned_cpu"
-    assert metadata["exact_encoder_residency_effective"] == "active_pinned_cpu"
+    assert metadata["exact_encoder_residency_requested"] == "active_cpu"
+    assert metadata["exact_encoder_residency_effective"] == "active_cpu"
     assert metadata["exact_encoder_residency_applicable"] is True
     assert metadata["exact_encoder_residency_fallback_reason"] is None
     assert metadata["exact_encoder_materialize_phase0"] is True
-    assert metadata["exact_encoder_staging_destination_planned"] == "pinned_cpu"
-    assert metadata["exact_encoder_pinned_requested"] is True
-    assert metadata["exact_encoder_pinned_planned"] is True
+    assert metadata["exact_encoder_staging_destination_planned"] == "cpu"
+    assert metadata["exact_encoder_pinned_requested"] is False
+    assert metadata["exact_encoder_pinned_planned"] is False
     assert metadata["exact_encoder_pinned_effective"] is None
     assert metadata["exact_encoder_pinning_success"] is None
     assert metadata["exact_encoder_residency_default"] == "lazy"
     assert metadata["exact_encoder_residency_reference_execution"] is False
 
     fallback_config = _resolve_exact_encoder_residency_config(
-        "active_pinned_cpu",
+        "active_cpu",
         supports_exact_encoder_residency=False,
     )
     fallback_metadata = _build_exact_encoder_residency_metadata(fallback_config)
@@ -1917,7 +1866,7 @@ def test_exact_encoder_residency_config_validates_tracks_effective_mode_and_fall
     assert fallback_metadata["exact_encoder_residency_applicable"] is False
     assert fallback_metadata["exact_encoder_residency_fallback_reason"] is not None
     assert fallback_metadata["exact_encoder_materialize_phase0"] is False
-    assert fallback_metadata["exact_encoder_pinned_requested"] is True
+    assert fallback_metadata["exact_encoder_pinned_requested"] is False
     assert fallback_metadata["exact_encoder_pinned_planned"] is False
     assert fallback_metadata["exact_encoder_pinned_effective"] is None
     assert fallback_metadata["exact_encoder_residency_reference_execution"] is True

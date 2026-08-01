@@ -630,7 +630,10 @@ def test_canonical_execution_policy_type_hints_include_supported_modes() -> None
     assert "topk_v1" in get_args(semantics_hints["ranker"])
     assert "fadvise_dontneed_after_append_v1" in get_args(storage_hints["cache_control"])
     assert "fadvise_dontneed_after_append_and_read_v1" in get_args(storage_hints["cache_control"])
-    assert "active_pinned_cpu" in get_args(storage_hints["exact_encoder_residency"])
+    assert set(get_args(storage_hints["exact_encoder_residency"])) == {
+        "lazy",
+        "active_cpu",
+    }
 
 
 def test_exact_trace_internal_dtype_resolution_rejects_unknown_value() -> None:

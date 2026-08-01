@@ -575,7 +575,7 @@ class NNSightReplacementModel(LanguageModel):
         stage_encoder_vecs_on_cpu: bool | None = None,
         stage_error_vectors_on_cpu: bool | None = None,
         row_subchunk_size: int | None = None,
-        exact_encoder_residency: Literal["lazy", "active_cpu", "active_pinned_cpu"] = "lazy",
+        exact_encoder_residency: Literal["lazy", "active_cpu"] = "lazy",
         internal_precision_requested: str | None = None,
         resolved_dtype_map: dict[str, str] | None = None,
         prefix_view_length: int | None = None,
