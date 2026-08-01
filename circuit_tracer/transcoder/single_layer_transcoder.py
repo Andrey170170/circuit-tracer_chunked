@@ -841,7 +841,12 @@ class TranscoderSet(nn.Module):
                 ),
                 destination="cpu",
                 order=DecoderRowOrder.SORTED_UNIQUE,
-                output_dtype=self.dtype,
+                # Preserve checkpoint precision until the rows reach the
+                # provider device.  The canonical full-page path performs its
+                # dtype conversion there; casting mapped FP32 rows on CPU can
+                # move cutoff-level feature scores even when retained edges
+                # are unchanged.
+                output_dtype=None,
             )
             if isinstance(mapped_result, DecoderRowRefusal):
                 mapped_refusal_reason = (
@@ -951,8 +956,11 @@ class TranscoderSet(nn.Module):
                 ),
             )
 
+        raw_decoder_vectors: torch.Tensor | None = None
+        provider_decoder_vectors: torch.Tensor | None = None
         decoder_vectors: torch.Tensor | None = None
         scaled_decoders: torch.Tensor | None = None
+        retained_seed_rows: torch.Tensor | None = None
         try:
             reconstruction = torch.zeros(
                 sparse_acts.shape[0],
@@ -982,13 +990,23 @@ class TranscoderSet(nn.Module):
                         chunk_feature_ids, feat_idx[chunk_mask]
                     )
                     h2d_started = time.perf_counter()
-                    decoder_vectors = compact_rows.index_select(
+                    raw_decoder_vectors = compact_rows.index_select(
                         0, unique_destinations.to(device="cpu")
-                    ).to(
-                        device=sparse_acts.device,
-                        dtype=sparse_acts.dtype,
-                    )
+                    ).to(device=sparse_acts.device)
+                    provider_decoder_vectors = raw_decoder_vectors.to(dtype=self.dtype)
+                    decoder_vectors = provider_decoder_vectors.to(dtype=sparse_acts.dtype)
                     h2d_seconds += time.perf_counter() - h2d_started
+                    if retained_seed_rows is None:
+                        retained_seed_rows = torch.empty(
+                            (int(unique_feature_ids.numel()), self.d_model),
+                            device="cpu",
+                            dtype=self.dtype,
+                        )
+                    retained_seed_rows.index_copy_(
+                        0,
+                        unique_destinations.to(device="cpu"),
+                        provider_decoder_vectors.detach().to(device="cpu"),
+                    )
                     scaled_decoders = (
                         decoder_vectors[occurrence_rows] * values[chunk_mask, None]
                     )
@@ -1006,12 +1024,12 @@ class TranscoderSet(nn.Module):
             )
             reconstruction_seconds = time.perf_counter() - reconstruct_started
             seed_layer = None
-            if compact_rows.numel():
+            if retained_seed_rows is not None:
                 seed_layer = DecoderRowSeedLayer(
                     source_layer=layer,
                     output_layers=(layer,),
                     feature_ids=range_plan.unique_feature_ids,
-                    rows=compact_rows.unsqueeze(1),
+                    rows=retained_seed_rows.unsqueeze(1),
                 )
             requested_bytes = int(unique_feature_ids.numel()) * self.d_model * int(
                 self.dtype.itemsize
@@ -1036,6 +1054,7 @@ class TranscoderSet(nn.Module):
                 output_bytes = requested_bytes
                 temporary_staging_high_water_bytes = (
                     source_telemetry.temporary_staging_high_water_bytes
+                    + requested_bytes
                 )
                 backend_requested_bytes = source_telemetry.requested_row_bytes
                 backend_materialized_bytes = (
@@ -1127,8 +1146,11 @@ class TranscoderSet(nn.Module):
             )
             return reconstruction, seed_layer, materialized_bytes, telemetry
         except BaseException:
+            raw_decoder_vectors = None
+            provider_decoder_vectors = None
             decoder_vectors = None
             scaled_decoders = None
+            retained_seed_rows = None
             compact_rows = None
             raise
 

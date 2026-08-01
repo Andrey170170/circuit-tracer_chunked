@@ -239,6 +239,20 @@ def test_mapped_f32_rows_cast_chunkwise_to_bf16_provider_dtype(
         sparse,
         capture_decoder_row_seed=True,
     )
+    materialized_output_dtypes = []
+    original_materialize = (
+        single_layer_module.MappedSafetensorsDecoderRowSource.materialize
+    )
+
+    def tracked_materialize(source, *args, **kwargs):
+        materialized_output_dtypes.append(kwargs.get("output_dtype"))
+        return original_materialize(source, *args, **kwargs)
+
+    monkeypatch.setattr(
+        single_layer_module.MappedSafetensorsDecoderRowSource,
+        "materialize",
+        tracked_materialize,
+    )
     monkeypatch.setattr(
         provider,
         "get_decoder_chunk",
@@ -257,6 +271,7 @@ def test_mapped_f32_rows_cast_chunkwise_to_bf16_provider_dtype(
     )
 
     assert torch.equal(got, baseline)
+    assert materialized_output_dtypes == [None]
     assert baseline_seed is not None and seed is not None
     assert seed.rows.dtype is torch.bfloat16
     assert torch.equal(seed.rows, baseline_seed.rows)
