@@ -231,6 +231,9 @@ def _build_phase4_refresh_substage_telemetry(
                 "gpu_row_tier_host_mirror_read_bytes": (
                     "feature_row_store_gpu_tier_host_mirror_read_bytes"
                 ),
+                "gpu_row_tier_file_window_read_bytes": (
+                    "feature_row_store_gpu_tier_file_window_read_bytes"
+                ),
                 "gpu_row_tier_copy_failures": "feature_row_store_gpu_tier_copy_failures",
                 "gpu_row_tier_append_calls": "feature_row_store_gpu_tier_append_calls",
                 "gpu_row_tier_append_rows": "feature_row_store_gpu_tier_append_rows",

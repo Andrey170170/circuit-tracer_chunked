@@ -90,6 +90,7 @@ class RowStoreRuntime:
         "cpu_prepared",
         "cuda_full",
         "cuda_windowed",
+        "cuda_file_windowed",
         "auto",
     ] = "cpu_exact"
     gpu_resident_max_bytes: int = 0
@@ -103,6 +104,7 @@ class RowStoreRuntime:
             "cpu_prepared",
             "cuda_full",
             "cuda_windowed",
+            "cuda_file_windowed",
             "auto",
         }:
             raise ValueError("invalid feature-row influence mode")

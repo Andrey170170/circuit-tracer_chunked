@@ -108,6 +108,7 @@ class RowStoragePlan:
         "cpu_prepared",
         "cuda_full",
         "cuda_windowed",
+        "cuda_file_windowed",
         "auto",
     ] = "cpu_exact"
     gpu_resident_max_bytes: int = 0
@@ -122,6 +123,7 @@ class RowStoragePlan:
             "cpu_prepared",
             "cuda_full",
             "cuda_windowed",
+            "cuda_file_windowed",
             "auto",
         }
         if self.feature_row_influence_mode not in allowed_influence_modes:
@@ -142,8 +144,14 @@ class RowStoragePlan:
         )
         if self.feature_row_influence_mode == "cuda_full" and self.gpu_resident_max_bytes == 0:
             raise ValueError("cuda_full feature-row influence requires gpu_resident_max_bytes")
-        if self.feature_row_influence_mode == "cuda_windowed" and self.gpu_window_max_bytes == 0:
-            raise ValueError("cuda_windowed feature-row influence requires gpu_window_max_bytes")
+        if (
+            self.feature_row_influence_mode in {"cuda_windowed", "cuda_file_windowed"}
+            and self.gpu_window_max_bytes == 0
+        ):
+            raise ValueError(
+                f"{self.feature_row_influence_mode} feature-row influence requires "
+                "gpu_window_max_bytes"
+            )
         if self.feature_row_influence_mode == "auto" and (
             self.gpu_resident_max_bytes == 0 or self.gpu_window_max_bytes == 0
         ):
