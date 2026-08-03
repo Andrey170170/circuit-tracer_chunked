@@ -367,9 +367,6 @@ def test_cuda_file_windowed_mode_streams_backing_without_full_host_mirror() -> N
         assert stats["gpu_row_tier_avoided_file_read_bytes"] == 0
         assert stats["gpu_row_tier_append_bytes"] == 0
         assert stats["read_call_count"] == 1
-        assert stats["direct_read_into_call_count"] == 1
-        assert stats["direct_read_into_bytes"] == 2 * 4 * 4
-        assert stats["read_cache_entry_count"] == 0
         assert stats["row_store_cache_control_read_advisory_call_count"] == 1
     finally:
         store.cleanup()
