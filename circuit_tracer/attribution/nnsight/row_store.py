@@ -271,6 +271,10 @@ class _FileBackedFeatureRowStore:
             "read_row_count": 0,
             "read_last_row_start": None,
             "read_last_row_end": None,
+            "direct_read_into_call_count": 0,
+            "direct_read_into_row_count": 0,
+            "direct_read_into_bytes": 0,
+            "direct_read_into_elapsed_ms_total": 0.0,
             "read_cache_enabled": int(self._read_chunk_cache_max_bytes > 0),
             "read_cache_hit_count": 0,
             "read_cache_miss_count": 0,
@@ -758,6 +762,91 @@ class _FileBackedFeatureRowStore:
             )
         self._sync_read_cache_snapshot()
         return result
+
+    def read_feature_rows_into(
+        self,
+        row_start: int,
+        row_end: int,
+        *,
+        destination: torch.Tensor,
+        phase: str | None = None,
+    ) -> torch.Tensor:
+        """Read canonical row bytes directly into a contiguous CPU tensor.
+
+        This path deliberately bypasses the memmap and tensor read cache. It is
+        used by bounded file-window streaming so the caller can stage bytes in
+        pinned memory without faulting the complete backing file into the
+        process's mapped RSS.
+        """
+
+        if row_start < 0 or row_end < row_start or row_end > self.n_rows:
+            raise ValueError("requested row slice is out of bounds for file-backed store")
+        expected_shape = (int(row_end - row_start), self.n_feature_columns)
+        if (
+            destination.device.type != "cpu"
+            or destination.dtype != self._dtype
+            or tuple(destination.shape) != expected_shape
+            or not destination.is_contiguous()
+        ):
+            raise ValueError(
+                "direct row destination must be a contiguous canonical-dtype CPU tensor "
+                f"with shape {expected_shape}"
+            )
+        preadv = getattr(os, "preadv", None)
+        if not callable(preadv):
+            raise RuntimeError("direct file-window reads require os.preadv")
+
+        row_count = int(row_end - row_start)
+        byte_count = int(row_count * self._row_nbytes)
+        byte_offset = int(row_start * self._row_nbytes)
+        byte_view = destination.numpy().view(np.uint8).reshape(-1)
+        started = time.perf_counter()
+        with self._telemetry_timer(
+            name="feature_row_store.read_rows_into",
+            phase=phase,
+            attrs={
+                "row_start": row_start,
+                "row_end": row_end,
+                "row_count": row_count,
+                "byte_count": byte_count,
+            },
+        ):
+            bytes_read = 0
+            fd = self._require_open_write_fd()
+            while bytes_read < byte_count:
+                try:
+                    consumed = int(
+                        preadv(
+                            fd,
+                            [byte_view[bytes_read:]],
+                            byte_offset + bytes_read,
+                        )
+                    )
+                except InterruptedError:
+                    continue
+                if consumed <= 0:
+                    raise RuntimeError("direct file-window read ended before the row range")
+                bytes_read += consumed
+            self._apply_row_store_cache_control_after_safe_read(
+                row_start=row_start,
+                row_end=row_end,
+            )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        for key, delta in (
+            ("read_call_count", 1),
+            ("read_row_count", row_count),
+            ("direct_read_into_call_count", 1),
+            ("direct_read_into_row_count", row_count),
+            ("direct_read_into_bytes", byte_count),
+        ):
+            self._diagnostic_stats[key] = int(self._diagnostic_stats[key] or 0) + delta
+        self._diagnostic_stats["direct_read_into_elapsed_ms_total"] = float(
+            self._diagnostic_stats["direct_read_into_elapsed_ms_total"] or 0.0
+        ) + elapsed_ms
+        self._diagnostic_stats["read_last_row_start"] = int(row_start)
+        self._diagnostic_stats["read_last_row_end"] = int(row_end)
+        return destination
 
     def read_tile(
         self,
@@ -1422,20 +1511,16 @@ class _GpuResidentFeatureRowStore:
         pinned = self._window_slot(self._pinned_window_rows, slot, row_count)
         host_stage_start = time.perf_counter()
         if self._resolved_mode == "cuda_file_windowed":
-            host_source = self._backing_store.read_feature_rows(
+            self._backing_store.read_feature_rows_into(
                 row_start,
                 row_end,
+                destination=pinned,
                 phase="phase4",
             )
         else:
             assert self._host_rows is not None
             host_source = self._host_rows[row_start:row_end]
-        pinned.copy_(host_source, non_blocking=False)
-        if self._resolved_mode == "cuda_file_windowed":
-            self._backing_store._apply_row_store_cache_control_after_safe_read(
-                row_start=row_start,
-                row_end=row_end,
-            )
+            pinned.copy_(host_source, non_blocking=False)
         host_stage_elapsed_ms = (time.perf_counter() - host_stage_start) * 1000.0
         result = self._window_slot(self._window_rows, slot, row_count)
         dispatch_start = time.perf_counter()
@@ -1680,20 +1765,16 @@ class _GpuResidentFeatureRowStore:
                 )
                 transfer_start = time.perf_counter()
                 if self._resolved_mode == "cuda_file_windowed":
-                    host_source = self._backing_store.read_feature_rows(
+                    self._backing_store.read_feature_rows_into(
                         row_start,
                         row_end,
+                        destination=pinned,
                         phase=phase,
                     )
                 else:
                     assert self._host_rows is not None
                     host_source = self._host_rows[row_start:row_end]
-                pinned.copy_(host_source, non_blocking=False)
-                if self._resolved_mode == "cuda_file_windowed":
-                    self._backing_store._apply_row_store_cache_control_after_safe_read(
-                        row_start=row_start,
-                        row_end=row_end,
-                    )
+                    pinned.copy_(host_source, non_blocking=False)
                 result = self._window_slot(self._window_rows, 0, row_count)
                 result.copy_(pinned, non_blocking=False)
                 transfer_elapsed_ms = (time.perf_counter() - transfer_start) * 1000.0
