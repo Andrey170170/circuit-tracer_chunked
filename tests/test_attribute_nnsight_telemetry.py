@@ -203,7 +203,6 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
             "gpu_row_tier_h2d_bytes": 25,
             "gpu_row_tier_d2h_bytes": 21,
             "gpu_row_tier_host_mirror_read_bytes": 23,
-            "gpu_row_tier_file_window_read_bytes": 42,
             "gpu_row_tier_read_transfer_elapsed_ms": 22.5,
             "gpu_row_tier_copy_failures": 0,
             "gpu_row_tier_append_calls": 16,
@@ -244,7 +243,6 @@ def test_phase4_refresh_telemetry_exports_gpu_row_tier_counters() -> None:
     assert payload["feature_row_store_gpu_tier_h2d_bytes"] == 25
     assert payload["feature_row_store_gpu_tier_d2h_bytes"] == 21
     assert payload["feature_row_store_gpu_tier_host_mirror_read_bytes"] == 23
-    assert payload["feature_row_store_gpu_tier_file_window_read_bytes"] == 42
     assert payload["feature_row_store_gpu_tier_read_transfer_elapsed_ms"] == 22.5
     assert payload["feature_row_store_gpu_tier_copy_failures"] == 0
     assert payload["feature_row_store_gpu_tier_append_bytes"] == 18

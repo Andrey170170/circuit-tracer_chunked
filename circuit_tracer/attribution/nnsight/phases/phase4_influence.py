@@ -89,7 +89,7 @@ def recompute_feature_influences(state):
                 "resolved_influence_mode",
                 None,
             )
-            in {"cuda_windowed", "cuda_file_windowed"}
+            == "cuda_windowed"
             else None
         )
         if state.refresh_prepared_row_reader:

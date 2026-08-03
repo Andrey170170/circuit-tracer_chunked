@@ -52,8 +52,6 @@ def test_feature_row_influence_modes_require_their_byte_budgets() -> None:
         RowStoragePlan(feature_row_influence_mode="cuda_full")
     with pytest.raises(ValueError, match="cuda_windowed"):
         RowStoragePlan(feature_row_influence_mode="cuda_windowed")
-    with pytest.raises(ValueError, match="cuda_file_windowed"):
-        RowStoragePlan(feature_row_influence_mode="cuda_file_windowed")
     with pytest.raises(ValueError, match="full-resident and window"):
         RowStoragePlan(
             feature_row_influence_mode="auto",
@@ -332,47 +330,6 @@ def test_cuda_windowed_mode_bounds_hbm_and_streams_host_rows() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cuda_file_windowed_mode_streams_backing_without_full_host_mirror() -> None:
-    device = torch.device("cuda", torch.cuda.current_device())
-    backing = _FileBackedFeatureRowStore(
-        n_rows=5,
-        n_feature_columns=4,
-        dtype=torch.float32,
-        row_store_cache_control_mode="fadvise_dontneed_after_append_and_read_v1",
-    )
-    store = _GpuResidentFeatureRowStore(
-        backing_store=backing,
-        mode="cuda_file_windowed",
-        max_bytes=0,
-        window_max_bytes=4 * 4 * 4,
-        safety_margin_bytes=0,
-        device=device,
-    )
-    rows = torch.arange(16, dtype=torch.float32, device=device).reshape(4, 4) - 8
-    try:
-        assert store.resolved_influence_mode == "cuda_file_windowed"
-        assert store.influence_row_chunk_size == 2
-        _append(store, rows)
-
-        streamed = store.read_feature_rows(1, 3, phase="phase4")
-        assert streamed.device.type == "cuda"
-        assert torch.equal(streamed, rows[1:3])
-
-        stats = store.get_diagnostic_snapshot()
-        assert stats["gpu_row_tier_owned_bytes"] == 4 * 4 * 4
-        assert stats["gpu_row_tier_pinned_host_bytes"] == 4 * 4 * 4
-        assert stats["gpu_row_tier_host_mirror_owned_bytes"] == 0
-        assert stats["gpu_row_tier_host_mirror_read_bytes"] == 0
-        assert stats["gpu_row_tier_file_window_read_bytes"] == 2 * 4 * 4
-        assert stats["gpu_row_tier_avoided_file_read_bytes"] == 0
-        assert stats["gpu_row_tier_append_bytes"] == 0
-        assert stats["read_call_count"] == 1
-        assert stats["row_store_cache_control_read_advisory_call_count"] == 1
-    finally:
-        store.cleanup()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_auto_mode_falls_from_full_residency_to_cuda_window() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     backing = _FileBackedFeatureRowStore(
@@ -418,7 +375,6 @@ def test_cuda_windowed_solver_matches_cuda_full_with_fixed_chunk_geometry() -> N
         for mode, full_bytes, window_bytes in (
             ("cuda_full", 1024, 0),
             ("cuda_windowed", 0, 4 * 4 * 4),
-            ("cuda_file_windowed", 0, 4 * 4 * 4),
         ):
             backing = _FileBackedFeatureRowStore(
                 n_rows=3,
@@ -455,8 +411,7 @@ def test_cuda_windowed_solver_matches_cuda_full_with_fixed_chunk_geometry() -> N
                 active_row_accumulation="direct_v1",
                 row_batch_reader=(
                     store.iter_phase4_feature_rows
-                    if store.resolved_influence_mode
-                    in {"cuda_windowed", "cuda_file_windowed"}
+                    if store.resolved_influence_mode == "cuda_windowed"
                     else None
                 ),
             )
@@ -464,16 +419,14 @@ def test_cuda_windowed_solver_matches_cuda_full_with_fixed_chunk_geometry() -> N
         ]
 
         assert torch.equal(results[0], results[1])
-        assert torch.equal(results[0], results[2])
-        for window_store in stores[1:]:
-            window_stats = window_store.get_diagnostic_snapshot()
-            assert window_stats["gpu_row_tier_h2d_bytes"] > 0
-            assert window_stats["gpu_row_tier_window_read_calls"] > 1
-            assert window_stats["gpu_row_tier_window_prefetch_calls"] > 1
-            assert (
-                window_stats["gpu_row_tier_window_stream_wait_count"]
-                == window_stats["gpu_row_tier_window_prefetch_calls"]
-            )
+        window_stats = stores[1].get_diagnostic_snapshot()
+        assert window_stats["gpu_row_tier_h2d_bytes"] > 0
+        assert window_stats["gpu_row_tier_window_read_calls"] > 1
+        assert window_stats["gpu_row_tier_window_prefetch_calls"] > 1
+        assert (
+            window_stats["gpu_row_tier_window_stream_wait_count"]
+            == window_stats["gpu_row_tier_window_prefetch_calls"]
+        )
     finally:
         for store in stores:
             store.cleanup()
