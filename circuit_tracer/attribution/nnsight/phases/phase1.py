@@ -78,6 +78,12 @@ def _run_phase1_forward_pass(
         trace_input_ids,
         trace_batch_size=trace_batch_size,
     )
+    logit_materialization = getattr(ctx, "phase1_logit_materialization_metadata", {})
+    if logit_materialization:
+        logger.info(
+            "Phase 1 logit materialization | "
+            + " | ".join(f"{key}={value}" for key, value in logit_materialization.items())
+        )
 
     telemetry_observer.observe(PhaseMetrics("Forward pass", phase_start, model.device))
     phase1_elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
@@ -90,6 +96,10 @@ def _run_phase1_forward_pass(
             attrs={
                 "trace_batch_size": int(trace_batch_size),
                 **trace_batch_metadata,
+                **{
+                    f"logit_materialization_{key}": value
+                    for key, value in logit_materialization.items()
+                },
             },
             wall_clock=True,
         )

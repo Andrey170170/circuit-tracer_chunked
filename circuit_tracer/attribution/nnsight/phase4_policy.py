@@ -2497,7 +2497,10 @@ def _plan_phase4_feature_batch_size_preflight(
         trace_batch_size = max(batch_size, initial_feature_batch_size, effective_logit_batch_size)
 
         with model.trace() as tracer:
-            with tracer.invoke(trace_input_ids.expand(trace_batch_size, -1)):
+            with tracer.invoke(
+                trace_input_ids.expand(trace_batch_size, -1),
+                **ctx.resolve_phase1_invoke_kwargs(model),
+            ):
                 pass
 
             detach_barrier = tracer.barrier(2)

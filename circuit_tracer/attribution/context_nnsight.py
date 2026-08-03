@@ -217,6 +217,12 @@ class AttributionContext:
         self._replay_model = None
         self._replay_trace_input_ids: torch.Tensor | None = None
         self._replay_trace_batch_size: int | None = None
+        self.phase1_logit_materialization_metadata: dict[str, object] = {
+            "requested": self.logit_retention,
+            "effective": "unresolved",
+            "model_forward_kwarg": None,
+            "fallback_reason": None,
+        }
         self._diagnostic_stats: dict[str, object] = {
             "compute_batch_calls": 0.0,
             "compute_batch_seconds": 0.0,
@@ -544,6 +550,12 @@ class AttributionContext:
         if self.chunked_decoder_state is not None:
             snapshot["row_subchunk_size"] = float(self._effective_row_subchunk_size())
         snapshot["logit_retention"] = self.logit_retention
+        snapshot.update(
+            {
+                f"phase1_logit_materialization_{key}": value
+                for key, value in self.phase1_logit_materialization_metadata.items()
+            }
+        )
         snapshot["exact_encoder_residency_requested"] = self.exact_encoder_residency_requested
         snapshot["exact_encoder_residency_effective"] = self.exact_encoder_residency_effective
         snapshot["exact_encoder_residency_applicable"] = bool(
@@ -1507,8 +1519,12 @@ class AttributionContext:
         self._replay_model = model
         self._replay_trace_input_ids = trace_input_ids.detach()
         self._replay_trace_batch_size = int(trace_batch_size)
+        invoke_kwargs = self.resolve_phase1_invoke_kwargs(model)
         with model.trace() as tracer:
-            with tracer.invoke(trace_input_ids.expand(trace_batch_size, -1)):
+            with tracer.invoke(
+                trace_input_ids.expand(trace_batch_size, -1),
+                **invoke_kwargs,
+            ):
                 pass
 
             detach_barrier = tracer.barrier(2)
@@ -1516,6 +1532,53 @@ class AttributionContext:
             model.configure_gradient_flow(tracer)
             model.configure_skip_connection(tracer, barrier=detach_barrier)
             self.cache_residual(model, tracer, barrier=detach_barrier)
+
+    def resolve_phase1_invoke_kwargs(
+        self,
+        model: "NNSightReplacementModel",
+    ) -> dict[str, int]:
+        """Resolve an exact physical output-logit slice for Phase 1.
+
+        Phase 1 builds attribution state from hidden activations and only needs
+        the output logits retained by Phase 0.  When that contract is
+        ``last_token``, supported Hugging Face causal-LM forwards can avoid
+        materializing the otherwise unused full-position LM-head output.
+        """
+        requested = self.logit_retention
+        effective = "full"
+        model_forward_kwarg: str | None = None
+        fallback_reason: str | None = None
+        invoke_kwargs: dict[str, int] = {}
+
+        if requested != "last_token":
+            fallback_reason = "full_logits_required"
+        else:
+            wrapped_model = getattr(model, "_model", None)
+            forward = getattr(wrapped_model, "forward", None)
+            if forward is None:
+                fallback_reason = "model_forward_unavailable"
+            else:
+                try:
+                    parameters = inspect.signature(forward).parameters
+                except (TypeError, ValueError):
+                    fallback_reason = "model_forward_signature_unavailable"
+                else:
+                    for candidate in ("logits_to_keep", "num_logits_to_keep"):
+                        if candidate in parameters:
+                            model_forward_kwarg = candidate
+                            invoke_kwargs[candidate] = 1
+                            effective = "last_token"
+                            break
+                    if model_forward_kwarg is None:
+                        fallback_reason = "model_forward_logit_slice_unsupported"
+
+        self.phase1_logit_materialization_metadata = {
+            "requested": requested,
+            "effective": effective,
+            "model_forward_kwarg": model_forward_kwarg,
+            "fallback_reason": fallback_reason,
+        }
+        return invoke_kwargs
 
     def reset_saved_graph_handles(self) -> None:
         """Clear only Phase-1 graph handles while preserving immutable Phase-0 state."""
