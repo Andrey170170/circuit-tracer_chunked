@@ -103,4 +103,3 @@ class PhaseWorkingSetPlan:
             prefault_refused_bytes=requested - admitted_bytes,
             fallback_reason=fallback_reason,
         )
-

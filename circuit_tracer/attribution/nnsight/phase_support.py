@@ -84,7 +84,6 @@ def _resolve_internal_dtype_map(
         "shadow_debug_compute_dtype": _dtype_to_name(shadow_debug_compute_dtype),
     }
 
-
 def _dtype_from_name(dtype_name: str) -> torch.dtype:
     if dtype_name == "float32":
         return torch.float32
@@ -1135,4 +1134,3 @@ def _build_phase4_environment_fingerprint() -> dict[str, object]:
         "cuda_version": torch.version.cuda,
         "nnsight_backend_file": _NNSIGHT_BACKEND_FILE,
     }
-
