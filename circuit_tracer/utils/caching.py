@@ -15,6 +15,7 @@ from circuit_tracer.transcoder.cross_layer_transcoder import (
     load_clt,
     load_gemma_scope_2_clt,
 )
+from circuit_tracer.transcoder.activation_functions import activation_spec_from_config
 from circuit_tracer.transcoder.provider import (
     get_transcoder_capabilities,
     normalize_provider_fingerprints_for_comparison,
@@ -55,7 +56,10 @@ def _config_requests_exact_chunked_provider(config: dict) -> bool:
     if isinstance(provider_fp, dict) and "supports_exact_chunked_provider" in provider_fp:
         return bool(provider_fp["supports_exact_chunked_provider"])
 
-    return False
+    return bool(
+        config.get("model_kind") == "transcoder_set"
+        and activation_spec_from_config(config).kind == "topk"
+    )
 
 
 def get_cache_dir(cache_dir: str | Path | None = None) -> Path:
@@ -359,6 +363,8 @@ def _record_transcoder_set_cache_metadata(
         scan=config.get("scan", str(cache_path)),
         feature_input_hook=config["feature_input_hook"],
         feature_output_hook=config["feature_output_hook"],
+        activation=config.get("activation"),
+        k=config.get("k"),
         device=device,
         dtype=dtype,
         lazy_encoder=True,
@@ -554,6 +560,8 @@ def load_transcoders_from_cache(
             scan=config.get("scan", str(cache_path)),
             feature_input_hook=config["feature_input_hook"],
             feature_output_hook=config["feature_output_hook"],
+            activation=config.get("activation"),
+            k=config.get("k"),
             device=device,
             dtype=dtype,
             lazy_encoder=effective_lazy_encoder,

@@ -217,6 +217,7 @@ def recompute_feature_influences(state):
 
 def rank_feature_frontier(state):
     """Rank unvisited features and apply bounded frontier expansion."""
+    state.selection_visited = state.visited | ~state.eligible_feature_mask
     state.max_frontier_size = min(
         _compute_phase4_refresh_queue_window_size(
             update_interval=state.update_interval,
@@ -228,14 +229,16 @@ def rank_feature_frontier(state):
     state.phase4_frontier_buffer_event: dict[str, object] | None = None
     if bool(state.phase4_frontier_buffer_metadata["enabled"]):
         state.unvisited_scores_for_buffer = state.feature_influences[
-            _rank_phase4_unvisited_features_argsort(state.feature_influences, state.visited)
+            _rank_phase4_unvisited_features_argsort(
+                state.feature_influences, state.selection_visited
+            )
         ]
         state.buffer_decision = _build_phase4_frontier_buffer_decision(
             candidate_scores=state.unvisited_scores_for_buffer,
             base_frontier_size=int(state.max_frontier_size),
             actual_max_feature_nodes=int(state.actual_max_feature_nodes),
             capacity_feature_nodes=int(state.row_store_capacity_feature_nodes),
-            total_active_features=int(state.total_active_feats),
+            total_active_features=int(state.eligible_feature_count),
             used_total=int(state.phase4_frontier_buffer_extra_used_total),
             epsilon=state.phase4_frontier_buffer_relative_epsilon,
             max_per_refresh=int(state.phase4_frontier_buffer_max_extra_per_refresh),
@@ -272,7 +275,7 @@ def rank_feature_frontier(state):
     state.rank_topk_start = time.perf_counter()
     state.rank_selection = _select_phase4_frontier_rank_selection(
         feature_influences=state.feature_influences,
-        visited=state.visited,
+        visited=state.selection_visited,
         frontier_size=state.max_frontier_size,
         ranker_mode=state.phase4_ranker_config.effective_mode,
     )
@@ -283,7 +286,7 @@ def rank_feature_frontier(state):
         or state.phase4_debug_summary_enabled
     ):
         state.unvisited_feature_rank = _rank_phase4_unvisited_features_argsort(
-            state.feature_influences, state.visited
+            state.feature_influences, state.selection_visited
         )
     state.max_feature_nodes_cap_bound = _compute_phase4_rank_selection_max_feature_nodes_cap_bound(
         candidate_count=int(state.rank_selection.candidate_count),
@@ -317,7 +320,9 @@ def rank_feature_frontier(state):
     ):
         state.unvisited_scores_for_cutoff = (
             state.feature_influences[
-                _rank_phase4_unvisited_features_argsort(state.feature_influences, state.visited)
+                _rank_phase4_unvisited_features_argsort(
+                    state.feature_influences, state.selection_visited
+                )
             ]
             .detach()
             .to(device="cpu", dtype=torch.float64)

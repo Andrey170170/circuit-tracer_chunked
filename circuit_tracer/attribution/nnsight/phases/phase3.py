@@ -82,6 +82,7 @@ class Phase3Config:
     influence_column_tile_size: int = 2048
     feature_row_column_tile_size: int = 2048
     feature_row_retention: str = "full_file"
+    eligible_feature_indices: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)

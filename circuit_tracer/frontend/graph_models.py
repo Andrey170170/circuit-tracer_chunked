@@ -61,14 +61,13 @@ class Node(BaseModel):
     @classmethod
     def error_node(cls, layer, pos, influence=None):
         """Create an error node."""
-        reverse_ctx_idx = 0
         return cls(
-            node_id=f"0_{layer}_{pos}",
+            node_id=f"{layer}_-1_{pos}",
             feature=-1,
             layer=str(layer),
             ctx_idx=pos,
             feature_type="mlp reconstruction error",
-            jsNodeId=f"{layer}_{pos}-{reverse_ctx_idx}",
+            jsNodeId=f"{layer}_-1-{pos}",
             influence=influence,
         )
 

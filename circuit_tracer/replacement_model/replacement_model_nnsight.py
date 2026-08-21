@@ -195,7 +195,7 @@ class NNSightReplacementModel(LanguageModel):
     embed_loc: nn.Module
     unembed_loc: nn.Module
     skip_transcoder: bool
-    scan: str | list[str] | None
+    scan_name: str | list[str] | None
     backend: Literal["nnsight"]
     model_adapter: NNSightModelAdapter
 
@@ -269,8 +269,9 @@ class NNSightReplacementModel(LanguageModel):
 
         device_map = {"": dev_entry}
 
-        config = AutoConfig.from_pretrained(model_name)
-        if hasattr(config, "quantization_config"):
+        revision = kwargs.pop("revision", None)
+        config = AutoConfig.from_pretrained(model_name, revision=revision)
+        if getattr(config, "quantization_config", None) is not None:
             config.quantization_config["dequantize"] = True
 
         super(cls, model).__init__(
@@ -280,6 +281,7 @@ class NNSightReplacementModel(LanguageModel):
             dispatch=True,
             dtype=dtype,
             attn_implementation="eager",
+            revision=revision,
         )
 
         model._configure_replacement_model(transcoders)

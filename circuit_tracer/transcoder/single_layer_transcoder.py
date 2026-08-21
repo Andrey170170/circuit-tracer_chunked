@@ -19,7 +19,12 @@ from circuit_tracer.attribution.sparsification import (
     filter_sparse_activations,
     select_candidate_feature_indices,
 )
-from circuit_tracer.transcoder.activation_functions import JumpReLU
+from circuit_tracer.transcoder.activation_functions import (
+    JumpReLU,
+    TopK,
+    build_activation_function,
+    resolve_transcoder_activation_spec,
+)
 from circuit_tracer.transcoder.attribution_result import (
     AttributionComponents,
     DecoderRowSeed,
@@ -498,9 +503,24 @@ class TranscoderSet(nn.Module):
     @property
     def capabilities(self) -> TranscoderCapabilities:
         exact = bool(self.exact_chunked_provider)
+        activation_function = self.transcoders[0].activation_function
+        if isinstance(activation_function, TopK):
+            activation_kind = "topk"
+            activation_k = int(activation_function.k)
+        elif activation_function is F.relu:
+            activation_kind = "relu"
+            activation_k = None
+        elif isinstance(activation_function, JumpReLU):
+            activation_kind = "jump_relu"
+            activation_k = None
+        else:
+            activation_kind = type(activation_function).__name__
+            activation_k = None
         return TranscoderCapabilities(
             architecture="plt",
             checkpoint_format=str(getattr(self.transcoders[0], "weight_format", "standard")),
+            activation_kind=activation_kind,
+            activation_k=activation_k,
             supports_exact_chunked_provider=exact,
             supports_compact_row_store=exact,
             supports_decoder_chunk_cache=exact,
@@ -1501,6 +1521,7 @@ def load_gemma_scope_transcoder(
 def load_relu_transcoder(
     path: str,
     layer: int,
+    activation_function=None,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
     lazy_encoder: bool = True,
@@ -1522,11 +1543,12 @@ def load_relu_transcoder(
     d_model = param_dict["b_dec"].shape[0]
 
     assert param_dict.get("log_thresholds") is None
-    activation_function = (
-        JumpReLU(param_dict["activation_function.threshold"], 0.1)
-        if "activation_function.threshold" in param_dict
-        else F.relu
-    )
+    if activation_function is None:
+        activation_function = (
+            JumpReLU(param_dict["activation_function.threshold"], 0.1)
+            if "activation_function.threshold" in param_dict
+            else F.relu
+        )
     with torch.device("meta"):
         transcoder = SingleLayerTranscoder(
             d_model,
@@ -1617,6 +1639,8 @@ def load_transcoder_set(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
     special_load_fn: Literal["gemma-scope", "gemma-scope-2", None] = None,
+    activation: str | None = None,
+    k: int | None = None,
     lazy_encoder: bool = True,
     lazy_decoder: bool = True,
     exact_chunked_provider: bool = False,
@@ -1646,18 +1670,22 @@ def load_transcoder_set(
     if exact_chunked_provider:
         decoder_chunk_size = _validate_decoder_chunk_size(decoder_chunk_size)
 
+    activation_spec = resolve_transcoder_activation_spec(activation, k)
+    activation_function = build_activation_function(activation_spec)
+
     transcoders = {}
     for layer in range(len(transcoder_paths)):
         load_fn = select_single_layer_transcoder_load_fn(transcoder_paths[layer], special_load_fn)
 
-        transcoders[layer] = load_fn(
-            transcoder_paths[layer],
-            layer,
-            device=device,
-            dtype=dtype,
-            lazy_encoder=lazy_encoder,
-            lazy_decoder=lazy_decoder,
-        )
+        load_kwargs = {
+            "device": device,
+            "dtype": dtype,
+            "lazy_encoder": lazy_encoder,
+            "lazy_decoder": lazy_decoder,
+        }
+        if load_fn is load_relu_transcoder:
+            load_kwargs["activation_function"] = activation_function
+        transcoders[layer] = load_fn(transcoder_paths[layer], layer, **load_kwargs)
     # we don't know how many layers the model has, but we need all layers from 0 to max covered
     assert set(transcoders.keys()) == set(range(max(transcoders.keys()) + 1)), (
         f"Each layer should have a transcoder, but got transcoders for layers "

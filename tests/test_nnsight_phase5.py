@@ -125,7 +125,7 @@ def _inputs(
                 tokenizer=SimpleNamespace(decode=lambda tokens: "decoded"),
                 cfg=SimpleNamespace(n_layers=1),
                 config=SimpleNamespace(n_layers=1),
-                scan="test-scan",
+                scan_name="test-scan",
                 device=torch.device("cpu"),
                 transcoders=SimpleNamespace(),
             ),

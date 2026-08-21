@@ -17,6 +17,8 @@ DecoderOutputTopology = Literal["cross_layer", "same_layer"]
 class TranscoderCapabilities:
     architecture: TranscoderArchitecture
     checkpoint_format: str
+    activation_kind: str | None = None
+    activation_k: int | None = None
     supports_exact_chunked_provider: bool = False
     supports_compact_row_store: bool = False
     supports_decoder_chunk_cache: bool = False
@@ -211,6 +213,10 @@ def normalize_provider_fingerprints_for_comparison(
         if capability_key not in expected or capability_key not in current:
             normalized_expected[capability_key] = False
             normalized_current[capability_key] = False
+    for semantic_key in ("activation_kind", "activation_k"):
+        if semantic_key not in expected or semantic_key not in current:
+            normalized_expected[semantic_key] = None
+            normalized_current[semantic_key] = None
     if (
         "decoder_row_source_backend" not in expected
         or "decoder_row_source_backend" not in current
@@ -238,6 +244,8 @@ def provider_fingerprint(
         "checkpoint_format": checkpoint_format or caps.checkpoint_format,
         "checkpoint_identity": checkpoint_identity,
         "dtype": None if dtype is None else str(dtype),
+        "activation_kind": caps.activation_kind,
+        "activation_k": caps.activation_k,
         "n_layers": getattr(obj, "n_layers", None),
         "d_model": getattr(obj, "d_model", None),
         "d_transcoder": getattr(obj, "d_transcoder", None),

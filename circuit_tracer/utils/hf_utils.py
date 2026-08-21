@@ -14,6 +14,8 @@ from huggingface_hub.constants import HF_HUB_ENABLE_HF_TRANSFER
 from huggingface_hub.utils.tqdm import tqdm as hf_tqdm
 from tqdm.contrib.concurrent import thread_map
 
+from circuit_tracer.transcoder.activation_functions import activation_spec_from_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,6 +79,16 @@ def _resolve_exact_chunked_provider_requested(
     if isinstance(provider_fp, dict) and "supports_exact_chunked_provider" in provider_fp:
         config["transcoder_capability_source"] = "provider_fingerprint"
         return bool(provider_fp["supports_exact_chunked_provider"])
+
+    # TopK PLTs are standard per-layer safetensors providers. The exact
+    # chunked PLT path supports their decoder/encoder artifact format without
+    # changing activation semantics, and avoids materializing all active
+    # decoder rows. This policy is capability-shaped rather than repository-
+    # named; an explicit false above remains authoritative.
+    activation_spec = activation_spec_from_config(config)
+    if config.get("model_kind") == "transcoder_set" and activation_spec.kind == "topk":
+        config["transcoder_capability_source"] = "topk_exact_policy"
+        return True
 
     if not legacy_repo_scan:
         config["transcoder_capability_source"] = "default"
@@ -229,6 +241,8 @@ def load_transcoders(
             feature_input_hook=config["feature_input_hook"],
             feature_output_hook=config["feature_output_hook"],
             special_load_fn=special_load_fn,
+            activation=config.get("activation"),
+            k=config.get("k"),
             dtype=dtype,
             device=device,
             lazy_encoder=effective_lazy_encoder,

@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from circuit_tracer.replacement_model import ReplacementModel
     from circuit_tracer.tracing import (
         AttributionProblem,
+        AllActiveSources,
         BackwardEngineMode,
         BackwardExecutionTopology,
         BackwardPlan,
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
         RowStoragePlan,
         SessionPlan,
         SessionWindow,
+        SourceSelection,
         SensitivityClass,
         TraceEvidence,
         TraceRequest,
@@ -53,6 +55,8 @@ if TYPE_CHECKING:
         TraceSemantics,
         TraceSession,
         TraceStatus,
+        TokenPositionSources,
+        compile_source_selection,
         VjpKernelMode,
         open_session,
         resolve_trace_request,
@@ -62,6 +66,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AttributionProblem",
+    "AllActiveSources",
     "BackwardEngineMode",
     "BackwardExecutionTopology",
     "BackwardPlan",
@@ -98,6 +103,7 @@ __all__ = [
     "RowStoragePlan",
     "SessionPlan",
     "SessionWindow",
+    "SourceSelection",
     "SensitivityClass",
     "SparsificationConfig",
     "TraceEvidence",
@@ -106,10 +112,12 @@ __all__ = [
     "TraceSemantics",
     "TraceSession",
     "TraceStatus",
+    "TokenPositionSources",
     "VjpKernelMode",
     "open_session",
     "resolve_trace_request",
     "trace_batch",
+    "compile_source_selection",
     "trace_one",
 ]
 
