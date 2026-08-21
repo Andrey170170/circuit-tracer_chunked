@@ -9,6 +9,7 @@ from circuit_tracer.attribution.nnsight.replay import (
     _compute_row_denominator_scaled_l1,
 )
 from circuit_tracer.attribution.nnsight.row_store import (
+    FeatureRowInfluenceRequirementError,
     _FileBackedFeatureRowStore,
     _GpuResidentFeatureRowStore,
     estimate_gpu_row_tier_capacity,
@@ -65,6 +66,99 @@ def test_feature_row_influence_modes_require_their_byte_budgets() -> None:
         ).feature_row_influence_mode
         == "cuda_full"
     )
+    with pytest.raises(ValueError, match="auto feature-row influence cannot be required"):
+        RowStoragePlan(
+            feature_row_influence_mode="auto",
+            feature_row_influence_requirement="required",
+            gpu_resident_max_bytes=1024,
+            gpu_window_max_bytes=1024,
+        )
+
+
+def test_required_gpu_row_tier_refuses_admission_without_fallback() -> None:
+    backing = _FileBackedFeatureRowStore(
+        n_rows=3,
+        n_feature_columns=2,
+        dtype=torch.float32,
+    )
+    with pytest.raises(
+        FeatureRowInfluenceRequirementError,
+        match="required feature-row influence mode failed at admission",
+    ) as captured:
+        _GpuResidentFeatureRowStore(
+            backing_store=backing,
+            mode="cuda_full",
+            requirement="required",
+            max_bytes=1024,
+            safety_margin_bytes=0,
+            device="cpu",
+        )
+    assert captured.value.details == {
+        "requested_mode": "cuda_full",
+        "resolved_mode": "cpu_exact",
+        "requirement": "required",
+        "stage": "admission",
+        "reason": "cuda_full_device_not_cuda",
+    }
+
+
+def test_required_prepared_row_tier_rejects_fallback_read() -> None:
+    backing = _FileBackedFeatureRowStore(
+        n_rows=3,
+        n_feature_columns=2,
+        dtype=torch.float32,
+    )
+    store = _GpuResidentFeatureRowStore(
+        backing_store=backing,
+        mode="cpu_prepared",
+        requirement="required",
+        max_bytes=0,
+        safety_margin_bytes=0,
+        device="cpu",
+    )
+    rows = torch.tensor([[-1.0, 2.0]], dtype=torch.float32)
+    try:
+        _append(store, rows)
+        with pytest.raises(
+            FeatureRowInfluenceRequirementError,
+            match="required feature-row influence mode failed at fallback_read",
+        ):
+            store.read_prepared_feature_rows(
+                0,
+                2,
+                device="cpu",
+                dtype=torch.float32,
+                phase="phase4",
+            )
+    finally:
+        store.cleanup()
+
+
+def test_required_prepared_row_tier_rejects_late_copy_failure() -> None:
+    backing = _FileBackedFeatureRowStore(
+        n_rows=3,
+        n_feature_columns=2,
+        dtype=torch.float32,
+    )
+    store = _GpuResidentFeatureRowStore(
+        backing_store=backing,
+        mode="cpu_prepared",
+        requirement="required",
+        max_bytes=0,
+        safety_margin_bytes=0,
+        device="cpu",
+    )
+    store._prepared_host_rows = torch.empty((3, 2), dtype=torch.int32)
+    try:
+        with pytest.raises(
+            FeatureRowInfluenceRequirementError,
+            match="required feature-row influence mode failed at append_copy",
+        ) as captured:
+            _append(store, torch.tensor([[-1.0, 2.0]], dtype=torch.float32))
+        assert captured.value.details["resolved_mode"] == "cpu_exact"
+        assert captured.value.details["reason"].startswith("append_copy_failed:")
+    finally:
+        store.cleanup()
 
 
 def test_gpu_row_tier_refuses_before_allocation_and_falls_back() -> None:
@@ -121,6 +215,33 @@ def test_gpu_row_tier_allocation_failure_preserves_file_path() -> None:
         assert torch.equal(store.read_feature_rows(0, 2, phase="phase4"), rows)
     finally:
         store.cleanup()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_required_gpu_row_tier_rejects_allocation_failure() -> None:
+    backing = _FileBackedFeatureRowStore(
+        n_rows=2,
+        n_feature_columns=2,
+        dtype=torch.float32,
+    )
+
+    def fail_allocation(*args, **kwargs):
+        raise RuntimeError("synthetic allocation failure")
+
+    with pytest.raises(
+        FeatureRowInfluenceRequirementError,
+        match="required feature-row influence mode failed at admission",
+    ) as captured:
+        _GpuResidentFeatureRowStore(
+            backing_store=backing,
+            mode="cuda_full",
+            requirement="required",
+            max_bytes=1024,
+            safety_margin_bytes=0,
+            device="cuda",
+            allocator=fail_allocation,
+        )
+    assert captured.value.details["reason"] == ("cuda_full_allocation_failed:RuntimeError")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

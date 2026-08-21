@@ -76,6 +76,8 @@ class Phase3ReplayRows:
     feature_abs_sums: list[torch.Tensor] = field(default_factory=list)
     error_abs_sums: list[torch.Tensor] = field(default_factory=list)
     token_abs_sums: list[torch.Tensor] = field(default_factory=list)
+    error_rows_by_layer: list[torch.Tensor] = field(default_factory=list)
+    token_rows: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,8 @@ class EffectiveRows:
     donor_feature_abs_sums: torch.Tensor | None
     donor_error_abs_sums: torch.Tensor | None
     donor_token_abs_sums: torch.Tensor | None
+    donor_error_rows_by_layer: torch.Tensor | None
+    donor_token_rows: torch.Tensor | None
     denominator_elapsed_ms: float
 
 
@@ -200,12 +204,19 @@ def produce_logit_rows(
 
 
 def resolve_effective_rows(
-    *, produced: ProducedRows, donor_bundle: dict[str, object] | None, row_start: int,
-    row_count: int, logit_offset: int, total_active_features: int, dtype: torch.dtype,
+    *,
+    produced: ProducedRows,
+    donor_bundle: dict[str, object] | None,
+    row_start: int,
+    row_count: int,
+    logit_offset: int,
+    total_active_features: int,
+    dtype: torch.dtype,
 ) -> EffectiveRows:
     """Apply replay replacement and compute the stable row-L1 denominator."""
     donor_feature_rows = donor_row_abs_sums = None
     donor_feature_abs_sums = donor_error_abs_sums = donor_token_abs_sums = None
+    donor_error_rows_by_layer = donor_token_rows = None
     if donor_bundle is not None:
         end = row_start + row_count
         donor_feature_rows = cast(torch.Tensor, donor_bundle["phase3_feature_rows"])[row_start:end]
@@ -213,6 +224,12 @@ def resolve_effective_rows(
         donor_feature_abs_sums = cast(torch.Tensor, donor_bundle["feature_abs_sums"])[row_start:end]
         donor_error_abs_sums = cast(torch.Tensor, donor_bundle["error_abs_sums"])[row_start:end]
         donor_token_abs_sums = cast(torch.Tensor, donor_bundle["token_abs_sums"])[row_start:end]
+        donor_error_rows_by_layer_value = donor_bundle.get("phase3_error_rows_by_layer")
+        if isinstance(donor_error_rows_by_layer_value, torch.Tensor):
+            donor_error_rows_by_layer = donor_error_rows_by_layer_value[row_start:end]
+        donor_token_rows_value = donor_bundle.get("phase3_token_rows")
+        if isinstance(donor_token_rows_value, torch.Tensor):
+            donor_token_rows = donor_token_rows_value[row_start:end]
 
     start = time.perf_counter()
     if produced.tiled_production:
@@ -240,20 +257,59 @@ def resolve_effective_rows(
         feature_row_slice=feature_rows,
     )
     return EffectiveRows(
-        rows_cpu, row_input, feature_rows, denominator, row_abs_sums,
-        cast(dict[str, object], row_transfer), donor_feature_abs_sums,
-        donor_error_abs_sums, donor_token_abs_sums, elapsed_ms,
+        rows_cpu,
+        row_input,
+        feature_rows,
+        denominator,
+        row_abs_sums,
+        cast(dict[str, object], row_transfer),
+        donor_feature_abs_sums,
+        donor_error_abs_sums,
+        donor_token_abs_sums,
+        donor_error_rows_by_layer,
+        donor_token_rows,
+        elapsed_ms,
     )
 
 
 def capture_replay_rows(
-    *, captures: Phase3ReplayRows, rows: EffectiveRows, total_active_features: int,
-    n_layers: int, n_pos: int, logit_offset: int,
+    *,
+    captures: Phase3ReplayRows,
+    rows: EffectiveRows,
+    total_active_features: int,
+    n_layers: int,
+    n_pos: int,
+    logit_offset: int,
 ) -> None:
-    """Append replay evidence in the same batch order as attribution."""
+    """Append lossless effective-row evidence in attribution batch order.
+
+    The nonfeature slices are captured before row storage or frontier
+    computation can obscure their origin.  Error columns have the canonical
+    layer-major/position-minor layout and are retained as signed values so a
+    diagnostic comparison can localize denominator drift without re-running
+    Phase 3.
+    """
     feature_rows = rows.feature_rows.contiguous()
-    error_start = total_active_features
-    error_end = total_active_features + n_layers * n_pos
+    error_column_count = n_layers * n_pos
+    nonfeature_column_count = error_column_count + n_pos
+    if int(rows.rows_cpu.shape[1]) == logit_offset:
+        nonfeature_rows = rows.rows_cpu[:, total_active_features:logit_offset]
+    elif int(rows.rows_cpu.shape[1]) == nonfeature_column_count:
+        # Column-tiled paths return only the error/token contraction because
+        # feature columns were already streamed to their row store.
+        nonfeature_rows = rows.rows_cpu
+    else:
+        raise RuntimeError(
+            "Phase-3 capture cannot resolve nonfeature column layout "
+            f"(row_width={int(rows.rows_cpu.shape[1])}, "
+            f"full_width={logit_offset}, nonfeature_width={nonfeature_column_count})"
+        )
+    error_rows_by_layer = nonfeature_rows[:, :error_column_count].reshape(
+        int(nonfeature_rows.shape[0]), n_layers, n_pos
+    )
+    token_rows = nonfeature_rows[:, error_column_count:].reshape(
+        int(nonfeature_rows.shape[0]), n_pos
+    )
     captures.feature_rows.append(feature_rows)
     captures.row_abs_sums.append(rows.row_abs_sums.contiguous())
     if all(
@@ -264,26 +320,53 @@ def capture_replay_rows(
             rows.donor_token_abs_sums,
         )
     ):
-        captures.feature_abs_sums.append(cast(torch.Tensor, rows.donor_feature_abs_sums).contiguous())
+        captures.feature_abs_sums.append(
+            cast(torch.Tensor, rows.donor_feature_abs_sums).contiguous()
+        )
         captures.error_abs_sums.append(cast(torch.Tensor, rows.donor_error_abs_sums).contiguous())
         captures.token_abs_sums.append(cast(torch.Tensor, rows.donor_token_abs_sums).contiguous())
+        if (rows.donor_error_rows_by_layer is None) != (rows.donor_token_rows is None):
+            raise RuntimeError(
+                "Phase-3 donor row bundle contains only part of the raw nonfeature evidence"
+            )
+        if rows.donor_error_rows_by_layer is not None:
+            captures.error_rows_by_layer.append(
+                cast(torch.Tensor, rows.donor_error_rows_by_layer).contiguous()
+            )
+            captures.token_rows.append(cast(torch.Tensor, rows.donor_token_rows).contiguous())
         return
-    captures.feature_abs_sums.append(_compute_row_abs_sums(feature_rows, dtype=torch.float64).contiguous())
+    captures.feature_abs_sums.append(
+        _compute_row_abs_sums(feature_rows, dtype=torch.float64).contiguous()
+    )
     captures.error_abs_sums.append(
-        _compute_row_abs_sums(rows.rows_cpu[:, error_start:error_end], dtype=torch.float64).contiguous()
+        _compute_row_abs_sums(
+            error_rows_by_layer.reshape(int(error_rows_by_layer.shape[0]), -1),
+            dtype=torch.float64,
+        ).contiguous()
     )
     captures.token_abs_sums.append(
-        _compute_row_abs_sums(rows.rows_cpu[:, error_end:logit_offset], dtype=torch.float64).contiguous()
+        _compute_row_abs_sums(token_rows, dtype=torch.float64).contiguous()
     )
+    captures.error_rows_by_layer.append(error_rows_by_layer.contiguous())
+    captures.token_rows.append(token_rows.contiguous())
 
 
 def commit_effective_rows(
-    *, produced: ProducedRows, rows: EffectiveRows, batch: torch.Tensor, row_start: int,
-    n_layers: int, n_pos: int, output_position: int | None, logit_offset: int,
-    total_active_features: int, use_compact_store: bool,
+    *,
+    produced: ProducedRows,
+    rows: EffectiveRows,
+    batch: torch.Tensor,
+    row_start: int,
+    n_layers: int,
+    n_pos: int,
+    output_position: int | None,
+    logit_offset: int,
+    total_active_features: int,
+    use_compact_store: bool,
     feature_row_store: _FileBackedFeatureRowStore | None,
     nonfeature_row_store: _FileBackedFeatureRowStore | None,
-    edge_matrix: torch.Tensor | None, row_to_node_index: torch.Tensor,
+    edge_matrix: torch.Tensor | None,
+    row_to_node_index: torch.Tensor,
 ) -> float:
     """Commit rows to exactly one retention backend and assign node indices."""
     start = time.perf_counter()
@@ -299,12 +382,12 @@ def commit_effective_rows(
                 position=output_position if output_position is not None else n_pos - 1,
                 injection=batch[local_index],
             )
-            denominator = tuple(
-                value[local_index : local_index + 1] for value in rows.denominator
-            )
+            denominator = tuple(value[local_index : local_index + 1] for value in rows.denominator)
             node_index = logit_offset + ordinal
             feature_row_store.append_recipe(recipe, node_index=node_index, denominator=denominator)
-            nonfeature_row_store.append_recipe(recipe, node_index=node_index, denominator=denominator)
+            nonfeature_row_store.append_recipe(
+                recipe, node_index=node_index, denominator=denominator
+            )
         elapsed_ms = 0.0
     elif produced.tiled_production:
         elapsed_ms = 0.0

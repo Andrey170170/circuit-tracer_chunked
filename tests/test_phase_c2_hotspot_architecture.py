@@ -12,6 +12,7 @@ from circuit_tracer.attribution.context_nnsight import AttributionContext
 from circuit_tracer.attribution.nnsight.batch_execution import BatchAttributionRequest
 from circuit_tracer.attribution.nnsight.context_state import ContextExecutionPolicy
 from circuit_tracer.attribution.nnsight.phases.phase2 import (
+    FeatureRowInfluencePolicy,
     FrontierBufferPolicy,
     Phase2Config,
     Phase2ExecutionPolicy,
@@ -99,14 +100,12 @@ def test_batch_request_enforces_lane_and_column_invariants() -> None:
         include_nonfeature=True,
     )
     with pytest.raises(ValueError, match="equal batch size"):
-        request.validate(session_capacity=2, active_features=4)
+        request.validate(batch_capacity=2, active_features=4)
 
 
 def test_model_variation_is_resolved_through_adapter_capabilities() -> None:
     chat = resolve_model_adapter(architecture="Gemma3ForCausalLM", has_chat_template=True)
-    generic = resolve_model_adapter(
-        architecture="GptOssForCausalLM", has_chat_template=False
-    )
+    generic = resolve_model_adapter(architecture="GptOssForCausalLM", has_chat_template=False)
     assert chat.ignored_token_positions == slice(0, 4)
     assert chat.validate_preserved_prefix(torch.tensor([2, 105, 2364, 107]))
     assert generic.ignored_token_positions == slice(0, 1)
@@ -126,6 +125,37 @@ def test_hotspot_entrypoints_delegate_to_domain_owners() -> None:
     assert "Phase0ActivationCapture.run(" in setup
     assert "AttributionSetupOperation(" in setup
     assert "AttributionComponents(" in components
+
+
+def test_backward_mode_branching_stays_inside_strategy_owners() -> None:
+    package_root = Path(inspect.getfile(AttributionContext)).parents[1]
+    allowed = {
+        package_root / "tracing" / "plan.py",
+        package_root / "attribution" / "nnsight" / "backward_engines.py",
+    }
+    mode_literals = {
+        "duplicated_lanes",
+        "single_forward_batched_vjp",
+        "single_forward_serial_vjp",
+    }
+    violations: list[str] = []
+    for path in package_root.rglob("*.py"):
+        if path in allowed:
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            constants = {
+                child.value
+                for child in ast.walk(node)
+                if isinstance(child, ast.Constant) and isinstance(child.value, str)
+            }
+            if constants & mode_literals:
+                violations.append(f"{path.relative_to(package_root)}:{node.lineno}")
+    assert not violations, "backward-mode conditionals escaped strategy owners: " + ", ".join(
+        violations
+    )
 
 
 def test_replacement_model_hotspot_has_no_family_name_branch() -> None:
@@ -162,6 +192,7 @@ def test_phase2_and_phase5_use_bounded_domain_objects() -> None:
         Phase2Config,
         TargetSelectionPolicy,
         FrontierBufferPolicy,
+        FeatureRowInfluencePolicy,
         RowStoreLayout,
         RowStoreRuntime,
         Phase2ExecutionPolicy,
@@ -174,25 +205,41 @@ def test_phase2_and_phase5_use_bounded_domain_objects() -> None:
     )
     assert all(len(fields(domain_type)) <= 10 for domain_type in bounded_types)
     assert {field.name for field in fields(Phase2Config)} == {
-        "targets", "phase0_replay", "phase3_replay", "frontier",
-        "storage_layout", "storage_runtime", "execution",
+        "targets",
+        "phase0_replay",
+        "phase3_replay",
+        "frontier",
+        "storage_layout",
+        "storage_runtime",
+        "execution",
     }
     assert {field.name for field in fields(Phase5Inputs)} == {
-        "runtime", "graph", "replay", "diagnostics", "output",
+        "runtime",
+        "graph",
+        "replay",
+        "diagnostics",
+        "output",
     }
 
 
 def test_phase2_and_phase5_orchestrators_are_small_and_explicit() -> None:
     expected_calls = {
         run_phase2: [
-            "select_attribution_targets", "apply_phase0_replay",
-            "record_target_replay_evidence", "plan_active_feature_storage",
-            "open_row_storage", "record_storage_evidence", "load_phase3_replay",
+            "select_attribution_targets",
+            "apply_phase0_replay",
+            "record_target_replay_evidence",
+            "plan_active_feature_storage",
+            "open_row_storage",
+            "record_storage_evidence",
+            "load_phase3_replay",
         ],
         run_phase5: [
-            "select_graph_features", "assemble_compact_graph",
-            "package_compact_artifacts", "finalize_compact_publication",
-            "assemble_full_graph", "finalize_full_publication",
+            "select_graph_features",
+            "assemble_compact_graph",
+            "package_compact_artifacts",
+            "finalize_compact_publication",
+            "assemble_full_graph",
+            "finalize_full_publication",
         ],
     }
     for orchestrator, calls in expected_calls.items():

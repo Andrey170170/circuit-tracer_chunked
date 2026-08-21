@@ -6,6 +6,7 @@ import torch
 
 from circuit_tracer.attribution.nnsight.replay import (
     _build_phase3_gradient_bundle_payload,
+    _build_phase3_row_bundle_payload,
     _hash_float_tensor,
     _hash_index_tensor,
     _hash_tensor_raw_bytes,
@@ -45,6 +46,88 @@ def test_phase3_gradient_bundle_v2_replays_canonical_target_width_not_session_ca
     assert payload["schema_version"] == 2
     assert payload["canonical_target_width"] == 3
     assert torch.equal(loaded["gradients"], gradients)
+
+
+def test_phase3_row_bundle_v2_round_trips_lossless_nonfeature_rows(tmp_path):
+    target_ids = torch.tensor([10], dtype=torch.int64)
+    active_features = torch.tensor([[0, 0, 1], [0, 1, 2]], dtype=torch.int64)
+    activation_values = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    feature_rows = torch.tensor([[0.25, -0.5]], dtype=torch.float32)
+    error_rows = torch.tensor([[[1.0, -2.0], [3.0, -4.0]]], dtype=torch.float32)
+    token_rows = torch.tensor([[5.0, -6.0]], dtype=torch.float32)
+    payload = _build_phase3_row_bundle_payload(
+        feature_rows=[feature_rows],
+        row_abs_sums=[torch.tensor([21.75], dtype=torch.float64)],
+        feature_abs_sums=[torch.tensor([0.75], dtype=torch.float64)],
+        error_abs_sums=[torch.tensor([10.0], dtype=torch.float64)],
+        token_abs_sums=[torch.tensor([11.0], dtype=torch.float64)],
+        error_rows_by_layer=[error_rows],
+        token_rows=[token_rows],
+        active_features=active_features,
+        activation_values=activation_values,
+        target_token_ids=target_ids,
+        target_probabilities=torch.ones(1),
+        total_active_features=2,
+        error_column_count=4,
+        token_column_count=2,
+        status="captured",
+    )
+    path = tmp_path / "row_v2.npz"
+    np.savez_compressed(path, **payload)
+
+    loaded = _load_phase3_row_donor_bundle_npz(
+        path,
+        target_token_ids=target_ids,
+        active_features=active_features,
+        activation_values=activation_values,
+        expected_total_active_features=2,
+        expected_n_layers=2,
+        expected_n_positions=2,
+    )
+
+    assert payload["schema_version"] == 2
+    assert payload["capture_kind"] == "phase3_row_bundle_v2"
+    assert payload["nonfeature_row_layout"] == "target_layer_position_v1"
+    assert torch.equal(loaded["phase3_error_rows_by_layer"], error_rows)
+    assert torch.equal(loaded["phase3_token_rows"], token_rows)
+
+
+def test_phase3_row_bundle_v2_rejects_tampered_error_rows(tmp_path):
+    target_ids = torch.tensor([10], dtype=torch.int64)
+    active_features = torch.tensor([[0, 0, 1]], dtype=torch.int64)
+    activation_values = torch.tensor([1.0], dtype=torch.float32)
+    error_rows = torch.tensor([[[1.0]]], dtype=torch.float32)
+    payload = _build_phase3_row_bundle_payload(
+        feature_rows=[torch.tensor([[0.25]], dtype=torch.float32)],
+        row_abs_sums=[torch.tensor([1.25], dtype=torch.float64)],
+        feature_abs_sums=[torch.tensor([0.25], dtype=torch.float64)],
+        error_abs_sums=[torch.tensor([1.0], dtype=torch.float64)],
+        token_abs_sums=[torch.tensor([0.0], dtype=torch.float64)],
+        error_rows_by_layer=[error_rows],
+        token_rows=[torch.tensor([[0.0]], dtype=torch.float32)],
+        active_features=active_features,
+        activation_values=activation_values,
+        target_token_ids=target_ids,
+        target_probabilities=torch.ones(1),
+        total_active_features=1,
+        error_column_count=1,
+        token_column_count=1,
+        status="captured",
+    )
+    payload["phase3_error_rows_by_layer"] = torch.tensor([[[2.0]]], dtype=torch.float32)
+    path = tmp_path / "tampered_row_v2.npz"
+    np.savez_compressed(path, **payload)
+
+    with pytest.raises(ValueError, match="error_rows_hash mismatch"):
+        _load_phase3_row_donor_bundle_npz(
+            path,
+            target_token_ids=target_ids,
+            active_features=active_features,
+            activation_values=activation_values,
+            expected_total_active_features=1,
+            expected_n_layers=1,
+            expected_n_positions=1,
+        )
 
 
 def test_phase3_gradient_donor_validation_rejects_target_mismatch(tmp_path):

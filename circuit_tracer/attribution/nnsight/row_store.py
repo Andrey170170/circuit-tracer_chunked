@@ -967,6 +967,32 @@ _FEATURE_ROW_INFLUENCE_MODES = {
     "cuda_windowed",
     "auto",
 }
+_FeatureRowInfluenceRequirement = Literal["preferred", "required"]
+
+
+class FeatureRowInfluenceRequirementError(RuntimeError):
+    """Selected feature-row mechanism could not remain effective."""
+
+    def __init__(
+        self,
+        *,
+        requested_mode: str,
+        resolved_mode: str,
+        stage: str,
+        reason: str,
+    ) -> None:
+        self.details = {
+            "requested_mode": requested_mode,
+            "resolved_mode": resolved_mode,
+            "requirement": "required",
+            "stage": stage,
+            "reason": reason,
+        }
+        super().__init__(
+            "required feature-row influence mode failed "
+            f"at {stage}: requested={requested_mode}, "
+            f"resolved={resolved_mode}, reason={reason}"
+        )
 
 
 class _GpuResidentFeatureRowStore:
@@ -987,12 +1013,17 @@ class _GpuResidentFeatureRowStore:
         safety_margin_bytes: int,
         device: torch.device | str,
         mode: _FeatureRowInfluenceMode = "cuda_full",
+        requirement: _FeatureRowInfluenceRequirement = "preferred",
         window_max_bytes: int = 0,
         allocator: Callable[..., torch.Tensor] | None = None,
     ) -> None:
         if mode not in _FEATURE_ROW_INFLUENCE_MODES:
             allowed = ", ".join(sorted(_FEATURE_ROW_INFLUENCE_MODES))
             raise ValueError(f"feature-row influence mode must be one of: {allowed}")
+        if requirement not in {"preferred", "required"}:
+            raise ValueError("feature-row influence requirement must be preferred or required")
+        if mode == "auto" and requirement == "required":
+            raise ValueError("auto feature-row influence cannot be required")
         if min(max_bytes, window_max_bytes, safety_margin_bytes) < 0:
             raise ValueError("feature-row acceleration byte budgets must be non-negative")
 
@@ -1005,6 +1036,7 @@ class _GpuResidentFeatureRowStore:
         self._device = torch.device(device)
         self._allocator = allocator or torch.empty
         self._requested_mode = mode
+        self._requirement = requirement
         self._resolved_mode: _FeatureRowInfluenceMode = "cpu_exact"
         self._resident_rows: torch.Tensor | None = None
         self._host_rows: torch.Tensor | None = None
@@ -1023,6 +1055,7 @@ class _GpuResidentFeatureRowStore:
         self._diagnostic_stats: dict[str, object] = {
             "feature_row_influence_mode_requested": mode,
             "feature_row_influence_mode_resolved": "cpu_exact",
+            "feature_row_influence_requirement": requirement,
             "gpu_row_tier_requested": int(mode in {"cuda_full", "cuda_windowed", "auto"}),
             "gpu_row_tier_admitted": 0,
             "gpu_row_tier_reason": "not_evaluated",
@@ -1076,6 +1109,10 @@ class _GpuResidentFeatureRowStore:
             max_bytes=int(max_bytes),
             window_max_bytes=int(window_max_bytes),
             safety_margin_bytes=int(safety_margin_bytes),
+        )
+        self._enforce_required_mode(
+            stage="admission",
+            reason=self.admission.reason,
         )
 
     @property
@@ -1338,6 +1375,18 @@ class _GpuResidentFeatureRowStore:
         if self._closed:
             raise RuntimeError("feature row store has been cleaned up")
 
+    def _enforce_required_mode(self, *, stage: str, reason: str) -> None:
+        if self._requirement != "required":
+            return
+        if stage != "fallback_read" and self._resolved_mode == self._requested_mode:
+            return
+        raise FeatureRowInfluenceRequirementError(
+            requested_mode=self._requested_mode,
+            resolved_mode=self._resolved_mode,
+            stage=stage,
+            reason=reason,
+        )
+
     def _disable_acceleration(self, reason: str) -> None:
         self._resident_rows = None
         self._host_rows = None
@@ -1366,6 +1415,7 @@ class _GpuResidentFeatureRowStore:
                 "gpu_row_tier_pinned_host_bytes": 0,
             }
         )
+        self._enforce_required_mode(stage="append_copy", reason=reason)
 
     def _range_is_ready(self, row_start: int, row_end: int) -> bool:
         if row_end < row_start or not all(self._committed_rows[row_start:row_end]):
@@ -1514,6 +1564,10 @@ class _GpuResidentFeatureRowStore:
         )
         self._diagnostic_stats["gpu_row_tier_read_fallback_rows"] = (
             int(self._diagnostic_stats["gpu_row_tier_read_fallback_rows"]) + row_count
+        )
+        self._enforce_required_mode(
+            stage="fallback_read",
+            reason="requested_rows_not_available_in_selected_mode",
         )
 
     def append_rows(

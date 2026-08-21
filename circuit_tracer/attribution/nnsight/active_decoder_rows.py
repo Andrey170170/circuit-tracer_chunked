@@ -15,6 +15,161 @@ import torch
 DecoderStateSignature = tuple[tuple[str, tuple[int, ...], str, str, int, int], ...]
 
 
+@dataclass(frozen=True)
+class ActiveDecoderRowMemorySnapshot:
+    """Live CUDA allocator/headroom state used by active-row admission."""
+
+    free_bytes: int | None
+    total_bytes: int | None
+    allocated_bytes: int | None
+    reserved_bytes: int | None
+    device: str
+
+
+@dataclass(frozen=True)
+class ActiveDecoderRowAdmission:
+    """One exact, auditable active-row residency decision."""
+
+    requested: bool
+    admitted: bool
+    reason: str
+    estimated_bytes: int | None
+    hard_ceiling_bytes: int
+    safety_margin_bytes: int
+    dynamic_budget_bytes: int
+    effective_budget_bytes: int
+    memory: ActiveDecoderRowMemorySnapshot
+
+    def as_metadata(self) -> dict[str, object]:
+        return {
+            "decoder_active_row_residency_requested": self.requested,
+            "decoder_active_row_residency_effective": self.admitted,
+            "decoder_active_row_admission_reason": self.reason,
+            "decoder_active_row_estimated_bytes": self.estimated_bytes,
+            "decoder_active_row_max_bytes_requested": self.hard_ceiling_bytes,
+            "decoder_active_row_safety_margin_bytes": self.safety_margin_bytes,
+            "decoder_active_row_dynamic_budget_bytes": self.dynamic_budget_bytes,
+            "decoder_active_row_effective_budget_bytes": self.effective_budget_bytes,
+            "decoder_active_row_hbm_free_bytes": self.memory.free_bytes,
+            "decoder_active_row_hbm_total_bytes": self.memory.total_bytes,
+            "decoder_active_row_hbm_allocated_bytes": self.memory.allocated_bytes,
+            "decoder_active_row_hbm_reserved_bytes": self.memory.reserved_bytes,
+            "decoder_active_row_hbm_device": self.memory.device,
+            "decoder_active_row_admission_policy": (
+                "legacy_static_ceiling"
+                if self.safety_margin_bytes == 0 and self.hard_ceiling_bytes > 0
+                else "live_hbm_headroom"
+            ),
+        }
+
+
+class ActiveDecoderRowResidencyRequirementError(RuntimeError):
+    """Required active decoder-row residency could not be admitted."""
+
+    def __init__(self, decision: ActiveDecoderRowAdmission) -> None:
+        self.details = {
+            **decision.as_metadata(),
+            "decoder_active_row_residency_requirement": "required",
+        }
+        super().__init__(
+            "required decoder active-row residency failed at final admission: "
+            f"reason={decision.reason}, estimated_bytes={decision.estimated_bytes}, "
+            f"effective_budget_bytes={decision.effective_budget_bytes}"
+        )
+
+
+def sample_active_decoder_row_memory(device: torch.device | str) -> ActiveDecoderRowMemorySnapshot:
+    """Sample CUDA headroom without silently inventing a budget."""
+
+    resolved_device = torch.device(device)
+    if resolved_device.type != "cuda" or not torch.cuda.is_available():
+        return ActiveDecoderRowMemorySnapshot(
+            free_bytes=None,
+            total_bytes=None,
+            allocated_bytes=None,
+            reserved_bytes=None,
+            device=str(resolved_device),
+        )
+    try:
+        with torch.cuda.device(resolved_device):
+            free_bytes, total_bytes = torch.cuda.mem_get_info(resolved_device)
+            allocated_bytes = torch.cuda.memory_allocated(resolved_device)
+            reserved_bytes = torch.cuda.memory_reserved(resolved_device)
+    except (RuntimeError, torch.cuda.OutOfMemoryError):
+        return ActiveDecoderRowMemorySnapshot(
+            free_bytes=None,
+            total_bytes=None,
+            allocated_bytes=None,
+            reserved_bytes=None,
+            device=str(resolved_device),
+        )
+    return ActiveDecoderRowMemorySnapshot(
+        free_bytes=int(free_bytes),
+        total_bytes=int(total_bytes),
+        allocated_bytes=int(allocated_bytes),
+        reserved_bytes=int(reserved_bytes),
+        device=str(resolved_device),
+    )
+
+
+def resolve_active_decoder_row_admission(
+    *,
+    requested: bool,
+    estimated_bytes: int | None,
+    hard_ceiling_bytes: int,
+    safety_margin_bytes: int,
+    memory: ActiveDecoderRowMemorySnapshot,
+) -> ActiveDecoderRowAdmission:
+    """Resolve dynamic HBM admission with an optional authoritative ceiling."""
+
+    if estimated_bytes is not None and estimated_bytes < 0:
+        raise ValueError("estimated_bytes must be non-negative")
+    if hard_ceiling_bytes < 0:
+        raise ValueError("hard_ceiling_bytes must be non-negative")
+    if safety_margin_bytes < 0:
+        raise ValueError("safety_margin_bytes must be non-negative")
+
+    free_bytes = memory.free_bytes
+    legacy_static_ceiling = safety_margin_bytes == 0 and hard_ceiling_bytes > 0
+    dynamic_budget_bytes = (
+        int(hard_ceiling_bytes)
+        if legacy_static_ceiling
+        else (max(0, int(free_bytes) - int(safety_margin_bytes)) if free_bytes is not None else 0)
+    )
+    effective_budget_bytes = dynamic_budget_bytes
+    if hard_ceiling_bytes > 0:
+        effective_budget_bytes = min(effective_budget_bytes, int(hard_ceiling_bytes))
+
+    admitted = False
+    if not requested:
+        reason = "disabled"
+    elif safety_margin_bytes <= 0 and not legacy_static_ceiling:
+        reason = "safety_margin_nonpositive"
+    elif not legacy_static_ceiling and (free_bytes is None or memory.total_bytes is None):
+        reason = "cuda_memory_info_unavailable"
+    elif estimated_bytes is None:
+        reason = "estimate_pending"
+    elif hard_ceiling_bytes > 0 and estimated_bytes > hard_ceiling_bytes:
+        reason = "estimated_bytes_exceed_user_ceiling"
+    elif estimated_bytes > dynamic_budget_bytes:
+        reason = "estimated_bytes_exceed_dynamic_budget"
+    else:
+        admitted = True
+        reason = "admitted"
+
+    return ActiveDecoderRowAdmission(
+        requested=bool(requested),
+        admitted=admitted,
+        reason=reason,
+        estimated_bytes=estimated_bytes,
+        hard_ceiling_bytes=int(hard_ceiling_bytes),
+        safety_margin_bytes=int(safety_margin_bytes),
+        dynamic_budget_bytes=dynamic_budget_bytes,
+        effective_budget_bytes=effective_budget_bytes,
+        memory=memory,
+    )
+
+
 def decoder_state_signature(
     state: Mapping[str, torch.Tensor],
 ) -> DecoderStateSignature:

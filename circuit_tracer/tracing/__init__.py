@@ -22,17 +22,22 @@ from circuit_tracer.execution_identity import (
     EffectiveExecutionIdentity,
 )
 from .plan import (
+    BackwardEngineMode,
+    BackwardExecutionTopology,
+    BackwardPlan,
     DecoderCachePolicy,
     DecoderPlan,
     DiagnosticStopPolicy,
     ExecutionConstraints,
     FrontierExpansionPlan,
+    ForwardGraphMode,
     ObservabilityPolicy,
     ReplayPlan,
     ResolvedTracePlan,
     RowStoragePlan,
     SessionPlan,
     TraceEvidence,
+    VjpKernelMode,
 )
 from .planning import resolve_trace_request
 from .problem import AttributionProblem, FrontierSemantics, PrefixViewTarget, TraceSemantics
@@ -42,6 +47,9 @@ from .session import SessionWindow, TraceSession
 
 __all__ = [
     "AttributionProblem",
+    "BackwardEngineMode",
+    "BackwardExecutionTopology",
+    "BackwardPlan",
     "CalibrationCatalog",
     "CalibrationObservation",
     "DEFAULT_KNOB_SENSITIVITIES",
@@ -56,6 +64,7 @@ __all__ = [
     "EffectiveExecutionDescriptor",
     "EffectiveExecutionIdentity",
     "FrontierExpansionPlan",
+    "ForwardGraphMode",
     "FrontierSemantics",
     "GovernorFidelityPolicy",
     "KnobSensitivity",
@@ -73,6 +82,7 @@ __all__ = [
     "SessionWindow",
     "SensitivityClass",
     "TraceEvidence",
+    "VjpKernelMode",
     "TraceRequest",
     "TraceResult",
     "TraceSemantics",

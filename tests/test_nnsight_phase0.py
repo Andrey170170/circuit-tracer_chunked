@@ -283,6 +283,31 @@ def test_phase0_validation_failure_before_context_is_not_wrapped() -> None:
     assert "model.setup" not in calls
 
 
+def test_phase0_required_backward_mode_cannot_silently_fall_back() -> None:
+    calls: list[str] = []
+    ctx = FakeContext(calls)
+    model = FakeModel(calls, ctx)
+    metadata = {
+        "trace_batch_cap_reason": None,
+        "backward_engine_mode": "single_forward_batched_vjp",
+        "backward_batch_capacity": 8,
+        "forward_lane_count": 1,
+    }
+
+    with pytest.raises(Phase0ExecutionError) as raised:
+        run_phase0(
+            inputs=_inputs(calls, model),
+            config=_config(
+                backward_engine_mode="single_forward_batched_vjp",
+                backward_batch_capacity=8,
+                phase1_trace_batch_metadata=metadata,
+            ),
+        )
+
+    assert isinstance(raised.value.cause, RuntimeError)
+    assert "required backward engine selection" in str(raised.value.cause)
+
+
 def test_phase0_base_exception_exposes_context_and_original_cause(monkeypatch) -> None:
     calls: list[str] = []
     ctx = FakeContext(calls)

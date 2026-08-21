@@ -27,6 +27,9 @@ from circuit_tracer.attribution.nnsight.batch_execution import (
     execute_observed_batch,
     slice_phase3_gradient_replay_batch as _slice_phase3_gradient_replay_batch,  # noqa: F401
 )
+from circuit_tracer.attribution.nnsight.backward_engines import (
+    resolve_backward_batch_engine,
+)
 from circuit_tracer.attribution.nnsight.feature_vjp_tape import (
     FeatureVjpTapeByteEstimate,
     FeatureVjpTapeEntry,
@@ -98,6 +101,15 @@ class AttributionContext:
         self._error_vector_prefetch_lookahead = policy.error_vector_prefetch_lookahead
         self._chunked_feature_replay_window = policy.chunked_feature_replay_window
         self._row_subchunk_size = policy.row_subchunk_size
+        self._backward_strategy = resolve_backward_batch_engine(
+            mode=policy.backward_engine_mode,
+            batch_capacity=policy.backward_batch_capacity,
+        )
+        self.backward_engine_mode = self._backward_strategy.mode
+        self.backward_batch_capacity = self._backward_strategy.batch_capacity
+        self.forward_graph_mode = self._backward_strategy.forward_graph_mode
+        self.vjp_kernel_mode = self._backward_strategy.vjp_kernel_mode
+        self.forward_lane_count = self._backward_strategy.forward_lane_count
         self._materialized_error_vector_layers: dict[int, torch.Tensor] = {}
         self._cleanup_complete = False
         self.exact_encoder_residency_requested = policy.encoder_residency_requested
@@ -924,6 +936,8 @@ class AttributionContext:
                 error_vector_prefetch_lookahead=self._error_vector_prefetch_lookahead,
                 chunked_feature_replay_window=self._chunked_feature_replay_window,
                 row_subchunk_size=self._row_subchunk_size,
+                backward_engine_mode=self.backward_engine_mode,
+                backward_batch_capacity=self.backward_batch_capacity,
             ),
             decoder_runtime=DecoderRuntime.resolve(
                 provider=self.decoder_provider,
@@ -1736,6 +1750,7 @@ class AttributionContext:
                 feature_column_range=feature_column_range,
                 include_nonfeature=include_nonfeature,
             ),
+            strategy=self._backward_strategy,
             batch_call_index=self._compute_batch_call_index,
         )
         return result.rows
@@ -1796,6 +1811,7 @@ class AttributionContext:
                 feature_column_range=None,
                 include_nonfeature=True,
             ),
+            strategy=self._backward_strategy,
             batch_call_index=self._compute_batch_call_index,
             defer_feature_vjps=True,
         )

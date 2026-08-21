@@ -916,7 +916,9 @@ def _load_phase3_gradient_donor_bundle_npz(
     elif (
         int(gradients.shape[0]) != int(expected_n_layers)
         or int(gradients.shape[1])
-        != int(expected_gradient_batch_size if schema_version == 1 else target_token_ids_cpu.numel())
+        != int(
+            expected_gradient_batch_size if schema_version == 1 else target_token_ids_cpu.numel()
+        )
         or int(gradients.shape[2]) != int(expected_n_positions)
         or int(gradients.shape[3]) != int(expected_d_model)
     ):
@@ -983,6 +985,8 @@ def _load_phase3_row_donor_bundle_npz(
     active_features: torch.Tensor,
     activation_values: torch.Tensor,
     expected_total_active_features: int,
+    expected_n_layers: int | None = None,
+    expected_n_positions: int | None = None,
     validation_policy: Literal["strict"] = "strict",
 ) -> dict[str, object]:
     if validation_policy != "strict":
@@ -1018,6 +1022,19 @@ def _load_phase3_row_donor_bundle_npz(
             np.asarray(donor_payload.get("token_abs_sums", np.empty((0,), dtype=np.float64)))
         )
     ).to(dtype=torch.float64)
+    error_rows_by_layer_array = np.ascontiguousarray(
+        np.asarray(
+            donor_payload.get(
+                "phase3_error_rows_by_layer",
+                np.empty((0, 0, 0), dtype=np.float32),
+            )
+        )
+    )
+    error_rows_by_layer = torch.from_numpy(error_rows_by_layer_array)
+    token_rows_array = np.ascontiguousarray(
+        np.asarray(donor_payload.get("phase3_token_rows", np.empty((0, 0), dtype=np.float32)))
+    )
+    token_rows = torch.from_numpy(token_rows_array)
     donor_target_ids = _phase0_to_int64_tensor(
         donor_payload.get("target_token_ids", np.empty((0,), dtype=np.int64))
     ).reshape(-1)
@@ -1043,13 +1060,23 @@ def _load_phase3_row_donor_bundle_npz(
     total_active_features = _phase3_npz_int(
         donor_payload.get("total_active_features"), default=int(feature_rows.shape[1])
     )
+    error_column_count = _phase3_npz_int(donor_payload.get("error_column_count"), default=0)
+    token_column_count = _phase3_npz_int(donor_payload.get("token_column_count"), default=0)
+    nonfeature_row_layout = _phase3_npz_optional_str(donor_payload.get("nonfeature_row_layout"))
+    stored_error_rows_hash = _phase3_npz_optional_str(donor_payload.get("error_rows_hash"))
+    stored_token_rows_hash = _phase3_npz_optional_str(donor_payload.get("token_rows_hash"))
+    computed_error_rows_hash = (
+        _hash_tensor_raw_bytes(error_rows_by_layer) if schema_version == 2 else None
+    )
+    computed_token_rows_hash = _hash_tensor_raw_bytes(token_rows) if schema_version == 2 else None
 
     validation_issues: list[str] = []
-    if schema_version != 1:
-        validation_issues.append(f"schema_version mismatch (expected 1, got {schema_version})")
-    if capture_kind != "phase3_row_bundle_v1":
+    if schema_version not in {1, 2}:
+        validation_issues.append(f"schema_version mismatch (expected 1 or 2, got {schema_version})")
+    expected_capture_kind = f"phase3_row_bundle_v{schema_version}"
+    if capture_kind != expected_capture_kind:
         validation_issues.append(
-            f"capture_kind mismatch (expected 'phase3_row_bundle_v1', got {capture_kind!r})"
+            f"capture_kind mismatch (expected {expected_capture_kind!r}, got {capture_kind!r})"
         )
     if status not in {"captured", "captured_replayed_effective_state"}:
         validation_issues.append(f"unexpected status {status!r}")
@@ -1091,6 +1118,69 @@ def _load_phase3_row_donor_bundle_npz(
             "total_active_features mismatch "
             f"(declared={total_active_features}, runtime={int(expected_total_active_features)})"
         )
+    if schema_version == 2:
+        if nonfeature_row_layout != "target_layer_position_v1":
+            validation_issues.append(
+                "nonfeature_row_layout mismatch "
+                f"(expected 'target_layer_position_v1', got {nonfeature_row_layout!r})"
+            )
+        if expected_n_layers is None or expected_n_positions is None:
+            validation_issues.append(
+                "runtime layer and position counts are required for a version-2 row bundle"
+            )
+        else:
+            expected_error_shape = (
+                int(target_token_ids_cpu.numel()),
+                int(expected_n_layers),
+                int(expected_n_positions),
+            )
+            expected_token_shape = (
+                int(target_token_ids_cpu.numel()),
+                int(expected_n_positions),
+            )
+            if tuple(error_rows_by_layer.shape) != expected_error_shape:
+                validation_issues.append(
+                    "phase3_error_rows_by_layer shape mismatch "
+                    f"(expected={expected_error_shape}, got={tuple(error_rows_by_layer.shape)})"
+                )
+            if tuple(token_rows.shape) != expected_token_shape:
+                validation_issues.append(
+                    "phase3_token_rows shape mismatch "
+                    f"(expected={expected_token_shape}, got={tuple(token_rows.shape)})"
+                )
+            expected_error_columns = int(expected_n_layers) * int(expected_n_positions)
+            if error_column_count != expected_error_columns:
+                validation_issues.append(
+                    "error_column_count mismatch "
+                    f"(declared={error_column_count}, runtime={expected_error_columns})"
+                )
+            if token_column_count != int(expected_n_positions):
+                validation_issues.append(
+                    "token_column_count mismatch "
+                    f"(declared={token_column_count}, runtime={int(expected_n_positions)})"
+                )
+        if not error_rows_by_layer.dtype.is_floating_point:
+            validation_issues.append("phase3_error_rows_by_layer must be floating point")
+        elif not torch.isfinite(error_rows_by_layer).all().item():
+            validation_issues.append("phase3_error_rows_by_layer contain nonfinite values")
+        if not token_rows.dtype.is_floating_point:
+            validation_issues.append("phase3_token_rows must be floating point")
+        elif not torch.isfinite(token_rows).all().item():
+            validation_issues.append("phase3_token_rows contain nonfinite values")
+        if not stored_error_rows_hash:
+            validation_issues.append("missing error_rows_hash")
+        elif stored_error_rows_hash != computed_error_rows_hash:
+            validation_issues.append(
+                "error_rows_hash mismatch within donor bundle "
+                f"(stored={stored_error_rows_hash}, computed={computed_error_rows_hash})"
+            )
+        if not stored_token_rows_hash:
+            validation_issues.append("missing token_rows_hash")
+        elif stored_token_rows_hash != computed_token_rows_hash:
+            validation_issues.append(
+                "token_rows_hash mismatch within donor bundle "
+                f"(stored={stored_token_rows_hash}, computed={computed_token_rows_hash})"
+            )
     if not stored_active_hash:
         validation_issues.append("missing active_features_hash")
     elif stored_active_hash != computed_active_hash:
@@ -1130,6 +1220,17 @@ def _load_phase3_row_donor_bundle_npz(
         split_total = feature_abs_sums + error_abs_sums + token_abs_sums
         if not torch.allclose(row_abs_sums, split_total, rtol=1e-5, atol=1e-6):
             validation_issues.append("row_abs_sums do not match feature/error/token split sums")
+    if schema_version == 2 and error_rows_by_layer.ndim == 3:
+        computed_error_abs_sums = _compute_row_abs_sums(
+            error_rows_by_layer.reshape(int(error_rows_by_layer.shape[0]), -1),
+            dtype=torch.float64,
+        )
+        if not torch.equal(error_abs_sums, computed_error_abs_sums):
+            validation_issues.append("error_abs_sums do not match phase3_error_rows_by_layer")
+    if schema_version == 2 and token_rows.ndim == 2:
+        computed_token_abs_sums = _compute_row_abs_sums(token_rows, dtype=torch.float64)
+        if not torch.equal(token_abs_sums, computed_token_abs_sums):
+            validation_issues.append("token_abs_sums do not match phase3_token_rows")
     if not stored_row_hash:
         validation_issues.append("missing row_hash")
     elif stored_row_hash != computed_row_hash:
@@ -1149,7 +1250,7 @@ def _load_phase3_row_donor_bundle_npz(
             "Phase-3 row donor bundle validation failed: " + "; ".join(validation_issues)
         )
 
-    return {
+    result: dict[str, object] = {
         "status": status,
         "phase3_feature_rows": feature_rows,
         "row_abs_sums": row_abs_sums,
@@ -1165,6 +1266,8 @@ def _load_phase3_row_donor_bundle_npz(
                 "activation_values_hash": computed_activation_hash,
                 "row_hash": computed_row_hash,
                 "row_abs_sum_hash": computed_row_abs_hash,
+                "error_rows_hash": computed_error_rows_hash,
+                "token_rows_hash": computed_token_rows_hash,
             },
             "stored_hashes": {
                 "target_token_ids_hash": stored_target_hash,
@@ -1172,9 +1275,19 @@ def _load_phase3_row_donor_bundle_npz(
                 "activation_values_hash": stored_activation_hash,
                 "row_hash": stored_row_hash,
                 "row_abs_sum_hash": stored_row_abs_hash,
+                "error_rows_hash": stored_error_rows_hash,
+                "token_rows_hash": stored_token_rows_hash,
             },
         },
     }
+    if schema_version == 2:
+        result.update(
+            {
+                "phase3_error_rows_by_layer": error_rows_by_layer,
+                "phase3_token_rows": token_rows,
+            }
+        )
+    return result
 
 
 def _build_phase3_seed_influence_topk(
@@ -1323,6 +1436,8 @@ def _build_phase3_row_bundle_payload(
     feature_abs_sums: list[torch.Tensor],
     error_abs_sums: list[torch.Tensor],
     token_abs_sums: list[torch.Tensor],
+    error_rows_by_layer: list[torch.Tensor],
+    token_rows: list[torch.Tensor],
     active_features: torch.Tensor,
     activation_values: torch.Tensor,
     target_token_ids: torch.Tensor,
@@ -1372,11 +1487,36 @@ def _build_phase3_row_bundle_payload(
         if token_abs_sums
         else torch.empty((0,), dtype=torch.float64)
     )
+    if bool(error_rows_by_layer) != bool(token_rows):
+        raise ValueError(
+            "Phase-3 raw nonfeature capture requires both error and token row evidence"
+        )
+    error_rows_by_layer_cpu = (
+        torch.cat(
+            [
+                row.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                for row in error_rows_by_layer
+            ],
+            dim=0,
+        ).contiguous()
+        if error_rows_by_layer
+        else torch.empty((0, 0, 0), dtype=torch.float32)
+    )
+    token_rows_cpu = (
+        torch.cat(
+            [row.detach().to(device="cpu", dtype=torch.float32).contiguous() for row in token_rows],
+            dim=0,
+        ).contiguous()
+        if token_rows
+        else torch.empty((0, 0), dtype=torch.float32)
+    )
+    has_raw_nonfeature_rows = bool(error_rows_by_layer)
+    schema_version = 2 if has_raw_nonfeature_rows else 1
 
-    return {
-        "schema_version": 1,
+    payload: dict[str, object] = {
+        "schema_version": schema_version,
         "status": status,
-        "capture_kind": "phase3_row_bundle_v1",
+        "capture_kind": f"phase3_row_bundle_v{schema_version}",
         "target_token_ids": target_token_ids_cpu,
         "target_probabilities": target_probabilities_cpu,
         "target_token_ids_hash": _hash_index_tensor(target_token_ids_cpu),
@@ -1398,3 +1538,14 @@ def _build_phase3_row_bundle_payload(
         "row_hash": _hash_float_tensor(feature_rows_cpu, dtype=torch.float32),
         "row_abs_sum_hash": _hash_float_tensor(row_abs_sums_cpu, dtype=torch.float64),
     }
+    if has_raw_nonfeature_rows:
+        payload.update(
+            {
+                "nonfeature_row_layout": "target_layer_position_v1",
+                "phase3_error_rows_by_layer": error_rows_by_layer_cpu,
+                "phase3_token_rows": token_rows_cpu,
+                "error_rows_hash": _hash_tensor_raw_bytes(error_rows_by_layer_cpu),
+                "token_rows_hash": _hash_tensor_raw_bytes(token_rows_cpu),
+            }
+        )
+    return payload

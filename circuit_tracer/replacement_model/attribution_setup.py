@@ -18,6 +18,7 @@ from circuit_tracer.attribution.nnsight.context_state import (
 )
 from circuit_tracer.attribution.sparsification import SparsificationConfig
 from circuit_tracer.observability.events import MemorySnapshot, TraceObserver
+from circuit_tracer.tracing.plan import BackwardEngineMode, BackwardExecutionTopology
 from circuit_tracer.transcoder.provider import (
     TranscoderCapabilities,
     get_transcoder_capabilities,
@@ -152,7 +153,16 @@ class AttributionSetupOptions:
     decoder_cache_fingerprint: object | None
     decoder_active_row_residency: bool
     decoder_active_row_max_bytes: int
+    backward_engine_mode: BackwardEngineMode = "duplicated_lanes"
+    backward_batch_capacity: int = 1
     phase0_decoder_row_ranges: bool = False
+
+    @property
+    def backward_topology(self) -> BackwardExecutionTopology:
+        return BackwardExecutionTopology.resolve(
+            mode=self.backward_engine_mode,
+            batch_capacity=self.backward_batch_capacity,
+        )
 
 
 @dataclass(frozen=True)
@@ -198,9 +208,7 @@ class AttributionSetupOperation:
                 self.options.decoder_active_row_max_bytes
             )
         if get_transcoder_capabilities(transcoders).supports_phase0_decoder_row_ranges:
-            component_kwargs["phase0_decoder_row_ranges"] = (
-                self.options.phase0_decoder_row_ranges
-            )
+            component_kwargs["phase0_decoder_row_ranges"] = self.options.phase0_decoder_row_ranges
         components = transcoders.compute_attribution_components(  # type: ignore[attr-defined]
             self.capture.mlp_inputs,
             model.zero_positions,  # type: ignore[attr-defined]
@@ -227,7 +235,8 @@ class AttributionSetupOperation:
             components = replace(
                 components,
                 decoder_row_seed=replace(
-                    components.decoder_row_seed, source_fingerprint=provider_fingerprint(transcoders)
+                    components.decoder_row_seed,
+                    source_fingerprint=provider_fingerprint(transcoders),
                 ),
             )
         component_seconds = time.perf_counter() - component_start
@@ -287,6 +296,8 @@ class AttributionSetupOperation:
                 error_vector_prefetch_lookahead=self.options.error_vector_prefetch_lookahead,
                 chunked_feature_replay_window=self.options.chunked_feature_replay_window,
                 row_subchunk_size=self.options.row_subchunk_size,
+                backward_engine_mode=self.options.backward_engine_mode,
+                backward_batch_capacity=self.options.backward_batch_capacity,
             ),
             decoder_runtime=DecoderRuntime.resolve(
                 provider=transcoders if exact_chunked else None,
@@ -330,6 +341,11 @@ class AttributionSetupOperation:
             "stage_encoder_vecs_on_cpu_effective": residency.stage_on_cpu,
             "stage_error_vectors_on_cpu": self.options.stage_error_vectors_on_cpu,
             "row_subchunk_size": self.options.row_subchunk_size,
+            "backward_engine_mode": self.options.backward_engine_mode,
+            "backward_batch_capacity": self.options.backward_batch_capacity,
+            "forward_graph_mode": self.options.backward_topology.forward_graph_mode,
+            "vjp_kernel_mode": self.options.backward_topology.vjp_kernel_mode,
+            "forward_lane_count": self.options.backward_topology.forward_lane_count,
             "exact_encoder_residency_requested": residency.requested,
             "exact_encoder_residency_effective": residency.effective,
             "exact_encoder_residency_fallback_reason": residency.fallback_reason,

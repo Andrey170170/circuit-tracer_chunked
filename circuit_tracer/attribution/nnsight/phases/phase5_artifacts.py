@@ -35,120 +35,7 @@ def _active_decoder_row_residency(
         "fallback_reason": metadata.get("decoder_active_row_fallback_reason"),
         "max_bytes_requested": int(metadata.get("decoder_active_row_max_bytes_requested", 0) or 0),
         "max_bytes_effective": int(metadata.get("decoder_active_row_max_bytes_effective", 0) or 0),
-        "phase0_decoder_row_ranges": {
-            "requested": bool(metadata.get("phase0_decoder_row_ranges_requested", False)),
-            "effective": bool(metadata.get("phase0_decoder_row_ranges_effective", False)),
-            "fallback_reason": metadata.get("phase0_decoder_row_ranges_fallback_reason"),
-            "backend": metadata.get("phase0_decoder_row_ranges_backend"),
-            "planning_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_planning_seconds", 0.0) or 0.0
-            ),
-            "read_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_read_seconds", 0.0) or 0.0
-            ),
-            "gather_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_gather_seconds", 0.0) or 0.0
-            ),
-            "reconstruction_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_reconstruction_seconds", 0.0) or 0.0
-            ),
-            "seed_capture_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_seed_capture_seconds", 0.0) or 0.0
-            ),
-            "unique_row_count": int(
-                metadata.get("phase0_decoder_row_ranges_unique_row_count", 0) or 0
-            ),
-            "unique_row_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_unique_row_bytes", 0) or 0
-            ),
-            "range_request_count": int(
-                metadata.get("phase0_decoder_row_ranges_range_request_count", 0) or 0
-            ),
-            "range_rows": metadata.get("phase0_decoder_row_ranges_range_rows", ()),
-            "merged_gap_rows": int(
-                metadata.get("phase0_decoder_row_ranges_merged_gap_rows", 0) or 0
-            ),
-            "overfetch_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_overfetch_bytes", 0) or 0
-            ),
-            "logical_requested_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_logical_requested_bytes", 0) or 0
-            ),
-            "logical_materialized_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_logical_materialized_bytes", 0) or 0
-            ),
-            "baseline_full_page_count": int(
-                metadata.get("phase0_decoder_row_ranges_baseline_full_page_count", 0) or 0
-            ),
-            "baseline_full_page_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_baseline_full_page_bytes", 0) or 0
-            ),
-            "occurrence_row_count": int(
-                metadata.get("phase0_decoder_row_ranges_occurrence_row_count", 0) or 0
-            ),
-            "mapping_count": int(
-                metadata.get("phase0_decoder_row_ranges_mapping_count", 0) or 0
-            ),
-            "block_count": int(
-                metadata.get("phase0_decoder_row_ranges_block_count", 0) or 0
-            ),
-            "read_count": int(
-                metadata.get("phase0_decoder_row_ranges_read_count", 0) or 0
-            ),
-            "backend_request_count": int(
-                metadata.get(
-                    "phase0_decoder_row_ranges_backend_request_count", 0
-                )
-                or 0
-            ),
-            "page_span_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_page_span_bytes", 0) or 0
-            ),
-            "backend_requested_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_backend_requested_bytes", 0) or 0
-            ),
-            "backend_materialized_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_backend_materialized_bytes", 0) or 0
-            ),
-            "planned_overfetch_ratio": float(
-                metadata.get("phase0_decoder_row_ranges_planned_overfetch_ratio", 0.0)
-                or 0.0
-            ),
-            "physical_read_estimate_bytes": metadata.get(
-                "phase0_decoder_row_ranges_physical_read_estimate_bytes"
-            ),
-            "fault_read_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_fault_read_seconds", 0.0) or 0.0
-            ),
-            "reorder_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_reorder_seconds", 0.0) or 0.0
-            ),
-            "h2d_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_h2d_seconds", 0.0) or 0.0
-            ),
-            "total_seconds": float(
-                metadata.get("phase0_decoder_row_ranges_total_seconds", 0.0) or 0.0
-            ),
-            "occurrence_row_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_occurrence_row_bytes", 0) or 0
-            ),
-            "mapping_open_count": int(
-                metadata.get("phase0_decoder_row_ranges_mapping_open_count", 0) or 0
-            ),
-            "range_count": int(
-                metadata.get("phase0_decoder_row_ranges_range_count", 0) or 0
-            ),
-            "output_bytes": int(
-                metadata.get("phase0_decoder_row_ranges_output_bytes", 0) or 0
-            ),
-            "temporary_staging_high_water_bytes": int(
-                metadata.get(
-                    "phase0_decoder_row_ranges_temporary_staging_high_water_bytes",
-                    0,
-                )
-                or 0
-            ),
-        },
+        "phase0_decoder_row_ranges": _phase0_decoder_row_ranges(metadata),
         "resident": {
             "row_count": int(metadata.get("decoder_active_row_count", 0) or 0),
             "bytes": int(metadata.get("decoder_active_row_bytes", 0) or 0),
@@ -210,9 +97,143 @@ def _active_decoder_row_residency(
             ),
         },
     }
+    _attach_active_decoder_row_admission(result, metadata)
     if "phase0_decoder_row_ranges_requested" not in metadata:
         del result["phase0_decoder_row_ranges"]
     return result
+
+
+def _phase0_decoder_row_ranges(metadata: dict[str, object]) -> dict[str, object]:
+    return {
+        "requested": bool(metadata.get("phase0_decoder_row_ranges_requested", False)),
+        "effective": bool(metadata.get("phase0_decoder_row_ranges_effective", False)),
+        "fallback_reason": metadata.get("phase0_decoder_row_ranges_fallback_reason"),
+        "backend": metadata.get("phase0_decoder_row_ranges_backend"),
+        "planning_seconds": float(
+            metadata.get("phase0_decoder_row_ranges_planning_seconds", 0.0) or 0.0
+        ),
+        "read_seconds": float(metadata.get("phase0_decoder_row_ranges_read_seconds", 0.0) or 0.0),
+        "gather_seconds": float(
+            metadata.get("phase0_decoder_row_ranges_gather_seconds", 0.0) or 0.0
+        ),
+        "reconstruction_seconds": float(
+            metadata.get("phase0_decoder_row_ranges_reconstruction_seconds", 0.0) or 0.0
+        ),
+        "seed_capture_seconds": float(
+            metadata.get("phase0_decoder_row_ranges_seed_capture_seconds", 0.0) or 0.0
+        ),
+        "unique_row_count": int(metadata.get("phase0_decoder_row_ranges_unique_row_count", 0) or 0),
+        "unique_row_bytes": int(metadata.get("phase0_decoder_row_ranges_unique_row_bytes", 0) or 0),
+        "range_request_count": int(
+            metadata.get("phase0_decoder_row_ranges_range_request_count", 0) or 0
+        ),
+        "range_rows": metadata.get("phase0_decoder_row_ranges_range_rows", ()),
+        "merged_gap_rows": int(metadata.get("phase0_decoder_row_ranges_merged_gap_rows", 0) or 0),
+        "overfetch_bytes": int(metadata.get("phase0_decoder_row_ranges_overfetch_bytes", 0) or 0),
+        "logical_requested_bytes": int(
+            metadata.get("phase0_decoder_row_ranges_logical_requested_bytes", 0) or 0
+        ),
+        "logical_materialized_bytes": int(
+            metadata.get("phase0_decoder_row_ranges_logical_materialized_bytes", 0) or 0
+        ),
+        "baseline_full_page_count": int(
+            metadata.get("phase0_decoder_row_ranges_baseline_full_page_count", 0) or 0
+        ),
+        "baseline_full_page_bytes": int(
+            metadata.get("phase0_decoder_row_ranges_baseline_full_page_bytes", 0) or 0
+        ),
+        "occurrence_row_count": int(
+            metadata.get("phase0_decoder_row_ranges_occurrence_row_count", 0) or 0
+        ),
+        "mapping_count": int(metadata.get("phase0_decoder_row_ranges_mapping_count", 0) or 0),
+        "block_count": int(metadata.get("phase0_decoder_row_ranges_block_count", 0) or 0),
+        "read_count": int(metadata.get("phase0_decoder_row_ranges_read_count", 0) or 0),
+        "backend_request_count": int(
+            metadata.get("phase0_decoder_row_ranges_backend_request_count", 0) or 0
+        ),
+        "page_span_bytes": int(metadata.get("phase0_decoder_row_ranges_page_span_bytes", 0) or 0),
+        "backend_requested_bytes": int(
+            metadata.get("phase0_decoder_row_ranges_backend_requested_bytes", 0) or 0
+        ),
+        "backend_materialized_bytes": int(
+            metadata.get("phase0_decoder_row_ranges_backend_materialized_bytes", 0) or 0
+        ),
+        "planned_overfetch_ratio": float(
+            metadata.get("phase0_decoder_row_ranges_planned_overfetch_ratio", 0.0) or 0.0
+        ),
+        "physical_read_estimate_bytes": metadata.get(
+            "phase0_decoder_row_ranges_physical_read_estimate_bytes"
+        ),
+        "fault_read_seconds": float(
+            metadata.get("phase0_decoder_row_ranges_fault_read_seconds", 0.0) or 0.0
+        ),
+        "reorder_seconds": float(
+            metadata.get("phase0_decoder_row_ranges_reorder_seconds", 0.0) or 0.0
+        ),
+        "h2d_seconds": float(metadata.get("phase0_decoder_row_ranges_h2d_seconds", 0.0) or 0.0),
+        "total_seconds": float(metadata.get("phase0_decoder_row_ranges_total_seconds", 0.0) or 0.0),
+        "occurrence_row_bytes": int(
+            metadata.get("phase0_decoder_row_ranges_occurrence_row_bytes", 0) or 0
+        ),
+        "mapping_open_count": int(
+            metadata.get("phase0_decoder_row_ranges_mapping_open_count", 0) or 0
+        ),
+        "range_count": int(metadata.get("phase0_decoder_row_ranges_range_count", 0) or 0),
+        "output_bytes": int(metadata.get("phase0_decoder_row_ranges_output_bytes", 0) or 0),
+        "temporary_staging_high_water_bytes": int(
+            metadata.get(
+                "phase0_decoder_row_ranges_temporary_staging_high_water_bytes",
+                0,
+            )
+            or 0
+        ),
+    }
+
+
+def _attach_active_decoder_row_admission(
+    result: dict[str, object], metadata: dict[str, object]
+) -> None:
+    optional_values = {
+        "requirement": (
+            "decoder_active_row_residency_requirement",
+            lambda value: value,
+        ),
+        "admission_reason": (
+            "decoder_active_row_admission_reason",
+            lambda value: value,
+        ),
+        "admission_policy": (
+            "decoder_active_row_admission_policy",
+            lambda value: value,
+        ),
+        "safety_margin_bytes": (
+            "decoder_active_row_safety_margin_bytes",
+            lambda value: int(value or 0),
+        ),
+        "dynamic_budget_bytes": (
+            "decoder_active_row_dynamic_budget_bytes",
+            lambda value: int(value or 0),
+        ),
+        "effective_budget_bytes": (
+            "decoder_active_row_effective_budget_bytes",
+            lambda value: int(value or 0),
+        ),
+    }
+    for output_key, (metadata_key, convert) in optional_values.items():
+        if metadata_key in metadata:
+            result[output_key] = convert(metadata[metadata_key])
+
+    hbm_keys = {
+        "free_bytes": "decoder_active_row_hbm_free_bytes",
+        "total_bytes": "decoder_active_row_hbm_total_bytes",
+        "allocated_bytes": "decoder_active_row_hbm_allocated_bytes",
+        "reserved_bytes": "decoder_active_row_hbm_reserved_bytes",
+        "device": "decoder_active_row_hbm_device",
+    }
+    if any(metadata_key in metadata for metadata_key in hbm_keys.values()):
+        result["hbm"] = {
+            output_key: metadata.get(metadata_key) for output_key, metadata_key in hbm_keys.items()
+        }
 
 
 def package_compact_artifacts(

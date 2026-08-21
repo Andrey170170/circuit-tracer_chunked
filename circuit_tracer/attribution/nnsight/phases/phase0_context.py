@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from circuit_tracer.attribution.nnsight.phases.phase0_tokens import Phase0TokenPreparation
 from circuit_tracer.observability.events import TraceObserver
+from circuit_tracer.tracing.plan import BackwardEngineMode, BackwardExecutionTopology
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,8 @@ class Phase0AttributionPolicy:
     stage_encoder_vecs_on_cpu: bool | None
     stage_error_vectors_on_cpu: bool | None
     row_subchunk_size: int | None
+    backward_engine_mode: BackwardEngineMode
+    backward_batch_capacity: int
     exact_encoder_residency: str
     internal_precision_requested: str
     resolved_dtype_map: dict[str, str]
@@ -53,6 +56,18 @@ class Phase0ContextConfiguration:
     """Metadata produced while configuring a created attribution context."""
 
     runtime_metadata: dict[str, object]
+
+
+def _required_metadata_int(
+    metadata: dict[str, object],
+    key: str,
+    *,
+    default: int,
+) -> int:
+    value = metadata.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(f"Phase-0 metadata {key!r} must be an integer")
+    return value
 
 
 def configure_phase0_transcoders(
@@ -104,6 +119,8 @@ def log_phase0_profile(
         f"stage_encoder_vecs_on_cpu={attribution.stage_encoder_vecs_on_cpu} | "
         f"stage_error_vectors_on_cpu={attribution.stage_error_vectors_on_cpu} | "
         f"row_subchunk_size={attribution.row_subchunk_size} | "
+        f"backward_engine_mode={attribution.backward_engine_mode} | "
+        f"backward_batch_capacity={attribution.backward_batch_capacity} | "
         f"phase0_decoder_row_ranges={attribution.phase0_decoder_row_ranges} | "
         f"planner_enabled={settings.planner_enabled} | "
         f"feature_batch_size_max={settings.max_phase4_feature_batch_size} | "
@@ -153,6 +170,8 @@ def create_phase0_context(
         stage_encoder_vecs_on_cpu=policy.stage_encoder_vecs_on_cpu,
         stage_error_vectors_on_cpu=policy.stage_error_vectors_on_cpu,
         row_subchunk_size=policy.row_subchunk_size,
+        backward_engine_mode=policy.backward_engine_mode,
+        backward_batch_capacity=policy.backward_batch_capacity,
         exact_encoder_residency=policy.exact_encoder_residency,
         internal_precision_requested=policy.internal_precision_requested,
         resolved_dtype_map=policy.resolved_dtype_map,
@@ -178,6 +197,100 @@ def configure_phase0_context(
     exact_encoder_residency_metadata: dict[str, object],
 ) -> Phase0ContextConfiguration:
     """Configure the created context and publish its encoder residency metadata."""
+    expected_topology = BackwardExecutionTopology.resolve(
+        mode=cast(
+            BackwardEngineMode,
+            str(phase1_trace_batch_metadata.get("backward_engine_mode", "duplicated_lanes")),
+        ),
+        batch_capacity=_required_metadata_int(
+            phase1_trace_batch_metadata,
+            "backward_batch_capacity",
+            default=1,
+        ),
+    )
+    recorded_forward_lane_count = _required_metadata_int(
+        phase1_trace_batch_metadata,
+        "forward_lane_count",
+        default=expected_topology.forward_lane_count,
+    )
+    recorded_forward_graph_mode = str(
+        phase1_trace_batch_metadata.get(
+            "forward_graph_mode",
+            expected_topology.forward_graph_mode,
+        )
+    )
+    recorded_vjp_kernel_mode = str(
+        phase1_trace_batch_metadata.get(
+            "vjp_kernel_mode",
+            expected_topology.vjp_kernel_mode,
+        )
+    )
+    if (
+        recorded_forward_graph_mode != expected_topology.forward_graph_mode
+        or recorded_vjp_kernel_mode != expected_topology.vjp_kernel_mode
+    ):
+        raise RuntimeError(
+            "Phase-0 backward component metadata is internally inconsistent "
+            f"(mode={expected_topology.mode!r}, "
+            f"forward_graph_mode={recorded_forward_graph_mode!r}, "
+            f"vjp_kernel_mode={recorded_vjp_kernel_mode!r})"
+        )
+    if recorded_forward_lane_count != expected_topology.forward_lane_count:
+        raise RuntimeError(
+            "Phase-0 backward topology metadata is internally inconsistent "
+            f"(mode={expected_topology.mode!r}, "
+            f"capacity={expected_topology.batch_capacity}, "
+            f"required_forward_lanes={expected_topology.forward_lane_count}, "
+            f"recorded_forward_lanes={recorded_forward_lane_count})"
+        )
+    actual_backward_mode = getattr(ctx, "backward_engine_mode", None)
+    actual_backward_capacity = getattr(ctx, "backward_batch_capacity", None)
+    actual_forward_graph_mode = getattr(ctx, "forward_graph_mode", None)
+    actual_vjp_kernel_mode = getattr(ctx, "vjp_kernel_mode", None)
+    actual_forward_lane_count = getattr(ctx, "forward_lane_count", None)
+    if expected_topology.requires_explicit_runtime_identity and actual_backward_mode is None:
+        raise RuntimeError("Phase-0 context does not expose the required backward engine selection")
+    if actual_backward_mode is not None and str(actual_backward_mode) != expected_topology.mode:
+        raise RuntimeError(
+            "Phase-0 context backward engine mismatch "
+            f"(required={expected_topology.mode!r}, actual={actual_backward_mode!r})"
+        )
+    if (
+        actual_backward_capacity is not None
+        and int(actual_backward_capacity) != expected_topology.batch_capacity
+    ):
+        raise RuntimeError(
+            "Phase-0 context backward batch capacity mismatch "
+            f"(required={expected_topology.batch_capacity}, "
+            f"actual={actual_backward_capacity})"
+        )
+    if (
+        actual_forward_graph_mode is not None
+        and str(actual_forward_graph_mode) != expected_topology.forward_graph_mode
+    ):
+        raise RuntimeError(
+            "Phase-0 context forward graph mode mismatch "
+            f"(required={expected_topology.forward_graph_mode!r}, "
+            f"actual={actual_forward_graph_mode!r})"
+        )
+    if (
+        actual_vjp_kernel_mode is not None
+        and str(actual_vjp_kernel_mode) != expected_topology.vjp_kernel_mode
+    ):
+        raise RuntimeError(
+            "Phase-0 context VJP kernel mode mismatch "
+            f"(required={expected_topology.vjp_kernel_mode!r}, "
+            f"actual={actual_vjp_kernel_mode!r})"
+        )
+    if (
+        actual_forward_lane_count is not None
+        and int(actual_forward_lane_count) != expected_topology.forward_lane_count
+    ):
+        raise RuntimeError(
+            "Phase-0 context forward lane count mismatch "
+            f"(required={expected_topology.forward_lane_count}, "
+            f"actual={actual_forward_lane_count})"
+        )
     encoder_vecs = getattr(ctx, "encoder_vecs")
     runtime_metadata = {
         "exact_encoder_staging_destination": getattr(
@@ -194,6 +307,21 @@ def configure_phase0_context(
         "exact_encoder_pinning_success": getattr(ctx, "exact_encoder_pinning_success", None),
         "exact_encoder_pinning_failure_reason": getattr(
             ctx, "exact_encoder_pinning_failure_reason", None
+        ),
+        "backward_engine_mode": (
+            expected_topology.mode if actual_backward_mode is None else actual_backward_mode
+        ),
+        "backward_batch_capacity": (
+            expected_topology.batch_capacity
+            if actual_backward_capacity is None
+            else int(actual_backward_capacity)
+        ),
+        "forward_graph_mode": expected_topology.forward_graph_mode,
+        "vjp_kernel_mode": expected_topology.vjp_kernel_mode,
+        "forward_lane_count": getattr(
+            ctx,
+            "forward_lane_count",
+            expected_topology.forward_lane_count,
         ),
     }
     exact_encoder_residency_metadata.update(runtime_metadata)

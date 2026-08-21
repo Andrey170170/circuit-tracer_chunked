@@ -437,11 +437,7 @@ class TranscoderSet(nn.Module):
                 and transcoder.transcoder_path is not None
                 and safetensors_decoder_tensor_supported(
                     transcoder.transcoder_path,
-                    (
-                        "w_dec"
-                        if transcoder.weight_format == "gemmascope2"
-                        else "W_dec"
-                    ),
+                    ("w_dec" if transcoder.weight_format == "gemmascope2" else "W_dec"),
                     expected_shape=(
                         transcoder.d_transcoder,
                         transcoder.d_model,
@@ -610,11 +606,9 @@ class TranscoderSet(nn.Module):
                 unique_feature_ids,
                 device=target_device,
             )
-            active_encoders[layer_rows.to(device=active_encoders.device)] = (
-                unique_rows[inverse.to(device=unique_rows.device)].to(
-                    device=active_encoders.device, dtype=active_encoders.dtype
-                )
-            )
+            active_encoders[layer_rows.to(device=active_encoders.device)] = unique_rows[
+                inverse.to(device=unique_rows.device)
+            ].to(device=active_encoders.device, dtype=active_encoders.dtype)
         return active_encoders
 
     @property
@@ -849,9 +843,7 @@ class TranscoderSet(nn.Module):
                 output_dtype=None,
             )
             if isinstance(mapped_result, DecoderRowRefusal):
-                mapped_refusal_reason = (
-                    f"{mapped_result.code.value}:{mapped_result.reason}"
-                )
+                mapped_refusal_reason = f"{mapped_result.code.value}:{mapped_result.reason}"
             else:
                 mapped_telemetry = mapped_result.telemetry
                 compact_rows = mapped_result.rows
@@ -867,29 +859,23 @@ class TranscoderSet(nn.Module):
         using_ranges = False
         if compact_rows is None and range_plan.admitted:
             using_ranges = True
-            compact_rows, range_read_seconds, range_gather_seconds = (
-                load_decoder_row_ranges(
-                    path=transcoder.transcoder_path,
-                    key=key,
-                    plan=range_plan,
-                    dtype=self.dtype,
-                )
+            compact_rows, range_read_seconds, range_gather_seconds = load_decoder_row_ranges(
+                path=transcoder.transcoder_path,
+                key=key,
+                plan=range_plan,
+                dtype=self.dtype,
             )
 
         if compact_rows is None:
             reconstruct_started = time.perf_counter()
-            reconstruction, seed_layer, traversal_bytes = (
-                self._decode_sparse_with_decoder_chunks(
-                    layer,
-                    sparse_acts,
-                    input_acts,
-                    capture_decoder_row_seed=True,
-                )
+            reconstruction, seed_layer, traversal_bytes = self._decode_sparse_with_decoder_chunks(
+                layer,
+                sparse_acts,
+                input_acts,
+                capture_decoder_row_seed=True,
             )
             reconstruction_seconds = time.perf_counter() - reconstruct_started
-            unique_bytes = int(unique_feature_ids.numel()) * self.d_model * int(
-                self.dtype.itemsize
-            )
+            unique_bytes = int(unique_feature_ids.numel()) * self.d_model * int(self.dtype.itemsize)
             return (
                 reconstruction,
                 seed_layer,
@@ -942,16 +928,12 @@ class TranscoderSet(nn.Module):
                     ),
                     total_seconds=time.perf_counter() - phase0_started,
                     occurrence_row_bytes=(
-                        int(feat_idx.numel())
-                        * self.d_model
-                        * int(self.dtype.itemsize)
+                        int(feat_idx.numel()) * self.d_model * int(self.dtype.itemsize)
                     ),
                     output_bytes=unique_bytes,
                     temporary_staging_high_water_bytes=min(
                         traversal_bytes,
-                        self.decoder_chunk_size
-                        * self.d_model
-                        * int(self.dtype.itemsize),
+                        self.decoder_chunk_size * self.d_model * int(self.dtype.itemsize),
                     ),
                 ),
             )
@@ -971,9 +953,7 @@ class TranscoderSet(nn.Module):
             reconstruct_started = time.perf_counter()
             h2d_seconds = 0.0
             if feat_idx.numel() > 0:
-                chunk_ids = torch.div(
-                    feat_idx, self.decoder_chunk_size, rounding_mode="floor"
-                )
+                chunk_ids = torch.div(feat_idx, self.decoder_chunk_size, rounding_mode="floor")
                 unique_chunk_ids = torch.div(
                     unique_feature_ids,
                     self.decoder_chunk_size,
@@ -982,13 +962,9 @@ class TranscoderSet(nn.Module):
                 for chunk_id_tensor in torch.unique(chunk_ids, sorted=True):
                     chunk_mask = chunk_ids == chunk_id_tensor
                     unique_chunk_mask = unique_chunk_ids == chunk_id_tensor
-                    unique_destinations = unique_chunk_mask.nonzero(
-                        as_tuple=False
-                    ).flatten()
+                    unique_destinations = unique_chunk_mask.nonzero(as_tuple=False).flatten()
                     chunk_feature_ids = unique_feature_ids[unique_chunk_mask]
-                    occurrence_rows = torch.searchsorted(
-                        chunk_feature_ids, feat_idx[chunk_mask]
-                    )
+                    occurrence_rows = torch.searchsorted(chunk_feature_ids, feat_idx[chunk_mask])
                     h2d_started = time.perf_counter()
                     raw_decoder_vectors = compact_rows.index_select(
                         0, unique_destinations.to(device="cpu")
@@ -1007,12 +983,8 @@ class TranscoderSet(nn.Module):
                         unique_destinations.to(device="cpu"),
                         provider_decoder_vectors.detach().to(device="cpu"),
                     )
-                    scaled_decoders = (
-                        decoder_vectors[occurrence_rows] * values[chunk_mask, None]
-                    )
-                    reconstruction.index_add_(
-                        0, pos_idx[chunk_mask], scaled_decoders
-                    )
+                    scaled_decoders = decoder_vectors[occurrence_rows] * values[chunk_mask, None]
+                    reconstruction.index_add_(0, pos_idx[chunk_mask], scaled_decoders)
             if transcoder.W_skip is not None:
                 assert input_acts is not None, (
                     "Transcoder has skip connection but no input_acts were provided"
@@ -1031,8 +1003,8 @@ class TranscoderSet(nn.Module):
                     feature_ids=range_plan.unique_feature_ids,
                     rows=retained_seed_rows.unsqueeze(1),
                 )
-            requested_bytes = int(unique_feature_ids.numel()) * self.d_model * int(
-                self.dtype.itemsize
+            requested_bytes = (
+                int(unique_feature_ids.numel()) * self.d_model * int(self.dtype.itemsize)
             )
             if mapped_telemetry is not None:
                 backend = "mapped_safetensors"
@@ -1046,28 +1018,21 @@ class TranscoderSet(nn.Module):
                 read_count = source_telemetry.read_count
                 backend_request_count = source_telemetry.backend_request_count
                 page_span_bytes = source_telemetry.block_count * PAGESIZE
-                planning_seconds = (
-                    range_plan.planning_seconds + source_telemetry.planning_seconds
-                )
+                planning_seconds = range_plan.planning_seconds + source_telemetry.planning_seconds
                 mapped_reorder_seconds = source_telemetry.reorder_seconds
                 planned_overfetch_ratio = source_telemetry.planned_overfetch_ratio
                 output_bytes = requested_bytes
                 temporary_staging_high_water_bytes = (
-                    source_telemetry.temporary_staging_high_water_bytes
-                    + requested_bytes
+                    source_telemetry.temporary_staging_high_water_bytes + requested_bytes
                 )
                 backend_requested_bytes = source_telemetry.requested_row_bytes
-                backend_materialized_bytes = (
-                    source_telemetry.backend_materialized_bytes
-                )
+                backend_materialized_bytes = source_telemetry.backend_materialized_bytes
             else:
                 backend = "coalesced_ranges"
                 materialized_rows = sum(
                     row_range.materialized_rows for row_range in range_plan.ranges
                 )
-                materialized_bytes = (
-                    materialized_rows * self.d_model * int(self.dtype.itemsize)
-                )
+                materialized_bytes = materialized_rows * self.d_model * int(self.dtype.itemsize)
                 read_seconds = range_read_seconds
                 gather_seconds = range_gather_seconds
                 mapping_count = 0
@@ -1078,11 +1043,9 @@ class TranscoderSet(nn.Module):
                 page_span_bytes = 0
                 planning_seconds = range_plan.planning_seconds
                 mapped_reorder_seconds = 0.0
-                planned_overfetch_ratio = (
-                    max(
-                        0.0,
-                        materialized_bytes / max(1, requested_bytes) - 1.0,
-                    )
+                planned_overfetch_ratio = max(
+                    0.0,
+                    materialized_bytes / max(1, requested_bytes) - 1.0,
                 )
                 output_bytes = requested_bytes
                 temporary_staging_high_water_bytes = materialized_bytes
@@ -1103,14 +1066,9 @@ class TranscoderSet(nn.Module):
                 seed_capture_seconds=0.0,
                 unique_row_count=int(unique_feature_ids.numel()),
                 unique_row_bytes=requested_bytes,
-                range_request_count=(
-                    len(range_plan.ranges) if using_ranges else 0
-                ),
+                range_request_count=(len(range_plan.ranges) if using_ranges else 0),
                 range_rows=(
-                    tuple(
-                        row_range.materialized_rows
-                        for row_range in range_plan.ranges
-                    )
+                    tuple(row_range.materialized_rows for row_range in range_plan.ranges)
                     if using_ranges
                     else ()
                 ),
@@ -1140,9 +1098,7 @@ class TranscoderSet(nn.Module):
                 ),
                 range_count=len(range_plan.ranges) if using_ranges else 0,
                 output_bytes=output_bytes,
-                temporary_staging_high_water_bytes=(
-                    temporary_staging_high_water_bytes
-                ),
+                temporary_staging_high_water_bytes=(temporary_staging_high_water_bytes),
             )
             return reconstruction, seed_layer, materialized_bytes, telemetry
         except BaseException:
@@ -1357,9 +1313,9 @@ class TranscoderSet(nn.Module):
             seed_refusal_reason = None
             if not decoder_active_row_residency:
                 seed_refusal_reason = "not_requested"
-            elif int(decoder_active_row_max_bytes) <= 0:
-                seed_refusal_reason = "max_bytes_nonpositive"
-            elif seed_estimated_bytes > int(decoder_active_row_max_bytes):
+            elif int(decoder_active_row_max_bytes) > 0 and seed_estimated_bytes > int(
+                decoder_active_row_max_bytes
+            ):
                 seed_refusal_reason = "phase0_occurrence_bytes_exceed_max"
             capture_seed = seed_refusal_reason is None
             seed_started = time.perf_counter()

@@ -109,9 +109,7 @@ def apply_phase0_replay(
         activation_matrix = ctx.activation_matrix.coalesce()
         validation = cast(dict[str, object], loaded.get("validation_metadata", {}))
         dtype_metadata = cast(dict[str, object], loaded.get("dtype_metadata", {}))
-        warnings = [
-            str(item) for item in cast(list[object], validation.get("warnings", []))
-        ]
+        warnings = [str(item) for item in cast(list[object], validation.get("warnings", []))]
         status = "applied_with_warnings" if warnings else "applied"
         metadata = _build_phase0_replay_metadata(
             mode=policy.mode,
@@ -154,7 +152,9 @@ def apply_phase0_replay(
             note="single-step intended replay mode",
         )
         attrs = {"phase0_replay_mode": policy.mode, "phase0_replay_status": "disabled"}
-    observer.observe(TraceEvent(scope="phase", name="phase2.phase0_replay", phase="phase2", attrs=attrs))
+    observer.observe(
+        TraceEvent(scope="phase", name="phase2.phase0_replay", phase="phase2", attrs=attrs)
+    )
 
     payload = None
     if policy.capture_bundle:
@@ -177,9 +177,7 @@ def apply_phase0_replay(
                 observer.observe(DiagnosticSnapshot(model.transcoders)),
             ),
             status=(
-                "captured_replayed_effective_state"
-                if policy.mode != "disabled"
-                else "captured"
+                "captured_replayed_effective_state" if policy.mode != "disabled" else "captured"
             ),
         )
         payload["replayed_effective_state"] = policy.mode != "disabled"
@@ -233,12 +231,15 @@ def load_phase3_replay(
         setattr(ctx, "phase3_gradient_replay_status", "applied")
         validation = cast(dict[str, object], loaded_gradient.get("validation_metadata", {}))
         gradient_metadata = _build_phase3_replay_metadata(
-            replay_kind="phase3_gradient_replay_v1", mode=policy.gradient_mode,
-            status="applied", donor_bundle_path=policy.gradient_bundle_path,
+            replay_kind="phase3_gradient_replay_v1",
+            mode=policy.gradient_mode,
+            status="applied",
+            donor_bundle_path=policy.gradient_bundle_path,
             validation_policy=policy.validation_policy,
             validation_failure_count=int(cast(int, validation.get("validation_failure_count", 0))),
             donor_hashes=cast(dict[str, object], validation.get("stored_hashes", {})),
-            host_hashes=common_host_hashes, source="donor_gradient_bundle",
+            host_hashes=common_host_hashes,
+            source="donor_gradient_bundle",
             note="feature/error gradients replayed from donor; token gradient remains host-computed",
         )
     else:
@@ -246,9 +247,11 @@ def load_phase3_replay(
         setattr(ctx, "phase3_gradient_replay_status", "disabled")
 
     row_metadata = _build_phase3_replay_metadata(
-        replay_kind="phase3_row_replay_v1", mode=policy.row_mode,
+        replay_kind="phase3_row_replay_v1",
+        mode=policy.row_mode,
         status="disabled" if policy.row_mode == "disabled" else "pending",
-        donor_bundle_path=policy.row_bundle_path, validation_policy=policy.validation_policy,
+        donor_bundle_path=policy.row_bundle_path,
+        validation_policy=policy.validation_policy,
         source="host_computed" if policy.row_mode == "disabled" else None,
     )
     loaded_row = None
@@ -260,17 +263,24 @@ def load_phase3_replay(
             active_features=activation_matrix.indices().T,
             activation_values=activation_matrix.values(),
             expected_total_active_features=total_active_feats,
+            expected_n_layers=n_layers,
+            expected_n_positions=n_pos,
             validation_policy=cast(Literal["strict"], policy.validation_policy),
         )
         validation = cast(dict[str, object], loaded_row.get("validation_metadata", {}))
         row_metadata = _build_phase3_replay_metadata(
-            replay_kind="phase3_row_replay_v1", mode=policy.row_mode, status="applied",
+            replay_kind="phase3_row_replay_v1",
+            mode=policy.row_mode,
+            status="applied",
             donor_bundle_path=policy.row_bundle_path,
             validation_policy=policy.validation_policy,
             validation_failure_count=int(cast(int, validation.get("validation_failure_count", 0))),
             donor_hashes=cast(dict[str, object], validation.get("stored_hashes", {})),
-            host_hashes=common_host_hashes, source="donor_row_bundle_override",
-            note=("donor row bundle overrides feature rows and row normalizers; "
-                  "dense token/error columns remain host-computed"),
+            host_hashes=common_host_hashes,
+            source="donor_row_bundle_override",
+            note=(
+                "donor row bundle overrides feature rows and row normalizers; "
+                "dense token/error columns remain host-computed"
+            ),
         )
     return Phase3ReplayState(gradient_metadata, row_metadata, loaded_row)

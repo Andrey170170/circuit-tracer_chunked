@@ -54,6 +54,8 @@ def package_phase3_replay_evidence(
             feature_abs_sums=rows.feature_abs_sums,
             error_abs_sums=rows.error_abs_sums,
             token_abs_sums=rows.token_abs_sums,
+            error_rows_by_layer=rows.error_rows_by_layer,
+            token_rows=rows.token_rows,
             active_features=inputs.activation_matrix.indices().T,
             activation_values=inputs.activation_matrix.values(),
             target_token_ids=target_token_ids,

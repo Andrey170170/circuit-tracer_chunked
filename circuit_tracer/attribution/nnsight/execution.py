@@ -22,6 +22,7 @@ from circuit_tracer.attribution.nnsight.phases.phase0 import (
     Phase0Result,
 )
 from circuit_tracer.attribution.nnsight.phases.phase2 import (
+    FeatureRowInfluencePolicy,
     FrontierBufferPolicy,
     Phase2Config,
     Phase2ExecutionPolicy,
@@ -65,12 +66,14 @@ from circuit_tracer.attribution.nnsight.phases.phase5 import (
 from circuit_tracer.attribution.nnsight.preparation import (
     PreparedBackend,
     finalize_active_decoder_row_admission,
+    finalize_feature_row_influence_execution,
     finalize_phase0_decoder_row_range_execution,
     reprepare_after_active_universe,
 )
 from circuit_tracer.attribution.nnsight.run_scope import AttributionRunScope
 from circuit_tracer.utils.disk_offload import offload_modules
 from circuit_tracer.observability.events import MemoryDelta, MemorySnapshot, TraceEvent
+from circuit_tracer.observability.errors import safe_exception_attrs, safe_exception_message
 from circuit_tracer.diagnostic import ProbeCompletion
 from circuit_tracer.transcoder.checkpoint_assets import (
     CheckpointPageLifecycle,
@@ -171,6 +174,12 @@ class AttributionExecution:
             self.apply_phase3_entry_replan()
             self.finalize_active_decoder_row_admission()
             self._run_with_grant(PhaseId.PHASE3, self.attribute_seed_nodes)
+            if self._diagnostic_stop_mode() == "phase3_probe":
+                return ProbeCompletion(
+                    mode="phase3_probe",
+                    diagnostic_metadata=self._probe_diagnostic_metadata(),
+                    diagnostic_artifacts=self._probe_diagnostic_artifacts(),
+                )
             self.apply_checkpoint_working_set_transition()
             self.apply_phase4_entry_replan()
             self._run_with_grant(PhaseId.PHASE4, self.expand_feature_frontier)
@@ -218,16 +227,10 @@ class AttributionExecution:
             "phase3_seed_bundle": phase3.phase3_seed_bundle_payload,
             "phase3_gradient_bundle": phase3.phase3_gradient_bundle_payload,
             "phase3_row_bundle": phase3.phase3_row_bundle_payload,
-            "feature_semantic_descriptors": (
-                phase3.feature_semantic_descriptors_payload
-            ),
+            "feature_semantic_descriptors": (phase3.feature_semantic_descriptors_payload),
         }
         return MappingProxyType(
-            {
-                name: payload
-                for name, payload in candidates.items()
-                if payload is not None
-            }
+            {name: payload for name, payload in candidates.items() if payload is not None}
         )
 
     def apply_active_universe_replan(self) -> None:
@@ -508,10 +511,7 @@ class AttributionExecution:
             **(delta if isinstance(delta, dict) else {}),
         }
         if error is not None:
-            attrs.update(
-                error_type=type(error).__name__,
-                error_message=str(error),
-            )
+            attrs.update(safe_exception_attrs(error))
         self._observe_diagnostic(
             TraceEvent(
                 scope="phase",
@@ -530,7 +530,7 @@ class AttributionExecution:
             self.prepared.logger.warning(
                 "Diagnostic resource observation failed: %s: %s",
                 type(error).__name__,
-                error,
+                safe_exception_message(error),
             )
             return None
 
@@ -579,6 +579,8 @@ class AttributionExecution:
                     effective_source_batch_size=p.batches.source_batch_size,
                     effective_feature_batch_size=p.batches.feature_batch_size,
                     effective_logit_batch_size=p.batches.logit_batch_size,
+                    backward_engine_mode=p.batches.backward_engine_mode,
+                    backward_batch_capacity=p.batches.backward_batch_capacity,
                     internal_precision_requested=p.numerics.internal_precision_requested,
                     resolved_dtype_map=p.numerics.dtype_map,
                     decoder_chunk_cache=p.forward_overrides.decoder_chunk_cache,
@@ -612,7 +614,7 @@ class AttributionExecution:
             model=model,
             ctx=phase0.ctx,
             trace_input_ids=phase0.trace_input_ids,
-            trace_batch_size=p.batches.trace_batch_size,
+            trace_batch_size=p.batches.forward_lane_count,
             trace_batch_config=p.batches.phase1_config,
             trace_batch_metadata=p.batches.phase1_metadata,
             effective_source_batch_size=p.batches.source_batch_size,
@@ -696,11 +698,14 @@ class AttributionExecution:
                     preallocate=storage.preallocate,
                     prepared_chunk_cache_bytes=(p.frontier.prepared_chunk_cache_bytes_effective),
                     replay_tile_cache_bytes=int(storage.replay_tile_cache_bytes or 0),
-                    feature_row_influence_mode=storage.feature_row_influence_mode,
-                    gpu_resident_max_bytes=storage.gpu_resident_max_bytes,
-                    gpu_window_max_bytes=storage.gpu_window_max_bytes,
-                    gpu_resident_safety_margin_bytes=(storage.gpu_resident_safety_margin_bytes),
-                    gpu_resident_device=p.problem.model.device,
+                    influence=FeatureRowInfluencePolicy(
+                        mode=storage.feature_row_influence_mode,
+                        requirement=storage.feature_row_influence_requirement,
+                        resident_max_bytes=storage.gpu_resident_max_bytes,
+                        window_max_bytes=storage.gpu_window_max_bytes,
+                        safety_margin_bytes=storage.gpu_resident_safety_margin_bytes,
+                        device=p.problem.model.device,
+                    ),
                 ),
                 execution=Phase2ExecutionPolicy(
                     offload=plan.execution.offload,
@@ -716,6 +721,26 @@ class AttributionExecution:
         )
         self.scope.feature_row_store = self.phase2.feature_row_store
         self.scope.nonfeature_row_store = self.phase2.nonfeature_row_store
+        self._refresh_feature_row_influence_execution_identity()
+
+    def _refresh_feature_row_influence_execution_identity(self) -> None:
+        phase2 = self._phase2()
+        feature_store = phase2.feature_row_store
+        if feature_store is not None:
+            storage = self.prepared.plan.execution.storage
+            snapshot = feature_store.get_diagnostic_snapshot()
+            self.prepared = finalize_feature_row_influence_execution(
+                self.prepared,
+                resolved_mode=str(
+                    snapshot.get(
+                        "feature_row_influence_mode_resolved",
+                        storage.feature_row_influence_mode,
+                    )
+                ),
+                reason=str(snapshot.get("gpu_row_tier_reason", "requested_mode_effective")),
+            )
+            if self.execution_identity is not None:
+                self.execution_identity.revise_effective(self.prepared.effective_execution)
 
     def attribute_seed_nodes(self) -> None:
         p = self.prepared
@@ -903,6 +928,7 @@ class AttributionExecution:
         )
         self.scope.feature_row_store = self.phase4.feature_row_store
         self.scope.nonfeature_row_store = self.phase4.nonfeature_row_store
+        self._refresh_feature_row_influence_execution_identity()
 
     def assemble_graph(self) -> Any:
         p = self.prepared

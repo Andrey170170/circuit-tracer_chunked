@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from circuit_tracer.observability.events import TraceEvent
+from circuit_tracer.observability.errors import safe_exception_attrs
 from circuit_tracer.execution_identity import ExecutionIdentityState
 
 
@@ -62,10 +63,7 @@ class TraceRunScope:
             "status": terminal_status,
         }
         if primary_error is not None:
-            attrs.update(
-                error_type=type(primary_error).__name__,
-                error_message=str(primary_error),
-            )
+            attrs.update(safe_exception_attrs(primary_error))
 
         terminal_failure: BaseException | None = None
         try:

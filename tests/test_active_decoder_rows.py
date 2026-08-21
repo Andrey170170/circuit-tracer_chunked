@@ -7,6 +7,10 @@ import torch
 
 from circuit_tracer.attribution.context_nnsight import AttributionContext
 import circuit_tracer.attribution.nnsight.active_decoder_rows as active_decoder_rows_module
+from circuit_tracer.attribution.nnsight.active_decoder_rows import (
+    ActiveDecoderRowMemorySnapshot,
+    resolve_active_decoder_row_admission,
+)
 from circuit_tracer.attribution.nnsight.context_state import (
     AttributionTensorState,
     ContextExecutionPolicy,
@@ -127,6 +131,70 @@ def _provider(
         architecture=architecture,
         source_id=source_id,
     )
+
+
+def test_dynamic_active_row_admission_uses_live_hbm_headroom() -> None:
+    required_bytes = 8_690_000_000
+    decision = resolve_active_decoder_row_admission(
+        requested=True,
+        estimated_bytes=required_bytes,
+        hard_ceiling_bytes=0,
+        safety_margin_bytes=16 * 1024**3,
+        memory=ActiveDecoderRowMemorySnapshot(
+            free_bytes=100 * 1024**3,
+            total_bytes=140 * 1024**3,
+            allocated_bytes=24 * 1024**3,
+            reserved_bytes=24 * 1024**3,
+            device="cuda:0",
+        ),
+    )
+
+    assert decision.admitted is True
+    assert decision.reason == "admitted"
+    assert decision.hard_ceiling_bytes == 0
+    assert decision.dynamic_budget_bytes == 84 * 1024**3
+    assert decision.effective_budget_bytes == decision.dynamic_budget_bytes
+    assert decision.estimated_bytes == required_bytes
+
+
+def test_dynamic_active_row_admission_refuses_insufficient_hbm_headroom() -> None:
+    decision = resolve_active_decoder_row_admission(
+        requested=True,
+        estimated_bytes=8_690_000_000,
+        hard_ceiling_bytes=0,
+        safety_margin_bytes=16 * 1024**3,
+        memory=ActiveDecoderRowMemorySnapshot(
+            free_bytes=20 * 1024**3,
+            total_bytes=140 * 1024**3,
+            allocated_bytes=100 * 1024**3,
+            reserved_bytes=100 * 1024**3,
+            device="cuda:0",
+        ),
+    )
+
+    assert decision.admitted is False
+    assert decision.reason == "estimated_bytes_exceed_dynamic_budget"
+    assert decision.effective_budget_bytes == decision.dynamic_budget_bytes
+
+
+def test_explicit_active_row_ceiling_remains_authoritative() -> None:
+    decision = resolve_active_decoder_row_admission(
+        requested=True,
+        estimated_bytes=8_690_000_000,
+        hard_ceiling_bytes=8 * 1024**3,
+        safety_margin_bytes=16 * 1024**3,
+        memory=ActiveDecoderRowMemorySnapshot(
+            free_bytes=100 * 1024**3,
+            total_bytes=140 * 1024**3,
+            allocated_bytes=24 * 1024**3,
+            reserved_bytes=24 * 1024**3,
+            device="cuda:0",
+        ),
+    )
+
+    assert decision.admitted is False
+    assert decision.reason == "estimated_bytes_exceed_user_ceiling"
+    assert decision.effective_budget_bytes == 8 * 1024**3
 
 
 def _context(

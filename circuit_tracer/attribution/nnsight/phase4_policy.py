@@ -18,6 +18,7 @@ from circuit_tracer.graph import compute_partial_feature_influences
 from circuit_tracer.observability import CudaMemoryProbe, probe_cuda_memory
 from circuit_tracer.observability.events import TraceEvent, TraceObserver
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
+from circuit_tracer.tracing.plan import BackwardEngineMode, BackwardExecutionTopology
 from circuit_tracer.transcoder.provider import require_exact_chunked_provider
 
 from circuit_tracer.attribution.nnsight.numerics import _exact_trace_internal_dtype_name
@@ -2386,6 +2387,8 @@ def _plan_phase4_feature_batch_size_preflight(
     planner_compute_dtype: torch.dtype = torch.float64,
     trace_observer: TraceObserver | None = None,
     prefix_view_metadata: PrefixViewMetadata | None = None,
+    backward_engine_mode: BackwardEngineMode = "duplicated_lanes",
+    backward_batch_capacity: int = 1,
 ) -> int:
     # Runtime import avoids the phase_support -> phase4_policy module cycle.
     from circuit_tracer.attribution.nnsight.phase_support import (
@@ -2468,6 +2471,8 @@ def _plan_phase4_feature_batch_size_preflight(
             internal_precision_requested=internal_precision_requested,
             resolved_dtype_map=resolved_dtype_map,
             prefix_view_length=prefix_view_length,
+            backward_engine_mode=backward_engine_mode,
+            backward_batch_capacity=backward_batch_capacity,
             trace_observer=trace_observer,
         )
         if hasattr(ctx, "set_diagnostic_mode"):
@@ -2494,19 +2499,20 @@ def _plan_phase4_feature_batch_size_preflight(
         feat_layers, feat_pos, feat_ids = activation_matrix.indices()
         n_layers, n_pos, _ = activation_matrix.shape
         logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
-        trace_batch_size = max(batch_size, initial_feature_batch_size, effective_logit_batch_size)
-
-        with model.trace() as tracer:
-            with tracer.invoke(
-                trace_input_ids.expand(trace_batch_size, -1),
-                **ctx.resolve_phase1_invoke_kwargs(model),
-            ):
-                pass
-
-            detach_barrier = tracer.barrier(2)
-            model.configure_gradient_flow(tracer)
-            model.configure_skip_connection(tracer, barrier=detach_barrier)
-            ctx.cache_residual(model, tracer, barrier=detach_barrier)
+        logical_batch_capacity = max(
+            batch_size,
+            initial_feature_batch_size,
+            effective_logit_batch_size,
+        )
+        backward_topology = BackwardExecutionTopology.resolve(
+            mode=backward_engine_mode,
+            batch_capacity=logical_batch_capacity,
+        )
+        ctx.run_forward_pass(
+            model,
+            trace_input_ids,
+            trace_batch_size=backward_topology.forward_lane_count,
+        )
 
         exact_chunked_decoder = require_exact_chunked_provider(model.transcoders)
         decoder_chunk_size = getattr(model.transcoders, "decoder_chunk_size", None)

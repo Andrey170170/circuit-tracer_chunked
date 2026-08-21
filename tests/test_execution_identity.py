@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from circuit_tracer.attribution.nnsight.preparation import (
@@ -13,13 +14,22 @@ from circuit_tracer.attribution.nnsight.preparation import (
     ProviderMechanisms,
     ReplayMechanisms,
     _effective_execution_identity,
+    finalize_active_decoder_row_admission,
+    finalize_feature_row_influence_execution,
     _finalize_active_decoder_row_frontier,
     finalize_phase0_decoder_row_range_execution,
     reprepare_after_active_universe,
 )
+from circuit_tracer.attribution.nnsight.active_decoder_rows import (
+    ActiveDecoderRowMemorySnapshot,
+    ActiveDecoderRowResidencyRequirementError,
+)
 from circuit_tracer.attribution.nnsight.session_controls import NNSightSessionControls
 from circuit_tracer.execution_identity import ExecutionIdentityState
 from circuit_tracer.tracing.plan import (
+    BackwardEngineMode,
+    BackwardExecutionTopology,
+    BackwardPlan,
     DecoderCachePolicy,
     ExecutionConstraints,
     FrontierExpansionPlan,
@@ -39,11 +49,19 @@ def _identity(
     tape_window: int = 1,
     tape_bytes: int = 0,
     decoder_prefetch_depth: int = 0,
+    active_row_residency: bool | None = None,
+    active_row_requirement: str = "preferred",
     active_row_max_bytes: int = 0,
+    active_row_safety_margin_bytes: int = 0,
     active_row_estimated_bytes: int | None = None,
+    active_row_memory: ActiveDecoderRowMemorySnapshot | None = None,
     phase0_decoder_row_ranges: bool = False,
+    backward_engine_mode: BackwardEngineMode = "duplicated_lanes",
     return_components: bool = False,
 ):
+    active_rows_requested = (
+        active_row_max_bytes > 0 if active_row_residency is None else active_row_residency
+    )
     provider = ProviderMechanisms(
         capabilities=TranscoderCapabilities(
             architecture="clt",
@@ -96,6 +114,10 @@ def _identity(
         phase4_execution_batch_max_rows=feature_batch_size,
         metadata={},
     )
+    backward_topology = BackwardExecutionTopology.resolve(
+        mode=backward_engine_mode,
+        batch_capacity=feature_batch_size,
+    )
     batches = BatchMechanisms(
         phase1_config=SimpleNamespace(
             effective_policy="legacy",
@@ -112,6 +134,11 @@ def _identity(
         planner_skip_reason=None,
         session_controls=controls,
         trace_batch_size=feature_batch_size,
+        backward_engine_mode=backward_engine_mode,
+        backward_batch_capacity=feature_batch_size,
+        forward_graph_mode=backward_topology.forward_graph_mode,
+        vjp_kernel_mode=backward_topology.vjp_kernel_mode,
+        forward_lane_count=backward_topology.forward_lane_count,
     )
     mode = "v1" if compact_row_store else "off"
     frontier = FrontierMechanisms(
@@ -159,10 +186,12 @@ def _identity(
         ),
         decoder_page_prefetch_depth_effective=decoder_prefetch_depth,
         decoder_page_prefetch_fallback_reason=(None if decoder_prefetch_depth else "disabled"),
-        decoder_active_row_residency_requested=active_row_max_bytes > 0,
-        decoder_active_row_residency_effective=active_row_max_bytes > 0,
+        decoder_active_row_residency_requested=active_rows_requested,
+        decoder_active_row_residency_requirement=active_row_requirement,
+        decoder_active_row_residency_effective=active_rows_requested,
         decoder_active_row_max_bytes_effective=active_row_max_bytes,
-        decoder_active_row_fallback_reason=(None if active_row_max_bytes > 0 else "disabled"),
+        decoder_active_row_safety_margin_bytes=active_row_safety_margin_bytes,
+        decoder_active_row_fallback_reason=(None if active_rows_requested else "disabled"),
         phase0_decoder_row_ranges_requested=phase0_decoder_row_ranges,
         phase0_decoder_row_ranges_effective=(
             phase0_decoder_row_ranges and active_row_max_bytes > 0
@@ -171,9 +200,7 @@ def _identity(
             None
             if phase0_decoder_row_ranges and active_row_max_bytes > 0
             else (
-                "requires_active_decoder_row_residency"
-                if phase0_decoder_row_ranges
-                else "disabled"
+                "requires_active_decoder_row_residency" if phase0_decoder_row_ranges else "disabled"
             )
         ),
     )
@@ -182,9 +209,12 @@ def _identity(
             frontier,
             max_bytes=active_row_max_bytes,
             estimated_bytes=active_row_estimated_bytes,
+            safety_margin_bytes=active_row_safety_margin_bytes,
+            memory=active_row_memory,
         )
     plan = SimpleNamespace(
         execution=ExecutionConstraints(
+            backward=BackwardPlan(mode=backward_engine_mode),
             session=SessionPlan(
                 decoder_cache=DecoderCachePolicy(
                     enabled=decoder_cache_bytes > 0,
@@ -196,8 +226,10 @@ def _identity(
                 feature_vjp_tape_batch_window=tape_window,
                 feature_vjp_tape_max_bytes=tape_bytes,
                 decoder_page_prefetch_depth=decoder_prefetch_depth,
-                decoder_active_row_residency=active_row_max_bytes > 0,
+                decoder_active_row_residency=active_rows_requested,
+                decoder_active_row_residency_requirement=active_row_requirement,
                 decoder_active_row_max_bytes=active_row_max_bytes,
+                decoder_active_row_safety_margin_bytes=(active_row_safety_margin_bytes),
                 phase0_decoder_row_ranges=phase0_decoder_row_ranges,
             ),
         )
@@ -227,12 +259,62 @@ def test_effective_execution_descriptor_is_stable_and_json_serializable() -> Non
     assert payload["batches"]["feature_batch_planner_status"] == "executed"
 
 
+def test_feature_row_resolution_revises_effective_execution_identity() -> None:
+    components = _identity(return_components=True)
+    prepared = PreparedBackend(
+        problem=SimpleNamespace(),
+        plan=components.plan,
+        logger=None,
+        offload_handles=[],
+        forward_overrides=None,
+        prefix_view_metadata=None,
+        output_position=None,
+        provider=components.provider,
+        numerics=components.numerics,
+        replay=components.replay,
+        batches=components.batches,
+        frontier=components.frontier,
+        diagnostics=SimpleNamespace(),
+        effective_execution=components.identity,
+        start_time=0.0,
+    )
+
+    revised = finalize_feature_row_influence_execution(
+        prepared,
+        resolved_mode="cpu_exact",
+        reason="cuda_windowed_capacity_refused",
+    )
+
+    assert revised.effective_execution.fingerprint != components.identity.fingerprint
+    assert revised.effective_execution.descriptor is not None
+    storage = revised.effective_execution.descriptor.storage
+    assert storage["feature_row_influence_mode_resolved"] == "cpu_exact"
+    assert storage["feature_row_influence_resolution_reason"] == "cuda_windowed_capacity_refused"
+
+
 def test_effective_identity_changes_with_planner_outcome_and_batch_size() -> None:
     base = _identity(feature_batch_size=8, planner_status="executed")
     resized = _identity(feature_batch_size=16, planner_status="executed")
     skipped = _identity(feature_batch_size=8, planner_status="skipped_no_headroom")
 
     assert len({base.fingerprint, resized.fingerprint, skipped.fingerprint}) == 3
+
+
+def test_effective_identity_records_backward_engine_and_forward_lane_topology() -> None:
+    duplicated = _identity(backward_engine_mode="duplicated_lanes")
+    batched_vjp = _identity(backward_engine_mode="single_forward_batched_vjp")
+    serial_vjp = _identity(backward_engine_mode="single_forward_serial_vjp")
+
+    assert len({duplicated.fingerprint, batched_vjp.fingerprint, serial_vjp.fingerprint}) == 3
+    assert batched_vjp.descriptor is not None
+    assert batched_vjp.descriptor.batches["backward_engine_mode"] == "single_forward_batched_vjp"
+    assert batched_vjp.descriptor.batches["forward_lane_count"] == 1
+    assert batched_vjp.descriptor.batches["backward_batch_capacity"] == 8
+    assert batched_vjp.descriptor.batches["forward_graph_mode"] == "single_lane"
+    assert batched_vjp.descriptor.batches["vjp_kernel_mode"] == "autograd_batched"
+    assert serial_vjp.descriptor is not None
+    assert serial_vjp.descriptor.batches["forward_graph_mode"] == "single_lane"
+    assert serial_vjp.descriptor.batches["vjp_kernel_mode"] == "autograd_serial"
 
 
 def test_effective_identity_changes_with_provider_dependent_fallbacks() -> None:
@@ -315,24 +397,10 @@ def test_effective_identity_distinguishes_phase0_decoder_range_execution() -> No
     assert full_pages.fingerprint != selective_ranges.fingerprint
     assert full_pages.descriptor is not None
     assert selective_ranges.descriptor is not None
-    assert (
-        full_pages.descriptor.frontier["phase0_decoder_row_ranges_effective"]
-        is False
-    )
-    assert (
-        selective_ranges.descriptor.frontier["phase0_decoder_row_ranges_requested"]
-        is True
-    )
-    assert (
-        selective_ranges.descriptor.frontier["phase0_decoder_row_ranges_effective"]
-        is True
-    )
-    assert (
-        selective_ranges.descriptor.frontier[
-            "phase0_decoder_row_ranges_fallback_reason"
-        ]
-        is None
-    )
+    assert full_pages.descriptor.frontier["phase0_decoder_row_ranges_effective"] is False
+    assert selective_ranges.descriptor.frontier["phase0_decoder_row_ranges_requested"] is True
+    assert selective_ranges.descriptor.frontier["phase0_decoder_row_ranges_effective"] is True
+    assert selective_ranges.descriptor.frontier["phase0_decoder_row_ranges_fallback_reason"] is None
 
 
 def test_missing_phase0_range_telemetry_records_seed_capture_refusal() -> None:
@@ -366,10 +434,7 @@ def test_missing_phase0_range_telemetry_records_seed_capture_refusal() -> None:
 
     assert refused.effective_execution.fingerprint != components.identity.fingerprint
     assert refused.frontier.phase0_decoder_row_ranges_effective is False
-    assert (
-        refused.frontier.phase0_decoder_row_ranges_fallback_reason
-        == "seed_capture_refused"
-    )
+    assert refused.frontier.phase0_decoder_row_ranges_fallback_reason == "seed_capture_refused"
 
 
 def test_over_cap_active_row_admission_changes_effective_identity_and_reason() -> None:
@@ -392,6 +457,82 @@ def test_over_cap_active_row_admission_changes_effective_identity_and_reason() -
     assert (
         refused.descriptor.frontier["decoder_active_row_fallback_reason"]
         == "estimated_bytes_exceed_max"
+    )
+
+
+def test_dynamic_active_row_identity_excludes_live_hbm_budget() -> None:
+    def identity(free_bytes: int):
+        return _identity(
+            active_row_residency=True,
+            active_row_requirement="required",
+            active_row_max_bytes=0,
+            active_row_safety_margin_bytes=16,
+            active_row_estimated_bytes=96,
+            active_row_memory=ActiveDecoderRowMemorySnapshot(
+                free_bytes=free_bytes,
+                total_bytes=256,
+                allocated_bytes=64,
+                reserved_bytes=64,
+                device="cuda:0",
+            ),
+        )
+
+    higher_headroom = identity(192)
+    lower_headroom = identity(160)
+
+    assert higher_headroom.fingerprint == lower_headroom.fingerprint
+    assert higher_headroom.descriptor is not None
+    assert higher_headroom.descriptor.frontier["decoder_active_row_max_bytes_effective"] == 0
+    assert "decoder_active_row_dynamic_budget_bytes" not in higher_headroom.descriptor.frontier
+    assert "decoder_active_row_effective_budget_bytes" not in higher_headroom.descriptor.frontier
+
+
+def test_required_dynamic_active_row_admission_fails_closed() -> None:
+    components = _identity(
+        active_row_residency=True,
+        active_row_requirement="required",
+        active_row_max_bytes=0,
+        active_row_safety_margin_bytes=16,
+        return_components=True,
+    )
+    prepared = PreparedBackend(
+        problem=SimpleNamespace(model=SimpleNamespace(device=torch.device("cuda:0"))),
+        plan=components.plan,
+        logger=None,
+        offload_handles=[],
+        forward_overrides=None,
+        prefix_view_metadata=None,
+        output_position=None,
+        provider=components.provider,
+        numerics=components.numerics,
+        replay=components.replay,
+        frontier=components.frontier,
+        batches=components.batches,
+        diagnostics=SimpleNamespace(),
+        effective_execution=components.identity,
+        start_time=0.0,
+    )
+
+    with pytest.raises(
+        ActiveDecoderRowResidencyRequirementError,
+        match="required decoder active-row residency failed",
+    ) as raised:
+        finalize_active_decoder_row_admission(
+            prepared,
+            estimated_bytes=96,
+            memory=ActiveDecoderRowMemorySnapshot(
+                free_bytes=100,
+                total_bytes=256,
+                allocated_bytes=64,
+                reserved_bytes=64,
+                device="cuda:0",
+            ),
+        )
+    assert raised.value.details["decoder_active_row_hbm_free_bytes"] == 100
+    assert raised.value.details["decoder_active_row_effective_budget_bytes"] == 84
+    assert (
+        raised.value.details["decoder_active_row_admission_reason"]
+        == "estimated_bytes_exceed_dynamic_budget"
     )
 
 

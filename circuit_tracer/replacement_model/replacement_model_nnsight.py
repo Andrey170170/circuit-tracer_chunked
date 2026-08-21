@@ -30,6 +30,7 @@ from circuit_tracer.replacement_model.attribution_setup import (
     Phase0ActivationCapture,
 )
 from circuit_tracer.observability.events import TraceObserver
+from circuit_tracer.tracing.plan import BackwardEngineMode
 from circuit_tracer.utils import get_default_device
 from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
 
@@ -583,6 +584,8 @@ class NNSightReplacementModel(LanguageModel):
         decoder_cache_fingerprint: object | None = None,
         decoder_active_row_residency: bool = False,
         decoder_active_row_max_bytes: int = 0,
+        backward_engine_mode: BackwardEngineMode = "duplicated_lanes",
+        backward_batch_capacity: int = 1,
         phase0_decoder_row_ranges: bool = False,
         trace_observer: TraceObserver | None = None,
     ):
@@ -632,6 +635,8 @@ class NNSightReplacementModel(LanguageModel):
                 decoder_cache_fingerprint=decoder_cache_fingerprint,
                 decoder_active_row_residency=decoder_active_row_residency,
                 decoder_active_row_max_bytes=decoder_active_row_max_bytes,
+                backward_engine_mode=backward_engine_mode,
+                backward_batch_capacity=backward_batch_capacity,
                 phase0_decoder_row_ranges=phase0_decoder_row_ranges,
             ),
             setup_started_at=setup_start,

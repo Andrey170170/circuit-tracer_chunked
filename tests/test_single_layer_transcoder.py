@@ -665,6 +665,19 @@ def test_exact_plt_phase0_seed_reuses_reconstruction_page_sequence(
         assert torch.equal(seed_layer.rows, torch.stack(expected_rows))
 
     page_sequence.clear()
+    dynamic_seeded = exact.compute_attribution_components(
+        mlp_inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=False,
+        decoder_active_row_residency=True,
+        decoder_active_row_max_bytes=0,
+    )
+    assert torch.equal(dynamic_seeded.reconstruction, baseline.reconstruction)
+    assert dynamic_seeded.decoder_row_seed is not None
+    assert dynamic_seeded.decoder_row_seed_refusal_reason is None
+    assert page_sequence == baseline_sequence
+
+    page_sequence.clear()
     over_cap = exact.compute_attribution_components(
         mlp_inputs,
         zero_positions=slice(0, 1),

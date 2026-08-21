@@ -32,6 +32,7 @@ from circuit_tracer.attribution.nnsight.phases.phase0_evidence import (
 from circuit_tracer.attribution.nnsight.phases.phase0_tokens import prepare_phase0_tokens
 from circuit_tracer.attribution.nnsight.prefix_view import PrefixViewMetadata
 from circuit_tracer.observability.events import MemoryBoundary, TraceObserver
+from circuit_tracer.tracing.plan import BackwardEngineMode
 
 __all__ = [
     "Phase0CleanupOwner",
@@ -93,6 +94,8 @@ class Phase0Config:
     decoder_active_row_residency: bool = False
     decoder_active_row_max_bytes: int = 0
     phase0_decoder_row_ranges: bool = False
+    backward_engine_mode: BackwardEngineMode = "duplicated_lanes"
+    backward_batch_capacity: int = 1
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,8 @@ def _attribution_policy(config: Phase0Config) -> Phase0AttributionPolicy:
         stage_encoder_vecs_on_cpu=config.stage_encoder_vecs_on_cpu,
         stage_error_vectors_on_cpu=config.stage_error_vectors_on_cpu,
         row_subchunk_size=config.row_subchunk_size,
+        backward_engine_mode=config.backward_engine_mode,
+        backward_batch_capacity=config.backward_batch_capacity,
         exact_encoder_residency=config.exact_encoder_residency_config.effective_mode,
         internal_precision_requested=config.internal_precision_requested,
         resolved_dtype_map=config.resolved_dtype_map,

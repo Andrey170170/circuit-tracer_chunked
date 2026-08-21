@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from circuit_tracer.attribution.nnsight.execution import (
     AttributionExecution,
@@ -10,6 +11,11 @@ from circuit_tracer.attribution.nnsight.execution import (
 )
 from circuit_tracer.attribution.nnsight.phases.phase4_batches import (
     _record_replay_cuda_window,
+)
+from circuit_tracer.attribution.nnsight.phases.phase3_rows import (
+    EffectiveRows,
+    Phase3ReplayRows,
+    capture_replay_rows,
 )
 from circuit_tracer.observability.run_scope import TraceRunScope
 from circuit_tracer.governor.ledger import PhaseId
@@ -26,22 +32,59 @@ def test_diagnostic_stop_policy_requires_positive_transition_batch_count() -> No
     assert DiagnosticStopPolicy(mode="transition_probe", phase4_batches=3).phase4_batches == 3
 
 
+@pytest.mark.parametrize("tiled", [False, True])
+def test_phase3_row_capture_retains_signed_error_rows_by_layer_and_token_rows(
+    tiled: bool,
+) -> None:
+    feature_rows = torch.tensor([[0.25, -0.5]], dtype=torch.float32)
+    error_rows = torch.tensor([[[1.0, -2.0], [3.0, -4.0]]], dtype=torch.float32)
+    token_rows = torch.tensor([[5.0, -6.0]], dtype=torch.float32)
+    nonfeature_rows = torch.cat((error_rows.reshape(1, -1), token_rows), dim=1)
+    rows_cpu = nonfeature_rows if tiled else torch.cat((feature_rows, nonfeature_rows), dim=1)
+    effective = EffectiveRows(
+        rows_cpu=rows_cpu,
+        row_input=rows_cpu,
+        feature_rows=torch.empty((1, 0)) if tiled else feature_rows,
+        denominator=(torch.tensor([6.0]), torch.tensor([3.625])),
+        row_abs_sums=torch.tensor([21.75], dtype=torch.float64),
+        row_transfer={},
+        donor_feature_abs_sums=None,
+        donor_error_abs_sums=None,
+        donor_token_abs_sums=None,
+        donor_error_rows_by_layer=None,
+        donor_token_rows=None,
+        denominator_elapsed_ms=0.0,
+    )
+    captures = Phase3ReplayRows()
+
+    capture_replay_rows(
+        captures=captures,
+        rows=effective,
+        total_active_features=2,
+        n_layers=2,
+        n_pos=2,
+        logit_offset=8,
+    )
+
+    assert torch.equal(captures.error_rows_by_layer[0], error_rows)
+    assert torch.equal(captures.token_rows[0], token_rows)
+    assert torch.equal(captures.error_abs_sums[0], torch.tensor([10.0], dtype=torch.float64))
+    assert torch.equal(captures.token_abs_sums[0], torch.tensor([11.0], dtype=torch.float64))
+
+
 def test_phase0_probe_stops_before_all_later_phases_and_releases_session() -> None:
     calls: list[str] = []
     execution = object.__new__(AttributionExecution)
     execution.prepared = SimpleNamespace(
         plan=SimpleNamespace(
-            execution=SimpleNamespace(
-                diagnostic_stop=DiagnosticStopPolicy(mode="phase0_probe")
-            )
+            execution=SimpleNamespace(diagnostic_stop=DiagnosticStopPolicy(mode="phase0_probe"))
         ),
         frontier=SimpleNamespace(execution_metadata={"mapped_rows": 11}),
     )
     execution.row_store_grant = None
     execution._grant = lambda phase: calls.append(f"grant:{phase.value}") or phase
-    execution._release = lambda grant: calls.append(
-        f"release:{getattr(grant, 'value', None)}"
-    )
+    execution._release = lambda grant: calls.append(f"release:{getattr(grant, 'value', None)}")
+
     def run_phase0() -> None:
         calls.append("run:phase0")
         execution.prepared.frontier.execution_metadata["mapped_rows"] = 12
@@ -52,9 +95,7 @@ def test_phase0_probe_stops_before_all_later_phases_and_releases_session() -> No
 
     result = execution.run()
 
-    assert result == ProbeCompletion(
-        mode="phase0_probe", diagnostic_metadata={"mapped_rows": 12}
-    )
+    assert result == ProbeCompletion(mode="phase0_probe", diagnostic_metadata={"mapped_rows": 12})
     with pytest.raises(TypeError):
         result.diagnostic_metadata["mapped_rows"] = 13  # type: ignore[index]
     assert calls == [
@@ -62,6 +103,68 @@ def test_phase0_probe_stops_before_all_later_phases_and_releases_session() -> No
         "run:phase0",
         "release:None",
         "release:session",
+    ]
+
+
+def test_phase3_probe_returns_requested_artifacts_without_entering_phase4() -> None:
+    calls: list[str] = []
+    execution = object.__new__(AttributionExecution)
+    execution.prepared = SimpleNamespace(
+        plan=SimpleNamespace(
+            execution=SimpleNamespace(diagnostic_stop=DiagnosticStopPolicy(mode="phase3_probe"))
+        ),
+        frontier=SimpleNamespace(execution_metadata={"frontier_hash": "abc"}),
+    )
+    execution.row_store_grant = None
+    execution._grant = lambda phase: phase
+    execution._release = lambda grant: None
+    execution._run_with_grant = lambda phase, callback: callback()
+    execution.run_phase0_preparation = lambda: calls.append("phase0")
+    execution.apply_active_universe_replan = lambda: calls.append("replan0")
+    execution.run_forward_pass = lambda: calls.append("phase1")
+    execution.setup_active_features_and_storage = lambda: calls.append("phase2")
+    execution.apply_phase3_entry_replan = lambda: calls.append("replan3")
+    execution.finalize_active_decoder_row_admission = lambda: calls.append("admit3")
+
+    def run_phase3() -> None:
+        calls.append("phase3")
+        execution.phase2 = SimpleNamespace(phase0_donor_bundle_payload={"donor": 1})
+        execution.phase3 = SimpleNamespace(
+            phase3_seed_bundle_payload={"seed": 2},
+            phase3_gradient_bundle_payload={"gradient": 3},
+            phase3_row_bundle_payload={"row": 4},
+            feature_semantic_descriptors_payload=None,
+        )
+
+    execution.attribute_seed_nodes = run_phase3
+    execution.apply_checkpoint_working_set_transition = lambda: calls.append(
+        "checkpoint_transition"
+    )
+    execution.apply_phase4_entry_replan = lambda: calls.append("replan4")
+    execution.expand_feature_frontier = lambda: calls.append("phase4")
+    execution.assemble_graph = lambda: calls.append("phase5")
+
+    result = execution.run()
+
+    assert result == ProbeCompletion(
+        mode="phase3_probe",
+        diagnostic_metadata={"frontier_hash": "abc"},
+        diagnostic_artifacts={
+            "phase0_donor_bundle": {"donor": 1},
+            "phase3_seed_bundle": {"seed": 2},
+            "phase3_gradient_bundle": {"gradient": 3},
+            "phase3_row_bundle": {"row": 4},
+        },
+    )
+    assert result.phase4_batches_completed == 0
+    assert calls == [
+        "phase0",
+        "replan0",
+        "phase1",
+        "phase2",
+        "replan3",
+        "admit3",
+        "phase3",
     ]
 
 
@@ -90,9 +193,7 @@ def test_transition_probe_stops_after_declared_physical_batch_count() -> None:
     def run_phase4() -> None:
         calls.append("phase4")
         execution.prepared.frontier.execution_metadata["lifecycle_released"] = False
-        execution.phase4 = SimpleNamespace(
-            phase4_execution_batch_count=policy.phase4_batches
-        )
+        execution.phase4 = SimpleNamespace(phase4_execution_batch_count=policy.phase4_batches)
 
     execution.phase2 = SimpleNamespace(phase0_donor_bundle_payload={"donor": 1})
     execution.phase3 = SimpleNamespace(
@@ -173,17 +274,13 @@ def test_resource_observer_failure_does_not_leak_phase_grant(
         diagnostics=SimpleNamespace(observer=Observer()),
         logger=SimpleNamespace(warning=lambda *args, **kwargs: calls.append("warning")),
         plan=SimpleNamespace(
-            execution=SimpleNamespace(
-                observability=SimpleNamespace(telemetry_context={})
-            )
+            execution=SimpleNamespace(observability=SimpleNamespace(telemetry_context={}))
         ),
     )
     execution._grant = lambda phase: calls.append(f"grant:{phase.value}") or phase
     execution._release = lambda grant: calls.append(f"release:{grant.value}")
 
-    result = execution._run_with_grant(
-        PhaseId.PHASE4, lambda: calls.append("callback") or "result"
-    )
+    result = execution._run_with_grant(PhaseId.PHASE4, lambda: calls.append("callback") or "result")
 
     assert result == "result"
     assert calls[0] == "grant:phase4"
@@ -210,9 +307,7 @@ def test_callback_failure_records_failed_interval_and_releases_grant() -> None:
         diagnostics=SimpleNamespace(observer=Observer()),
         logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
         plan=SimpleNamespace(
-            execution=SimpleNamespace(
-                observability=SimpleNamespace(telemetry_context={})
-            )
+            execution=SimpleNamespace(observability=SimpleNamespace(telemetry_context={}))
         ),
     )
     execution._grant = lambda phase: phase
@@ -225,9 +320,7 @@ def test_callback_failure_records_failed_interval_and_releases_grant() -> None:
         )
 
     failed = [
-        event
-        for event in events
-        if getattr(event, "name", "") == "phase4.resource_interval.failed"
+        event for event in events if getattr(event, "name", "") == "phase4.resource_interval.failed"
     ]
     assert len(failed) == 1
     assert failed[0].attrs["error_type"] == "RuntimeError"

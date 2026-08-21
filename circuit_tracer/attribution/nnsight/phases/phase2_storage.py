@@ -78,27 +78,24 @@ class RowStoreLayout:
 
 
 @dataclass(frozen=True)
-class RowStoreRuntime:
-    cache_control: Any
-    temp_root_policy: Literal["default", "env_node_local"]
-    temp_root: str | os.PathLike[str] | None
-    preallocate: bool
-    prepared_chunk_cache_bytes: int
-    replay_tile_cache_bytes: int
-    feature_row_influence_mode: Literal[
+class FeatureRowInfluencePolicy:
+    """Selection, admission budget, and device for feature-row influence."""
+
+    mode: Literal[
         "cpu_exact",
         "cpu_prepared",
         "cuda_full",
         "cuda_windowed",
         "auto",
     ] = "cpu_exact"
-    gpu_resident_max_bytes: int = 0
-    gpu_window_max_bytes: int = 0
-    gpu_resident_safety_margin_bytes: int = 0
-    gpu_resident_device: torch.device = torch.device("cpu")
+    requirement: Literal["preferred", "required"] = "preferred"
+    resident_max_bytes: int = 0
+    window_max_bytes: int = 0
+    safety_margin_bytes: int = 0
+    device: torch.device = torch.device("cpu")
 
     def __post_init__(self) -> None:
-        if self.feature_row_influence_mode not in {
+        if self.mode not in {
             "cpu_exact",
             "cpu_prepared",
             "cuda_full",
@@ -106,13 +103,33 @@ class RowStoreRuntime:
             "auto",
         }:
             raise ValueError("invalid feature-row influence mode")
+        if self.requirement not in {"preferred", "required"}:
+            raise ValueError("invalid feature-row influence requirement")
+        if self.mode == "auto" and self.requirement == "required":
+            raise ValueError("auto feature-row influence cannot be required")
         if (
-            self.prepared_chunk_cache_bytes < 0
-            or self.replay_tile_cache_bytes < 0
-            or self.gpu_resident_max_bytes < 0
-            or self.gpu_window_max_bytes < 0
-            or self.gpu_resident_safety_margin_bytes < 0
+            min(
+                self.resident_max_bytes,
+                self.window_max_bytes,
+                self.safety_margin_bytes,
+            )
+            < 0
         ):
+            raise ValueError("feature-row influence byte budgets must be non-negative")
+
+
+@dataclass(frozen=True)
+class RowStoreRuntime:
+    cache_control: Any
+    temp_root_policy: Literal["default", "env_node_local"]
+    temp_root: str | os.PathLike[str] | None
+    preallocate: bool
+    prepared_chunk_cache_bytes: int
+    replay_tile_cache_bytes: int
+    influence: FeatureRowInfluencePolicy
+
+    def __post_init__(self) -> None:
+        if self.prepared_chunk_cache_bytes < 0 or self.replay_tile_cache_bytes < 0:
             raise ValueError("row-store cache sizes must be non-negative")
 
 
@@ -372,18 +389,25 @@ def _open_file_stores(
             **common,
         ),
     )
-    if runtime.feature_row_influence_mode != "cpu_exact":
+    influence = runtime.influence
+    if influence.mode != "cpu_exact":
         if layout.backend != "full_file":
             raise ValueError("accelerated feature-row influence requires full_file row storage")
         assert isinstance(feature_store, _FileBackedFeatureRowStore)
-        feature_store = _GpuResidentFeatureRowStore(
-            backing_store=feature_store,
-            mode=runtime.feature_row_influence_mode,
-            max_bytes=runtime.gpu_resident_max_bytes,
-            window_max_bytes=runtime.gpu_window_max_bytes,
-            safety_margin_bytes=runtime.gpu_resident_safety_margin_bytes,
-            device=runtime.gpu_resident_device,
-        )
+        backing_store = feature_store
+        try:
+            feature_store = _GpuResidentFeatureRowStore(
+                backing_store=backing_store,
+                mode=influence.mode,
+                requirement=influence.requirement,
+                max_bytes=influence.resident_max_bytes,
+                window_max_bytes=influence.window_max_bytes,
+                safety_margin_bytes=influence.safety_margin_bytes,
+                device=influence.device,
+            )
+        except Exception:
+            backing_store.cleanup()
+            raise
     owner.feature_row_store = feature_store
     nonfeature_store = cast(
         FeatureRowStore,

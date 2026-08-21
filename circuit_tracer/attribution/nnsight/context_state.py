@@ -7,6 +7,11 @@ from typing import Literal, cast
 
 import torch
 
+from circuit_tracer.tracing.plan import (
+    BackwardEngineMode,
+    BackwardExecutionTopology,
+)
+
 from circuit_tracer.transcoder.attribution_result import DecoderRowSeed
 
 from circuit_tracer.transcoder.provider import get_transcoder_capabilities, provider_fingerprint
@@ -54,6 +59,8 @@ class ContextExecutionPolicy:
     error_vector_prefetch_lookahead: int
     chunked_feature_replay_window: int
     row_subchunk_size: int | None
+    backward_engine_mode: BackwardEngineMode
+    backward_batch_capacity: int
 
     @classmethod
     def resolve(
@@ -68,6 +75,8 @@ class ContextExecutionPolicy:
         error_vector_prefetch_lookahead: int,
         chunked_feature_replay_window: int,
         row_subchunk_size: int | None,
+        backward_engine_mode: str = "duplicated_lanes",
+        backward_batch_capacity: int = 1,
     ) -> "ContextExecutionPolicy":
         normalized = str(exact_encoder_residency).strip().lower()
         allowed = {"lazy", "active_cpu"}
@@ -92,6 +101,13 @@ class ContextExecutionPolicy:
             stage_encoder_vectors_on_cpu = True
         if stage_error_vectors_on_cpu is None:
             stage_error_vectors_on_cpu = exact_chunked_mode and error_vectors.numel() > 0
+        topology = BackwardExecutionTopology.resolve(
+            mode=cast(
+                BackwardEngineMode,
+                str(backward_engine_mode).strip().lower(),
+            ),
+            batch_capacity=int(backward_batch_capacity),
+        )
         return cls(
             exact_chunked_mode=exact_chunked_mode,
             encoder_residency_requested=requested,
@@ -102,6 +118,8 @@ class ContextExecutionPolicy:
             error_vector_prefetch_lookahead=max(1, int(error_vector_prefetch_lookahead)),
             chunked_feature_replay_window=max(1, int(chunked_feature_replay_window)),
             row_subchunk_size=None if row_subchunk_size is None else max(1, int(row_subchunk_size)),
+            backward_engine_mode=topology.mode,
+            backward_batch_capacity=topology.batch_capacity,
         )
 
 

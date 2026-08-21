@@ -58,6 +58,13 @@ def _run_phase1_forward_pass(
 ) -> None:
     """Run Phase 1 while preserving its logging and telemetry contract."""
     logger.info("Phase 1: Running forward pass")
+    backward_detail = ""
+    if "backward_engine_mode" in trace_batch_metadata:
+        backward_detail = (
+            f"backward_engine_mode={trace_batch_metadata['backward_engine_mode']} | "
+            f"backward_batch_capacity={trace_batch_metadata.get('backward_batch_capacity')} | "
+            f"forward_lane_count={trace_batch_metadata.get('forward_lane_count')} | "
+        )
     logger.info(
         "Phase 1 trace-batch policy | "
         f"requested_policy={trace_batch_config.requested_policy} | "
@@ -69,6 +76,7 @@ def _run_phase1_forward_pass(
         f"feature_batch_size={effective_feature_batch_size} | "
         f"logit_batch_size={effective_logit_batch_size} | "
         f"cap_reason={trace_batch_metadata.get('trace_batch_cap_reason')} | "
+        f"{backward_detail}"
         f"trace_batch_size={trace_batch_size}"
     )
     phase_start = time.perf_counter()

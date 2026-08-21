@@ -9,6 +9,14 @@ from typing import Any, Callable
 
 import torch
 
+from circuit_tracer.attribution.nnsight.active_decoder_rows import (
+    ActiveDecoderRowAdmission,
+    ActiveDecoderRowMemorySnapshot,
+    ActiveDecoderRowResidencyRequirementError,
+    resolve_active_decoder_row_admission,
+    sample_active_decoder_row_memory,
+)
+
 from circuit_tracer.attribution.nnsight.numerics import (
     _exact_trace_internal_dtype_name,
     _resolve_exact_trace_internal_dtype,
@@ -65,7 +73,12 @@ from circuit_tracer.execution_identity import (
     EffectiveExecutionDescriptor,
     EffectiveExecutionIdentity,
 )
-from circuit_tracer.tracing.plan import ResolvedTracePlan
+from circuit_tracer.tracing.plan import (
+    BackwardEngineMode,
+    ForwardGraphMode,
+    ResolvedTracePlan,
+    VjpKernelMode,
+)
 from circuit_tracer.tracing.problem import AttributionProblem
 from circuit_tracer.transcoder.provider import (
     get_transcoder_capabilities,
@@ -136,6 +149,11 @@ class BatchMechanisms:
     planner_skip_reason: str | None
     session_controls: Any
     trace_batch_size: int
+    backward_engine_mode: BackwardEngineMode = "duplicated_lanes"
+    backward_batch_capacity: int = 1
+    forward_graph_mode: ForwardGraphMode = "logical_capacity"
+    vjp_kernel_mode: VjpKernelMode = "nnsight_injected"
+    forward_lane_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -161,8 +179,11 @@ class FrontierMechanisms:
     decoder_page_prefetch_depth_effective: int = 0
     decoder_page_prefetch_fallback_reason: str | None = "disabled"
     decoder_active_row_residency_requested: bool = False
+    decoder_active_row_residency_requirement: str = "preferred"
     decoder_active_row_residency_effective: bool = False
     decoder_active_row_max_bytes_effective: int = 0
+    decoder_active_row_safety_margin_bytes: int = 0
+    decoder_active_row_admission: ActiveDecoderRowAdmission | None = None
     decoder_active_row_estimated_bytes: int | None = None
     decoder_active_row_admission_finalized: bool = False
     decoder_active_row_fallback_reason: str | None = "disabled"
@@ -449,7 +470,9 @@ def _resolve_frontier(
         ),
     }
     active_rows_requested = bool(frontier.decoder_active_row_residency)
+    active_rows_requirement = str(frontier.decoder_active_row_residency_requirement)
     active_rows_max_bytes_requested = int(frontier.decoder_active_row_max_bytes)
+    active_rows_safety_margin_bytes = int(frontier.decoder_active_row_safety_margin_bytes)
     active_rows_fallback_reason = None
     if not active_rows_requested:
         active_rows_fallback_reason = "disabled"
@@ -457,17 +480,23 @@ def _resolve_frontier(
         active_rows_fallback_reason = "requires_exact_chunked_provider"
     elif not bool(getattr(provider.capabilities, "supports_active_decoder_row_residency", False)):
         active_rows_fallback_reason = "provider_capability_unavailable"
-    elif active_rows_max_bytes_requested == 0:
-        active_rows_fallback_reason = "max_bytes_disabled"
     active_rows_effective = active_rows_fallback_reason is None
-    active_rows_max_bytes_effective = (
-        active_rows_max_bytes_requested if active_rows_effective else 0
-    )
+    active_rows_max_bytes_effective = 0
+    if active_rows_requirement == "required" and not active_rows_effective:
+        raise RuntimeError(
+            "required decoder active-row residency is unavailable before Phase 0: "
+            f"reason={active_rows_fallback_reason}"
+        )
     active_rows_metadata = {
         "decoder_active_row_residency_requested": active_rows_requested,
+        "decoder_active_row_residency_requirement": active_rows_requirement,
         "decoder_active_row_residency_effective": active_rows_effective,
         "decoder_active_row_max_bytes_requested": active_rows_max_bytes_requested,
         "decoder_active_row_max_bytes_effective": active_rows_max_bytes_effective,
+        "decoder_active_row_safety_margin_bytes": active_rows_safety_margin_bytes,
+        "decoder_active_row_admission_reason": (
+            "estimate_pending" if active_rows_effective else active_rows_fallback_reason
+        ),
         "decoder_active_row_fallback_reason": active_rows_fallback_reason,
     }
     phase0_ranges_requested = bool(frontier.phase0_decoder_row_ranges)
@@ -520,8 +549,11 @@ def _resolve_frontier(
         decoder_page_prefetch_depth_effective=prefetch_depth_effective,
         decoder_page_prefetch_fallback_reason=prefetch_fallback_reason,
         decoder_active_row_residency_requested=active_rows_requested,
+        decoder_active_row_residency_requirement=active_rows_requirement,
         decoder_active_row_residency_effective=active_rows_effective,
         decoder_active_row_max_bytes_effective=active_rows_max_bytes_effective,
+        decoder_active_row_safety_margin_bytes=active_rows_safety_margin_bytes,
+        decoder_active_row_admission=None,
         decoder_active_row_estimated_bytes=None,
         decoder_active_row_admission_finalized=False,
         decoder_active_row_fallback_reason=active_rows_fallback_reason,
@@ -544,6 +576,16 @@ def _resolve_batches(
     semantics = plan.semantics
     session = plan.execution.session
     frontier_plan = plan.execution.frontier
+    backward_plan = plan.execution.backward
+    backward_mode = backward_plan.mode
+    if (
+        not backward_plan.supports_phase3_gradient_replay
+        and plan.execution.replay.phase3_gradient_mode != "disabled"
+    ):
+        raise ValueError(
+            f"{backward_mode} requires native Phase-3 gradients; "
+            "Phase-3 gradient replay is unsupported"
+        )
     phase1_config = _resolve_phase1_trace_batch_config(
         phase1_trace_batch_policy=session.phase1_trace_batch_policy,
         phase1_trace_batch_size_max=session.phase1_trace_batch_size_max,
@@ -608,6 +650,13 @@ def _resolve_batches(
             planner_compute_dtype=numerics.planner_compute_dtype,
             trace_observer=diagnostics.observer,
             prefix_view_metadata=prefix_view_metadata,
+            backward_engine_mode=backward_mode,
+            backward_batch_capacity=backward_plan.planner_batch_capacity(
+                source_rows=source_size,
+                feature_rows=feature_size,
+                feature_row_ceiling=max_feature_size,
+                logit_rows=logit_size,
+            ),
         )
         planner_status = "executed"
     legacy_phase4_rows = feature_size
@@ -621,9 +670,15 @@ def _resolve_batches(
         legacy_phase3_batch_rows=logit_size,
         legacy_phase4_batch_rows=legacy_phase4_rows,
     )
+    backward_topology = backward_plan.topology(batch_capacity=int(controls.session_capacity))
     metadata.update(
         trace_batch_size_legacy=int(sizing.trace_batch_size_legacy),
         trace_batch_size_effective=int(controls.session_capacity),
+        backward_engine_mode=backward_topology.mode,
+        backward_batch_capacity=backward_topology.batch_capacity,
+        forward_graph_mode=backward_topology.forward_graph_mode,
+        vjp_kernel_mode=backward_topology.vjp_kernel_mode,
+        forward_lane_count=backward_topology.forward_lane_count,
     )
     return BatchMechanisms(
         phase1_config=phase1_config,
@@ -637,6 +692,11 @@ def _resolve_batches(
         planner_skip_reason=skip_reason,
         session_controls=controls,
         trace_batch_size=controls.session_capacity,
+        backward_engine_mode=backward_topology.mode,
+        backward_batch_capacity=backward_topology.batch_capacity,
+        forward_graph_mode=backward_topology.forward_graph_mode,
+        vjp_kernel_mode=backward_topology.vjp_kernel_mode,
+        forward_lane_count=backward_topology.forward_lane_count,
     )
 
 
@@ -810,6 +870,11 @@ def _effective_execution_identity(
                 batches.session_controls.phase4_execution_batch_max_rows
             ),
             "trace_batch_size": batches.trace_batch_size,
+            "backward_engine_mode": batches.backward_engine_mode,
+            "backward_batch_capacity": batches.backward_batch_capacity,
+            "forward_graph_mode": batches.forward_graph_mode,
+            "vjp_kernel_mode": batches.vjp_kernel_mode,
+            "forward_lane_count": batches.forward_lane_count,
         },
         frontier={
             "scheduler_mode": frontier.scheduler.effective_mode,
@@ -870,6 +935,9 @@ def _effective_execution_identity(
             "decoder_active_row_residency_requested": (
                 plan.execution.frontier.decoder_active_row_residency
             ),
+            "decoder_active_row_residency_requirement": (
+                frontier.decoder_active_row_residency_requirement
+            ),
             "decoder_active_row_residency_effective": (
                 frontier.decoder_active_row_residency_effective
             ),
@@ -877,9 +945,19 @@ def _effective_execution_identity(
                 plan.execution.frontier.decoder_active_row_max_bytes
             ),
             "decoder_active_row_max_bytes_effective": (
-                frontier.decoder_active_row_max_bytes_effective
+                plan.execution.frontier.decoder_active_row_max_bytes
+                if frontier.decoder_active_row_residency_effective
+                else 0
+            ),
+            "decoder_active_row_safety_margin_bytes": (
+                frontier.decoder_active_row_safety_margin_bytes
             ),
             "decoder_active_row_estimated_bytes": (frontier.decoder_active_row_estimated_bytes),
+            "decoder_active_row_admission_reason": (
+                None
+                if frontier.decoder_active_row_admission is None
+                else frontier.decoder_active_row_admission.reason
+            ),
             "decoder_active_row_fallback_reason": frontier.decoder_active_row_fallback_reason,
             "phase0_decoder_row_ranges_requested": (frontier.phase0_decoder_row_ranges_requested),
             "phase0_decoder_row_ranges_effective": (frontier.phase0_decoder_row_ranges_effective),
@@ -903,6 +981,12 @@ def _effective_execution_identity(
             "preallocate": plan.execution.storage.preallocate,
             "replay_tile_cache_bytes": plan.execution.storage.replay_tile_cache_bytes,
             "feature_row_influence_mode": (plan.execution.storage.feature_row_influence_mode),
+            "feature_row_influence_mode_requested": (
+                plan.execution.storage.feature_row_influence_mode
+            ),
+            "feature_row_influence_requirement": (
+                plan.execution.storage.feature_row_influence_requirement
+            ),
             "gpu_resident_max_bytes": plan.execution.storage.gpu_resident_max_bytes,
             "gpu_window_max_bytes": plan.execution.storage.gpu_window_max_bytes,
             "gpu_resident_safety_margin_bytes": (
@@ -917,6 +1001,31 @@ def _effective_execution_identity(
         },
     )
     return EffectiveExecutionIdentity(descriptor=descriptor, fingerprint=fingerprint(descriptor))
+
+
+def finalize_feature_row_influence_execution(
+    prepared: PreparedBackend,
+    *,
+    resolved_mode: str,
+    reason: str,
+) -> PreparedBackend:
+    """Fold the Phase-2 row-store resolution into effective execution identity."""
+
+    identity = prepared.effective_execution
+    descriptor = identity.descriptor
+    if descriptor is None:
+        raise RuntimeError("NNSight effective execution descriptor is missing")
+    storage = {
+        **descriptor.storage,
+        "feature_row_influence_mode_resolved": resolved_mode,
+        "feature_row_influence_resolution_reason": reason,
+    }
+    revised_descriptor = replace(descriptor, storage=storage)
+    revised_identity = EffectiveExecutionIdentity(
+        descriptor=revised_descriptor,
+        fingerprint=fingerprint(revised_descriptor),
+    )
+    return replace(prepared, effective_execution=revised_identity)
 
 
 def prepare_backend(
@@ -1011,13 +1120,54 @@ def reprepare_after_active_universe(
             ),
         )
     if prepared.frontier.decoder_active_row_admission_finalized:
-        estimated_bytes = prepared.frontier.decoder_active_row_estimated_bytes
-        if estimated_bytes is None:
+        prior_frontier = prepared.frontier
+        if prior_frontier.decoder_active_row_estimated_bytes is None:
             raise RuntimeError("finalized active-row admission is missing its exact byte estimate")
-        frontier = _finalize_active_decoder_row_frontier(
+        prior_policy = prepared.plan.execution.frontier
+        revised_policy = plan.execution.frontier
+        policy_fields = (
+            "decoder_active_row_residency",
+            "decoder_active_row_residency_requirement",
+            "decoder_active_row_max_bytes",
+            "decoder_active_row_safety_margin_bytes",
+        )
+        changed = [
+            name
+            for name in policy_fields
+            if getattr(prior_policy, name) != getattr(revised_policy, name)
+        ]
+        if changed:
+            raise RuntimeError(
+                "active-universe reprepare changed finalized active-row admission policy: "
+                + ", ".join(changed)
+            )
+        execution_metadata = dict(frontier.execution_metadata)
+        execution_metadata.update(
+            {
+                key: value
+                for key, value in prior_frontier.execution_metadata.items()
+                if key.startswith("decoder_active_row_")
+            }
+        )
+        frontier = replace(
             frontier,
-            max_bytes=int(plan.execution.frontier.decoder_active_row_max_bytes),
-            estimated_bytes=estimated_bytes,
+            execution_metadata=execution_metadata,
+            decoder_active_row_residency_requirement=(
+                prior_frontier.decoder_active_row_residency_requirement
+            ),
+            decoder_active_row_residency_effective=(
+                prior_frontier.decoder_active_row_residency_effective
+            ),
+            decoder_active_row_max_bytes_effective=(
+                prior_frontier.decoder_active_row_max_bytes_effective
+            ),
+            decoder_active_row_safety_margin_bytes=(
+                prior_frontier.decoder_active_row_safety_margin_bytes
+            ),
+            decoder_active_row_estimated_bytes=(prior_frontier.decoder_active_row_estimated_bytes),
+            decoder_active_row_admission_finalized=True,
+            decoder_active_row_admission=prior_frontier.decoder_active_row_admission,
+            decoder_active_row_fallback_reason=(prior_frontier.decoder_active_row_fallback_reason),
         )
     batches = _resolve_batches(
         prepared.problem,
@@ -1059,16 +1209,47 @@ def _finalize_active_decoder_row_frontier(
     *,
     max_bytes: int,
     estimated_bytes: int,
+    safety_margin_bytes: int = 0,
+    memory: ActiveDecoderRowMemorySnapshot | None = None,
 ) -> FrontierMechanisms:
     if not frontier.decoder_active_row_residency_effective:
         return frontier
-    admitted = estimated_bytes <= max_bytes
-    fallback_reason = None if admitted else "estimated_bytes_exceed_max"
+    if memory is None:
+        memory = ActiveDecoderRowMemorySnapshot(
+            free_bytes=None,
+            total_bytes=None,
+            allocated_bytes=None,
+            reserved_bytes=None,
+            device="unavailable",
+        )
+    decision = resolve_active_decoder_row_admission(
+        requested=frontier.decoder_active_row_residency_requested,
+        estimated_bytes=estimated_bytes,
+        hard_ceiling_bytes=max_bytes,
+        safety_margin_bytes=safety_margin_bytes,
+        memory=memory,
+    )
+    admitted = decision.admitted
+    fallback_reason = (
+        None
+        if admitted
+        else (
+            "estimated_bytes_exceed_max"
+            if decision.reason == "estimated_bytes_exceed_user_ceiling"
+            else decision.reason
+        )
+    )
     metadata = dict(frontier.execution_metadata)
+    metadata.update(decision.as_metadata())
     metadata.update(
         {
+            "decoder_active_row_residency_requirement": (
+                frontier.decoder_active_row_residency_requirement
+            ),
             "decoder_active_row_residency_effective": admitted,
-            "decoder_active_row_max_bytes_effective": max_bytes if admitted else 0,
+            "decoder_active_row_max_bytes_effective": (
+                decision.effective_budget_bytes if admitted else 0
+            ),
             "decoder_active_row_estimated_bytes": estimated_bytes,
             "decoder_active_row_fallback_reason": fallback_reason,
         }
@@ -1077,9 +1258,10 @@ def _finalize_active_decoder_row_frontier(
         frontier,
         execution_metadata=metadata,
         decoder_active_row_residency_effective=admitted,
-        decoder_active_row_max_bytes_effective=max_bytes if admitted else 0,
+        decoder_active_row_max_bytes_effective=(decision.effective_budget_bytes if admitted else 0),
         decoder_active_row_estimated_bytes=estimated_bytes,
         decoder_active_row_admission_finalized=True,
+        decoder_active_row_admission=decision,
         decoder_active_row_fallback_reason=fallback_reason,
     )
 
@@ -1088,6 +1270,7 @@ def finalize_active_decoder_row_admission(
     prepared: PreparedBackend,
     *,
     estimated_bytes: int,
+    memory: ActiveDecoderRowMemorySnapshot | None = None,
 ) -> PreparedBackend:
     """Finalize exact active-row byte admission before Phase 3 executes."""
 
@@ -1095,11 +1278,25 @@ def finalize_active_decoder_row_admission(
     if not frontier.decoder_active_row_residency_effective:
         return prepared
     max_bytes = int(prepared.plan.execution.frontier.decoder_active_row_max_bytes)
+    safety_margin_bytes = int(
+        prepared.plan.execution.frontier.decoder_active_row_safety_margin_bytes
+    )
+    if memory is None:
+        memory = sample_active_decoder_row_memory(prepared.problem.model.device)
     frontier = _finalize_active_decoder_row_frontier(
         frontier,
         max_bytes=max_bytes,
         estimated_bytes=estimated_bytes,
+        safety_margin_bytes=safety_margin_bytes,
+        memory=memory,
     )
+    decision = frontier.decoder_active_row_admission
+    if (
+        frontier.decoder_active_row_residency_requirement == "required"
+        and decision is not None
+        and not decision.admitted
+    ):
+        raise ActiveDecoderRowResidencyRequirementError(decision)
     effective = _effective_execution_identity(
         prepared.provider,
         prepared.numerics,

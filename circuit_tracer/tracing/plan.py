@@ -23,6 +23,109 @@ from circuit_tracer.governor.response_models import ResponseBundle
 from .problem import TraceSemantics, _nonnegative, _positive
 
 
+BackwardEngineMode = Literal[
+    "duplicated_lanes",
+    "single_forward_batched_vjp",
+    "single_forward_serial_vjp",
+]
+ForwardGraphMode = Literal["logical_capacity", "single_lane"]
+VjpKernelMode = Literal[
+    "nnsight_injected",
+    "autograd_batched",
+    "autograd_serial",
+]
+
+
+_BACKWARD_MODE_COMPONENTS: dict[
+    BackwardEngineMode,
+    tuple[ForwardGraphMode, VjpKernelMode],
+] = {
+    "duplicated_lanes": ("logical_capacity", "nnsight_injected"),
+    "single_forward_batched_vjp": ("single_lane", "autograd_batched"),
+    "single_forward_serial_vjp": ("single_lane", "autograd_serial"),
+}
+
+
+@dataclass(frozen=True)
+class BackwardExecutionTopology:
+    """Resolved, valid combination of logical capacity, graph width, and VJP kernel."""
+
+    mode: BackwardEngineMode
+    logical_batch_capacity: int
+    forward_graph_mode: ForwardGraphMode
+    vjp_kernel_mode: VjpKernelMode
+    forward_lane_count: int
+    requires_explicit_runtime_identity: bool
+
+    @property
+    def batch_capacity(self) -> int:
+        """Compatibility name for callers that consume logical batch capacity."""
+
+        return self.logical_batch_capacity
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        mode: BackwardEngineMode,
+        batch_capacity: int,
+    ) -> "BackwardExecutionTopology":
+        if batch_capacity <= 0:
+            raise ValueError("backward batch capacity must be positive")
+        components = _BACKWARD_MODE_COMPONENTS.get(mode)
+        if components is None:
+            raise ValueError(f"unsupported backward engine mode: {mode!r}")
+        forward_graph_mode, vjp_kernel_mode = components
+        return cls.resolve_components(
+            mode=mode,
+            forward_graph_mode=forward_graph_mode,
+            vjp_kernel_mode=vjp_kernel_mode,
+            batch_capacity=batch_capacity,
+        )
+
+    @classmethod
+    def resolve_components(
+        cls,
+        *,
+        forward_graph_mode: ForwardGraphMode,
+        vjp_kernel_mode: VjpKernelMode,
+        batch_capacity: int,
+        mode: BackwardEngineMode | None = None,
+    ) -> "BackwardExecutionTopology":
+        """Resolve the constrained component matrix, rejecting partial hybrids."""
+
+        if batch_capacity <= 0:
+            raise ValueError("backward batch capacity must be positive")
+        matching_modes = tuple(
+            candidate
+            for candidate, components in _BACKWARD_MODE_COMPONENTS.items()
+            if components == (forward_graph_mode, vjp_kernel_mode)
+        )
+        if not matching_modes:
+            raise ValueError(
+                "unsupported backward execution combination "
+                f"(forward_graph_mode={forward_graph_mode!r}, "
+                f"vjp_kernel_mode={vjp_kernel_mode!r})"
+            )
+        resolved_mode = matching_modes[0]
+        if mode is not None and mode != resolved_mode:
+            raise ValueError(
+                "backward engine preset conflicts with explicit execution components "
+                f"(mode={mode!r}, forward_graph_mode={forward_graph_mode!r}, "
+                f"vjp_kernel_mode={vjp_kernel_mode!r})"
+            )
+        return cls(
+            mode=resolved_mode,
+            logical_batch_capacity=int(batch_capacity),
+            forward_graph_mode=forward_graph_mode,
+            vjp_kernel_mode=vjp_kernel_mode,
+            forward_lane_count=(
+                int(batch_capacity) if forward_graph_mode == "logical_capacity" else 1
+            ),
+            requires_explicit_runtime_identity=(resolved_mode != "duplicated_lanes"),
+        )
+
+
 @dataclass(frozen=True)
 class DecoderCachePolicy:
     """Physical cross-trace decoder reuse owned by a tracing session."""
@@ -46,6 +149,77 @@ class DecoderPlan:
 
     def __post_init__(self) -> None:
         _positive("decoder fetch_chunk_size", self.fetch_chunk_size)
+
+
+@dataclass(frozen=True, init=False)
+class BackwardPlan:
+    """Backward-graph topology and vector-Jacobian execution strategy."""
+
+    mode: BackwardEngineMode
+
+    def __init__(
+        self,
+        mode: BackwardEngineMode | None = None,
+        *,
+        forward_graph_mode: ForwardGraphMode | None = None,
+        vjp_kernel_mode: VjpKernelMode | None = None,
+    ) -> None:
+        explicit_components = forward_graph_mode is not None or vjp_kernel_mode is not None
+        if mode is not None and explicit_components:
+            raise ValueError(
+                "select backward execution by preset mode or explicit components, not both"
+            )
+        if explicit_components and (forward_graph_mode is None or vjp_kernel_mode is None):
+            raise ValueError(
+                "explicit backward execution requires both forward_graph_mode and vjp_kernel_mode"
+            )
+        if explicit_components:
+            topology = BackwardExecutionTopology.resolve_components(
+                forward_graph_mode=forward_graph_mode,
+                vjp_kernel_mode=vjp_kernel_mode,
+                batch_capacity=1,
+            )
+        else:
+            topology = BackwardExecutionTopology.resolve(
+                mode="duplicated_lanes" if mode is None else mode,
+                batch_capacity=1,
+            )
+        object.__setattr__(self, "mode", topology.mode)
+
+    @property
+    def forward_graph_mode(self) -> ForwardGraphMode:
+        return _BACKWARD_MODE_COMPONENTS[self.mode][0]
+
+    @property
+    def vjp_kernel_mode(self) -> VjpKernelMode:
+        return _BACKWARD_MODE_COMPONENTS[self.mode][1]
+
+    @property
+    def supports_phase3_gradient_replay(self) -> bool:
+        return self.vjp_kernel_mode == "nnsight_injected"
+
+    def topology(self, *, batch_capacity: int) -> BackwardExecutionTopology:
+        return BackwardExecutionTopology.resolve(
+            mode=self.mode,
+            batch_capacity=batch_capacity,
+        )
+
+    def planner_batch_capacity(
+        self,
+        *,
+        source_rows: int,
+        feature_rows: int,
+        feature_row_ceiling: int,
+        logit_rows: int,
+    ) -> int:
+        """Logical preflight capacity without widening the physical graph by accident."""
+
+        planned_feature_rows = (
+            min(feature_rows, feature_row_ceiling)
+            if self.forward_graph_mode == "logical_capacity"
+            else feature_row_ceiling
+        )
+        return max(source_rows, planned_feature_rows, logit_rows)
 
 
 @dataclass(frozen=True)
@@ -110,6 +284,7 @@ class RowStoragePlan:
         "cuda_windowed",
         "auto",
     ] = "cpu_exact"
+    feature_row_influence_requirement: Literal["preferred", "required"] = "preferred"
     gpu_resident_max_bytes: int = 0
     gpu_window_max_bytes: int = 0
     gpu_resident_safety_margin_bytes: int = 0
@@ -127,6 +302,13 @@ class RowStoragePlan:
         if self.feature_row_influence_mode not in allowed_influence_modes:
             allowed = ", ".join(sorted(allowed_influence_modes))
             raise ValueError(f"feature_row_influence_mode must be one of: {allowed}")
+        if self.feature_row_influence_requirement not in {"preferred", "required"}:
+            raise ValueError("feature_row_influence_requirement must be preferred or required")
+        if (
+            self.feature_row_influence_mode == "auto"
+            and self.feature_row_influence_requirement == "required"
+        ):
+            raise ValueError("auto feature-row influence cannot be required")
         for name in (
             "feature_column_tile_size",
             "influence_row_tile_size",
@@ -206,7 +388,9 @@ class FrontierExpansionPlan:
     feature_vjp_tape_max_bytes: int = 0
     decoder_page_prefetch_depth: int = 0
     decoder_active_row_residency: bool = False
+    decoder_active_row_residency_requirement: Literal["preferred", "required"] = "preferred"
     decoder_active_row_max_bytes: int = 0
+    decoder_active_row_safety_margin_bytes: int = 0
     phase0_decoder_row_ranges: bool = False
 
     def __post_init__(self) -> None:
@@ -217,6 +401,30 @@ class FrontierExpansionPlan:
         _nonnegative("feature_vjp_tape_max_bytes", self.feature_vjp_tape_max_bytes)
         _nonnegative("decoder_page_prefetch_depth", self.decoder_page_prefetch_depth)
         _nonnegative("decoder_active_row_max_bytes", self.decoder_active_row_max_bytes)
+        _nonnegative(
+            "decoder_active_row_safety_margin_bytes",
+            self.decoder_active_row_safety_margin_bytes,
+        )
+        if self.decoder_active_row_residency_requirement not in {"preferred", "required"}:
+            raise ValueError(
+                "decoder_active_row_residency_requirement must be preferred or required"
+            )
+        if (
+            self.decoder_active_row_residency_requirement == "required"
+            and not self.decoder_active_row_residency
+        ):
+            raise ValueError(
+                "required decoder active-row residency requires decoder_active_row_residency=true"
+            )
+        if (
+            self.decoder_active_row_residency
+            and self.decoder_active_row_max_bytes == 0
+            and self.decoder_active_row_safety_margin_bytes == 0
+        ):
+            raise ValueError(
+                "dynamic decoder active-row residency requires a positive "
+                "decoder_active_row_safety_margin_bytes"
+            )
         if self.feature_vjp_tape_batch_window > 1 and self.feature_vjp_tape_max_bytes == 0:
             raise ValueError(
                 "feature_vjp_tape_batch_window > 1 requires feature_vjp_tape_max_bytes > 0"
@@ -262,11 +470,16 @@ class ObservabilityPolicy:
 class DiagnosticStopPolicy:
     """Diagnostic-only termination contract; never produces a scientific graph."""
 
-    mode: Literal["none", "phase0_probe", "transition_probe"] = "none"
+    mode: Literal["none", "phase0_probe", "phase3_probe", "transition_probe"] = "none"
     phase4_batches: int | None = None
 
     def __post_init__(self) -> None:
-        if self.mode not in {"none", "phase0_probe", "transition_probe"}:
+        if self.mode not in {
+            "none",
+            "phase0_probe",
+            "phase3_probe",
+            "transition_probe",
+        }:
             raise ValueError(f"unsupported diagnostic stop mode: {self.mode!r}")
         if self.mode == "transition_probe":
             if self.phase4_batches is None or self.phase4_batches <= 0:
@@ -280,6 +493,7 @@ class ExecutionConstraints:
     """Explicit physical restrictions, grouped by their mechanism owners."""
 
     session: SessionPlan = field(default_factory=SessionPlan)
+    backward: BackwardPlan = field(default_factory=BackwardPlan)
     decoder: DecoderPlan = field(default_factory=DecoderPlan)
     storage: RowStoragePlan = field(default_factory=RowStoragePlan)
     replay: ReplayPlan = field(default_factory=ReplayPlan)
