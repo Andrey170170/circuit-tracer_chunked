@@ -10,10 +10,11 @@ from typing import Any, Mapping
 from circuit_tracer.governor.contracts import ProviderProfile, ResourceEnvelope, fingerprint
 
 from .plan import ExecutionConstraints, ResolvedTracePlan
+from .problem import AllActiveSources
 from .request import TraceRequest
 
 
-RUNTIME_SCHEMA_VERSION = 3
+RUNTIME_SCHEMA_VERSION = 4
 
 
 def _stable(value: Any) -> Any:
@@ -41,9 +42,23 @@ def _stable(value: Any) -> Any:
 def _provider_identity(model: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     semantic = {
         name: _stable(getattr(model, name))
-        for name in ("backend", "scan", "model_name", "provider_id", "dtype")
+        for name in (
+            "backend",
+            "model_name",
+            "repo_id",
+            "provider_id",
+            "revision",
+            "dtype",
+        )
         if hasattr(model, name)
     }
+    scan_name = getattr(model, "scan_name", None)
+    if scan_name is not None:
+        semantic["scan_name"] = _stable(scan_name)
+    else:
+        scan = getattr(model, "scan", None)
+        if scan is not None and not callable(scan):
+            semantic["scan"] = _stable(scan)
     config = getattr(model, "config", None)
     if config is not None:
         semantic["model_checkpoint"] = getattr(config, "_name_or_path", None)
@@ -63,6 +78,8 @@ def _provider_identity(model: Any) -> tuple[dict[str, Any], dict[str, Any]]:
             "n_layers",
             "d_model",
             "d_transcoder",
+            "activation_kind",
+            "activation_k",
             "decoder_output_topology",
             "decoder_chunk_size",
         }
@@ -92,6 +109,10 @@ def _resolve_explicit_trace_request(request: TraceRequest) -> ResolvedTracePlan:
     if not isinstance(backend, str):
         raise ValueError("problem model must declare a tracing backend")
     _validate_backend_constraints(backend, request.execution)
+    if backend != "nnsight" and not isinstance(
+        request.problem.source_selection, AllActiveSources
+    ):
+        raise ValueError("restricted source selection requires the NNSight backend")
     semantic_provider, physical_provider = _provider_identity(request.problem.model)
     semantics = {
         "schema_version": RUNTIME_SCHEMA_VERSION,
@@ -102,6 +123,7 @@ def _resolve_explicit_trace_request(request: TraceRequest) -> ResolvedTracePlan:
             "desired_logit_prob": request.problem.desired_logit_prob,
             "output_position": request.problem.output_position,
             "prefix_view": _stable(request.problem.prefix_view),
+            "source_selection": _stable(request.problem.source_selection),
         },
         "semantics": _stable(request.semantics),
         "provider": semantic_provider,

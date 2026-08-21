@@ -121,11 +121,21 @@ def select_phase3_frontier(*, inputs: Any, config: Any) -> Phase3FrontierResult:
 
 def _rank_frontier(inputs: Any, config: Any) -> RankedFrontier:
     influences, normalization, store_snapshot = _compute_seed_influences(inputs, config)
-    rank = torch.argsort(influences, descending=True).cpu()
+    eligible = config.eligible_feature_indices
+    if eligible is None:
+        rank = torch.argsort(influences, descending=True).cpu()
+        eligible_influences = influences
+    else:
+        eligible = eligible.to(device=influences.device, dtype=torch.long)
+        eligible_order = torch.argsort(
+            influences[eligible], descending=True, stable=True
+        )
+        rank = eligible[eligible_order].cpu()
+        eligible_influences = influences[eligible]
     metadata = _build_phase3_frontier_buffer_metadata(
-        seed_feature_influences=influences,
+        seed_feature_influences=eligible_influences,
         base_max_feature_nodes=int(config.base_max_feature_nodes),
-        total_active_features=int(config.total_active_feats),
+        total_active_features=int(rank.numel()),
         relative_epsilon=config.phase3_frontier_buffer_relative_epsilon,
         max_extra=int(config.phase3_frontier_buffer_max_extra),
     )

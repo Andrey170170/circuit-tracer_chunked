@@ -88,6 +88,12 @@ def _bind_phase4_contract(state):
     state.rows_cpu_staging = state.inputs.rows_cpu_staging
     state.actual_max_feature_nodes = state.config.actual_max_feature_nodes
     state.total_active_feats = state.config.total_active_feats
+    state.eligible_feature_indices = state.config.eligible_feature_indices
+    state.eligible_feature_count = (
+        state.total_active_feats
+        if state.eligible_feature_indices is None
+        else int(state.eligible_feature_indices.numel())
+    )
     state.n_logits = state.config.n_logits
     state.logit_offset = state.config.logit_offset
     state.effective_feature_batch_size = state.config.effective_feature_batch_size
@@ -468,7 +474,7 @@ def _record_anomaly_refresh_debug(state):
                 state.float64_feature_influences, descending=True
             ).cpu()
             state.float64_pending = state.float64_feature_rank[
-                ~state.visited[state.float64_feature_rank]
+                ~state.selection_visited[state.float64_feature_rank]
             ][: state.queue_size]
             state.float64_pending = _reorder_pending_for_phase4_locality(
                 state.float64_pending,

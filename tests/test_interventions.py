@@ -2,8 +2,13 @@ import gc
 
 import pytest
 import torch
+from transformer_lens import HookedTransformerConfig
 
 from circuit_tracer import ReplacementModel
+from tests.test_attributions_gemma import (
+    load_dummy_gemma_model,
+    patch_tokenizer_special_ids,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -11,6 +16,38 @@ def cleanup_cuda():
     yield
     torch.cuda.empty_cache()
     gc.collect()
+
+
+def test_intervention_generate_returns_step_by_vocab_logits_on_cpu() -> None:
+    cfg = HookedTransformerConfig(
+        d_model=8,
+        d_head=4,
+        n_layers=1,
+        n_ctx=16,
+        n_heads=2,
+        d_mlp=16,
+        d_vocab=16,
+        d_vocab_out=16,
+        device="cpu",
+        tokenizer_name="gpt2",
+        init_weights=False,
+    )
+    model = load_dummy_gemma_model(cfg)
+    generated_steps = 2
+
+    with patch_tokenizer_special_ids(model, [0]):
+        _, logits, _ = model.feature_intervention_generate(
+            torch.tensor([[1, 2, 3]]),
+            [],
+            freeze_attention=False,
+            return_activations=False,
+            max_new_tokens=generated_steps,
+            do_sample=False,
+            stop_at_eos=False,
+            verbose=False,
+        )
+
+    assert logits.shape == (generated_steps, cfg.d_vocab_out)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

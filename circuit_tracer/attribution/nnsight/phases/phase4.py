@@ -95,6 +95,7 @@ class Phase4Config:
     diagnostic_stop_after_batches: int | None = None
     cache_state: str = "unavailable"
     cache_state_provenance: str = "unavailable"
+    eligible_feature_indices: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)

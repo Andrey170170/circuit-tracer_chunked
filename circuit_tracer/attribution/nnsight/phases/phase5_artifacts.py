@@ -346,7 +346,7 @@ def package_compact_artifacts(
             "phase0_activation_threshold_compare_mode": numerics.activation_compare_mode,
             "telemetry_max_events": numerics.telemetry_max_events,
             "cfg": inputs.runtime.model.config,
-            "scan": inputs.runtime.model.scan,
+            "scan": inputs.runtime.model.scan_name,
         }
     )
     for prefix, metadata in (

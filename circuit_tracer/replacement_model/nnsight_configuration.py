@@ -59,7 +59,10 @@ def configure_nnsight_replacement_model(
     model.unembed_weight = cast(  # type: ignore[attr-defined]
         torch.Tensor, model._resolve_attr(model, nnsight_config.unembed_weight)
     )
-    model.scan = transcoder_set.scan  # type: ignore[attr-defined]
+    # ``LanguageModel.scan`` is NNSight's callable Envoy API. Keep transcoder
+    # provenance under a distinct name so replacement-model setup cannot
+    # shadow that inherited method.
+    model.scan_name = transcoder_set.scan  # type: ignore[attr-defined]
 
     for parameter in model.parameters():
         parameter.requires_grad = False

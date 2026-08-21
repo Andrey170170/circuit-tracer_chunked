@@ -378,6 +378,38 @@ def test_phase4_nonzero_dense_execution_writes_rows_and_returns_owned_state(
     assert observer.phases[0]["attrs"]["phase4_execution_batch_count"] == 1
 
 
+def test_phase4_all_eligible_path_visits_only_restricted_source_membership() -> None:
+    observer = FakeObserver()
+    inputs = replace(
+        _inputs(observer),
+        ctx=SimpleNamespace(
+            encoder_vecs=torch.tensor([[2.0], [3.0], [4.0]]),
+            materialize_encoder_vectors=lambda idx_batch: torch.tensor([[3.0]]),
+            compute_batch=lambda **kwargs: torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+        ),
+        edge_matrix=torch.zeros((2, 4)),
+        feat_ids=torch.tensor([10, 11, 12]),
+        feat_layers=torch.tensor([0, 0, 0]),
+        feat_pos=torch.tensor([0, 1, 2]),
+        row_to_node_index=torch.tensor([7, -1]),
+        phase4_frontier_buffer_metadata={"enabled": False},
+    )
+    config = replace(
+        _config(),
+        actual_max_feature_nodes=1,
+        total_active_feats=3,
+        logit_offset=4,
+        row_store_capacity_feature_nodes=1,
+        eligible_feature_indices=torch.tensor([1]),
+    )
+
+    result = run_phase4(inputs=inputs, config=config)
+
+    assert result.visited.tolist() == [False, True, False]
+    assert result.row_to_node_index.tolist() == [7, 1]
+    assert torch.equal(result.edge_matrix[1], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+
+
 def test_phase4_nonzero_compact_execution_appends_partitioned_rows_to_owned_stores(
     monkeypatch,
 ) -> None:

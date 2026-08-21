@@ -40,5 +40,5 @@ def assemble_full_graph(
         selected_features=selected_features,
         adjacency_matrix=full_edges.detach(),
         cfg=runtime.model.config,
-        scan=runtime.model.scan,
+        scan=runtime.model.scan_name,
     ), full_edges

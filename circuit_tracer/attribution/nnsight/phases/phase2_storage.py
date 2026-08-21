@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from typing import Any, Literal, Protocol, cast
 
@@ -25,6 +25,11 @@ from circuit_tracer.attribution.nnsight.row_store import (
     _GpuResidentFeatureRowStore,
 )
 from circuit_tracer.transcoder.provider import provider_fingerprint
+from circuit_tracer.tracing.problem import (
+    AllActiveSources,
+    SourceSelection,
+    compile_source_selection,
+)
 from circuit_tracer.utils.disk_offload import offload_modules
 
 
@@ -143,6 +148,8 @@ class Phase2ExecutionPolicy:
     exact_dtype: torch.dtype
     effective_feature_batch_size: int
     trace_batch_size: int
+    source_selection: SourceSelection = field(default_factory=AllActiveSources)
+    target_position: int | None = None
 
     def __post_init__(self) -> None:
         if self.effective_feature_batch_size <= 0 or self.trace_batch_size <= 0:
@@ -167,6 +174,7 @@ class ActiveFeaturePlan:
     row_store_capacity_feature_nodes: int
     phase3_frontier_buffer_metadata: dict[str, object]
     phase4_frontier_buffer_metadata: dict[str, object]
+    eligible_feature_indices: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -205,6 +213,20 @@ def plan_active_feature_storage(
     feat_layers, feat_pos, feat_ids = activation_matrix.indices()
     n_layers, n_pos, _ = activation_matrix.shape
     total_active_feats = int(activation_matrix._nnz())
+    eligible_feature_indices: torch.Tensor | None = None
+    if not isinstance(execution.source_selection, AllActiveSources):
+        if execution.target_position is None:
+            raise ValueError("restricted source selection requires a resolved target position")
+        eligible_feature_indices = compile_source_selection(
+            execution.source_selection,
+            activation_matrix,
+            target_position=execution.target_position,
+        )
+    eligible_feature_count = (
+        total_active_feats
+        if eligible_feature_indices is None
+        else int(eligible_feature_indices.numel())
+    )
     if execution.offload:
         offload_handles += offload_modules([model.embed_location], execution.offload)
         tied_embeds = (
@@ -215,11 +237,11 @@ def plan_active_feature_storage(
             offload_handles += offload_modules([model.lm_head], execution.offload)
     logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
     total_nodes = logit_offset + n_logits
-    base_max = min(execution.max_feature_nodes or total_active_feats, total_active_feats)
+    base_max = min(execution.max_feature_nodes or eligible_feature_count, eligible_feature_count)
     phase3_metadata = _build_phase3_frontier_buffer_metadata(
         seed_feature_influences=None,
         base_max_feature_nodes=base_max,
-        total_active_features=total_active_feats,
+        total_active_features=eligible_feature_count,
         relative_epsilon=frontier.phase3_relative_epsilon,
         max_extra=frontier.phase3_max_extra,
     )
@@ -227,7 +249,7 @@ def plan_active_feature_storage(
         base_max
         + (frontier.phase3_max_extra if frontier.phase3_relative_epsilon is not None else 0)
         + (frontier.phase4_max_extra_total if frontier.phase4_relative_epsilon is not None else 0),
-        total_active_feats,
+        eligible_feature_count,
     )
     phase4_metadata: dict[str, object] = {
         "schema_version": 1,
@@ -257,7 +279,10 @@ def plan_active_feature_storage(
         "final_actual_max_feature_nodes": base_max,
         "events": [],
     }
-    logger.info(f"Will include {base_max} of {total_active_feats} feature nodes")
+    logger.info(
+        f"Will include {base_max} of {eligible_feature_count} eligible feature nodes "
+        f"({total_active_feats} active total)"
+    )
     return ActiveFeaturePlan(
         feat_layers,
         feat_pos,
@@ -273,6 +298,7 @@ def plan_active_feature_storage(
         int(capacity),
         phase3_metadata,
         phase4_metadata,
+        eligible_feature_indices,
     )
 
 

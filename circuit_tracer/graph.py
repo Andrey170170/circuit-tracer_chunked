@@ -171,6 +171,11 @@ class Graph:
             Graph: the Graph saved at the specified path
         """
         d = torch.load(path, weights_only=False, map_location=map_location)
+        if "scan_name" in d:
+            legacy_scan_name = d.pop("scan_name")
+            if "scan" in d and d["scan"] != legacy_scan_name:
+                raise ValueError("Serialized graph has conflicting scan and scan_name values")
+            d.setdefault("scan", legacy_scan_name)
         # BC: convert legacy tensor logit_targets to LogitTarget list
         lt = d.get("logit_targets")
         if isinstance(lt, torch.Tensor):

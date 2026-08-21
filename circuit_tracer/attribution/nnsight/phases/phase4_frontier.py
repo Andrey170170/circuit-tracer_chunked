@@ -146,6 +146,13 @@ def _initialize_phase4_counters(state):
     """Initialize frontier, metrics, and progress state."""
     state.st = state.n_logits
     state.visited = torch.zeros(state.total_active_feats, dtype=torch.bool)
+    state.eligible_feature_mask = torch.ones(state.total_active_feats, dtype=torch.bool)
+    if state.eligible_feature_indices is not None:
+        state.eligible_feature_mask.fill_(False)
+        state.eligible_feature_mask[
+            state.eligible_feature_indices.to(device="cpu", dtype=torch.long)
+        ] = True
+    state.selection_visited = ~state.eligible_feature_mask
     state.n_visited = 0
     state.phase4_scheduler_reference_batch_count = 0
     state.phase4_execution_batch_count = 0
@@ -267,8 +274,12 @@ def prepare_feature_frontier(state):
     """Select the next pending feature frontier."""
     state.phase4_frontier_plan: _Phase4FrontierPlan | None = None
     state.pending_refresh_index: int | None = None
-    if state.actual_max_feature_nodes == state.total_active_feats:
-        state.pending = torch.arange(state.total_active_feats)
+    if state.actual_max_feature_nodes == state.eligible_feature_count:
+        state.pending = (
+            torch.arange(state.total_active_feats)
+            if state.eligible_feature_indices is None
+            else state.eligible_feature_indices.to(device="cpu", dtype=torch.long)
+        )
         if state.scheduler_uses_reference_planner:
             state.phase4_frontier_plan = _plan_phase4_frontier_membership_preserving_v1(
                 state.pending,
@@ -350,7 +361,7 @@ def plan_feature_frontier(state):
             reference_plan=state.phase4_frontier_plan,
             unvisited_feature_rank=state.unvisited_feature_rank,
             candidate_scores=state.planner_v2_candidate_scores,
-            visited=state.visited,
+            visited=state.selection_visited,
             max_batch_size=state.phase4_feature_batch_size,
             max_batches=state.phase4_refresh_cycle_batches,
             feat_layers=state.feat_layers,

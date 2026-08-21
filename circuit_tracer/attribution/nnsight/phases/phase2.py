@@ -99,6 +99,7 @@ class Phase2Result:
     phase3_gradient_replay_metadata: dict[str, object]
     phase3_row_replay_metadata: dict[str, object]
     loaded_phase3_row_donor_bundle: dict[str, object] | None
+    eligible_feature_indices: torch.Tensor | None
 
 
 def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
@@ -205,4 +206,5 @@ def run_phase2(*, inputs: Phase2Inputs, config: Phase2Config) -> Phase2Result:
         phase3_gradient_replay_metadata=phase3.gradient_metadata,
         phase3_row_replay_metadata=phase3.row_metadata,
         loaded_phase3_row_donor_bundle=phase3.loaded_row_donor_bundle,
+        eligible_feature_indices=feature_plan.eligible_feature_indices,
     )

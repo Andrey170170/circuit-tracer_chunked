@@ -716,6 +716,12 @@ class AttributionExecution:
                     exact_dtype=p.numerics.exact_dtype,
                     effective_feature_batch_size=p.batches.feature_batch_size,
                     trace_batch_size=p.batches.trace_batch_size,
+                    source_selection=p.problem.source_selection,
+                    target_position=(
+                        phase0.output_position
+                        if phase0.output_position is not None
+                        else phase0.n_input_pos - 1
+                    ),
                 ),
             ),
         )
@@ -824,6 +830,7 @@ class AttributionExecution:
                 influence_column_tile_size=storage.influence_column_tile_size,
                 feature_row_column_tile_size=storage.feature_column_tile_size,
                 feature_row_retention=storage.retention,
+                eligible_feature_indices=phase2.eligible_feature_indices,
             ),
         )
 
@@ -924,6 +931,7 @@ class AttributionExecution:
                 profile=policy.profile,
                 profile_log_interval=policy.profile_log_interval,
                 verbose=policy.verbose,
+                eligible_feature_indices=phase2.eligible_feature_indices,
             ),
         )
         self.scope.feature_row_store = self.phase4.feature_row_store

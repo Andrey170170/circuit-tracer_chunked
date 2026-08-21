@@ -40,13 +40,23 @@ from .plan import (
     VjpKernelMode,
 )
 from .planning import resolve_trace_request
-from .problem import AttributionProblem, FrontierSemantics, PrefixViewTarget, TraceSemantics
+from .problem import (
+    AllActiveSources,
+    AttributionProblem,
+    FrontierSemantics,
+    PrefixViewTarget,
+    SourceSelection,
+    TokenPositionSources,
+    TraceSemantics,
+    compile_source_selection,
+)
 from .request import GovernorFidelityPolicy, TraceRequest
 from .result import TraceResult, TraceStatus
 from .session import SessionWindow, TraceSession
 
 __all__ = [
     "AttributionProblem",
+    "AllActiveSources",
     "BackwardEngineMode",
     "BackwardExecutionTopology",
     "BackwardPlan",
@@ -80,6 +90,7 @@ __all__ = [
     "RowStoragePlan",
     "SessionPlan",
     "SessionWindow",
+    "SourceSelection",
     "SensitivityClass",
     "TraceEvidence",
     "VjpKernelMode",
@@ -88,8 +99,10 @@ __all__ = [
     "TraceSemantics",
     "TraceSession",
     "TraceStatus",
+    "TokenPositionSources",
     "open_session",
     "resolve_trace_request",
     "trace_batch",
+    "compile_source_selection",
     "trace_one",
 ]

@@ -6,7 +6,7 @@ import torch
 from transformer_lens import HookedTransformerConfig
 
 from circuit_tracer.attribution.targets import LogitTarget
-from circuit_tracer.graph import Graph, compute_edge_influence, compute_node_influence
+from circuit_tracer.graph import Graph, compute_edge_influence, compute_node_influence, normalize_matrix
 from circuit_tracer.utils import get_default_device
 
 
@@ -15,6 +15,25 @@ def cleanup_cuda():
     yield
     torch.cuda.empty_cache()
     gc.collect()
+
+
+def test_normalize_matrix_preserves_autograd() -> None:
+    matrix = torch.tensor([[1.0, 3.0]], requires_grad=True)
+
+    normalize_matrix(matrix).sum().backward()
+
+    assert matrix.grad is not None
+    assert torch.isfinite(matrix.grad).all()
+
+
+@pytest.mark.parametrize("row", [[[0.0, 0.0]], [[1e-20, 0.0]]])
+def test_normalize_matrix_clamped_rows_have_finite_gradients(row: list[list[float]]) -> None:
+    matrix = torch.tensor(row, requires_grad=True)
+
+    normalize_matrix(matrix).sum().backward()
+
+    assert matrix.grad is not None
+    assert torch.isfinite(matrix.grad).all()
 
 
 def test_small_graph():
