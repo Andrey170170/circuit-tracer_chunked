@@ -6,7 +6,13 @@ import pytest
 import torch
 
 from circuit_tracer.attribution.context_nnsight import AttributionContext
-from circuit_tracer.attribution.attribute_nnsight import (
+from circuit_tracer.attribution.nnsight.context_state import (
+    AttributionTensorState,
+    ContextExecutionPolicy,
+    ContextNumericPolicy,
+    DecoderRuntime,
+)
+from circuit_tracer.attribution.nnsight.prefix_view import (
     _compact_nonfeature_column_counts,
     _compact_selected_feature_columns,
     _hash_token_ids,
@@ -19,6 +25,8 @@ from circuit_tracer.replacement_model import (
     replacement_model_nnsight as replacement_model_nnsight_module,
 )
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
+from circuit_tracer.tracing import PrefixViewTarget
+from circuit_tracer.transcoder.attribution_result import AttributionComponents
 
 
 def _metadata(**overrides):
@@ -36,8 +44,78 @@ def _metadata(**overrides):
     return payload
 
 
+def _validate_prefix_view_metadata(*, prompt, attribution_targets, prefix_view_metadata):
+    if prefix_view_metadata is None:
+        prefix_view = None
+        evidence = None
+    else:
+        prefix_view = PrefixViewTarget(
+            mode=prefix_view_metadata.get("mode", "independent_prefix"),
+            target_position=prefix_view_metadata.get("target_position", 3),
+        )
+        evidence = dict(prefix_view_metadata)
+        evidence.pop("mode", None)
+        evidence.pop("target_position", None)
+    return validate_prefix_view_metadata(
+        prompt=prompt,
+        attribution_targets=attribution_targets,
+        prefix_view=prefix_view,
+        prefix_view_metadata=evidence,
+    )
+
+
+def _context(
+    *,
+    activation_matrix,
+    error_vectors,
+    token_vectors,
+    decoder_vecs,
+    encoder_vecs,
+    encoder_to_decoder_map,
+    decoder_locations,
+    logits,
+    full_logits=None,
+    decoder_provider=None,
+    chunked_decoder_state=None,
+    stage_error_vectors_on_cpu=False,
+    decoder_chunk_cache=None,
+    decoder_cache_fingerprint=None,
+):
+    return AttributionContext(
+        tensor_state=AttributionTensorState(
+            activation_matrix=activation_matrix,
+            error_vectors=error_vectors,
+            token_vectors=token_vectors,
+            decoder_vectors=decoder_vecs,
+            encoder_vectors=encoder_vecs,
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=decoder_locations,
+            logits=logits,
+            full_logits=full_logits,
+        ),
+        execution_policy=ContextExecutionPolicy.resolve(
+            chunked_decoder_state=chunked_decoder_state,
+            encoder_vectors=encoder_vecs,
+            error_vectors=error_vectors,
+            exact_encoder_residency="lazy",
+            stage_encoder_vectors_on_cpu=False,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            error_vector_prefetch_lookahead=1,
+            chunked_feature_replay_window=4,
+            row_subchunk_size=None,
+        ),
+        decoder_runtime=DecoderRuntime.resolve(
+            provider=decoder_provider,
+            chunked_state=chunked_decoder_state,
+            chunk_cache=decoder_chunk_cache,
+            cache_fingerprint=decoder_cache_fingerprint,
+        ),
+        numeric_policy=ContextNumericPolicy(),
+    )
+
+
 def test_validate_prefix_view_metadata_success_normalizes_payload() -> None:
-    normalized = validate_prefix_view_metadata(
+    normalized = _validate_prefix_view_metadata(
         prompt=torch.tensor([10, 11, 12], dtype=torch.long),
         attribution_targets=torch.tensor([42], dtype=torch.long),
         prefix_view_metadata=_metadata(),
@@ -48,7 +126,7 @@ def test_validate_prefix_view_metadata_success_normalizes_payload() -> None:
 
 def test_validate_prefix_view_metadata_full_sequence_success() -> None:
     full_sequence = [10, 11, 12, 42, 43]
-    normalized = validate_prefix_view_metadata(
+    normalized = _validate_prefix_view_metadata(
         prompt=full_sequence,
         attribution_targets=torch.tensor([42], dtype=torch.long),
         prefix_view_metadata=_metadata(
@@ -83,7 +161,7 @@ def test_validate_prefix_view_metadata_full_sequence_rejects_mismatch(overrides,
     )
     metadata.update(overrides)
     with pytest.raises(ValueError, match=message):
-        validate_prefix_view_metadata(
+        _validate_prefix_view_metadata(
             prompt=full_sequence,
             attribution_targets=torch.tensor([42], dtype=torch.long),
             prefix_view_metadata=metadata,
@@ -94,14 +172,13 @@ def test_validate_prefix_view_metadata_full_sequence_rejects_mismatch(overrides,
     ("overrides", "message"),
     [
         ({"prefix_token_count": 2}, "prefix_token_count"),
-        ({"target_position": 4}, "target_position"),
         ({"target_token_ids": [99]}, "target_token_ids"),
         ({"prefix_token_ids_sha256": "bad"}, "prefix_token_ids_sha256"),
     ],
 )
 def test_validate_prefix_view_metadata_rejects_mismatches(overrides, message) -> None:
     with pytest.raises(ValueError, match=message):
-        validate_prefix_view_metadata(
+        _validate_prefix_view_metadata(
             prompt=[10, 11, 12],
             attribution_targets=torch.tensor([42], dtype=torch.long),
             prefix_view_metadata=_metadata(**overrides),
@@ -110,7 +187,7 @@ def test_validate_prefix_view_metadata_rejects_mismatches(overrides, message) ->
 
 def test_validate_prefix_view_metadata_is_backward_compatible_without_metadata() -> None:
     assert (
-        validate_prefix_view_metadata(
+        _validate_prefix_view_metadata(
             prompt=[10, 11, 12],
             attribution_targets=torch.tensor([42], dtype=torch.long),
             prefix_view_metadata=None,
@@ -127,7 +204,7 @@ def test_resolve_prefix_view_output_position_infers_full_sequence_target() -> No
         input_token_ids_sha256=_hash_token_ids([10, 11, 12, 42, 43]),
     )
 
-    normalized = validate_prefix_view_metadata(
+    normalized = _validate_prefix_view_metadata(
         prompt=[10, 11, 12, 42, 43],
         attribution_targets=[42],
         prefix_view_metadata=metadata,
@@ -137,7 +214,7 @@ def test_resolve_prefix_view_output_position_infers_full_sequence_target() -> No
 
 
 def test_resolve_prefix_view_output_position_rejects_argument_mismatch() -> None:
-    normalized = validate_prefix_view_metadata(
+    normalized = _validate_prefix_view_metadata(
         prompt=[10, 11, 12, 42, 43],
         attribution_targets=[42],
         prefix_view_metadata=_metadata(
@@ -196,7 +273,7 @@ def test_prefix_view_state_truncates_position_indexed_context() -> None:
         size=(2, 5, 8),
     ).coalesce()
     full_logits = torch.randn(1, 5, 8)
-    ctx = AttributionContext(
+    ctx = _context(
         activation_matrix=activation_matrix,
         error_vectors=torch.randn(2, 5, 3),
         token_vectors=torch.randn(5, 3),
@@ -248,18 +325,18 @@ def test_setup_attribution_prefix_view_traces_only_prefix(monkeypatch) -> None:
     class FakeTranscoders:
         def compute_attribution_components(self, mlp_in_cache, zero_positions, **kwargs):
             n_layers, n_pos, d_model = mlp_in_cache.shape
-            return {
-                "activation_matrix": torch.sparse_coo_tensor(
+            return AttributionComponents(
+                activation_matrix=torch.sparse_coo_tensor(
                     torch.empty((3, 0), dtype=torch.long),
                     torch.empty(0),
                     size=(n_layers, n_pos, 4),
                 ).coalesce(),
-                "reconstruction": torch.zeros_like(mlp_in_cache),
-                "decoder_vecs": torch.empty(0, d_model),
-                "encoder_vecs": torch.empty(0, d_model),
-                "encoder_to_decoder_map": torch.empty(0, dtype=torch.long),
-                "decoder_locations": torch.empty(2, 0, dtype=torch.long),
-            }
+                reconstruction=torch.zeros_like(mlp_in_cache),
+                decoder_vectors=torch.empty(0, d_model),
+                encoder_vectors=torch.empty(0, d_model),
+                encoder_to_decoder_map=torch.empty(0, dtype=torch.long),
+                decoder_locations=torch.empty(2, 0, dtype=torch.long),
+            )
 
     monkeypatch.setattr(replacement_model_nnsight_module, "save", lambda tensor: tensor)
 
@@ -269,6 +346,7 @@ def test_setup_attribution_prefix_view_traces_only_prefix(monkeypatch) -> None:
     model.zero_positions = []
     model.embed_weight = torch.randn(20, 3)
     model.transcoders = FakeTranscoders()
+    model.model_adapter = SimpleNamespace(normalize_feature_output=lambda output: output)
     model.trace = lambda tokens: FakeTrace(model, tokens)
 
     ctx = NNSightReplacementModel.setup_attribution(
@@ -302,7 +380,7 @@ def test_prefix_view_state_compacts_feature_row_state() -> None:
     ).coalesce()
     encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(4, 3)
     decoder_vecs = torch.arange(100, 112, dtype=torch.float32).reshape(4, 3)
-    ctx = AttributionContext(
+    ctx = _context(
         activation_matrix=activation_matrix,
         error_vectors=torch.randn(2, 5, 3),
         token_vectors=torch.randn(5, 3),
@@ -394,7 +472,7 @@ class _FakeDecoderProvider:
 
 
 def _context_with_cache(provider, cache=None, fingerprint=None):
-    return AttributionContext(
+    return _context(
         activation_matrix=torch.sparse_coo_tensor(
             indices=torch.tensor([[0], [0], [0]], dtype=torch.long),
             values=torch.ones(1),

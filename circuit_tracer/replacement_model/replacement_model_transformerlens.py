@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import partial
 import time
-from typing import Callable, Literal, cast
+from typing import Callable, Literal
 
 import torch
 import torch.nn.functional as F
@@ -484,7 +484,7 @@ class TransformerLensReplacementModel(HookedTransformer):
         if callable(trace_event):
             trace_event("phase0.setup.components_start", backend="transformerlens")
         exact_provider_mode = require_exact_chunked_provider(self.transcoders)
-        attribution_data = self.transcoders.compute_attribution_components(
+        attribution_components = self.transcoders.compute_attribution_components(
             mlp_in_cache,
             self.zero_positions,
             sparsification=sparsification,
@@ -496,14 +496,14 @@ class TransformerLensReplacementModel(HookedTransformer):
                 "phase0.setup.components_done",
                 backend="transformerlens",
                 elapsed_s=f"{component_seconds:.2f}",
-                active_features=int(attribution_data["activation_matrix"]._nnz()),
+                active_features=attribution_components.active_feature_count,
             )
 
         # Compute error vectors
         error_start = time.perf_counter()
         if callable(trace_event):
             trace_event("phase0.setup.error_start", backend="transformerlens")
-        error_vectors = mlp_out_cache - attribution_data["reconstruction"]
+        error_vectors = mlp_out_cache - attribution_components.reconstruction
 
         error_vectors[:, self.zero_positions] = 0
         token_vectors = self.W_E[tokens].detach()  # (n_pos, d_model)
@@ -514,19 +514,17 @@ class TransformerLensReplacementModel(HookedTransformer):
                 backend="transformerlens",
                 elapsed_s=f"{error_seconds:.2f}",
             )
-        chunked_decoder_state = cast(
-            dict[str, torch.Tensor] | None, attribution_data.get("chunked_decoder_state")
-        )
+        chunked_decoder_state = attribution_components.chunked_decoder_state
 
         ctx = AttributionContext(
-            activation_matrix=attribution_data["activation_matrix"],
+            activation_matrix=attribution_components.activation_matrix,
             logits=logits,
             error_vectors=error_vectors,
             token_vectors=token_vectors,
-            decoder_vecs=attribution_data["decoder_vecs"],
-            encoder_vecs=attribution_data["encoder_vecs"],
-            encoder_to_decoder_map=attribution_data["encoder_to_decoder_map"],
-            decoder_locations=attribution_data["decoder_locations"],
+            decoder_vecs=attribution_components.decoder_vectors,
+            encoder_vecs=attribution_components.encoder_vectors,
+            encoder_to_decoder_map=attribution_components.encoder_to_decoder_map,
+            decoder_locations=attribution_components.decoder_locations,
             decoder_provider=self.transcoders if exact_provider_mode else None,
             chunked_decoder_state=chunked_decoder_state,
         )
@@ -540,10 +538,10 @@ class TransformerLensReplacementModel(HookedTransformer):
             "setup_total_seconds": time.perf_counter() - setup_start,
             "mlp_in_shape": tuple(mlp_in_cache.shape),
             "mlp_out_shape": tuple(mlp_out_cache.shape),
-            "reconstruction_shape": tuple(attribution_data["reconstruction"].shape),
-            "active_features": int(attribution_data["activation_matrix"]._nnz()),
+            "reconstruction_shape": tuple(attribution_components.reconstruction.shape),
+            "active_features": attribution_components.active_feature_count,
         }
-        ctx.sparsification_stats = attribution_data.get("sparsification_stats")
+        ctx.sparsification_stats = attribution_components.sparsification_stats
         return ctx
 
     def setup_intervention_with_freeze(

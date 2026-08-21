@@ -9,11 +9,21 @@ from torch import device
 from tqdm import tqdm
 from transformers import AutoConfig, GptOssConfig
 
-from circuit_tracer import attribute, Graph, ReplacementModel
+from circuit_tracer import Graph, ReplacementModel
+from circuit_tracer.tracing import AttributionProblem, TraceRequest, TraceSemantics, trace_one
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
+
+
+def _trace_graph(prompt, model, *, source_batch_size: int = 512):
+    return trace_one(
+        TraceRequest(
+            problem=AttributionProblem(prompt=prompt, model=model),
+            semantics=TraceSemantics(source_batch_size=source_batch_size),
+        )
+    ).graph
 
 gpt_oss_config = {
     "architectures": ["GptOssForCausalLM"],
@@ -433,7 +443,7 @@ def test_small_gpt_oss_model():
     original_all_special_ids = tokenizer_class.all_special_ids  # type:ignore
     try:
         tokenizer_class.all_special_ids = property(lambda self: [0])  # type:ignore
-        graph = attribute(s, model)
+        graph = _trace_graph(s, model)
         assert isinstance(model, NNSightReplacementModel)
 
         verify_token_and_error_edges(model, graph)
@@ -452,7 +462,7 @@ def test_large_gpt_oss_model_with_dummy_clt():
     original_all_special_ids = tokenizer_class.all_special_ids  # type:ignore
     try:
         tokenizer_class.all_special_ids = property(lambda self: [0])  # type:ignore
-        graph = attribute(s, model)
+        graph = _trace_graph(s, model)
         assert isinstance(model, NNSightReplacementModel)
 
         verify_token_and_error_edges(model, graph)
@@ -481,7 +491,7 @@ def test_large_gpt_oss_model():
     original_all_special_ids = tokenizer_class.all_special_ids  # type:ignore
     try:
         tokenizer_class.all_special_ids = property(lambda self: [0])  # type:ignore
-        graph = attribute(s, model)
+        graph = _trace_graph(s, model)
         assert isinstance(model, NNSightReplacementModel)
 
         verify_token_and_error_edges(model, graph)
@@ -504,7 +514,7 @@ def _test_gpt_oss_clt():
     )
 
     s_formatted = model.tokenizer.apply_chat_template(messages)[-11:-1]  # type:ignore
-    graph = attribute(s_formatted, model, verbose=True)  # type:ignore
+    graph = _trace_graph(s_formatted, model)  # type:ignore
     assert isinstance(model, NNSightReplacementModel)
 
     verify_token_and_error_edges(model, graph)

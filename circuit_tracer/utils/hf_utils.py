@@ -39,7 +39,10 @@ def _validate_configured_provider_fingerprint(config: dict, transcoder: object) 
         return
     if not isinstance(expected, dict):
         raise ValueError("Configured transcoder_provider_fingerprint is malformed")
-    from circuit_tracer.transcoder.provider import provider_fingerprint
+    from circuit_tracer.transcoder.provider import (
+        normalize_provider_fingerprints_for_comparison,
+        provider_fingerprint,
+    )
 
     current = provider_fingerprint(
         transcoder,
@@ -47,7 +50,10 @@ def _validate_configured_provider_fingerprint(config: dict, transcoder: object) 
         checkpoint_identity=expected.get("checkpoint_identity"),
         dtype=expected.get("dtype"),
     )
-    if expected != current:
+    normalized_expected, normalized_current = normalize_provider_fingerprints_for_comparison(
+        expected, current
+    )
+    if normalized_expected != normalized_current:
         raise ValueError("Configured transcoder_provider_fingerprint mismatch")
 
 

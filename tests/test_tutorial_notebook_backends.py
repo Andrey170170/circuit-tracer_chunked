@@ -5,17 +5,23 @@ import pytest
 import torch
 
 from circuit_tracer.replacement_model import ReplacementModel
-from circuit_tracer.attribution.attribute_nnsight import attribute as attribute_nnsight
-from circuit_tracer.attribution.attribute_transformerlens import (
-    attribute as attribute_transformerlens,
-)
 from circuit_tracer.attribution.targets import CustomTarget
 from circuit_tracer.graph import compute_node_influence
+from circuit_tracer.tracing import AttributionProblem, TraceRequest, TraceSemantics, trace_one
 from circuit_tracer.utils.demo_utils import get_unembed_vecs
 from tests.conftest import has_32gb
 
 # decorator used to gate individual tests on available VRAM
 skip32gb = pytest.mark.skipif(not has_32gb, reason="Requires >=32GB VRAM")
+
+
+def _trace_graph(prompt, model, *, targets=None, source_batch_size: int = 512):
+    return trace_one(
+        TraceRequest(
+            problem=AttributionProblem(prompt=prompt, model=model, targets=targets),
+            semantics=TraceSemantics(source_batch_size=source_batch_size),
+        )
+    ).graph
 
 
 def _move_replacement_model(model, device):
@@ -250,9 +256,9 @@ def test_dallas_austin_attribution(models, dallas_austin_prompt):
     model_nnsight, model_tl = models
 
     with model_nnsight.zero_softcap():
-        graph_nnsight = attribute_nnsight(dallas_austin_prompt, model_nnsight, verbose=False)
+        graph_nnsight = _trace_graph(dallas_austin_prompt, model_nnsight)
     with model_tl.zero_softcap():
-        graph_tl = attribute_transformerlens(dallas_austin_prompt, model_tl, verbose=False)
+        graph_tl = _trace_graph(dallas_austin_prompt, model_tl)
 
     assert (graph_nnsight.active_features == graph_tl.active_features).all(), (
         "Dallas-Austin active features don't match"
@@ -593,9 +599,9 @@ def test_oakland_sacramento_attribution(models, oakland_sacramento_prompt):
     model_nnsight, model_tl = models
 
     with model_nnsight.zero_softcap():
-        graph_nnsight = attribute_nnsight(oakland_sacramento_prompt, model_nnsight, verbose=False)
+        graph_nnsight = _trace_graph(oakland_sacramento_prompt, model_nnsight)
     with model_tl.zero_softcap():
-        graph_tl = attribute_transformerlens(oakland_sacramento_prompt, model_tl, verbose=False)
+        graph_tl = _trace_graph(oakland_sacramento_prompt, model_tl)
 
     assert (graph_nnsight.active_features == graph_tl.active_features).all(), (
         "Oakland-Sacramento active features don't match"
@@ -686,9 +692,9 @@ def test_multilingual_french_attribution(models, small_big_prompts):
     prompt = small_big_prompts["french"]
 
     with model_nnsight.zero_softcap():
-        graph_nnsight = attribute_nnsight(prompt, model_nnsight, verbose=False)
+        graph_nnsight = _trace_graph(prompt, model_nnsight)
     with model_tl.zero_softcap():
-        graph_tl = attribute_transformerlens(prompt, model_tl, verbose=False)
+        graph_tl = _trace_graph(prompt, model_tl)
 
     assert (graph_nnsight.active_features == graph_tl.active_features).all(), (
         "French multilingual active features don't match"
@@ -934,12 +940,11 @@ def test_attribution_targets_string(models_cpu, dallas_austin_prompt):
 
     # --- NNSight backend ---
     with clean_cuda(model_nnsight):
-        graph_nnsight = attribute_nnsight(
+        graph_nnsight = _trace_graph(
             dallas_austin_prompt,
             model_nnsight,
-            attribution_targets=str_targets,
-            verbose=False,
-            batch_size=256,
+            targets=str_targets,
+            source_batch_size=256,
         )
         nn_active = graph_nnsight.active_features.cpu()
         nn_selected = graph_nnsight.selected_features.cpu()
@@ -948,12 +953,11 @@ def test_attribution_targets_string(models_cpu, dallas_austin_prompt):
 
     # --- TL backend ---
     with clean_cuda(model_tl):
-        graph_tl = attribute_transformerlens(
+        graph_tl = _trace_graph(
             dallas_austin_prompt,
             model_tl,
-            attribution_targets=str_targets,
-            verbose=False,
-            batch_size=128,
+            targets=str_targets,
+            source_batch_size=128,
         )
         tl_active = graph_tl.active_features.cpu()
         tl_selected = graph_tl.selected_features.cpu()
@@ -988,12 +992,11 @@ def test_attribution_targets_tensor(models_cpu, dallas_austin_prompt):
 
     # --- NNSight backend ---
     with clean_cuda(model_nnsight):
-        graph_nnsight = attribute_nnsight(
+        graph_nnsight = _trace_graph(
             dallas_austin_prompt,
             model_nnsight,
-            attribution_targets=tensor_targets,
-            verbose=False,
-            batch_size=256,
+            targets=tensor_targets,
+            source_batch_size=256,
         )
         nn_active = graph_nnsight.active_features.cpu()
         nn_selected = graph_nnsight.selected_features.cpu()
@@ -1002,12 +1005,11 @@ def test_attribution_targets_tensor(models_cpu, dallas_austin_prompt):
 
     # --- TL backend ---
     with clean_cuda(model_tl):
-        graph_tl = attribute_transformerlens(
+        graph_tl = _trace_graph(
             dallas_austin_prompt,
             model_tl,
-            attribution_targets=tensor_targets,
-            verbose=False,
-            batch_size=128,
+            targets=tensor_targets,
+            source_batch_size=128,
         )
         tl_active = graph_tl.active_features.cpu()
         tl_selected = graph_tl.selected_features.cpu()
@@ -1037,12 +1039,11 @@ def test_attribution_targets_logit_diff(models_cpu, dallas_austin_prompt):
         custom_nnsight, _, _ = _build_demo_custom_target(
             model_nnsight, dallas_austin_prompt, "▁Austin", "▁Dallas", backend="nnsight"
         )
-        graph_nnsight = attribute_nnsight(
+        graph_nnsight = _trace_graph(
             dallas_austin_prompt,
             model_nnsight,
-            attribution_targets=[custom_nnsight],
-            verbose=False,
-            batch_size=256,
+            targets=[custom_nnsight],
+            source_batch_size=256,
         )
         nn_active = graph_nnsight.active_features.cpu()
         nn_selected = graph_nnsight.selected_features.cpu()
@@ -1054,12 +1055,11 @@ def test_attribution_targets_logit_diff(models_cpu, dallas_austin_prompt):
         custom_tl, _, _ = _build_demo_custom_target(
             model_tl, dallas_austin_prompt, "▁Austin", "▁Dallas", backend="transformerlens"
         )
-        graph_tl = attribute_transformerlens(
+        graph_tl = _trace_graph(
             dallas_austin_prompt,
             model_tl,
-            attribution_targets=[custom_tl],
-            verbose=False,
-            batch_size=128,
+            targets=[custom_tl],
+            source_batch_size=128,
         )
         tl_active = graph_tl.active_features.cpu()
         tl_selected = graph_tl.selected_features.cpu()
@@ -1101,12 +1101,11 @@ def test_attribution_targets_logit_diff_intervention(models_cpu, dallas_austin_p
         custom_nnsight, idx_x_nn, idx_y_nn = _build_demo_custom_target(
             model_nnsight, dallas_austin_prompt, "▁Austin", "▁Dallas", backend="nnsight"
         )
-        graph_nnsight = attribute_nnsight(
+        graph_nnsight = _trace_graph(
             dallas_austin_prompt,
             model_nnsight,
-            attribution_targets=[custom_nnsight],
-            verbose=False,
-            batch_size=256,
+            targets=[custom_nnsight],
+            source_batch_size=256,
         )
         top_feats_nn = _get_top_features(graph_nnsight, n_top)
 
@@ -1132,12 +1131,11 @@ def test_attribution_targets_logit_diff_intervention(models_cpu, dallas_austin_p
         custom_tl, idx_x_tl, idx_y_tl = _build_demo_custom_target(
             model_tl, dallas_austin_prompt, "▁Austin", "▁Dallas", backend="transformerlens"
         )
-        graph_tl = attribute_transformerlens(
+        graph_tl = _trace_graph(
             dallas_austin_prompt,
             model_tl,
-            attribution_targets=[custom_tl],
-            verbose=False,
-            batch_size=128,
+            targets=[custom_tl],
+            source_batch_size=128,
         )
         top_feats_tl = _get_top_features(graph_tl, n_top)
 
@@ -1184,12 +1182,11 @@ def test_attribution_targets_semantic(models_cpu, dallas_austin_prompt):
         sem_nnsight = _build_demo_semantic_target(
             model_nnsight, dallas_austin_prompt, capitals, states, label, backend="nnsight"
         )
-        graph_nnsight = attribute_nnsight(
+        graph_nnsight = _trace_graph(
             dallas_austin_prompt,
             model_nnsight,
-            attribution_targets=[sem_nnsight],
-            verbose=False,
-            batch_size=256,
+            targets=[sem_nnsight],
+            source_batch_size=256,
         )
         nn_active = graph_nnsight.active_features.cpu()
         nn_selected = graph_nnsight.selected_features.cpu()
@@ -1201,12 +1198,11 @@ def test_attribution_targets_semantic(models_cpu, dallas_austin_prompt):
         sem_tl = _build_demo_semantic_target(
             model_tl, dallas_austin_prompt, capitals, states, label, backend="transformerlens"
         )
-        graph_tl = attribute_transformerlens(
+        graph_tl = _trace_graph(
             dallas_austin_prompt,
             model_tl,
-            attribution_targets=[sem_tl],
-            verbose=False,
-            batch_size=128,
+            targets=[sem_tl],
+            source_batch_size=128,
         )
         tl_active = graph_tl.active_features.cpu()
         tl_selected = graph_tl.selected_features.cpu()
@@ -1256,12 +1252,11 @@ def test_attribution_targets_semantic_intervention(models_cpu, dallas_austin_pro
         idx_x_nn = model_nnsight.tokenizer.encode("▁Austin", add_special_tokens=False)[-1]
         idx_y_nn = model_nnsight.tokenizer.encode("▁Dallas", add_special_tokens=False)[-1]
 
-        graph_nnsight = attribute_nnsight(
+        graph_nnsight = _trace_graph(
             dallas_austin_prompt,
             model_nnsight,
-            attribution_targets=[sem_nnsight],
-            verbose=False,
-            batch_size=256,
+            targets=[sem_nnsight],
+            source_batch_size=256,
         )
         top_feats_nn = _get_top_features(graph_nnsight, n_top)
 
@@ -1290,12 +1285,11 @@ def test_attribution_targets_semantic_intervention(models_cpu, dallas_austin_pro
         idx_x_tl = model_tl.tokenizer.encode("▁Austin", add_special_tokens=False)[-1]
         idx_y_tl = model_tl.tokenizer.encode("▁Dallas", add_special_tokens=False)[-1]
 
-        graph_tl = attribute_transformerlens(
+        graph_tl = _trace_graph(
             dallas_austin_prompt,
             model_tl,
-            attribution_targets=[sem_tl],
-            verbose=False,
-            batch_size=128,
+            targets=[sem_tl],
+            source_batch_size=128,
         )
         top_feats_tl = _get_top_features(graph_tl, n_top)
 

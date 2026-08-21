@@ -1,5 +1,9 @@
+import json
+from pathlib import Path
+
 import torch
 
+from circuit_tracer.observability import resources
 import circuit_tracer.utils.telemetry as telemetry
 from circuit_tracer.utils.telemetry import (
     TelemetryRecorder,
@@ -95,6 +99,50 @@ def test_telemetry_timer_records_elapsed_and_error_type() -> None:
     assert event["attrs"]["error_type"] == "RuntimeError"
 
 
+def test_telemetry_recorder_streams_jsonl_without_changing_memory_cap(
+    tmp_path: Path,
+) -> None:
+    jsonl_path = tmp_path / "telemetry.live.jsonl"
+    recorder = TelemetryRecorder(
+        enabled=True,
+        max_events=1,
+        jsonl_path=jsonl_path,
+        static_context={"schema_version": 1, "trace_step_index": 3},
+    )
+
+    recorder.record_event(scope="phase", name="first", phase="phase0")
+    recorder.record_event(scope="phase", name="second", phase="phase4")
+    recorder.close()
+
+    records = [json.loads(line) for line in jsonl_path.read_text().splitlines()]
+    assert [record["event_index"] for record in records] == [0, 1]
+    assert [record["sequence"] for record in records] == [1, 2]
+    assert all(record["trace_step_index"] == 3 for record in records)
+    assert [record["name"] for record in records] == ["first", "second"]
+
+    exported = recorder.export(include_events=True)
+    assert len(exported["events"]) == 1
+    assert exported["summary"]["event_count"] == 2
+    assert exported["summary"]["dropped_event_count"] == 1
+    assert exported["summary"]["sink_event_count"] == 2
+    assert exported["summary"]["sink_status"] == "closed"
+
+
+def test_telemetry_recorder_sink_failure_is_nonfatal(tmp_path: Path) -> None:
+    recorder = TelemetryRecorder(
+        enabled=True,
+        jsonl_path=tmp_path / "missing" / "telemetry.live.jsonl",
+    )
+
+    recorder.record_event(scope="run", name="still-recorded")
+    recorder.close()
+
+    exported = recorder.export(include_events=True)
+    assert [event["name"] for event in exported["events"]] == ["still-recorded"]
+    assert exported["summary"]["sink_status"] == "error"
+    assert exported["summary"]["sink_error_count"] == 1
+
+
 def test_get_memory_snapshot_reports_current_and_peak_rss_keys() -> None:
     snapshot = get_memory_snapshot(torch.device("cpu"))
 
@@ -132,6 +180,15 @@ def test_get_memory_snapshot_soft_fails_when_cgroup_is_unavailable(monkeypatch) 
     assert snapshot["cgroup_memory_peak_gib"] is None
     assert snapshot["cgroup_memory_anon_gib"] is None
     assert snapshot["cgroup_memory_file_gib"] is None
+
+
+def test_facade_respects_direct_resource_resolver_monkeypatch(monkeypatch) -> None:
+    monkeypatch.setattr(resources, "_resolve_cgroup_memory_dir", lambda: None)
+
+    snapshot = get_memory_snapshot(torch.device("cpu"))
+
+    assert snapshot["cgroup_memory_current_gib"] is None
+    assert snapshot["cgroup_memory_peak_gib"] is None
 
 
 def test_build_memory_before_after_attrs_emits_prefixed_values_and_deltas() -> None:

@@ -4,15 +4,23 @@ import pytest
 import torch
 
 from circuit_tracer import ReplacementModel
-from circuit_tracer.attribution.attribute_transformerlens import attribute as attribute_tl
-from circuit_tracer.attribution.attribute_nnsight import attribute as attribute_nnsight
 from circuit_tracer.replacement_model.replacement_model_transformerlens import (
     TransformerLensReplacementModel,
 )
 from circuit_tracer.replacement_model.replacement_model_nnsight import (
     NNSightReplacementModel,
 )
+from circuit_tracer.tracing import AttributionProblem, ExecutionConstraints, TraceRequest, trace_one
 from tests.conftest import has_32gb
+
+
+def _trace_graph(prompt, model, *, offload: str | None = None):
+    return trace_one(
+        TraceRequest(
+            problem=AttributionProblem(prompt=prompt, model=model),
+            execution=ExecutionConstraints(offload=offload),
+        )
+    ).graph
 
 
 @pytest.fixture(autouse=True)
@@ -31,19 +39,15 @@ def test_offload_tl():
     original_device = model.cfg.device  # type:ignore
     assert isinstance(original_device, torch.device)
 
-    graph_none = attribute_tl(s, model, offload=None)
-    graph_cpu = attribute_tl(s, model, offload="cpu")
-    assert torch.allclose(
-        graph_none.adjacency_matrix, graph_cpu.adjacency_matrix, atol=1e-5, rtol=1e-3
-    )
+    _trace_graph(s, model)
+    with pytest.raises(ValueError, match="only default execution constraints"):
+        _trace_graph(s, model, offload="cpu")
 
     for param in model.parameters():
         assert param.device.type == original_device.type
 
-    graph_disk = attribute_tl(s, model, offload="disk")
-    assert torch.allclose(
-        graph_none.adjacency_matrix, graph_disk.adjacency_matrix, atol=1e-5, rtol=1e-3
-    )
+    with pytest.raises(ValueError, match="only default execution constraints"):
+        _trace_graph(s, model, offload="disk")
 
     for param in model.parameters():
         assert param.device.type == original_device.type
@@ -58,8 +62,8 @@ def test_offload_nnsight():
     original_device = model.device
     assert isinstance(original_device, torch.device)
 
-    graph_none = attribute_nnsight(s, model, offload=None)
-    graph_cpu = attribute_nnsight(s, model, offload="cpu")
+    graph_none = _trace_graph(s, model)
+    graph_cpu = _trace_graph(s, model, offload="cpu")
     assert torch.allclose(
         graph_none.adjacency_matrix, graph_cpu.adjacency_matrix, atol=1e-5, rtol=1e-3
     )
@@ -67,7 +71,7 @@ def test_offload_nnsight():
     for param in model.parameters():
         assert param.device.type == original_device.type
 
-    graph_disk = attribute_nnsight(s, model, offload="disk")
+    graph_disk = _trace_graph(s, model, offload="disk")
     assert torch.allclose(
         graph_none.adjacency_matrix, graph_disk.adjacency_matrix, atol=1e-5, rtol=1e-3
     )
@@ -87,7 +91,7 @@ def test_offload_nnsight_gemma_3():
     original_device = model.device
     assert isinstance(original_device, torch.device)
 
-    attribute_nnsight(s, model, offload="cpu")
+    _trace_graph(s, model, offload="cpu")
     for param in model.parameters():
         assert param.device.type == original_device.type
 

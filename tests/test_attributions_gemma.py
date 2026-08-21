@@ -9,10 +9,10 @@ from tqdm import tqdm
 from transformer_lens import HookedTransformerConfig
 
 from circuit_tracer import Graph, ReplacementModel
-from circuit_tracer.attribution.attribute_transformerlens import attribute
 from circuit_tracer.replacement_model.replacement_model_transformerlens import (
     TransformerLensReplacementModel,
 )
+from circuit_tracer.tracing import AttributionProblem, TraceRequest, TraceSemantics, trace_one
 from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.utils import get_default_device
@@ -23,6 +23,17 @@ def cleanup_cuda():
     yield
     torch.cuda.empty_cache()
     gc.collect()
+
+
+def trace_graph(prompt, model, *, source_batch_size: int = 512) -> Graph:
+    result = trace_one(
+        TraceRequest(
+            problem=AttributionProblem(prompt=prompt, model=model),
+            semantics=TraceSemantics(source_batch_size=source_batch_size),
+        )
+    )
+    assert isinstance(result.output, Graph)
+    return result.output
 
 
 def verify_token_and_error_edges(
@@ -291,7 +302,7 @@ def test_small_gemma_model():
     }
     cfg = HookedTransformerConfig.from_dict(gemma_small_cfg)
     model = load_dummy_gemma_model(cfg)
-    graph = attribute(s, model)
+    graph = trace_graph(s, model)
 
     verify_token_and_error_edges(model, graph)
     verify_feature_edges(model, graph)
@@ -386,7 +397,7 @@ def test_large_gemma_model():
     }
     cfg = HookedTransformerConfig.from_dict(gemma_large_cfg)
     model = load_dummy_gemma_model(cfg)
-    graph = attribute(s, model)
+    graph = trace_graph(s, model)
 
     verify_token_and_error_edges(model, graph)
     verify_feature_edges(model, graph)
@@ -397,7 +408,7 @@ def test_gemma_2_2b():
     s = "The National Digital Analytics Group (ND"
     model = ReplacementModel.from_pretrained("google/gemma-2-2b", "gemma")
     assert isinstance(model, TransformerLensReplacementModel)
-    graph = attribute(s, model, batch_size=256)
+    graph = trace_graph(s, model, source_batch_size=256)
 
     print("Changing logit softcap to 0, as the logits will otherwise be off.")
     with model.zero_softcap():
@@ -410,7 +421,7 @@ def test_gemma_2_2b_clt():
     s = "The National Digital Analytics Group (ND"
     model = ReplacementModel.from_pretrained("google/gemma-2-2b", "mntss/clt-gemma-2-2b-426k")
     assert isinstance(model, TransformerLensReplacementModel)
-    graph = attribute(s, model, batch_size=256)
+    graph = trace_graph(s, model, source_batch_size=256)
 
     print("Changing logit softcap to 0, as the logits will otherwise be off.")
     with model.zero_softcap():

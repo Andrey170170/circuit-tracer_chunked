@@ -1,9 +1,5 @@
-import glob
-import hashlib
-import json
 import os
 import time
-from collections import OrderedDict
 from typing import cast
 
 import numpy as np
@@ -18,59 +14,24 @@ from circuit_tracer.attribution.sparsification import (
     select_candidate_feature_indices,
 )
 from circuit_tracer.transcoder.activation_functions import JumpReLU
+from circuit_tracer.transcoder.decoder_cache import DecoderChunkCache
+from circuit_tracer.transcoder.diagnostics import DiagnosticsMixin
+from circuit_tracer.transcoder.fingerprints import FingerprintMixin
+from circuit_tracer.transcoder.loaders import (
+    DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
+    DEFAULT_EXACT_DECODER_CHUNK_SIZE,
+    _load_state_dict as _load_state_dict,
+    load_clt as load_clt,
+    load_gemma_scope_2_clt as load_gemma_scope_2_clt,
+)
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
+from circuit_tracer.transcoder.checkpoint_working_set import ProviderCheckpointLifecycle
+from circuit_tracer.transcoder.attribution_result import AttributionComponents
 from circuit_tracer.utils import get_default_device
-from circuit_tracer.utils.telemetry import TelemetryRecorder
 
 
-DEFAULT_EXACT_DECODER_CHUNK_SIZE = 1024
-DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES = 8589934592
 
-
-class DecoderChunkCache:
-    def __init__(self, max_bytes: int, *, fingerprint: object | None = None) -> None:
-        self.max_bytes = max(0, int(max_bytes))
-        self.fingerprint = fingerprint
-        self.bytes_resident = 0
-        self._entries: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
-
-    @staticmethod
-    def _tensor_nbytes(tensor: torch.Tensor) -> int:
-        return int(tensor.numel() * tensor.element_size())
-
-    def get(self, key: tuple[int, int]) -> torch.Tensor | None:
-        value = self._entries.get(key)
-        if value is None:
-            return None
-        self._entries.move_to_end(key)
-        return value
-
-    def put(self, key: tuple[int, int], value: torch.Tensor) -> list[tuple[tuple[int, int], int]]:
-        value_nbytes = self._tensor_nbytes(value)
-        evicted: list[tuple[tuple[int, int], int]] = []
-        existing = self._entries.pop(key, None)
-        if existing is not None:
-            self.bytes_resident -= self._tensor_nbytes(existing)
-
-        if self.max_bytes <= 0 or value_nbytes > self.max_bytes:
-            return evicted
-
-        while self._entries and self.bytes_resident + value_nbytes > self.max_bytes:
-            evicted_key, evicted_value = self._entries.popitem(last=False)
-            evicted_nbytes = self._tensor_nbytes(evicted_value)
-            self.bytes_resident -= evicted_nbytes
-            evicted.append((evicted_key, evicted_nbytes))
-
-        self._entries[key] = value
-        self.bytes_resident += value_nbytes
-        return evicted
-
-    def clear(self) -> None:
-        self._entries.clear()
-        self.bytes_resident = 0
-
-
-class CrossLayerTranscoder(torch.nn.Module):
+class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
     """
     A cross-layer transcoder (CLT) where features read from one layer and write to all
     subsequent layers.
@@ -125,6 +86,7 @@ class CrossLayerTranscoder(torch.nn.Module):
         exact_chunked_decoder: bool = False,
         decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
         cross_batch_decoder_cache_bytes: int | None = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES,
+        checkpoint_lifecycle: ProviderCheckpointLifecycle | None = None,
     ):
         super().__init__()
 
@@ -144,9 +106,10 @@ class CrossLayerTranscoder(torch.nn.Module):
         if cross_batch_decoder_cache_bytes is None:
             cross_batch_decoder_cache_bytes = DEFAULT_CROSS_BATCH_DECODER_CACHE_BYTES
         self.cross_batch_decoder_cache_bytes = max(0, int(cross_batch_decoder_cache_bytes))
+        self.checkpoint_lifecycle = checkpoint_lifecycle
         self._diagnostic_stats = self._make_empty_diagnostic_stats()
         self._trace_logger = None
-        self._telemetry_recorder: TelemetryRecorder | None = None
+        self._trace_observer = None
         self._trace_chunk_interval = 16
         self._trace_decoder_load_interval = 32
         self._phase0_activation_threshold_compare_mode = "baseline"
@@ -222,11 +185,20 @@ class CrossLayerTranscoder(torch.nn.Module):
             supports_lazy_encoder=bool(self.lazy_encoder),
             supports_lazy_decoder_chunks=exact_provider,
             supports_lazy_encoder_rows=exact_provider,
+            supports_exact_row_replay=exact_provider,
             decoder_output_topology="cross_layer",
             default_decoder_chunk_size=int(self.decoder_chunk_size),
             default_cross_batch_decoder_cache_bytes=int(self.cross_batch_decoder_cache_bytes),
             legacy_exact_chunked_decoder=bool(self.exact_chunked_decoder),
         )
+
+    def close_decoder_checkpoint_handles(self) -> None:
+        """Close provider-owned decoder mappings before page advice.
+
+        Current safetensors accesses are context-managed per request, so there
+        are no persistent handles to close. This explicit hook keeps the runtime
+        transition fail-closed if a future loader introduces owned mappings.
+        """
 
     def decoder_output_layers_for_source(
         self, source_layer: int, active_output_layers: list[int] | None = None
@@ -257,592 +229,6 @@ class CrossLayerTranscoder(torch.nn.Module):
     def dtype(self):
         """Get the dtype of the module's parameters."""
         return self.b_enc.dtype
-
-    @staticmethod
-    def _make_empty_diagnostic_stats() -> dict[str, object]:
-        return {
-            "encoder_load_count": 0,
-            "encoder_load_seconds": 0.0,
-            "encoder_load_by_layer": {},
-            "decoder_load_count": 0,
-            "decoder_load_seconds": 0.0,
-            "decoder_load_by_layer": {},
-            "decoder_cache_hit_count": 0,
-            "decoder_cache_miss_count": 0,
-            "decoder_cache_eviction_count": 0,
-            "decoder_cache_skip_count": 0,
-            "decoder_cache_auto_disable_count": 0,
-            "decoder_cache_bytes_resident": 0,
-            "decoder_cache_max_bytes": 0,
-            "encode_sparse_seconds": 0.0,
-            "encode_sparse_by_layer": {},
-            "encode_sparse_active_features_by_layer": {},
-            "reconstruction_chunk_count": 0,
-            "reconstruction_seconds": 0.0,
-            "reconstruction_by_layer": {},
-            "reconstruction_chunks_by_layer": {},
-            "phase0_activation_threshold_compare_mode": "baseline",
-            "phase0_activation_threshold_compare_dtype": None,
-            "phase0_threshold_membership_debug_enabled": False,
-            "phase0_threshold_membership_sample_limit_per_layer": 0,
-            "phase0_threshold_membership": None,
-            "phase0_boundary_fingerprints": None,
-        }
-
-    @staticmethod
-    def _resolve_phase0_activation_threshold_compare_mode(mode: str) -> str:
-        aliases = {
-            "baseline": "baseline",
-            "default": "baseline",
-            "bf16": "bf16",
-            "bfloat16": "bf16",
-            "fp32": "fp32",
-            "float32": "fp32",
-            "torch.float32": "fp32",
-            "fp64": "fp64",
-            "float64": "fp64",
-            "torch.float64": "fp64",
-        }
-        normalized = str(mode).strip().lower()
-        resolved = aliases.get(normalized)
-        if resolved is None:
-            allowed = "baseline, bf16, fp32, fp64"
-            raise ValueError(
-                "phase0_activation_threshold_compare_mode must be one of "
-                f"{{{allowed}}} (got {mode!r})"
-            )
-        return resolved
-
-    @staticmethod
-    def _dtype_name(dtype: torch.dtype) -> str:
-        if dtype == torch.bfloat16:
-            return "bfloat16"
-        if dtype == torch.float32:
-            return "float32"
-        if dtype == torch.float64:
-            return "float64"
-        return str(dtype)
-
-    @staticmethod
-    def _hash_json_payload(payload: object) -> str:
-        encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-        return hashlib.sha1(encoded).hexdigest()[:16]
-
-    @staticmethod
-    def _hash_tensor_payload(
-        values: torch.Tensor,
-        *,
-        dtype: torch.dtype | None = None,
-    ) -> str:
-        resolved = values.detach()
-        if dtype is not None:
-            resolved = resolved.to(dtype=dtype)
-        resolved_cpu = resolved.to(device="cpu").contiguous()
-        hasher = hashlib.blake2s(digest_size=8)
-        hasher.update(np.asarray(list(resolved_cpu.shape), dtype=np.int64).tobytes())
-        hasher.update(resolved_cpu.numpy().tobytes())
-        return hasher.hexdigest()
-
-    @staticmethod
-    def _build_compact_tensor_stats(
-        values: torch.Tensor,
-        *,
-        epsilon: float = 1e-12,
-    ) -> dict[str, object]:
-        flat = values.detach().to(device="cpu", dtype=torch.float64).flatten()
-        count = int(flat.numel())
-        if count == 0:
-            return {
-                "count": 0,
-                "finite_count": 0,
-                "nonfinite_count": 0,
-                "nan_count": 0,
-                "posinf_count": 0,
-                "neginf_count": 0,
-                "min": None,
-                "max": None,
-                "mean": None,
-                "abs_sum": 0.0,
-                "abs_max": None,
-                "effective_nonzero_count": 0,
-                "effective_zero_count": 0,
-                "epsilon": float(epsilon),
-            }
-
-        finite_mask = torch.isfinite(flat)
-        finite_values = flat[finite_mask]
-        abs_flat = flat.abs()
-        effective_nonzero_count = int((abs_flat > epsilon).sum().item())
-        return {
-            "count": count,
-            "finite_count": int(finite_mask.sum().item()),
-            "nonfinite_count": int(count - int(finite_mask.sum().item())),
-            "nan_count": int(torch.isnan(flat).sum().item()),
-            "posinf_count": int(torch.isposinf(flat).sum().item()),
-            "neginf_count": int(torch.isneginf(flat).sum().item()),
-            "min": float(finite_values.min().item()) if finite_values.numel() > 0 else None,
-            "max": float(finite_values.max().item()) if finite_values.numel() > 0 else None,
-            "mean": float(finite_values.mean().item()) if finite_values.numel() > 0 else None,
-            "abs_sum": float(abs_flat.sum().item()),
-            "abs_max": float(abs_flat.max().item()) if abs_flat.numel() > 0 else None,
-            "effective_nonzero_count": effective_nonzero_count,
-            "effective_zero_count": int(count - effective_nonzero_count),
-            "epsilon": float(epsilon),
-        }
-
-    @staticmethod
-    def _hash_sparse_membership_indices_2d(
-        indices: torch.Tensor,
-        *,
-        shape: tuple[int, int],
-        canonicalize: bool,
-    ) -> str:
-        indices_cpu = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
-        hasher = hashlib.blake2s(digest_size=8)
-        hasher.update(np.asarray(list(shape), dtype=np.int64).tobytes())
-        if indices_cpu.numel() == 0:
-            hasher.update(b"empty")
-            return hasher.hexdigest()
-
-        if not canonicalize:
-            hasher.update(indices_cpu.numpy().tobytes())
-            return hasher.hexdigest()
-
-        flat = indices_cpu[:, 0] * int(shape[1]) + indices_cpu[:, 1]
-        hasher.update(torch.sort(flat).values.contiguous().numpy().tobytes())
-        return hasher.hexdigest()
-
-    def _build_sampled_tensor_fingerprint(
-        self,
-        values: torch.Tensor,
-        *,
-        sample_limit: int = 4096,
-        hash_dtype: torch.dtype = torch.float32,
-    ) -> dict[str, object]:
-        flat = values.detach().flatten()
-        total_count = int(flat.numel())
-        sample_limit = max(1, int(sample_limit))
-        if total_count == 0:
-            sample = flat
-            sample_stride = 1
-        elif total_count <= sample_limit:
-            sample = flat
-            sample_stride = 1
-        else:
-            sample_count = min(total_count, sample_limit)
-            sample_indices = (
-                torch.linspace(
-                    0,
-                    total_count - 1,
-                    steps=sample_count,
-                    device=flat.device,
-                )
-                .round()
-                .to(dtype=torch.int64)
-            )
-            sample = flat.index_select(0, sample_indices)
-            sample_stride = max(1, total_count // sample_count)
-
-        return {
-            "shape": list(values.shape),
-            "dtype": self._dtype_name(values.dtype),
-            "element_count": total_count,
-            "sample_count": int(sample.numel()),
-            "sample_stride": int(sample_stride),
-            "sample_hash": self._hash_tensor_payload(sample, dtype=hash_dtype),
-            "sample_hash_dtype": self._dtype_name(hash_dtype),
-            "sample_stats": self._build_compact_tensor_stats(sample, epsilon=1e-12),
-        }
-
-    def _build_layer_constant_fingerprint(
-        self,
-        *,
-        layer_id: int,
-        encoder_weights: torch.Tensor,
-    ) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "layer": int(layer_id),
-            "encoder_weight": self._build_sampled_tensor_fingerprint(
-                encoder_weights,
-                sample_limit=4096,
-            ),
-            "encoder_bias_hash_fp32": self._hash_tensor_payload(
-                self.b_enc[layer_id],
-                dtype=torch.float32,
-            ),
-            "encoder_bias_stats": self._build_compact_tensor_stats(
-                self.b_enc[layer_id],
-                epsilon=1e-12,
-            ),
-        }
-        if isinstance(self.activation_function, JumpReLU):
-            threshold = cast(JumpReLU, self.activation_function).threshold[layer_id]
-            payload["threshold_hash_fp32"] = self._hash_tensor_payload(
-                threshold,
-                dtype=torch.float32,
-            )
-            payload["threshold_stats"] = self._build_compact_tensor_stats(
-                threshold,
-                epsilon=1e-12,
-            )
-        payload["layer_constant_hash"] = self._hash_json_payload(payload)
-        return payload
-
-    def configure_phase0_activation_threshold_compare(
-        self,
-        *,
-        mode: str = "baseline",
-        collect_diagnostics: bool = False,
-        sample_limit_per_layer: int = 3,
-    ) -> None:
-        resolved_mode = self._resolve_phase0_activation_threshold_compare_mode(mode)
-        self._phase0_activation_threshold_compare_mode = resolved_mode
-        self._phase0_threshold_membership_debug_enabled = bool(collect_diagnostics)
-        self._phase0_threshold_membership_sample_limit_per_layer = max(
-            0,
-            int(sample_limit_per_layer),
-        )
-
-    def _resolve_phase0_compare_dtype(self) -> torch.dtype | None:
-        mode = self._phase0_activation_threshold_compare_mode
-        if mode == "bf16":
-            return torch.bfloat16
-        if mode == "fp32":
-            return torch.float32
-        if mode == "fp64":
-            return torch.float64
-        return None
-
-    def _compute_jump_relu_mask(
-        self,
-        *,
-        layer_id: int,
-        features: torch.Tensor,
-        collect_diagnostics: bool,
-    ) -> tuple[torch.Tensor, dict[str, object] | None]:
-        thresholds = cast(JumpReLU, self.activation_function).threshold[layer_id]
-        compare_dtype = self._resolve_phase0_compare_dtype()
-        if compare_dtype is None:
-            compare_features = features
-            compare_thresholds = thresholds
-            compare_dtype_name = self._dtype_name(features.dtype)
-        else:
-            compare_features = features.to(dtype=compare_dtype)
-            compare_thresholds = thresholds.to(device=features.device, dtype=compare_dtype)
-            compare_dtype_name = self._dtype_name(compare_dtype)
-
-        mask = compare_features > compare_thresholds
-        self._diagnostic_stats["phase0_activation_threshold_compare_dtype"] = compare_dtype_name
-
-        if not collect_diagnostics:
-            return mask, None
-
-        pre_activation_fingerprint = self._build_sampled_tensor_fingerprint(
-            features,
-            sample_limit=4096,
-            hash_dtype=torch.float32,
-        )
-
-        margin_cpu = (
-            (compare_features - compare_thresholds)
-            .detach()
-            .to(
-                device="cpu",
-                dtype=torch.float64,
-            )
-        )
-        abs_margin_flat = margin_cpu.abs().flatten()
-        mask_flat_cpu = mask.detach().to(device="cpu").flatten()
-        mask_2d_cpu = mask.detach().to(device="cpu")
-        mask_u8 = mask_2d_cpu.to(dtype=torch.uint8)
-        compare_margin_fingerprint = self._build_sampled_tensor_fingerprint(
-            margin_cpu,
-            sample_limit=4096,
-            hash_dtype=torch.float64,
-        )
-        total_entries = int(mask_flat_cpu.numel())
-        active_entries = int(mask_flat_cpu.sum().item())
-
-        active_indices = torch.nonzero(mask_2d_cpu, as_tuple=False)
-        mask_membership_hash_raw = self._hash_sparse_membership_indices_2d(
-            active_indices,
-            shape=(int(mask.shape[0]), int(mask.shape[1])),
-            canonicalize=False,
-        )
-        mask_membership_hash_canonical = self._hash_sparse_membership_indices_2d(
-            active_indices,
-            shape=(int(mask.shape[0]), int(mask.shape[1])),
-            canonicalize=True,
-        )
-
-        near_counts_by_epsilon: dict[str, int] = {}
-        near_active_counts_by_epsilon: dict[str, int] = {}
-        near_inactive_counts_by_epsilon: dict[str, int] = {}
-        for epsilon in self._phase0_threshold_near_epsilons:
-            epsilon_key = f"abs_lte_{epsilon:.0e}"
-            near_mask = abs_margin_flat <= float(epsilon)
-            near_count = int(near_mask.sum().item())
-            near_active_count = int((near_mask & mask_flat_cpu).sum().item())
-            near_counts_by_epsilon[epsilon_key] = near_count
-            near_active_counts_by_epsilon[epsilon_key] = near_active_count
-            near_inactive_counts_by_epsilon[epsilon_key] = near_count - near_active_count
-
-        sample_limit = min(
-            self._phase0_threshold_membership_sample_limit_per_layer,
-            total_entries,
-        )
-        borderline_samples: list[dict[str, object]] = []
-        if sample_limit > 0 and total_entries > 0:
-            _, sample_indices = torch.topk(
-                abs_margin_flat,
-                k=sample_limit,
-                largest=False,
-            )
-            margin_flat = margin_cpu.flatten()
-            raw_features_flat = features.detach().to(device="cpu", dtype=torch.float64).flatten()
-            thresholds_flat = thresholds.detach().to(device="cpu", dtype=torch.float64).flatten()
-            for rank, flat_idx in enumerate(sample_indices.tolist(), start=1):
-                flat_idx_int = int(flat_idx)
-                pos_idx = flat_idx_int // self.d_transcoder
-                feat_idx = flat_idx_int % self.d_transcoder
-                borderline_samples.append(
-                    {
-                        "rank": rank,
-                        "position": int(pos_idx),
-                        "feature_id": int(feat_idx),
-                        "active": bool(mask_flat_cpu[flat_idx_int].item()),
-                        "pre_activation": float(raw_features_flat[flat_idx_int].item()),
-                        "threshold": float(thresholds_flat[feat_idx].item()),
-                        "compare_margin": float(margin_flat[flat_idx_int].item()),
-                        "abs_compare_margin": float(abs_margin_flat[flat_idx_int].item()),
-                    }
-                )
-
-        return mask, {
-            "layer": int(layer_id),
-            "compare_mode": self._phase0_activation_threshold_compare_mode,
-            "compare_dtype": compare_dtype_name,
-            "pre_activation_hash_fp32": pre_activation_fingerprint["sample_hash"],
-            "pre_activation_stats": pre_activation_fingerprint["sample_stats"],
-            "pre_activation_fingerprint": pre_activation_fingerprint,
-            "compare_margin_hash_fp64": compare_margin_fingerprint["sample_hash"],
-            "compare_margin_stats": compare_margin_fingerprint["sample_stats"],
-            "compare_margin_fingerprint": compare_margin_fingerprint,
-            "mask_value_hash_u8": self._hash_tensor_payload(mask_u8, dtype=torch.uint8),
-            "mask_membership_hash_raw_order": mask_membership_hash_raw,
-            "mask_membership_hash_canonical": mask_membership_hash_canonical,
-            "total_entries": total_entries,
-            "active_entries": active_entries,
-            "inactive_entries": int(total_entries - active_entries),
-            "near_counts_by_epsilon": near_counts_by_epsilon,
-            "near_active_counts_by_epsilon": near_active_counts_by_epsilon,
-            "near_inactive_counts_by_epsilon": near_inactive_counts_by_epsilon,
-            "borderline_samples": borderline_samples,
-        }
-
-    def reset_diagnostic_stats(self) -> None:
-        self._diagnostic_stats = self._make_empty_diagnostic_stats()
-
-    def configure_trace_logging(
-        self,
-        logger=None,
-        *,
-        chunk_interval: int = 16,
-        decoder_load_interval: int = 32,
-        telemetry_recorder: TelemetryRecorder | None = None,
-    ) -> None:
-        self._trace_logger = logger
-        self._telemetry_recorder = telemetry_recorder
-        self._trace_chunk_interval = max(1, chunk_interval)
-        self._trace_decoder_load_interval = max(1, decoder_load_interval)
-
-    @staticmethod
-    def _infer_phase_from_trace_event(event: str) -> str | None:
-        phase_name = event.split(".", 1)[0]
-        if phase_name.startswith("phase") and len(phase_name) > len("phase"):
-            suffix = phase_name[len("phase") :]
-            if suffix.isdigit():
-                return phase_name
-        return None
-
-    def emit_trace_event(self, event: str, **fields: object) -> None:
-        if self._trace_logger is not None:
-            payload = ", ".join(f"{key}={value}" for key, value in fields.items())
-            message = f"TRACE {event}"
-            if payload:
-                message = f"{message} | {payload}"
-            self._trace_logger(message)
-
-        if self._telemetry_recorder is not None:
-            elapsed_ms = fields.get("elapsed_ms")
-            elapsed_ms_value: float | None
-            if isinstance(elapsed_ms, (int, float)):
-                elapsed_ms_value = float(elapsed_ms)
-            else:
-                elapsed_ms_value = None
-            self._telemetry_recorder.record_event(
-                scope="op",
-                name=f"transcoder.{event}",
-                phase=self._infer_phase_from_trace_event(event),
-                elapsed_ms=elapsed_ms_value,
-                attrs=fields,
-            )
-
-    def get_diagnostic_snapshot(self) -> dict[str, object]:
-        snapshot: dict[str, object] = {}
-        for key, value in self._diagnostic_stats.items():
-            snapshot[key] = dict(value) if isinstance(value, dict) else value
-        caps = self.capabilities
-        snapshot.update(
-            {
-                "architecture": caps.architecture,
-                "checkpoint_format": caps.checkpoint_format,
-                "decoder_output_topology": caps.decoder_output_topology,
-                "supports_exact_chunked_provider": caps.supports_exact_chunked_provider,
-                "supports_decoder_chunk_cache": caps.supports_decoder_chunk_cache,
-                "supports_compact_row_store": caps.supports_compact_row_store,
-                "supports_exact_encoder_residency": caps.supports_exact_encoder_residency,
-                "supports_encoder_row_materialization": caps.supports_encoder_row_materialization,
-                "supports_lazy_decoder_chunks": caps.supports_lazy_decoder_chunks,
-                "supports_lazy_encoder_rows": caps.supports_lazy_encoder_rows,
-                "decoder_chunk_size": caps.default_decoder_chunk_size,
-                "cross_batch_decoder_cache_bytes": caps.default_cross_batch_decoder_cache_bytes,
-                "legacy_exact_chunked_decoder": caps.legacy_exact_chunked_decoder,
-            }
-        )
-        return snapshot
-
-    def _add_diagnostic_value(self, key: str, value: float) -> None:
-        current = cast(float, self._diagnostic_stats.get(key, 0.0))
-        self._diagnostic_stats[key] = current + value
-
-    def _add_diagnostic_layer_value(self, key: str, layer_id: int, value: float) -> None:
-        layer_stats = cast(dict[int, float], self._diagnostic_stats.setdefault(key, {}))
-        layer_stats[layer_id] = layer_stats.get(layer_id, 0.0) + value
-
-    def _move_lazy_slice_to_device(self, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.device == self.device and tensor.dtype == self.dtype:
-            return tensor
-
-        if tensor.device.type == "cpu" and self.device.type == "cuda":
-            try:
-                tensor = tensor.pin_memory()
-            except RuntimeError:
-                pass
-            return tensor.to(device=self.device, dtype=self.dtype, non_blocking=True)
-
-        return tensor.to(device=self.device, dtype=self.dtype)
-
-    def create_decoder_block_cache(
-        self, max_bytes: int | None = None, *, fingerprint: object | None = None
-    ) -> DecoderChunkCache | None:
-        if not self.lazy_decoder:
-            return None
-
-        cache_budget = self.cross_batch_decoder_cache_bytes if max_bytes is None else max_bytes
-        cache_budget = max(0, int(cache_budget))
-        self._diagnostic_stats["decoder_cache_max_bytes"] = cache_budget
-        self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
-        if cache_budget <= 0:
-            return None
-
-        self.emit_trace_event("decoder.cache.init", max_bytes=cache_budget)
-        return DecoderChunkCache(cache_budget, fingerprint=fingerprint)
-
-    def clear_decoder_block_cache(self, cache: DecoderChunkCache | None) -> None:
-        if cache is None:
-            self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
-            return
-
-        cache.clear()
-        self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
-        self.emit_trace_event("decoder.cache.clear", max_bytes=cache.max_bytes)
-
-    def note_decoder_cache_auto_disabled(self, reason: str) -> None:
-        self._add_diagnostic_value("decoder_cache_auto_disable_count", 1)
-        self._diagnostic_stats["decoder_cache_bytes_resident"] = 0
-        self.emit_trace_event("decoder.cache.auto_disabled", reason=reason)
-
-    def _record_decoder_cache_resident_bytes(self, cache: DecoderChunkCache | None) -> None:
-        self._diagnostic_stats["decoder_cache_bytes_resident"] = (
-            0 if cache is None else cache.bytes_resident
-        )
-
-    def _record_decoder_cache_hit(
-        self, cache: DecoderChunkCache | None, *, layer_id: int, chunk_id: int
-    ) -> None:
-        self._add_diagnostic_value("decoder_cache_hit_count", 1)
-        self._record_decoder_cache_resident_bytes(cache)
-        hit_count = int(cast(float, self._diagnostic_stats["decoder_cache_hit_count"]))
-        if hit_count <= 3 or hit_count % self._trace_decoder_load_interval == 0:
-            self.emit_trace_event(
-                "decoder.cache.hit",
-                source_layer=layer_id,
-                chunk_id=chunk_id,
-                hit_count=hit_count,
-                resident_bytes=self._diagnostic_stats["decoder_cache_bytes_resident"],
-            )
-
-    def _record_decoder_cache_miss(
-        self,
-        cache: DecoderChunkCache | None,
-        *,
-        layer_id: int,
-        chunk_id: int,
-    ) -> None:
-        self._add_diagnostic_value("decoder_cache_miss_count", 1)
-        self._record_decoder_cache_resident_bytes(cache)
-        miss_count = int(cast(float, self._diagnostic_stats["decoder_cache_miss_count"]))
-        if miss_count <= 3 or miss_count % self._trace_decoder_load_interval == 0:
-            self.emit_trace_event(
-                "decoder.cache.miss",
-                source_layer=layer_id,
-                chunk_id=chunk_id,
-                miss_count=miss_count,
-            )
-
-    def _record_decoder_cache_skip(
-        self,
-        cache: DecoderChunkCache | None,
-        *,
-        layer_id: int,
-        chunk_id: int,
-        chunk_bytes: int,
-    ) -> None:
-        self._add_diagnostic_value("decoder_cache_skip_count", 1)
-        self._record_decoder_cache_resident_bytes(cache)
-        self.emit_trace_event(
-            "decoder.cache.skip",
-            source_layer=layer_id,
-            chunk_id=chunk_id,
-            chunk_bytes=chunk_bytes,
-            max_bytes=0 if cache is None else cache.max_bytes,
-        )
-
-    def _record_decoder_cache_put(
-        self,
-        cache: DecoderChunkCache | None,
-        *,
-        layer_id: int,
-        chunk_id: int,
-        evicted: list[tuple[tuple[int, int], int]],
-    ) -> None:
-        if evicted:
-            self._add_diagnostic_value("decoder_cache_eviction_count", len(evicted))
-            for (evicted_layer, evicted_chunk), evicted_nbytes in evicted:
-                self.emit_trace_event(
-                    "decoder.cache.evict",
-                    source_layer=evicted_layer,
-                    chunk_id=evicted_chunk,
-                    evicted_bytes=evicted_nbytes,
-                )
-        self._record_decoder_cache_resident_bytes(cache)
-        self.emit_trace_event(
-            "decoder.cache.store",
-            source_layer=layer_id,
-            chunk_id=chunk_id,
-            resident_bytes=self._diagnostic_stats["decoder_cache_bytes_resident"],
-        )
 
     def _get_encoder_weights(self, layer_id=None):
         """Get encoder weights, loading from disk if lazy."""
@@ -1301,26 +687,35 @@ class CrossLayerTranscoder(torch.nn.Module):
         self,
         layer_id: int,
         feat_ids: torch.Tensor,
+        *,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
+        target_device = self.device if device is None else torch.device(device)
         feat_ids = feat_ids.reshape(-1).to(device="cpu", dtype=torch.long)
         if feat_ids.numel() == 0:
-            return torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+            return torch.empty((0, self.d_model), device=target_device, dtype=self.dtype)
 
         if not self.lazy_encoder:
             assert self.W_enc is not None, "Encoder weights are not set"
-            return self.W_enc[layer_id][feat_ids.to(device=self.W_enc.device)].to(dtype=self.dtype)
+            return self.W_enc[layer_id][feat_ids.to(device=self.W_enc.device)].to(
+                device=target_device,
+                dtype=self.dtype,
+            )
 
         start = time.perf_counter()
         if self.layer_paths is not None:
             path = self.layer_paths[layer_id]
             with safe_open(path, framework="pt", device="cpu") as f:
                 encoder_rows = f.get_slice("w_enc")[:, feat_ids].transpose(0, 1).contiguous()
-                result = self._move_lazy_slice_to_device(encoder_rows)
+                result = encoder_rows.to(device=target_device, dtype=self.dtype)
         else:
             assert self.clt_path is not None, "CLT path is not set"
             path = os.path.join(self.clt_path, f"W_enc_{layer_id}.safetensors")
             with safe_open(path, framework="pt", device="cpu") as f:
-                result = self._move_lazy_slice_to_device(f.get_slice(f"W_enc_{layer_id}")[feat_ids])
+                result = f.get_slice(f"W_enc_{layer_id}")[feat_ids].to(
+                    device=target_device,
+                    dtype=self.dtype,
+                )
 
         elapsed = time.perf_counter() - start
         self._add_diagnostic_value("encoder_load_count", 1)
@@ -1338,6 +733,8 @@ class CrossLayerTranscoder(torch.nn.Module):
         self,
         source_layers: torch.Tensor,
         feature_ids: torch.Tensor,
+        *,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
         """Materialize encoder rows for specific (layer, feature) pairs.
 
@@ -1355,12 +752,13 @@ class CrossLayerTranscoder(torch.nn.Module):
         if source_layers.numel() != feature_ids.numel():
             raise ValueError("source_layers and feature_ids must have matching lengths")
 
+        target_device = self.device if device is None else torch.device(device)
         if source_layers.numel() == 0:
-            return torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+            return torch.empty((0, self.d_model), device=target_device, dtype=self.dtype)
 
         active_encoders = torch.empty(
             (source_layers.numel(), self.d_model),
-            device=self.device,
+            device=target_device,
             dtype=self.dtype,
         )
         for layer_id in torch.unique(source_layers, sorted=True).tolist():
@@ -1369,11 +767,17 @@ class CrossLayerTranscoder(torch.nn.Module):
             if layer_rows.numel() == 0:
                 continue
 
-            layer_feat_ids = feature_ids[layer_rows]
-            active_encoders[layer_rows.to(device=self.device)] = self._get_encoder_rows_for_layer(
-                layer_id,
-                layer_feat_ids,
+            unique_feature_ids, inverse = torch.unique(
+                feature_ids[layer_rows], sorted=True, return_inverse=True
             )
+            unique_rows = self._get_encoder_rows_for_layer(
+                layer_id,
+                unique_feature_ids,
+                device=target_device,
+            )
+            active_encoders[layer_rows.to(device=target_device)] = unique_rows[
+                inverse.to(device=target_device)
+            ]
 
         return active_encoders
 
@@ -1734,7 +1138,7 @@ class CrossLayerTranscoder(torch.nn.Module):
         sparsification: SparsificationConfig | None = None,
         *,
         materialize_encoder_vecs: bool = True,
-    ):
+    ) -> AttributionComponents:
         """Extract active features and their encoder/decoder vectors for attribution.
 
         Args:
@@ -1803,19 +1207,16 @@ class CrossLayerTranscoder(torch.nn.Module):
             decoder_locations = torch.stack((layer_ids, pos_ids))
             chunked_decoder_state = None
 
-        attribution_data = {
-            "activation_matrix": features,
-            "reconstruction": reconstruction,
-            "encoder_vecs": encoder_vectors,
-            "decoder_vecs": decoder_vectors,
-            "encoder_to_decoder_map": encoder_to_decoder_map,
-            "decoder_locations": decoder_locations,
-        }
-
-        if chunked_decoder_state is not None:
-            attribution_data["chunked_decoder_state"] = chunked_decoder_state
-        if sparsification_stats is not None:
-            attribution_data["sparsification_stats"] = sparsification_stats
+        attribution_result = AttributionComponents(
+            activation_matrix=features,
+            reconstruction=reconstruction,
+            encoder_vectors=encoder_vectors,
+            decoder_vectors=decoder_vectors,
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=decoder_locations,
+            chunked_decoder_state=chunked_decoder_state,
+            sparsification_stats=sparsification_stats,
+        )
 
         component_elapsed = time.perf_counter() - component_start
         self.emit_trace_event(
@@ -1825,7 +1226,7 @@ class CrossLayerTranscoder(torch.nn.Module):
             elapsed_ms=component_elapsed * 1000.0,
         )
 
-        return attribution_data
+        return attribution_result
 
     def to_safetensors(self, save_path: str):
         """Save CLT to safetensors format compatible with lazy loading.
@@ -1867,232 +1268,3 @@ class CrossLayerTranscoder(torch.nn.Module):
 
             dec_path = os.path.join(save_path, f"W_dec_{i}.safetensors")
             save_file(dec_dict, dec_path)
-
-
-def load_clt(
-    clt_path: str,
-    feature_input_hook: str = "hook_resid_mid",
-    feature_output_hook: str = "hook_mlp_out",
-    scan: str | list[str] | None = None,
-    device: torch.device | None = None,
-    dtype: torch.dtype = torch.bfloat16,
-    lazy_decoder: bool = True,
-    lazy_encoder: bool = False,
-    exact_chunked_decoder: bool = False,
-    decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
-    cross_batch_decoder_cache_bytes: int | None = None,
-) -> CrossLayerTranscoder:
-    """Load a cross-layer transcoder from safetensors files.
-
-    Args:
-        clt_path: Path to directory containing W_enc_*.safetensors and W_dec_*.safetensors files
-        dtype: Data type for loaded tensors
-        lazy_decoder: Whether to load decoder weights on-demand
-        lazy_encoder: Whether to load encoder weights on-demand
-        feature_input_hook: Hook point where features read from
-        feature_output_hook: Hook point where features write to
-        scan: Optional identifier for feature visualization
-        device: Device to load tensors to (defaults to auto-detected)
-
-    Returns:
-        CrossLayerTranscoder: Loaded transcoder instance
-    """
-    if device is None:
-        device = get_default_device()
-
-    state_dict = _load_state_dict(clt_path, lazy_decoder, lazy_encoder, device, dtype)
-
-    # Infer dimensions from loaded tensors
-    n_layers = state_dict["b_dec"].shape[0]
-    d_transcoder = state_dict["b_enc"].shape[1]
-    d_model = state_dict["b_dec"].shape[1]
-
-    act_fn = "jump_relu" if "activation_function.threshold" in state_dict else "relu"
-
-    # Create instance and load state dict
-    with torch.device("meta"):
-        instance = CrossLayerTranscoder(
-            n_layers,
-            d_transcoder,
-            d_model,
-            activation_function=act_fn,
-            skip_connection=state_dict.get("W_skip") is not None,
-            lazy_decoder=lazy_decoder,
-            lazy_encoder=lazy_encoder,
-            feature_input_hook=feature_input_hook,
-            feature_output_hook=feature_output_hook,
-            scan=scan,
-            device=torch.device("meta"),
-            dtype=dtype,
-            clt_path=clt_path,
-            exact_chunked_decoder=exact_chunked_decoder,
-            decoder_chunk_size=decoder_chunk_size,
-            cross_batch_decoder_cache_bytes=cross_batch_decoder_cache_bytes,
-        )
-
-    instance.load_state_dict(state_dict, assign=True)
-
-    return instance
-
-
-def load_gemma_scope_2_clt(
-    paths: dict[int, str],
-    feature_input_hook: str = "hook_resid_mid",
-    feature_output_hook: str = "hook_mlp_out",
-    scan: str | list[str] | None = None,
-    device: torch.device | None = None,
-    dtype: torch.dtype = torch.bfloat16,
-    lazy_decoder: bool = True,
-    lazy_encoder: bool = False,
-    decoder_chunk_size: int = DEFAULT_EXACT_DECODER_CHUNK_SIZE,
-    cross_batch_decoder_cache_bytes: int | None = None,
-) -> CrossLayerTranscoder:
-    """Load a CrossLayerTranscoder from a GemmaScope2 JumpReLUMultiLayerSAE checkpoint.
-
-    Args:
-        path: Path to the checkpoint file
-        feature_input_hook: Hook point where features read from
-        feature_output_hook: Hook point where features write to
-        scan: Optional identifier for feature visualization
-        device: Device to load to
-        dtype: Data type to use
-        lazy_decoder: Whether to lazily load decoder weights from per-layer safetensors files
-        lazy_encoder: Whether to lazily load encoder weights from per-layer safetensors files
-
-    Returns:
-        CrossLayerTranscoder: The loaded transcoder
-    """
-    if device is None:
-        device = get_default_device()
-
-    ordered_layers = sorted(paths)
-    if ordered_layers != list(range(len(ordered_layers))):
-        raise ValueError("GemmaScope-2 CLT paths must be indexed contiguously from 0")
-
-    normalized_path_list: list[str] = []
-    for layer_idx in ordered_layers:
-        path = paths[layer_idx]
-        if not normalized_path_list or normalized_path_list[-1] != path:
-            normalized_path_list.append(path)
-
-    paths = {layer_idx: path for layer_idx, path in enumerate(normalized_path_list)}
-
-    with safe_open(paths[0], framework="pt", device="cpu") as f:
-        d_model, d_transcoder = f.get_slice("w_enc").get_shape()
-        has_skip = "affine_skip_connection" in f.keys()
-
-    n_layers = len(paths)
-
-    state_dict = {
-        "b_enc": torch.zeros(n_layers, d_transcoder, device=device, dtype=dtype),
-        "b_dec": torch.zeros(n_layers, d_model, device=device, dtype=dtype),
-        "activation_function.threshold": torch.zeros(
-            n_layers, 1, d_transcoder, device=device, dtype=dtype
-        ),
-    }
-
-    if not lazy_encoder:
-        state_dict["W_enc"] = torch.zeros(
-            n_layers, d_transcoder, d_model, device=device, dtype=dtype
-        )
-
-    if has_skip:
-        state_dict["W_skip"] = torch.zeros(n_layers, d_model, d_model, device=device, dtype=dtype)
-
-    for i in range(n_layers):
-        with safe_open(paths[i], framework="pt", device=str(device)) as f:
-            state_dict["b_enc"][i] = f.get_tensor("b_enc").to(dtype=dtype)
-            state_dict["b_dec"][i] = f.get_tensor("b_dec").to(dtype=dtype)
-            state_dict["activation_function.threshold"][i] = (
-                f.get_tensor("threshold").to(dtype=dtype).unsqueeze(0)
-            )
-
-            if not lazy_encoder:
-                state_dict["W_enc"][i] = f.get_tensor("w_enc").transpose(-1, -2).to(dtype=dtype)
-
-            if not lazy_decoder:
-                state_dict[f"W_dec.{i}"] = f.get_tensor("w_dec")[:, i:, :].to(dtype=dtype)
-
-            if has_skip:
-                state_dict["W_skip"][i] = f.get_tensor("affine_skip_connection").to(dtype=dtype)
-
-    # Create instance
-    with torch.device("meta"):
-        instance = CrossLayerTranscoder(
-            n_layers,
-            d_transcoder,
-            d_model,
-            activation_function="jump_relu",
-            skip_connection=("W_skip" in state_dict),
-            lazy_decoder=lazy_decoder,
-            lazy_encoder=lazy_encoder,
-            feature_input_hook=feature_input_hook,
-            feature_output_hook=feature_output_hook,
-            scan=scan,
-            device=torch.device("meta"),
-            dtype=dtype,
-            layer_paths=paths if (lazy_encoder or lazy_decoder) else None,
-            weight_format="gemmascope2",
-            exact_chunked_decoder=True,
-            decoder_chunk_size=decoder_chunk_size,
-            cross_batch_decoder_cache_bytes=cross_batch_decoder_cache_bytes,
-        )
-
-    instance.load_state_dict(state_dict, assign=True)
-
-    return instance
-
-
-def _load_state_dict(
-    clt_path, lazy_decoder=True, lazy_encoder=False, device=None, dtype=torch.bfloat16
-):
-    if device is None:
-        device = get_default_device()
-
-    enc_files = glob.glob(os.path.join(clt_path, "W_enc_*.safetensors"))
-    n_layers = len(enc_files)
-
-    # Get dimensions from first file
-    dec_file = "W_enc_0.safetensors"
-    with safe_open(os.path.join(clt_path, dec_file), framework="pt", device=str(device)) as f:
-        d_transcoder, d_model = f.get_slice("W_enc_0").get_shape()
-        has_threshold = "threshold_0" in f.keys()
-
-    # Preallocate tensors
-    b_dec = torch.zeros(n_layers, d_model, device=device, dtype=dtype)
-    b_enc = torch.zeros(n_layers, d_transcoder, device=device, dtype=dtype)
-
-    state_dict = {"b_dec": b_dec, "b_enc": b_enc}
-
-    if has_threshold:
-        state_dict["activation_function.threshold"] = torch.zeros(
-            n_layers, 1, d_transcoder, device=device, dtype=dtype
-        )
-
-    # Only create W_enc if not lazy
-    if not lazy_encoder:
-        W_enc = torch.zeros(n_layers, d_transcoder, d_model, device=device, dtype=dtype)
-        state_dict["W_enc"] = W_enc
-
-    # Load all layers
-    for i in range(n_layers):
-        enc_file = f"W_enc_{i}.safetensors"
-        with safe_open(os.path.join(clt_path, enc_file), framework="pt", device=str(device)) as f:
-            b_dec[i] = f.get_tensor(f"b_dec_{i}").to(dtype)
-            b_enc[i] = f.get_tensor(f"b_enc_{i}").to(dtype)
-
-            # Only load W_enc if not lazy
-            if not lazy_encoder:
-                W_enc[i] = f.get_tensor(f"W_enc_{i}").to(dtype)
-
-            if has_threshold:
-                threshold = f.get_tensor(f"threshold_{i}").to(dtype)
-                state_dict["activation_function.threshold"][i] = threshold.unsqueeze(0)
-
-        # Load W_dec for this layer if not lazy
-        if not lazy_decoder:
-            dec_file = os.path.join(clt_path, f"W_dec_{i}.safetensors")
-            with safe_open(dec_file, framework="pt", device=str(device)) as f:
-                state_dict[f"W_dec.{i}"] = f.get_tensor(f"W_dec_{i}").to(dtype)
-
-    return state_dict

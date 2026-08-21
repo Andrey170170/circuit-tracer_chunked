@@ -1,18 +1,91 @@
+from __future__ import annotations
+
 import torch
 
-from circuit_tracer.attribution import attribute_nnsight
 from circuit_tracer.attribution.context_nnsight import AttributionContext
+from circuit_tracer.attribution.nnsight.context_state import (
+    AttributionTensorState,
+    ContextExecutionPolicy,
+    ContextNumericPolicy,
+    DecoderRuntime,
+)
+from circuit_tracer.attribution.nnsight.forward_session import ForwardTraceSession
+from circuit_tracer.tracing import AttributionProblem, PrefixViewTarget, TraceRequest
 
 
-def _sparse_activation():
+class FakeBackendModel:
+    backend = "nnsight"
+
+
+def _request(
+    model,
+    *,
+    output_position: int | None = None,
+    prefix_view: PrefixViewTarget | None = None,
+) -> TraceRequest:
+    return TraceRequest(
+        problem=AttributionProblem(
+            model=model,
+            prompt=[1, 2, 3, 4],
+            output_position=output_position,
+            prefix_view=prefix_view,
+        )
+    )
+
+
+def _sparse_activation() -> torch.Tensor:
     indices = torch.tensor([[0, 0, 1, 1], [0, 2, 1, 3], [5, 6, 7, 8]])
     values = torch.tensor([1.0, 2.0, 3.0, 4.0])
     return torch.sparse_coo_tensor(indices, values, size=(2, 4, 10)).coalesce()
 
 
-def test_derive_prefix_view_context_filters_without_mutating_parent():
+def _context(
+    *,
+    activation_matrix: torch.Tensor,
+    error_vectors: torch.Tensor,
+    token_vectors: torch.Tensor,
+    decoder_vecs: torch.Tensor,
+    encoder_vecs: torch.Tensor,
+    encoder_to_decoder_map: torch.Tensor,
+    decoder_locations: torch.Tensor,
+    logits: torch.Tensor,
+    full_logits: torch.Tensor | None = None,
+    chunked_decoder_state: dict[str, torch.Tensor] | None = None,
+) -> AttributionContext:
+    return AttributionContext(
+        tensor_state=AttributionTensorState(
+            activation_matrix=activation_matrix,
+            error_vectors=error_vectors,
+            token_vectors=token_vectors,
+            decoder_vectors=decoder_vecs,
+            encoder_vectors=encoder_vecs,
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=decoder_locations,
+            logits=logits,
+            full_logits=full_logits,
+        ),
+        execution_policy=ContextExecutionPolicy.resolve(
+            chunked_decoder_state=chunked_decoder_state,
+            encoder_vectors=encoder_vecs,
+            error_vectors=error_vectors,
+            exact_encoder_residency="lazy",
+            stage_encoder_vectors_on_cpu=False,
+            stage_error_vectors_on_cpu=False,
+            error_vector_prefetch_lookahead=1,
+            chunked_feature_replay_window=4,
+            row_subchunk_size=None,
+        ),
+        decoder_runtime=DecoderRuntime.resolve(
+            provider=None,
+            chunked_state=chunked_decoder_state,
+        ),
+        numeric_policy=ContextNumericPolicy(),
+    )
+
+
+def test_derive_prefix_view_context_filters_without_mutating_parent() -> None:
     activation = _sparse_activation()
-    ctx = AttributionContext(
+    ctx = _context(
         activation_matrix=activation,
         error_vectors=torch.randn(2, 4, 3),
         token_vectors=torch.randn(4, 3),
@@ -44,33 +117,32 @@ def test_derive_prefix_view_context_filters_without_mutating_parent():
     assert torch.equal(view.encoder_vecs, ctx.encoder_vecs[torch.tensor([0, 2])])
 
 
-def test_full_sequence_session_delegates_when_reuse_disabled(monkeypatch):
-    calls = []
-
-    def fake_attribute(prompt, model, **kwargs):
-        calls.append((prompt, model, kwargs))
-        return "graph"
-
-    monkeypatch.setattr(attribute_nnsight, "attribute", fake_attribute)
-    session = attribute_nnsight.FullSequenceWindowAttributionSession(
-        model=object(),
+def test_forward_session_prepares_prefix_when_reuse_disabled() -> None:
+    model = FakeBackendModel()
+    selected = _request(
+        model,
+        output_position=1,
+        prefix_view=PrefixViewTarget(mode="independent_prefix", target_position=2),
+    )
+    session = ForwardTraceSession(
+        model=model,
         full_token_ids=[1, 2, 3, 4],
         window_max_prefix_len=4,
+        reuse_phase0_window_state=False,
+        reuse_target_logits=False,
     )
 
-    assert session.attribute_target_position(2, max_n_logits=1) == "graph"
-    prompt, _, kwargs = calls[0]
-    assert prompt.tolist() == [1, 2]
-    assert kwargs["output_position"] == 1
-    assert kwargs["max_n_logits"] == 1
+    problem, overrides = session.prepare_target_position(2, selected)
+    assert problem.prompt.tolist() == [1, 2]
+    assert problem.output_position == 1
+    assert overrides.decoder_chunk_cache is None
 
 
-def test_full_sequence_session_reuses_context_and_window_logits(monkeypatch):
-    calls = []
-
+def test_forward_session_reuses_context_and_window_logits() -> None:
     class FakeContext:
         def __init__(self):
             self.derived = object()
+            self.cleaned = False
 
         def derive_prefix_view_context(self, target_position):
             assert target_position == 3
@@ -78,10 +150,12 @@ def test_full_sequence_session_reuses_context_and_window_logits(monkeypatch):
 
         def get_logits_at_position(self, position):
             assert position == 2
-            logits = torch.arange(10, dtype=torch.float32).reshape(1, 10)
-            return logits
+            return torch.arange(10, dtype=torch.float32).reshape(1, 10)
 
-    class FakeModel:
+        def cleanup(self):
+            self.cleaned = True
+
+    class FakeModel(FakeBackendModel):
         def __init__(self):
             self.ctx = FakeContext()
             self.setup_calls = 0
@@ -92,13 +166,16 @@ def test_full_sequence_session_reuses_context_and_window_logits(monkeypatch):
             assert kwargs["retain_full_logits"] is True
             return self.ctx
 
-    def fake_attribute(prompt, model, **kwargs):
-        calls.append((prompt, kwargs))
-        return "graph"
-
-    monkeypatch.setattr(attribute_nnsight, "attribute", fake_attribute)
     model = FakeModel()
-    session = attribute_nnsight.FullSequenceWindowAttributionSession(
+    selected = _request(
+        model,
+        output_position=2,
+        prefix_view=PrefixViewTarget(
+            mode="full_sequence_target_position",
+            target_position=3,
+        ),
+    )
+    session = ForwardTraceSession(
         model=model,
         full_token_ids=[1, 2, 3, 4, 5],
         window_max_prefix_len=4,
@@ -106,9 +183,11 @@ def test_full_sequence_session_reuses_context_and_window_logits(monkeypatch):
         reuse_target_logits=True,
     )
 
-    assert session.attribute_target_position(3) == "graph"
+    problem, overrides = session.prepare_target_position(3, selected)
+    assert problem is selected.problem
     assert model.setup_calls == 1
-    _, kwargs = calls[0]
-    assert kwargs["_phase0_context_override"] is model.ctx.derived
-    assert kwargs["_target_logit_source"] == "full_sequence_window_logits"
-    assert torch.equal(kwargs["_target_logits_override"], torch.arange(10, dtype=torch.float32))
+    assert overrides.phase0_context is model.ctx.derived
+    assert overrides.target_logit_source == "full_sequence_window_logits"
+    assert torch.equal(overrides.target_logits, torch.arange(10, dtype=torch.float32))
+    session.close()
+    assert model.ctx.cleaned

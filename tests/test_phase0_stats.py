@@ -3,7 +3,7 @@ from typing import Any, cast
 
 import torch
 
-from circuit_tracer.attribution.attribute import attribute_phase0_stats
+from circuit_tracer.attribution.phase0_stats import attribute_phase0_stats
 
 
 @dataclass

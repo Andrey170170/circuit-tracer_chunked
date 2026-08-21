@@ -73,9 +73,9 @@ def test_gemmascope2_exact_chunked_matches_standard_clt_conversion(tmp_path: Pat
     attribution_data = chunked_clt.compute_attribution_components(
         inputs, zero_positions=slice(0, 1)
     )
-    assert "chunked_decoder_state" in attribution_data
-    assert attribution_data["decoder_vecs"].numel() == 0
-    assert attribution_data["encoder_to_decoder_map"].numel() == 0
+    assert attribution_data.chunked_decoder_state is not None
+    assert attribution_data.decoder_vectors.numel() == 0
+    assert attribution_data.encoder_to_decoder_map.numel() == 0
     assert torch.allclose(
-        attribution_data["reconstruction"][:, 1:], standard_outputs[:, 1:], atol=5e-2, rtol=5e-2
+        attribution_data.reconstruction[:, 1:], standard_outputs[:, 1:], atol=5e-2, rtol=5e-2
     )

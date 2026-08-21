@@ -129,33 +129,34 @@ def test_chunked_components_apply_sparsification_before_reconstruction(tmp_path:
     )
 
     selected, expected_stats = select_candidate_feature_indices(
-        full_components["activation_matrix"],
+        full_components.activation_matrix,
         config,
     )
     expected_activation_matrix = filter_sparse_activations(
-        full_components["activation_matrix"], selected
+        full_components.activation_matrix, selected
     )
     expected_reconstruction = clt.compute_reconstruction_chunked(expected_activation_matrix, inputs)
 
-    assert sparse_components["activation_matrix"]._nnz() == expected_activation_matrix._nnz()
+    assert sparse_components.activation_matrix._nnz() == expected_activation_matrix._nnz()
     assert torch.equal(
-        sparse_components["activation_matrix"].indices(),
+        sparse_components.activation_matrix.indices(),
         expected_activation_matrix.indices(),
     )
     assert torch.allclose(
-        sparse_components["activation_matrix"].values(),
+        sparse_components.activation_matrix.values(),
         expected_activation_matrix.values(),
     )
-    assert torch.allclose(sparse_components["reconstruction"], expected_reconstruction)
-    assert sparse_components["chunked_decoder_state"]["source_layers"].numel() == (
+    assert torch.allclose(sparse_components.reconstruction, expected_reconstruction)
+    assert sparse_components.chunked_decoder_state is not None
+    assert sparse_components.chunked_decoder_state["source_layers"].numel() == (
         expected_activation_matrix._nnz()
     )
     assert (
-        sparse_components["sparsification_stats"]["candidate_count_after"]
+        sparse_components.sparsification_stats["candidate_count_after"]
         == expected_stats["candidate_count_after"]
     )
     assert (
-        sparse_components["sparsification_stats"]["per_layer_retained_counts"]
+        sparse_components.sparsification_stats["per_layer_retained_counts"]
         == expected_stats["per_layer_retained_counts"]
     )
 
@@ -178,22 +179,22 @@ def test_chunked_components_match_baseline_when_budget_is_unconstrained(tmp_path
     )
 
     assert torch.equal(
-        baseline["activation_matrix"].indices(),
-        all_kept["activation_matrix"].indices(),
+        baseline.activation_matrix.indices(),
+        all_kept.activation_matrix.indices(),
     )
     assert torch.allclose(
-        baseline["activation_matrix"].values(),
-        all_kept["activation_matrix"].values(),
+        baseline.activation_matrix.values(),
+        all_kept.activation_matrix.values(),
     )
-    assert torch.allclose(baseline["reconstruction"], all_kept["reconstruction"])
-    assert torch.allclose(baseline["encoder_vecs"], all_kept["encoder_vecs"])
+    assert torch.allclose(baseline.reconstruction, all_kept.reconstruction)
+    assert torch.allclose(baseline.encoder_vectors, all_kept.encoder_vectors)
     assert (
-        all_kept["sparsification_stats"]["candidate_count_before"]
-        == baseline["activation_matrix"]._nnz()
+        all_kept.sparsification_stats["candidate_count_before"]
+        == baseline.activation_matrix._nnz()
     )
     assert (
-        all_kept["sparsification_stats"]["candidate_count_after"]
-        == baseline["activation_matrix"]._nnz()
+        all_kept.sparsification_stats["candidate_count_after"]
+        == baseline.activation_matrix._nnz()
     )
 
 
@@ -217,16 +218,16 @@ def test_single_layer_components_match_baseline_when_budget_is_unconstrained(tmp
         sparsification=SparsificationConfig(per_layer_position_topk=10_000),
     )
 
-    baseline_activation_matrix = cast(torch.Tensor, baseline["activation_matrix"])
-    all_kept_activation_matrix = cast(torch.Tensor, all_kept["activation_matrix"])
-    baseline_reconstruction = cast(torch.Tensor, baseline["reconstruction"])
-    all_kept_reconstruction = cast(torch.Tensor, all_kept["reconstruction"])
-    baseline_encoder_vecs = cast(torch.Tensor, baseline["encoder_vecs"])
-    all_kept_encoder_vecs = cast(torch.Tensor, all_kept["encoder_vecs"])
-    baseline_decoder_vecs = cast(torch.Tensor, baseline["decoder_vecs"])
-    all_kept_decoder_vecs = cast(torch.Tensor, all_kept["decoder_vecs"])
-    baseline_encoder_to_decoder_map = cast(torch.Tensor, baseline["encoder_to_decoder_map"])
-    all_kept_encoder_to_decoder_map = cast(torch.Tensor, all_kept["encoder_to_decoder_map"])
+    baseline_activation_matrix = baseline.activation_matrix
+    all_kept_activation_matrix = all_kept.activation_matrix
+    baseline_reconstruction = baseline.reconstruction
+    all_kept_reconstruction = all_kept.reconstruction
+    baseline_encoder_vecs = baseline.encoder_vectors
+    all_kept_encoder_vecs = all_kept.encoder_vectors
+    baseline_decoder_vecs = baseline.decoder_vectors
+    all_kept_decoder_vecs = all_kept.decoder_vectors
+    baseline_encoder_to_decoder_map = baseline.encoder_to_decoder_map
+    all_kept_encoder_to_decoder_map = all_kept.encoder_to_decoder_map
 
     assert torch.equal(
         baseline_activation_matrix.indices(),

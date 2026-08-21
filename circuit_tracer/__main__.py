@@ -237,7 +237,15 @@ def run_attribution(args, parser):
     )
     logging.info(f"Using batch size of {args.batch_size} for backward passes")
 
-    from circuit_tracer import ReplacementModel, attribute
+    from circuit_tracer import (
+        AttributionProblem,
+        ExecutionConstraints,
+        ObservabilityPolicy,
+        ReplacementModel,
+        TraceRequest,
+        TraceSemantics,
+        trace_one,
+    )
     from circuit_tracer.utils.create_graph_files import create_graph_files
     from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
 
@@ -256,19 +264,30 @@ def run_attribution(args, parser):
     )
 
     logging.info("Running attribution...")
-    graph = attribute(
-        prompt=args.prompt,
-        model=model_instance,  # type:ignore
-        max_n_logits=args.max_n_logits,
-        desired_logit_prob=args.desired_logit_prob,
-        batch_size=args.batch_size,
-        verbose=args.verbose,
-        profile=args.profile,
-        profile_log_interval=args.profile_log_interval,
-        diagnostic_feature_cap=args.diagnostic_feature_cap,
-        offload=args.offload,
-        max_feature_nodes=args.max_feature_nodes,
+    result = trace_one(
+        TraceRequest(
+            problem=AttributionProblem(
+                prompt=args.prompt,
+                model=model_instance,
+                max_n_logits=args.max_n_logits,
+                desired_logit_prob=args.desired_logit_prob,
+            ),
+            semantics=TraceSemantics(
+                source_batch_size=args.batch_size,
+                max_feature_nodes=args.max_feature_nodes,
+                diagnostic_feature_cap=args.diagnostic_feature_cap,
+            ),
+            execution=ExecutionConstraints(
+                offload=args.offload,
+                observability=ObservabilityPolicy(
+                    verbose=args.verbose,
+                    profile=args.profile,
+                    profile_log_interval=args.profile_log_interval,
+                ),
+            ),
+        )
     )
+    graph = result.graph
 
     # Save to file if output path specified
     if args.graph_output_path:

@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, LlamaConfig
 
-from circuit_tracer import attribute, ReplacementModel
+from circuit_tracer import ReplacementModel
+from circuit_tracer.tracing import AttributionProblem, TraceRequest, TraceSemantics, trace_one
 from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
 from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
 from circuit_tracer.transcoder.activation_functions import TopK
@@ -15,6 +16,15 @@ from tests.conftest import has_32gb
 
 sys.path.append(os.path.dirname(__file__))
 from test_attributions_gemma_nnsight import verify_feature_edges, verify_token_and_error_edges
+
+
+def _trace_graph(prompt, model, *, source_batch_size: int = 512):
+    return trace_one(
+        TraceRequest(
+            problem=AttributionProblem(prompt=prompt, model=model),
+            semantics=TraceSemantics(source_batch_size=source_batch_size),
+        )
+    ).graph
 
 llama_3_2_config_dict = {
     "architectures": ["LlamaForCausalLM"],
@@ -110,7 +120,7 @@ def test_small_llama_model():
     original_all_special_ids = tokenizer_class.all_special_ids  # type:ignore
     try:
         tokenizer_class.all_special_ids = property(lambda self: [0])  # type:ignore
-        graph = attribute(s, model)
+        graph = _trace_graph(s, model)
         assert isinstance(model, NNSightReplacementModel)
 
         verify_token_and_error_edges(model, graph)
@@ -140,7 +150,7 @@ def test_large_llama_model():
     original_all_special_ids = tokenizer_class.all_special_ids  # type:ignore
     try:
         tokenizer_class.all_special_ids = property(lambda self: [0])  # type:ignore
-        graph = attribute(s, model)
+        graph = _trace_graph(s, model)
         assert isinstance(model, NNSightReplacementModel)
 
         verify_token_and_error_edges(model, graph)
@@ -156,7 +166,7 @@ def test_llama_3_2_1b():
     model = ReplacementModel.from_pretrained(
         "meta-llama/Llama-3.2-1B", "llama", backend="nnsight", device=torch.device("cuda")
     )
-    graph = attribute(s, model, batch_size=128)
+    graph = _trace_graph(s, model, source_batch_size=128)
     assert isinstance(model, NNSightReplacementModel)
 
     verify_token_and_error_edges(model, graph)

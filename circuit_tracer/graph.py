@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import NamedTuple
 import time
 import warnings
@@ -707,6 +707,7 @@ def compute_partial_feature_influences_streaming(
     active_row_only_chunks: bool = False,
     row_reader_returns_prepared: bool = False,
     active_row_accumulation: str = "zero_fill",
+    row_batch_reader: (Callable[[list[tuple[int, int]]], Iterator[torch.Tensor]] | None) = None,
 ) -> torch.Tensor:
     """Compute feature-only partial influences from streamed dense row chunks.
 
@@ -737,6 +738,9 @@ def compute_partial_feature_influences_streaming(
         active_row_only_chunks: When ``True``, preserve fixed row-chunk windows but
             read only contiguous non-zero subranges inside each active chunk.
             Default ``False`` preserves legacy fixed-chunk behavior.
+        row_batch_reader: Optional ordered range iterator used by direct active-row
+            accumulation. This lets a row store pipeline transfer of range ``N+1``
+            while range ``N`` is consumed without changing accumulation order.
 
     Returns:
         Tensor of shape ``(n_feature_nodes,)`` with partial influence values.
@@ -780,6 +784,8 @@ def compute_partial_feature_influences_streaming(
         raise ValueError("active_row_accumulation must be 'zero_fill' or 'direct_v1'")
     if active_row_accumulation == "direct_v1" and not active_row_only_chunks:
         raise ValueError("active_row_accumulation='direct_v1' requires active_row_only_chunks=True")
+    if row_batch_reader is not None and active_row_accumulation != "direct_v1":
+        raise ValueError("row_batch_reader requires active_row_accumulation='direct_v1'")
 
     if isinstance(row_abs_sums, torch.Tensor):
         row_denominator_device = row_abs_sums.device
@@ -986,7 +992,76 @@ def compute_partial_feature_influences_streaming(
                 next_feature_prod += normalized_row_weights @ chunk
                 matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
         else:
-            for start in range(0, n_rows, row_chunk_size):
+            if row_batch_reader is not None:
+                iteration_ranges: list[tuple[int, int]] = []
+                for start in range(0, n_rows, row_chunk_size):
+                    end = min(start + row_chunk_size, n_rows)
+                    active_row_scan_start = time.perf_counter()
+                    active_row_subranges = list(_iter_active_row_subranges(start, end, row_weights))
+                    active_row_scan_elapsed_ms_total += (
+                        time.perf_counter() - active_row_scan_start
+                    ) * 1000.0
+                    if not active_row_subranges:
+                        continue
+                    active_row_chunk_count += 1
+                    active_row_range_count += len(active_row_subranges)
+                    chunk_request_count += 1
+                    chunk_cache_miss_count += 1
+                    iteration_ranges.extend(active_row_subranges)
+
+                batch_iterator = iter(row_batch_reader(iteration_ranges))
+                for sub_start, sub_end in iteration_ranges:
+                    row_reader_start = time.perf_counter()
+                    try:
+                        subchunk = next(batch_iterator)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "row_batch_reader returned fewer tensors than requested ranges"
+                        ) from exc
+                    row_reader_elapsed_ms_total += (time.perf_counter() - row_reader_start) * 1000.0
+                    row_reader_call_count += 1
+                    row_reader_row_count += int(sub_end - sub_start)
+                    if subchunk.ndim != 2 or subchunk.shape != (
+                        sub_end - sub_start,
+                        n_feature_nodes,
+                    ):
+                        raise ValueError(
+                            "row_batch_reader must return shape "
+                            f"({sub_end - sub_start}, {n_feature_nodes}) for rows "
+                            f"[{sub_start}, {sub_end})"
+                        )
+                    subchunk = _prepare_chunk(subchunk)
+                    normalization_start = time.perf_counter()
+                    sub_weights = _normalize_row_weights_from_denominator(
+                        row_weights[sub_start:sub_end],
+                        denom_mode=denom_mode,
+                        denom_primary=denom_primary[sub_start:sub_end],
+                        denom_secondary=(
+                            denom_secondary[sub_start:sub_end]
+                            if denom_secondary is not None
+                            else None
+                        ),
+                    )
+                    normalization_elapsed_ms_total += (
+                        time.perf_counter() - normalization_start
+                    ) * 1000.0
+                    direct_start = time.perf_counter()
+                    next_feature_prod += sub_weights @ subchunk
+                    direct_accumulation_elapsed_ms_total += (
+                        time.perf_counter() - direct_start
+                    ) * 1000.0
+                    direct_accumulation_subrange_count += 1
+                try:
+                    next(batch_iterator)
+                except StopIteration:
+                    pass
+                else:
+                    raise ValueError("row_batch_reader returned more tensors than requested ranges")
+            for start in (
+                ()
+                if row_batch_reader is not None and iteration_ranges
+                else range(0, n_rows, row_chunk_size)
+            ):
                 end = min(start + row_chunk_size, n_rows)
                 chunk_row_weights = row_weights[start:end]
                 active_row_scan_start = time.perf_counter()
@@ -1197,4 +1272,92 @@ def compute_partial_feature_influences_streaming(
             }
         )
 
+    return influences
+
+
+def compute_partial_feature_influences_tiled(
+    tile_reader: Callable[[int, int, int, int], torch.Tensor],
+    row_abs_sums: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    logit_p: torch.Tensor,
+    row_to_node_index: torch.Tensor,
+    *,
+    n_feature_nodes: int,
+    n_logits: int,
+    row_tile_size: int,
+    column_tile_size: int,
+    max_iter: int = 128,
+    device=None,
+    compute_dtype: torch.dtype | None = None,
+    telemetry: dict[str, int | str] | None = None,
+) -> torch.Tensor:
+    """Canonical deterministic 2-D tiled full-retention influence oracle."""
+    if row_tile_size <= 0 or column_tile_size <= 0:
+        raise ValueError("row_tile_size and column_tile_size must be > 0")
+    if isinstance(row_abs_sums, torch.Tensor):
+        n_rows = row_abs_sums.numel()
+        denominator_dtype = row_abs_sums.dtype
+        denominator_device = row_abs_sums.device
+    elif isinstance(row_abs_sums, tuple) and len(row_abs_sums) == 2:
+        n_rows = row_abs_sums[0].numel()
+        denominator_dtype = row_abs_sums[0].dtype
+        denominator_device = row_abs_sums[0].device
+    else:
+        raise TypeError("row_abs_sums must be a Tensor or a scaled-L1 tuple")
+    if row_to_node_index.numel() != n_rows or logit_p.numel() != n_logits:
+        raise ValueError("inconsistent tiled influence inputs")
+    device = device or denominator_device
+    dtype = compute_dtype or denominator_dtype
+    denom_mode, denom_primary, denom_secondary = _resolve_row_denominator(
+        row_abs_sums, expected_rows=n_rows, device=device, dtype=dtype
+    )
+    row_index = row_to_node_index.to(device=device, dtype=torch.long)
+    feature_row_index = row_index[n_logits:]
+    influences = torch.zeros(n_feature_nodes, device=device, dtype=dtype)
+    row_weights = torch.zeros(n_rows, device=device, dtype=dtype)
+    row_weights[:n_logits] = logit_p.to(device=device, dtype=dtype)
+    maximum_tile_bytes = 0
+    tile_reads = 0
+    for _ in range(max_iter):
+        next_feature = torch.zeros_like(influences)
+        # Column-major accumulation fixes both traversal and floating-point order.
+        for column_start in range(0, n_feature_nodes, column_tile_size):
+            column_end = min(column_start + column_tile_size, n_feature_nodes)
+            column_accumulator = torch.zeros(column_end - column_start, device=device, dtype=dtype)
+            for row_start in range(0, n_rows, row_tile_size):
+                row_end = min(row_start + row_tile_size, n_rows)
+                weights = row_weights[row_start:row_end]
+                if not weights.any():
+                    continue
+                tile = tile_reader(row_start, row_end, column_start, column_end)
+                if tile.shape != (row_end - row_start, column_end - column_start):
+                    raise ValueError("tile_reader returned an unexpected shape")
+                tile = tile.to(device=device, dtype=dtype).abs_()
+                maximum_tile_bytes = max(maximum_tile_bytes, tile.numel() * tile.element_size())
+                tile_reads += 1
+                normalized = _normalize_row_weights_from_denominator(
+                    weights,
+                    denom_mode=denom_mode,
+                    denom_primary=denom_primary[row_start:row_end],
+                    denom_secondary=(
+                        denom_secondary[row_start:row_end] if denom_secondary is not None else None
+                    ),
+                )
+                column_accumulator += normalized @ tile
+            next_feature[column_start:column_end] = column_accumulator
+        if not next_feature.any():
+            break
+        influences += next_feature
+        row_weights.zero_()
+        if feature_row_index.numel():
+            row_weights[n_logits:] = next_feature[feature_row_index]
+    else:
+        raise RuntimeError("Failed to converge")
+    if telemetry is not None:
+        telemetry.update(
+            solver="canonical_2d_tiled_v1",
+            row_tile_size=row_tile_size,
+            column_tile_size=column_tile_size,
+            maximum_materialized_tile_bytes=maximum_tile_bytes,
+            tile_read_count=tile_reads,
+        )
     return influences

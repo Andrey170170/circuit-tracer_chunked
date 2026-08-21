@@ -1,12 +1,14 @@
 import gc
 import os
 import tempfile
+import weakref
 
 import pytest
 import torch
 import yaml
 from safetensors.torch import save_file
 
+from circuit_tracer.attribution.nnsight.decoder_page_prefetch import DecoderPagePrefetch
 from circuit_tracer.transcoder.single_layer_transcoder import (
     load_gemma_scope_2_transcoder,
     load_relu_transcoder,
@@ -98,20 +100,20 @@ def test_transcoder_set_attribution_components(create_test_transcoder_file, skip
     )
 
     # Verify all required components are present
-    assert "activation_matrix" in components
-    assert "reconstruction" in components
-    assert "encoder_vecs" in components
-    assert "decoder_vecs" in components
-    assert "encoder_to_decoder_map" in components
-    assert "decoder_locations" in components
+    assert components.activation_matrix is not None
+    assert components.reconstruction is not None
+    assert components.encoder_vectors is not None
+    assert components.decoder_vectors is not None
+    assert components.encoder_to_decoder_map is not None
+    assert components.decoder_locations is not None
 
     # Check activation matrix
-    act_matrix = components["activation_matrix"]
+    act_matrix = components.activation_matrix
     assert act_matrix.is_sparse
     assert act_matrix.shape == (n_layers, n_pos, 512)
 
     # Check reconstruction (only positions 1 and beyond)
-    reconstruction = components["reconstruction"]
+    reconstruction = components.reconstruction
     assert reconstruction.shape == (n_layers, n_pos, d_model)
     for layer, transcoder in enumerate(transcoder_set.transcoders):
         assert torch.allclose(
@@ -120,12 +122,12 @@ def test_transcoder_set_attribution_components(create_test_transcoder_file, skip
 
     # Check encoder/decoder vectors have matching counts
     n_active = act_matrix._nnz()
-    assert components["encoder_vecs"].shape[0] == n_active
-    assert components["decoder_vecs"].shape[0] == n_active
-    assert components["encoder_to_decoder_map"].shape[0] == n_active
+    assert components.encoder_vectors.shape[0] == n_active
+    assert components.decoder_vectors.shape[0] == n_active
+    assert components.encoder_to_decoder_map.shape[0] == n_active
 
     # Check decoder locations
-    decoder_locs = components["decoder_locations"]
+    decoder_locs = components.decoder_locations
     assert decoder_locs.shape == (2, n_active)
 
 
@@ -151,8 +153,8 @@ def test_transcoder_set_exact_provider_cache_metadata_round_trip(
         feature_input_hook="hook_resid_mid",
         feature_output_hook="hook_mlp_out",
         device=torch.device("cpu"),
-        lazy_encoder=False,
-        lazy_decoder=False,
+        lazy_encoder=True,
+        lazy_decoder=True,
         exact_chunked_provider=True,
         decoder_chunk_size=3,
     )
@@ -181,6 +183,7 @@ def test_transcoder_set_exact_provider_cache_metadata_round_trip(
     assert loaded.architecture == "plt"
     assert loaded.capabilities.decoder_output_topology == "same_layer"
     assert loaded.capabilities.supports_exact_chunked_provider is True
+    assert loaded.capabilities.supports_decoder_row_source is True
     assert (
         provider_fingerprint(loaded, checkpoint_format="standard", checkpoint_identity="test_scan")
         == fingerprint
@@ -191,6 +194,108 @@ def test_transcoder_set_exact_provider_cache_metadata_round_trip(
     (cache_path / "config.yaml").write_text(yaml.safe_dump(bad_config))
     with pytest.raises(ValueError, match="provider fingerprint"):
         load_transcoders_from_cache("org/plt-set", cache_dir=cache_root)
+
+
+def test_plt_decoder_provider_reports_request_load_bytes_and_cache_hits(
+    create_test_transcoder_file,
+):
+    paths = {}
+    for layer in range(2):
+        src, _ = create_test_transcoder_file(d_model=4, d_sae=6)
+        paths[layer] = src
+    provider = load_transcoder_set(
+        paths,
+        scan="test_scan",
+        feature_input_hook="hook_resid_mid",
+        feature_output_hook="hook_mlp_out",
+        device=torch.device("cpu"),
+        lazy_encoder=False,
+        lazy_decoder=False,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    cache = provider.create_decoder_block_cache(max_bytes=1_000_000)
+
+    first = provider.get_decoder_chunk(0, 0, decoder_cache=cache)
+    second = provider.get_decoder_chunk(0, 0, decoder_cache=cache)
+    snapshot = provider.get_diagnostic_snapshot()
+    chunk_nbytes = int(first.numel() * first.element_size())
+
+    assert second.data_ptr() == first.data_ptr()
+    assert snapshot["decoder_chunk_request_count"] == 2
+    assert snapshot["decoder_chunk_request_bytes"] == 2 * chunk_nbytes
+    assert snapshot["decoder_load_count"] == 1
+    assert snapshot["decoder_load_bytes"] == chunk_nbytes
+    assert snapshot["decoder_cache_hit_count"] == 1
+    assert snapshot["decoder_cache_miss_count"] == 1
+
+
+def test_lazy_plt_decoder_prefetch_reports_load_cache_wait_and_residency(
+    create_test_transcoder_file,
+):
+    src, _ = create_test_transcoder_file(d_model=4, d_sae=6)
+    provider = load_transcoder_set(
+        {0: src},
+        scan="test_scan",
+        feature_input_hook="hook_resid_mid",
+        feature_output_hook="hook_mlp_out",
+        device=torch.device("cpu"),
+        lazy_encoder=False,
+        lazy_decoder=True,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    assert provider.capabilities.supports_decoder_page_prefetch is True
+    cache = provider.create_decoder_block_cache(max_bytes=1_000_000)
+
+    with DecoderPagePrefetch(provider=provider, decoder_cache=cache, depth=1) as pages:
+        first = pages.get(0, 0)
+        pages.schedule(0, 1)
+        pages.finish(first)
+        second = pages.get(0, 1)
+        pages.finish(second)
+        pages.schedule(0, 1)
+        cached_second = pages.get(0, 1)
+        pages.finish(cached_second)
+
+    snapshot = provider.get_diagnostic_snapshot()
+    page_nbytes = int(second.numel() * second.element_size())
+    assert first.shape == second.shape
+    assert cached_second.data_ptr() == second.data_ptr()
+    assert snapshot["decoder_prefetch_request_count"] == 2
+    assert snapshot["decoder_prefetch_load_count"] == 1
+    assert snapshot["decoder_prefetch_load_bytes"] == page_nbytes
+    assert snapshot["decoder_prefetch_cache_hit_count"] == 1
+    assert snapshot["decoder_prefetch_consume_hit_count"] == 2
+    assert snapshot["decoder_prefetch_host_wait_count"] >= 0
+    assert snapshot["decoder_prefetch_host_wait_seconds"] >= 0.0
+    assert snapshot["decoder_prefetch_in_flight_high_watermark"] == 1
+    assert snapshot["decoder_prefetch_in_flight_bytes_high_watermark"] == page_nbytes
+    assert snapshot["decoder_prefetch_in_flight_count"] == 0
+    assert snapshot["decoder_prefetch_in_flight_bytes"] == 0
+    assert snapshot["decoder_prefetch_consumer_retirement_count"] == 3
+    assert snapshot["decoder_prefetch_consumer_retained_count"] == 0
+    assert snapshot["decoder_prefetch_pipeline_owned_final_page_count"] == 0
+    assert snapshot["decoder_prefetch_pipeline_owned_final_page_bytes"] == 0
+    assert snapshot["decoder_prefetch_pipeline_owned_final_page_high_watermark"] <= 2
+    assert (
+        snapshot["decoder_prefetch_pipeline_owned_final_page_bytes_high_watermark"]
+        <= 2 * page_nbytes
+    )
+    assert snapshot["decoder_prefetch_owner_open_count"] == 1
+    assert snapshot["decoder_prefetch_owner_close_count"] == 1
+    assert snapshot["decoder_prefetch_owner_count"] == 0
+    assert snapshot["decoder_prefetch_owner_high_watermark"] == 1
+
+    # A later Phase-4 owner starts a fresh telemetry scope rather than
+    # inheriting the prior trace's counters or page high-watermarks.
+    with DecoderPagePrefetch(provider=provider, decoder_cache=cache, depth=1):
+        pass
+    next_snapshot = provider.get_diagnostic_snapshot()
+    assert next_snapshot["decoder_prefetch_owner_open_count"] == 1
+    assert next_snapshot["decoder_prefetch_owner_close_count"] == 1
+    assert next_snapshot["decoder_prefetch_load_count"] == 0
+    assert next_snapshot["decoder_prefetch_pipeline_owned_final_page_high_watermark"] == 0
 
 
 def test_sparse_encode_decode(create_test_transcoder_file):
@@ -434,25 +539,41 @@ def test_transcoder_set_exact_plt_provider_components(create_test_transcoder_fil
     mlp_inputs = torch.randn(2, 4, 5)
     base = eager.compute_attribution_components(mlp_inputs, zero_positions=slice(0, 1))
     got = exact.compute_attribution_components(mlp_inputs, zero_positions=slice(0, 1))
-    assert torch.allclose(got["reconstruction"], base["reconstruction"])
-    assert got["decoder_vecs"].numel() == 0
-    assert got["encoder_to_decoder_map"].numel() == 0
+    assert torch.allclose(got.reconstruction, base.reconstruction)
+    assert got.decoder_vectors.numel() == 0
+    assert got.encoder_to_decoder_map.numel() == 0
+    assert got.chunked_decoder_state is not None
     assert torch.equal(
-        got["chunked_decoder_state"]["source_layers"], got["activation_matrix"].indices()[0]
+        got.chunked_decoder_state["source_layers"], got.activation_matrix.indices()[0]
     )
+    assert torch.equal(got.chunked_decoder_state["feature_ids"], got.activation_matrix.indices()[2])
     assert torch.equal(
-        got["chunked_decoder_state"]["feature_ids"], got["activation_matrix"].indices()[2]
-    )
-    assert torch.equal(
-        got["chunked_decoder_state"]["activation_values"], got["activation_matrix"].values()
+        got.chunked_decoder_state["activation_values"], got.activation_matrix.values()
     )
     no_enc = exact.compute_attribution_components(
         mlp_inputs, zero_positions=slice(0, 1), materialize_encoder_vecs=False
     )
-    assert no_enc["encoder_vecs"].numel() == 0
-    idx = got["activation_matrix"].indices()
+    assert no_enc.encoder_vectors.numel() == 0
+    idx = got.activation_matrix.indices()
     rows = exact.materialize_encoder_rows(idx[0].tolist(), idx[2].tolist())
-    assert torch.allclose(rows, base["encoder_vecs"])
+    assert torch.allclose(rows, base.encoder_vectors)
+    duplicate_probe = torch.tensor([3, 1, 3, 0], dtype=torch.long)
+    duplicate_layers = torch.tensor([1, 0, 1, 0], dtype=torch.long)
+    cpu_rows = exact.materialize_encoder_rows(
+        duplicate_layers,
+        duplicate_probe,
+        device=torch.device("cpu"),
+    )
+    assert cpu_rows.device.type == "cpu"
+    expected_rows = torch.stack(
+        [
+            eager.transcoders[int(layer)].W_enc[int(feature)]
+            for layer, feature in zip(
+                duplicate_layers.tolist(), duplicate_probe.tolist(), strict=True
+            )
+        ]
+    )
+    assert torch.equal(cpu_rows, expected_rows)
 
 
 def test_transcoder_set_rejects_non_positive_decoder_chunk_size(
@@ -486,3 +607,122 @@ def test_transcoder_set_plt_provider_topology(create_test_transcoder_file):
     fp = provider_fingerprint(provider)
     assert fp["architecture"] == "plt"
     assert fp["decoder_output_topology"] == "same_layer"
+
+
+def test_exact_plt_phase0_seed_reuses_reconstruction_page_sequence(
+    create_test_transcoder_file,
+):
+    paths = {}
+    for layer in range(2):
+        path, _ = create_test_transcoder_file(d_model=5, d_sae=7)
+        paths[layer] = path
+    exact = load_transcoder_set(
+        paths,
+        "scan",
+        "in",
+        "out",
+        device=torch.device("cpu"),
+        lazy_encoder=True,
+        lazy_decoder=True,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    mlp_inputs = torch.randn(2, 4, 5)
+    original_get_chunk = exact.get_decoder_chunk
+    page_sequence = []
+
+    def tracked_get_chunk(layer, chunk_id, *args, **kwargs):
+        page_sequence.append((int(layer), int(chunk_id)))
+        return original_get_chunk(layer, chunk_id, *args, **kwargs)
+
+    exact.get_decoder_chunk = tracked_get_chunk
+    baseline = exact.compute_attribution_components(
+        mlp_inputs, zero_positions=slice(0, 1), materialize_encoder_vecs=False
+    )
+    baseline_sequence = list(page_sequence)
+    page_sequence.clear()
+    estimated_bytes = baseline.active_feature_count * exact.d_model * exact.dtype.itemsize
+    seeded = exact.compute_attribution_components(
+        mlp_inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=False,
+        decoder_active_row_residency=True,
+        decoder_active_row_max_bytes=estimated_bytes,
+    )
+
+    assert torch.equal(seeded.reconstruction, baseline.reconstruction)
+    assert page_sequence == baseline_sequence
+    assert seeded.decoder_row_seed is not None
+    assert seeded.decoder_row_seed.occurrence_estimated_bytes == estimated_bytes
+    assert seeded.decoder_row_seed.shared_decoder_load_count == len(page_sequence)
+    for seed_layer in seeded.decoder_row_seed.layers:
+        if seed_layer is None:
+            continue
+        expected_rows = []
+        for feature_id in seed_layer.feature_ids.tolist():
+            chunk_id, local_id = divmod(feature_id, exact.decoder_chunk_size)
+            expected_rows.append(original_get_chunk(seed_layer.source_layer, chunk_id)[local_id])
+        assert torch.equal(seed_layer.rows, torch.stack(expected_rows))
+
+    page_sequence.clear()
+    dynamic_seeded = exact.compute_attribution_components(
+        mlp_inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=False,
+        decoder_active_row_residency=True,
+        decoder_active_row_max_bytes=0,
+    )
+    assert torch.equal(dynamic_seeded.reconstruction, baseline.reconstruction)
+    assert dynamic_seeded.decoder_row_seed is not None
+    assert dynamic_seeded.decoder_row_seed_refusal_reason is None
+    assert page_sequence == baseline_sequence
+
+    page_sequence.clear()
+    over_cap = exact.compute_attribution_components(
+        mlp_inputs,
+        zero_positions=slice(0, 1),
+        materialize_encoder_vecs=False,
+        decoder_active_row_residency=True,
+        decoder_active_row_max_bytes=max(0, estimated_bytes - 1),
+    )
+    assert over_cap.decoder_row_seed is None
+    assert over_cap.decoder_row_seed_refusal_reason == ("phase0_occurrence_bytes_exceed_max")
+    assert over_cap.decoder_row_seed_estimated_bytes == estimated_bytes
+    assert page_sequence == baseline_sequence
+
+
+def test_exact_plt_phase0_seed_failure_releases_ephemeral_decoder_page(
+    create_test_transcoder_file,
+):
+    path, _ = create_test_transcoder_file(d_model=5, d_sae=7)
+    exact = load_transcoder_set(
+        {0: path},
+        "scan",
+        "in",
+        "out",
+        device=torch.device("cpu"),
+        lazy_encoder=True,
+        lazy_decoder=True,
+        exact_chunked_provider=True,
+        decoder_chunk_size=3,
+    )
+    original_get_chunk = exact.get_decoder_chunk
+    page_refs = []
+
+    def failing_get_chunk(layer, chunk_id, *args, **kwargs):
+        if page_refs:
+            raise RuntimeError("synthetic Phase-0 decoder page failure")
+        page = original_get_chunk(layer, chunk_id, *args, **kwargs).clone()
+        page_refs.append(weakref.ref(page))
+        return page
+
+    exact.get_decoder_chunk = failing_get_chunk
+    sparse = torch.sparse_coo_tensor(
+        torch.tensor([[0, 1], [0, 4]]),
+        torch.tensor([1.0, 2.0]),
+        size=(2, 7),
+    ).coalesce()
+    with pytest.raises(RuntimeError, match="synthetic Phase-0 decoder page failure"):
+        exact._decode_sparse_with_decoder_chunks(0, sparse, capture_decoder_row_seed=True)
+    gc.collect()
+    assert page_refs and all(page_ref() is None for page_ref in page_refs)

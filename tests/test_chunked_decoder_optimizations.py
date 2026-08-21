@@ -7,91 +7,111 @@ import torch
 import yaml
 from safetensors.torch import save_file
 
-from circuit_tracer.attribution.attribute import attribute as attribute_top_level
+from circuit_tracer.attribution import context_nnsight
 from circuit_tracer.attribution.context_transformerlens import (
     AttributionContext as TransformerLensAttributionContext,
 )
-from circuit_tracer.attribution.attribute_nnsight import (
+from circuit_tracer.attribution.nnsight.preparation import (
+    resolve_phase0_activation_threshold_compare_mode,
+    resolve_telemetry_max_events,
+)
+from circuit_tracer.attribution.nnsight.context_state import (
+    AttributionTensorState,
+    ContextExecutionPolicy,
+    ContextNumericPolicy,
+    DecoderRuntime,
+)
+from circuit_tracer.attribution.nnsight.feature_vjp_tape import FeatureVjpTapeEntry
+from circuit_tracer.tracing.plan import ObservabilityPolicy
+from circuit_tracer.observability.lifecycle import TelemetryObserver
+from circuit_tracer.attribution.nnsight.phase1_policy import (
+    _build_phase1_trace_batch_metadata,
+    _build_phase1_trace_batch_sizing_metadata,
+    _resolve_phase1_trace_batch_config,
+    _resolve_phase1_trace_batch_policy,
+    _resolve_phase1_trace_batch_size_max,
+    _resolve_phase1_trace_batch_sizing,
+)
+from circuit_tracer.attribution.nnsight.phase4_policy import (
+    _apply_phase4_planner_v2_refresh_plan,
+    _build_exact_encoder_residency_metadata,
+    _build_phase4_batch_locality_summary,
+    _build_phase4_planner_v2_candidate_window,
+    _build_phase4_ranker_metadata,
+    _build_phase4_refresh_optimization_metadata,
+    _build_phase4_refresh_policy_metadata,
+    _build_phase4_row_executor_metadata,
+    _build_phase4_row_reduction_metadata,
+    _build_phase4_scheduler_metadata,
+    _build_phase4_scheduler_plan_telemetry,
+    _compute_phase4_locality_shaped_batch_end,
+    _compute_phase4_locality_shaped_frontier_size,
+    _compute_phase4_planned_feature_batch_size,
+    _compute_phase4_refresh_queue_window_size,
+    _plan_phase4_frontier_membership_preserving_v1,
+    _reorder_pending_for_phase4_locality,
+    _resolve_exact_encoder_residency,
+    _resolve_exact_encoder_residency_config,
+    _resolve_phase4_feature_batch_planner_status,
+    _resolve_phase4_ranker,
+    _resolve_phase4_ranker_config,
+    _resolve_phase4_refresh_interval_multiplier,
+    _resolve_phase4_refresh_optimization_config,
+    _resolve_phase4_refresh_optimization_mode,
+    _resolve_phase4_refresh_policy,
+    _resolve_phase4_refresh_policy_config,
+    _resolve_phase4_row_executor_config,
+    _resolve_phase4_row_executor_mode,
+    _resolve_phase4_row_reduction_config,
+    _resolve_phase4_row_reduction_mode,
+    _resolve_phase4_scheduler_config,
+    _resolve_phase4_scheduler_mode,
+    _resolve_phase4_scheduler_telemetry_detail,
+    _resolve_phase4_streaming_v1_microbatch_size,
+    _select_phase4_frontier_rank_selection,
+    _select_phase4_planner_v2_membership,
+    _build_phase4_probe_pending_frontier,
+)
+from circuit_tracer.attribution.nnsight.phase_support import (
     _annotate_phase4_selection_on_feature_semantic_descriptors,
-    _build_cross_cluster_runtime_snapshot,
-    _build_matrix_abs_stats,
     _build_feature_semantic_descriptors_payload,
+    _build_matrix_abs_stats,
+    _build_phase4_normalization_stats,
+    _copy_feature_rows_to_cpu_staging,
+    _build_phase4_deterministic_shadow_pending,
+    _build_phase4_cutoff_debug,
+    _build_vector_stats,
+    _compare_phase4_frontiers,
+    _resolve_internal_dtype_map,
+    _resolve_internal_precision_requested,
+)
+from circuit_tracer.attribution.nnsight.replay import (
     _build_phase0_activation_matrix_from_loaded_bundle,
     _build_phase0_donor_bundle_payload,
     _build_phase0_replay_metadata,
     _build_phase0_replay_validation_context,
-    _build_phase4_batch_locality_summary,
-    _build_phase4_executor_batch_telemetry,
-    _build_phase4_executor_substage_telemetry,
-    _build_phase4_normalization_stats,
-    _compute_row_denominator_scaled_l1,
-    _copy_feature_rows_to_cpu_staging,
-    _FileBackedFeatureRowStore,
-    _build_phase4_planner_v2_candidate_window,
-    _build_phase4_refresh_substage_telemetry,
-    _select_phase4_planner_v2_membership,
-    _apply_phase4_planner_v2_refresh_plan,
-    _build_phase4_deterministic_shadow_pending,
-    _build_phase4_cutoff_debug,
-    _build_phase4_probe_pending_frontier,
     _build_phase3_seed_bundle_payload,
-    _load_phase0_donor_bundle_npz,
-    _build_phase4_scheduler_metadata,
-    _build_phase4_scheduler_plan_telemetry,
-    _record_cross_cluster_batch_event,
-    _record_cross_cluster_checkpoint,
     _compute_row_abs_sums,
-    _build_vector_stats,
-    _compare_phase4_frontiers,
-    _compute_phase4_planned_feature_batch_size,
-    _compute_phase4_locality_shaped_batch_end,
-    _compute_phase4_locality_shaped_frontier_size,
-    _compute_phase4_refresh_queue_window_size,
-    _plan_phase4_frontier_membership_preserving_v1,
-    _reorder_pending_for_phase4_locality,
-    _resolve_internal_dtype_map,
-    _resolve_internal_precision_requested,
-    _resolve_telemetry_max_events,
-    _resolve_phase0_activation_threshold_compare_mode,
+    _compute_row_denominator_scaled_l1,
+    _hash_sparse_membership_indices,
+    _load_phase0_donor_bundle_npz,
     _resolve_phase0_donor_context_policy,
     _resolve_phase0_replay_mode,
-    _resolve_phase4_anomaly_debug_enabled,
-    _resolve_phase4_feature_batch_planner_status,
-    _hash_sparse_membership_indices,
-    _resolve_phase4_refresh_optimization_mode,
-    _resolve_phase4_refresh_optimization_config,
-    _build_phase4_refresh_optimization_metadata,
-    _resolve_phase1_trace_batch_policy,
-    _resolve_phase1_trace_batch_size_max,
-    _resolve_phase1_trace_batch_config,
-    _build_phase1_trace_batch_metadata,
-    _resolve_phase1_trace_batch_sizing,
-    _build_phase1_trace_batch_sizing_metadata,
-    _resolve_phase4_refresh_policy,
-    _resolve_phase4_refresh_interval_multiplier,
-    _resolve_phase4_refresh_policy_config,
-    _build_phase4_refresh_policy_metadata,
-    _resolve_phase4_ranker,
-    _resolve_phase4_ranker_config,
-    _build_phase4_ranker_metadata,
-    _select_phase4_frontier_rank_selection,
+)
+from circuit_tracer.attribution.nnsight.row_store import (
+    _FileBackedFeatureRowStore,
+    _build_row_store_cache_control_metadata,
     _resolve_row_store_cache_control,
     _resolve_row_store_cache_control_config,
-    _build_row_store_cache_control_metadata,
-    _resolve_exact_encoder_residency,
-    _resolve_exact_encoder_residency_config,
-    _build_exact_encoder_residency_metadata,
-    _resolve_phase4_row_executor_mode,
-    _resolve_phase4_row_executor_config,
-    _resolve_phase4_streaming_v1_microbatch_size,
-    _build_phase4_row_executor_metadata,
-    _resolve_phase4_row_reduction_config,
-    _resolve_phase4_row_reduction_mode,
-    _build_phase4_row_reduction_metadata,
+)
+from circuit_tracer.attribution.nnsight.telemetry import (
+    _build_cross_cluster_runtime_snapshot,
+    _build_phase4_executor_batch_telemetry,
+    _build_phase4_executor_substage_telemetry,
     _build_phase4_gpu_row_reduction_transfer_telemetry,
-    _resolve_phase4_scheduler_mode,
-    _resolve_phase4_scheduler_config,
-    _resolve_phase4_scheduler_telemetry_detail,
+    _build_phase4_refresh_substage_telemetry,
+    _record_cross_cluster_batch_event,
+    _record_cross_cluster_checkpoint,
 )
 from circuit_tracer.attribution.context_nnsight import (
     AttributionContext as NNSightAttributionContext,
@@ -125,7 +145,9 @@ class FakeDecoderProvider:
         self.enable_cache = enable_cache
         self.decoder_output_topology = decoder_output_topology
         self.load_calls: list[tuple[int, int]] = []
+        self.prefetch_events: list[tuple[str, dict[str, object]]] = []
         self.clear_calls = 0
+        self.decoder_device = torch.device("cpu")
 
     def create_decoder_block_cache(self):
         return {} if self.enable_cache else None
@@ -135,7 +157,24 @@ class FakeDecoderProvider:
         if cache is not None:
             cache.clear()
 
-    def get_decoder_chunk(self, layer_id: int, chunk_id: int, decoder_cache=None) -> torch.Tensor:
+    def decoder_chunk_nbytes(self, layer_id: int, chunk_id: int) -> int:
+        start = chunk_id * self.decoder_chunk_size
+        stop = min(start + self.decoder_chunk_size, self.blocks[layer_id].shape[0])
+        block = self.blocks[layer_id][start:stop]
+        return int(block.numel() * block.element_size())
+
+    def record_decoder_prefetch_event(self, event: str, **attrs: object) -> None:
+        self.prefetch_events.append((event, attrs))
+
+    def get_decoder_chunk(
+        self,
+        layer_id: int,
+        chunk_id: int,
+        decoder_cache=None,
+        *,
+        request_kind: str = "demand",
+    ) -> torch.Tensor:
+        del request_kind
         cache_key = (layer_id, chunk_id)
         if decoder_cache is not None and cache_key in decoder_cache:
             return decoder_cache[cache_key]
@@ -169,6 +208,58 @@ class FakeDecoderProvider:
 
     def materialize_encoder_rows(self, source_layers, feature_ids):
         return torch.stack([source_layers.to(torch.float32), feature_ids.to(torch.float32)], dim=1)
+
+
+def _make_nnsight_context(
+    *,
+    activation_matrix: torch.Tensor,
+    error_vectors: torch.Tensor,
+    token_vectors: torch.Tensor,
+    decoder_vecs: torch.Tensor,
+    encoder_vecs: torch.Tensor,
+    encoder_to_decoder_map: torch.Tensor,
+    decoder_locations: torch.Tensor,
+    logits: torch.Tensor,
+    decoder_provider: object,
+    chunked_decoder_state: dict[str, torch.Tensor],
+    exact_encoder_residency: str = "lazy",
+    stage_encoder_vecs_on_cpu: bool | None = None,
+    stage_error_vectors_on_cpu: bool | None = None,
+    error_vector_prefetch_lookahead: int = 1,
+    chunked_feature_replay_window: int = 1,
+    row_subchunk_size: int | None = None,
+    materialized_encoder_vecs_during_phase0: bool = False,
+) -> NNSightAttributionContext:
+    return NNSightAttributionContext(
+        tensor_state=AttributionTensorState(
+            activation_matrix=activation_matrix,
+            error_vectors=error_vectors,
+            token_vectors=token_vectors,
+            decoder_vectors=decoder_vecs,
+            encoder_vectors=encoder_vecs,
+            encoder_to_decoder_map=encoder_to_decoder_map,
+            decoder_locations=decoder_locations,
+            logits=logits,
+        ),
+        execution_policy=ContextExecutionPolicy.resolve(
+            chunked_decoder_state=chunked_decoder_state,
+            encoder_vectors=encoder_vecs,
+            error_vectors=error_vectors,
+            exact_encoder_residency=exact_encoder_residency,
+            stage_encoder_vectors_on_cpu=stage_encoder_vecs_on_cpu,
+            stage_error_vectors_on_cpu=stage_error_vectors_on_cpu,
+            error_vector_prefetch_lookahead=error_vector_prefetch_lookahead,
+            chunked_feature_replay_window=chunked_feature_replay_window,
+            row_subchunk_size=row_subchunk_size,
+        ),
+        decoder_runtime=DecoderRuntime.resolve(
+            provider=decoder_provider,
+            chunked_state=chunked_decoder_state,
+        ),
+        numeric_policy=ContextNumericPolicy(
+            materialized_encoder_vectors_during_phase0=materialized_encoder_vecs_during_phase0,
+        ),
+    )
 
 
 def test_clt_provider_capabilities_topology_and_fingerprint() -> None:
@@ -406,7 +497,7 @@ class GuardrailDecoderProvider:
         return result
 
 
-def _make_chunked_context(context_cls, *, enable_cache: bool = True):
+def _make_chunked_context(context_factory, *, enable_cache: bool = True):
     activation_matrix = torch.sparse_coo_tensor(
         indices=torch.tensor([[0, 0, 1], [0, 1, 1], [0, 1, 0]]),
         values=torch.tensor([2.0, 3.0, 5.0]),
@@ -426,7 +517,7 @@ def _make_chunked_context(context_cls, *, enable_cache: bool = True):
         chunk_size=1,
         enable_cache=enable_cache,
     )
-    ctx = context_cls(
+    ctx = context_factory(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(3, 2, 2),
         token_vectors=torch.zeros(2, 2),
@@ -447,7 +538,7 @@ def _make_chunked_context(context_cls, *, enable_cache: bool = True):
     return ctx, provider
 
 
-def _assert_chunked_attr_helper(context_cls) -> None:
+def _assert_chunked_attr_helper(context_factory) -> None:
     grads_by_output_layer = [
         torch.tensor(
             [
@@ -472,7 +563,7 @@ def _assert_chunked_attr_helper(context_cls) -> None:
     )
     expected_loads = [(0, 0), (0, 1), (1, 0)]
 
-    ctx, provider = _make_chunked_context(context_cls, enable_cache=True)
+    ctx, provider = _make_chunked_context(context_factory, enable_cache=True)
     ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
 
     assert ctx._chunked_layer_spans == [(0, 2), (2, 3), None]
@@ -502,14 +593,14 @@ def _assert_chunked_attr_helper(context_cls) -> None:
     assert torch.allclose(ctx._batch_buffer, cached_result)
     assert provider.load_calls == expected_loads + expected_loads + expected_loads
 
-    uncached_ctx, uncached_provider = _make_chunked_context(context_cls, enable_cache=False)
+    uncached_ctx, uncached_provider = _make_chunked_context(context_factory, enable_cache=False)
     uncached_ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
     assert torch.allclose(uncached_ctx._batch_buffer, cached_result)
     assert uncached_provider.load_calls == expected_loads
 
 
 def test_nnsight_chunked_attr_reuses_decoder_block_loads() -> None:
-    _assert_chunked_attr_helper(NNSightAttributionContext)
+    _assert_chunked_attr_helper(_make_nnsight_context)
 
 
 def test_nnsight_chunked_attr_uses_provider_same_layer_topology() -> None:
@@ -557,7 +648,7 @@ def test_nnsight_chunked_attr_uses_provider_same_layer_topology() -> None:
         size=(2, 1, 2),
         check_invariants=True,
     ).coalesce()
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(2, 1, 2),
         token_vectors=torch.zeros(1, 2),
@@ -594,7 +685,7 @@ def test_nnsight_chunked_attr_requires_sorted_source_layers() -> None:
     ).coalesce()
 
     with pytest.raises(ValueError, match="sorted by layer"):
-        NNSightAttributionContext(
+        _make_nnsight_context(
             activation_matrix=activation_matrix,
             error_vectors=torch.zeros(2, 2, 2),
             token_vectors=torch.zeros(2, 2),
@@ -616,7 +707,7 @@ def test_nnsight_chunked_attr_requires_sorted_source_layers() -> None:
 
 
 def test_nnsight_context_replace_phase0_activation_state_refreshes_chunked_state() -> None:
-    ctx, provider = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    ctx, provider = _make_chunked_context(_make_nnsight_context, enable_cache=True)
     assert ctx.decoder_chunk_cache is not None
 
     donor_activation_matrix = torch.sparse_coo_tensor(
@@ -660,7 +751,7 @@ def test_transformerlens_chunked_attr_reuses_decoder_block_loads() -> None:
     _assert_chunked_attr_helper(TransformerLensAttributionContext)
 
 
-def _assert_chunked_attr_subchunks_large_decoder_bucket(context_cls) -> None:
+def _assert_chunked_attr_subchunks_large_decoder_bucket(context_factory) -> None:
     activation_matrix = torch.sparse_coo_tensor(
         indices=torch.tensor([[0, 0, 0, 0, 0], [0, 1, 2, 3, 4], [0, 1, 0, 1, 0]]),
         values=torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]),
@@ -679,7 +770,7 @@ def _assert_chunked_attr_subchunks_large_decoder_bucket(context_cls) -> None:
         chunk_size=2,
         enable_cache=True,
     )
-    ctx = context_cls(
+    ctx = context_factory(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(2, 5, 2),
         token_vectors=torch.zeros(5, 2),
@@ -734,7 +825,7 @@ def _assert_chunked_attr_subchunks_large_decoder_bucket(context_cls) -> None:
 
 
 def test_nnsight_chunked_attr_subchunks_large_decoder_bucket() -> None:
-    _assert_chunked_attr_subchunks_large_decoder_bucket(NNSightAttributionContext)
+    _assert_chunked_attr_subchunks_large_decoder_bucket(_make_nnsight_context)
 
 
 def test_transformerlens_chunked_attr_subchunks_large_decoder_bucket() -> None:
@@ -778,7 +869,7 @@ def test_nnsight_row_subchunk_override_matches_default_replay() -> None:
 
     def _make_ctx(*, row_subchunk_size: int | None) -> NNSightAttributionContext:
         provider = FakeDecoderProvider(blocks=blocks, chunk_size=2, enable_cache=True)
-        ctx = NNSightAttributionContext(
+        ctx = _make_nnsight_context(
             activation_matrix=activation_matrix,
             error_vectors=torch.zeros(2, 5, 2),
             token_vectors=torch.zeros(5, 2),
@@ -807,6 +898,169 @@ def test_nnsight_row_subchunk_override_matches_default_replay() -> None:
 
     assert torch.allclose(custom_ctx._batch_buffer, baseline_ctx._batch_buffer)
     assert custom_ctx.get_diagnostic_snapshot()["row_subchunk_size"] == 1.0
+
+
+def _legacy_full_decoder_page_cast_replay(
+    *,
+    provider: FakeDecoderProvider,
+    positions: torch.Tensor,
+    feature_ids: torch.Tensor,
+    activation_values: torch.Tensor,
+    grads_by_output_layer: tuple[torch.Tensor, ...],
+    row_subchunk_size: int,
+) -> torch.Tensor:
+    """Reference the pre-optimization full-page cast and contraction order."""
+    batch_buffer = torch.zeros(
+        feature_ids.numel(),
+        grads_by_output_layer[0].shape[0],
+        dtype=grads_by_output_layer[0].dtype,
+    )
+    chunk_ids = torch.div(feature_ids, provider.decoder_chunk_size, rounding_mode="floor")
+    for chunk_id_tensor in torch.unique(chunk_ids, sorted=True):
+        chunk_id = int(chunk_id_tensor.item())
+        chunk_rows = (chunk_ids == chunk_id_tensor).nonzero(as_tuple=False).flatten()
+        chunk_positions = positions[chunk_rows]
+        chunk_local_feature_ids = (
+            feature_ids[chunk_rows] - chunk_id * provider.decoder_chunk_size
+        ).long()
+        decoder_chunk = provider.blocks[0][
+            chunk_id
+            * provider.decoder_chunk_size : (chunk_id + 1)
+            * provider.decoder_chunk_size
+        ]
+        chunk_activations = activation_values[chunk_rows].to(
+            dtype=batch_buffer.dtype
+        )[:, None]
+        for output_layer, grads in enumerate(grads_by_output_layer):
+            decoder_vectors = decoder_chunk[:, output_layer].to(dtype=batch_buffer.dtype)
+            typed_grads = grads.to(dtype=batch_buffer.dtype)
+            for row_start in range(0, len(chunk_rows), row_subchunk_size):
+                row_slice = slice(row_start, row_start + row_subchunk_size)
+                row_chunk_rows = chunk_rows[row_slice]
+                row_chunk_positions = chunk_positions[row_slice]
+                row_chunk_local_feature_ids = chunk_local_feature_ids[row_slice]
+                scaled_decoders = (
+                    decoder_vectors[row_chunk_local_feature_ids]
+                    * chunk_activations[row_slice]
+                )
+                batch_buffer[row_chunk_rows] += torch.einsum(
+                    "bpd,pd->pb",
+                    typed_grads[:, row_chunk_positions],
+                    scaled_decoders,
+                )
+    return batch_buffer
+
+
+@pytest.mark.parametrize("decoder_storage_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("row_subchunk_size", [1, 3])
+@pytest.mark.parametrize("replay_mode", ["direct", "tape"])
+def test_nnsight_gather_before_decoder_cast_is_bitwise_legacy_equivalent(
+    decoder_storage_dtype: torch.dtype,
+    row_subchunk_size: int,
+    replay_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Position ordering deliberately makes decoder chunk IDs [2, 0, 2, 1, 0, 2].
+    # Feature ID 5 is repeated, exercising repeated advanced-index gather rows.
+    feature_ids = torch.tensor([5, 1, 5, 3, 0, 4])
+    positions = torch.arange(feature_ids.numel())
+    activation_values = torch.tensor([0.5, -1.25, 2.0, 0.75, -0.5, 1.5])
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.stack(
+            [torch.zeros_like(feature_ids), positions, feature_ids]
+        ),
+        values=activation_values,
+        size=(2, feature_ids.numel(), 6),
+        check_invariants=True,
+    ).coalesce()
+    decoder_block = (
+        torch.arange(6 * 2 * 4, dtype=torch.float32).reshape(6, 2, 4) / 7
+    ).to(decoder_storage_dtype)
+    provider = FakeDecoderProvider(
+        {0: decoder_block},
+        chunk_size=2,
+        enable_cache=False,
+    )
+    first_grads = (
+        torch.arange(2 * feature_ids.numel() * 4, dtype=torch.float32)
+        .reshape(2, feature_ids.numel(), 4)
+        .div(11)
+    )
+    second_grads = first_grads.flip((0, 1)).mul(-0.75)
+    grad_batches = (
+        (first_grads, first_grads.flip(-1).mul(1.25)),
+        (second_grads, second_grads.flip(-1).mul(-1.5)),
+    )
+    expected = [
+        _legacy_full_decoder_page_cast_replay(
+            provider=provider,
+            positions=positions,
+            feature_ids=feature_ids,
+            activation_values=activation_values,
+            grads_by_output_layer=grads,
+            row_subchunk_size=row_subchunk_size,
+        )
+        for grads in grad_batches
+    ]
+    selected_decoder_row_counts: list[int] = []
+    original_einsum = context_nnsight.einsum
+
+    def _recording_einsum(*args, **kwargs):
+        selected_decoder_row_counts.append(int(args[1].shape[0]))
+        return original_einsum(*args, **kwargs)
+
+    monkeypatch.setattr(context_nnsight, "einsum", _recording_einsum)
+
+    ctx = _make_nnsight_context(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(2, feature_ids.numel(), 4),
+        token_vectors=torch.zeros(feature_ids.numel(), 4),
+        decoder_vecs=torch.empty((0, 4)),
+        encoder_vecs=torch.zeros((activation_matrix._nnz(), 4)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+        row_subchunk_size=row_subchunk_size,
+    )
+
+    if replay_mode == "direct":
+        observed = []
+        ctx._batch_buffer = torch.zeros(ctx._row_size, 2)
+        for grads in grad_batches:
+            ctx._batch_buffer.zero_()
+            ctx._compute_chunked_feature_attributions_from_grads(list(grads))
+            observed.append(ctx._batch_buffer.clone())
+    else:
+        ctx._batch_buffer = None
+        entries = tuple(
+            FeatureVjpTapeEntry(
+                batch_call_index=batch_index,
+                gradients=grads,
+                row_buffer=torch.zeros(ctx._row_size, 2),
+                batch_size=2,
+                host_nbytes=1,
+                device_nbytes=0,
+                row_nbytes=0,
+                total_nbytes=1,
+                pinned_host_nbytes=0,
+                pageable_host_nbytes=1,
+            )
+            for batch_index, grads in enumerate(grad_batches)
+        )
+        observed = [result.T for result in ctx.replay_feature_vjp_tape(entries)]
+
+    feature_row_count = feature_ids.numel()
+    assert torch.equal(observed[0][:feature_row_count], expected[0])
+    assert torch.equal(observed[1][:feature_row_count], expected[1])
+    assert selected_decoder_row_counts
+    assert max(selected_decoder_row_counts) <= provider.decoder_chunk_size
 
 
 def _create_gemmascope2_clt_files(
@@ -866,13 +1120,13 @@ def test_chunked_reconstruction_matches_saved_components_with_small_chunks(
     baseline = standard_clt.compute_attribution_components(inputs, zero_positions=slice(0, 1))
     clt.reset_diagnostic_stats()
     reconstructed = clt.compute_reconstruction_chunked(
-        components["activation_matrix"],
+        components.activation_matrix,
         inputs,
         chunk_size=chunk_size,
     )
 
     diagnostics = clt.get_diagnostic_snapshot()
-    assert torch.allclose(reconstructed, baseline["reconstruction"])
+    assert torch.allclose(reconstructed, baseline.reconstruction)
     assert diagnostics["decoder_load_count"] == diagnostics["reconstruction_chunk_count"]
 
 
@@ -918,7 +1172,7 @@ def test_exact_chunked_encoder_vectors_are_cpu_staged_and_materialized_equivalen
     ).coalesce()
     encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     staged_encoder_source = encoder_vecs.clone()
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(2, 2, 4),
         token_vectors=torch.zeros(2, 4),
@@ -988,7 +1242,7 @@ def test_exact_chunked_active_cpu_encoder_residency_stages_materialized_table() 
         check_invariants=True,
     ).coalesce()
     encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(2, 2, 4),
         token_vectors=torch.zeros(2, 4),
@@ -1016,58 +1270,6 @@ def test_exact_chunked_active_cpu_encoder_residency_stages_materialized_table() 
     assert ctx.exact_encoder_materialized_during_phase0 is True
     assert ctx.exact_encoder_pinned_requested is False
     assert ctx.exact_encoder_pinned_effective is False
-
-
-def test_exact_chunked_active_pinned_cpu_encoder_residency_falls_back_to_cpu(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    activation_matrix = torch.sparse_coo_tensor(
-        indices=torch.tensor([[0, 0, 1], [0, 1, 1], [0, 1, 0]]),
-        values=torch.tensor([1.0, 2.0, 3.0]),
-        size=(2, 2, 2),
-        check_invariants=True,
-    ).coalesce()
-    encoder_vecs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-
-    def _stage_with_forced_pin_failure(tensor: torch.Tensor, *, pin_memory: bool):
-        staged = NNSightAttributionContext._stage_tensor_on_cpu(tensor)
-        assert pin_memory is True
-        return staged, False, "RuntimeError: pinning unavailable"
-
-    monkeypatch.setattr(
-        NNSightAttributionContext,
-        "_stage_encoder_tensor",
-        staticmethod(_stage_with_forced_pin_failure),
-    )
-
-    ctx = NNSightAttributionContext(
-        activation_matrix=activation_matrix,
-        error_vectors=torch.zeros(2, 2, 4),
-        token_vectors=torch.zeros(2, 4),
-        decoder_vecs=torch.empty((0, 4)),
-        encoder_vecs=encoder_vecs,
-        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
-        decoder_locations=torch.empty((2, 0), dtype=torch.long),
-        logits=torch.zeros(1, 1, 5),
-        decoder_provider=FakeDecoderProvider({0: torch.zeros(2, 2, 4), 1: torch.zeros(1, 1, 4)}),
-        chunked_decoder_state={
-            "source_layers": activation_matrix.indices()[0],
-            "positions": activation_matrix.indices()[1],
-            "feature_ids": activation_matrix.indices()[2],
-            "activation_values": activation_matrix.values(),
-        },
-        exact_encoder_residency="active_pinned_cpu",
-        materialized_encoder_vecs_during_phase0=True,
-    )
-
-    assert ctx.encoder_vecs.device.type == "cpu"
-    assert ctx.exact_encoder_residency_requested == "active_pinned_cpu"
-    assert ctx.exact_encoder_residency_effective == "active_pinned_cpu"
-    assert ctx.exact_encoder_pinned_requested is True
-    assert ctx.exact_encoder_pinned_effective is False
-    assert ctx.exact_encoder_pinning_success is False
-    assert ctx.exact_encoder_pinning_failure_reason is not None
-    assert ctx.exact_encoder_staging_destination == "cpu"
 
 
 def test_stage_tensor_on_cpu_preserves_existing_cpu_layout() -> None:
@@ -1104,29 +1306,27 @@ def test_exact_chunked_lazy_encoder_materialization_matches_eager_rows(tmp_path:
         materialize_encoder_vecs=False,
     )
 
-    eager_activation = cast(torch.Tensor, eager_components["activation_matrix"])
-    lazy_activation = cast(torch.Tensor, lazy_components["activation_matrix"])
-    eager_encoder_vecs = cast(torch.Tensor, eager_components["encoder_vecs"])
-    lazy_encoder_vecs = cast(torch.Tensor, lazy_components["encoder_vecs"])
+    eager_activation = eager_components.activation_matrix
+    lazy_activation = lazy_components.activation_matrix
+    eager_encoder_vecs = eager_components.encoder_vectors
+    lazy_encoder_vecs = lazy_components.encoder_vectors
 
     assert torch.equal(lazy_activation.indices(), eager_activation.indices())
     assert torch.allclose(lazy_activation.values(), eager_activation.values())
     assert lazy_encoder_vecs.shape == (0, clt.d_model)
     assert eager_activation._nnz() > 0
 
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=lazy_activation,
         error_vectors=torch.zeros(clt.n_layers, inputs.shape[1], clt.d_model, dtype=clt.dtype),
         token_vectors=torch.zeros(inputs.shape[1], clt.d_model, dtype=clt.dtype),
-        decoder_vecs=cast(torch.Tensor, lazy_components["decoder_vecs"]),
+        decoder_vecs=lazy_components.decoder_vectors,
         encoder_vecs=lazy_encoder_vecs,
-        encoder_to_decoder_map=cast(torch.Tensor, lazy_components["encoder_to_decoder_map"]),
-        decoder_locations=cast(torch.Tensor, lazy_components["decoder_locations"]),
+        encoder_to_decoder_map=lazy_components.encoder_to_decoder_map,
+        decoder_locations=lazy_components.decoder_locations,
         logits=torch.zeros(1, 1, 1, dtype=clt.dtype),
         decoder_provider=clt,
-        chunked_decoder_state=cast(
-            dict[str, torch.Tensor], lazy_components["chunked_decoder_state"]
-        ),
+        chunked_decoder_state=lazy_components.chunked_decoder_state,
     )
 
     nnz = eager_activation._nnz()
@@ -1153,7 +1353,7 @@ def test_exact_chunked_error_vector_prefetch_window_stays_bounded() -> None:
         check_invariants=True,
     ).coalesce()
     error_vectors = torch.arange(32, dtype=torch.float32).reshape(4, 1, 8)
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=activation_matrix,
         error_vectors=error_vectors,
         token_vectors=torch.zeros(1, 8),
@@ -1634,30 +1834,31 @@ def test_row_store_cache_control_config_validates_and_tracks_effective_mode() ->
 def test_exact_encoder_residency_config_validates_tracks_effective_mode_and_fallback() -> None:
     assert _resolve_exact_encoder_residency("lazy") == "lazy"
     assert _resolve_exact_encoder_residency("active_cpu") == "active_cpu"
-    assert _resolve_exact_encoder_residency("active_pinned_cpu") == "active_pinned_cpu"
     with pytest.raises(ValueError, match="exact_encoder_residency must be one of"):
         _resolve_exact_encoder_residency("active")
+    with pytest.raises(ValueError, match="exact_encoder_residency must be one of"):
+        _resolve_exact_encoder_residency("active_pinned_cpu")
 
     config = _resolve_exact_encoder_residency_config(
-        "active_pinned_cpu",
+        "active_cpu",
         supports_exact_encoder_residency=True,
     )
     metadata = _build_exact_encoder_residency_metadata(config)
-    assert metadata["exact_encoder_residency_requested"] == "active_pinned_cpu"
-    assert metadata["exact_encoder_residency_effective"] == "active_pinned_cpu"
+    assert metadata["exact_encoder_residency_requested"] == "active_cpu"
+    assert metadata["exact_encoder_residency_effective"] == "active_cpu"
     assert metadata["exact_encoder_residency_applicable"] is True
     assert metadata["exact_encoder_residency_fallback_reason"] is None
     assert metadata["exact_encoder_materialize_phase0"] is True
-    assert metadata["exact_encoder_staging_destination_planned"] == "pinned_cpu"
-    assert metadata["exact_encoder_pinned_requested"] is True
-    assert metadata["exact_encoder_pinned_planned"] is True
+    assert metadata["exact_encoder_staging_destination_planned"] == "cpu"
+    assert metadata["exact_encoder_pinned_requested"] is False
+    assert metadata["exact_encoder_pinned_planned"] is False
     assert metadata["exact_encoder_pinned_effective"] is None
     assert metadata["exact_encoder_pinning_success"] is None
     assert metadata["exact_encoder_residency_default"] == "lazy"
     assert metadata["exact_encoder_residency_reference_execution"] is False
 
     fallback_config = _resolve_exact_encoder_residency_config(
-        "active_pinned_cpu",
+        "active_cpu",
         supports_exact_encoder_residency=False,
     )
     fallback_metadata = _build_exact_encoder_residency_metadata(fallback_config)
@@ -1665,7 +1866,7 @@ def test_exact_encoder_residency_config_validates_tracks_effective_mode_and_fall
     assert fallback_metadata["exact_encoder_residency_applicable"] is False
     assert fallback_metadata["exact_encoder_residency_fallback_reason"] is not None
     assert fallback_metadata["exact_encoder_materialize_phase0"] is False
-    assert fallback_metadata["exact_encoder_pinned_requested"] is True
+    assert fallback_metadata["exact_encoder_pinned_requested"] is False
     assert fallback_metadata["exact_encoder_pinned_planned"] is False
     assert fallback_metadata["exact_encoder_pinned_effective"] is None
     assert fallback_metadata["exact_encoder_residency_reference_execution"] is True
@@ -1860,58 +2061,55 @@ def test_phase4_streaming_v1_microbatch_size_is_capped() -> None:
     assert _resolve_phase4_streaming_v1_microbatch_size(256) == 64
 
 
-def test_phase4_executor_batch_telemetry_separates_scheduler_and_microbatch_counts() -> None:
+def test_phase4_executor_batch_telemetry_separates_semantic_and_execution_counts() -> None:
     telemetry = _build_phase4_executor_batch_telemetry(
-        scheduler_reference_batch_index=2,
-        scheduler_reference_batch_count=4,
-        scheduler_reference_batch_rows=128,
-        executor_microbatch_index=9,
-        executor_microbatch_count=12,
-        executor_configured_reference_batch_size=128,
-        executor_microbatch_rows=32,
-        executor_microbatch_size=32,
+        semantic_batch_count=4,
+        semantic_batch_max_rows=128,
+        semantic_batch_index_start=2,
+        semantic_batch_index_end=2,
+        semantic_batch_rows=(128,),
+        execution_batch_index=9,
+        execution_batch_count=12,
+        execution_batch_rows=32,
+        execution_batch_max_rows=32,
     )
 
-    assert telemetry["phase4_batch_count"] == 4
-    assert telemetry["phase4_batches"] == 4
-    assert telemetry["phase4_executor_microbatch_count"] == 12
-    assert telemetry["scheduler_reference_batch_index"] == 2
-    assert telemetry["scheduler_reference_batch_rows"] == 128
-    assert telemetry["executor_microbatch_index"] == 9
-    assert telemetry["executor_microbatch_rows"] == 32
-    assert telemetry["executor_configured_reference_batch_size"] == 128
-    assert telemetry["executor_reference_batch_size"] == 128
-    assert telemetry["executor_microbatch_size"] == 32
+    assert telemetry["phase4_semantic_batch_count"] == 4
+    assert telemetry["phase4_semantic_batch_max_rows"] == 128
+    assert telemetry["phase4_execution_batch_count"] == 12
+    assert telemetry["phase4_execution_batch_index"] == 9
+    assert telemetry["phase4_execution_batch_rows"] == 32
+    assert telemetry["phase4_execution_batch_max_rows"] == 32
 
 
-def test_phase4_executor_batch_telemetry_keeps_reference_and_microbatch_indices_separate() -> None:
+def test_phase4_executor_batch_telemetry_keeps_semantic_and_execution_indices_separate() -> None:
     first = _build_phase4_executor_batch_telemetry(
-        scheduler_reference_batch_index=0,
-        scheduler_reference_batch_count=1,
-        scheduler_reference_batch_rows=64,
-        executor_microbatch_index=1,
-        executor_microbatch_count=1,
-        executor_configured_reference_batch_size=64,
-        executor_microbatch_rows=32,
-        executor_microbatch_size=32,
+        semantic_batch_count=1,
+        semantic_batch_max_rows=64,
+        semantic_batch_index_start=0,
+        semantic_batch_index_end=0,
+        semantic_batch_rows=(64,),
+        execution_batch_index=1,
+        execution_batch_count=1,
+        execution_batch_rows=32,
+        execution_batch_max_rows=32,
     )
     second = _build_phase4_executor_batch_telemetry(
-        scheduler_reference_batch_index=1,
-        scheduler_reference_batch_count=2,
-        scheduler_reference_batch_rows=64,
-        executor_microbatch_index=2,
-        executor_microbatch_count=2,
-        executor_configured_reference_batch_size=64,
-        executor_microbatch_rows=32,
-        executor_microbatch_size=32,
+        semantic_batch_count=2,
+        semantic_batch_max_rows=64,
+        semantic_batch_index_start=1,
+        semantic_batch_index_end=1,
+        semantic_batch_rows=(64,),
+        execution_batch_index=2,
+        execution_batch_count=2,
+        execution_batch_rows=32,
+        execution_batch_max_rows=32,
     )
 
-    assert first["phase4_batch_count"] == 1
-    assert second["phase4_batch_count"] == 2
-    assert first["scheduler_reference_batch_index"] == 0
-    assert second["scheduler_reference_batch_index"] == 1
-    assert first["executor_microbatch_index"] == 1
-    assert second["executor_microbatch_index"] == 2
+    assert first["phase4_semantic_batch_count"] == 1
+    assert second["phase4_semantic_batch_count"] == 2
+    assert first["phase4_execution_batch_index"] == 1
+    assert second["phase4_execution_batch_index"] == 2
 
 
 def test_phase4_batch_locality_summary_reports_layer_and_chunk_ranges() -> None:
@@ -2210,7 +2408,7 @@ def test_phase4_planner_v2_refresh_fails_closed_when_candidate_window_raises(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_nnsight._build_phase4_planner_v2_candidate_window",
+        "circuit_tracer.attribution.nnsight.phase4_policy._build_phase4_planner_v2_candidate_window",
         _raise_candidate_window,
     )
 
@@ -2440,14 +2638,16 @@ def test_phase4_planner_status_is_pending_when_growth_is_possible() -> None:
 
 
 def test_phase4_anomaly_debug_enabled_from_flag() -> None:
-    assert _resolve_phase4_anomaly_debug_enabled(True) is True
+    policy = ObservabilityPolicy(phase4_anomaly_debug=True)
+    assert policy.phase4_anomaly_debug is True
 
 
 def test_phase4_anomaly_debug_ignores_env_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PHASE4_ANOMALY_DEBUG", "1")
-    assert _resolve_phase4_anomaly_debug_enabled(False) is False
+    policy = ObservabilityPolicy(phase4_anomaly_debug=False)
+    assert policy.phase4_anomaly_debug is False
 
 
 def test_telemetry_max_events_ignores_env_override(
@@ -2455,7 +2655,7 @@ def test_telemetry_max_events_ignores_env_override(
 ) -> None:
     monkeypatch.setenv("CIRCUIT_TRACER_TELEMETRY_MAX_EVENTS", "17")
     assert (
-        _resolve_telemetry_max_events(
+        resolve_telemetry_max_events(
             telemetry_max_events=None,
             compact_output=False,
             exact_chunked_decoder=False,
@@ -3193,6 +3393,7 @@ def test_record_cross_cluster_batch_event_emits_scalar_event_record() -> None:
 
 def test_build_cross_cluster_runtime_snapshot_emits_memory_and_hashes() -> None:
     summary_payload, stream_payload = _build_cross_cluster_runtime_snapshot(
+        observer=TelemetryObserver.create(),
         device=torch.device("cpu")
     )
 
@@ -3238,12 +3439,12 @@ def test_build_phase4_deterministic_shadow_pending_breaks_ties_stably() -> None:
 
 
 def test_phase0_activation_threshold_compare_mode_resolution() -> None:
-    assert _resolve_phase0_activation_threshold_compare_mode("DEFAULT") == "baseline"
-    assert _resolve_phase0_activation_threshold_compare_mode("bfloat16") == "bf16"
-    assert _resolve_phase0_activation_threshold_compare_mode("fp64") == "fp64"
+    assert resolve_phase0_activation_threshold_compare_mode("DEFAULT") == "baseline"
+    assert resolve_phase0_activation_threshold_compare_mode("bfloat16") == "bf16"
+    assert resolve_phase0_activation_threshold_compare_mode("fp64") == "fp64"
 
     with pytest.raises(ValueError, match="phase0_activation_threshold_compare_mode"):
-        _resolve_phase0_activation_threshold_compare_mode("float16")
+        resolve_phase0_activation_threshold_compare_mode("float16")
 
 
 def test_hash_sparse_membership_indices_canonicalizes_ordering() -> None:
@@ -3327,153 +3528,6 @@ def test_phase4_probe_frontier_preserves_full_frontier_order_when_all_features_i
     assert torch.equal(pending, torch.tensor([0, 1, 2, 3], dtype=torch.long))
 
 
-def test_top_level_attribute_rejects_phase4_planner_flags() -> None:
-    class _DummyModel:
-        backend = "nnsight"
-
-    with pytest.raises(
-        ValueError,
-        match=r"unsupported via circuit_tracer\.attribution\.attribute",
-    ):
-        attribute_top_level(
-            prompt="hello",
-            model=cast(object, _DummyModel()),
-            plan_feature_batch_size=True,
-        )
-
-
-def test_top_level_attribute_forwards_phase4_scheduler_args_to_nnsight(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def _fake_attribute(**kwargs):
-        captured.update(kwargs)
-        return sentinel
-
-    monkeypatch.setattr("circuit_tracer.attribution.attribute_nnsight.attribute", _fake_attribute)
-
-    class _DummyModel:
-        backend = "nnsight"
-
-    result = attribute_top_level(
-        prompt="hello",
-        model=cast(object, _DummyModel()),
-        phase4_scheduler_mode="planner_v1",
-        phase4_scheduler_debug=True,
-        phase4_scheduler_telemetry_detail="debug",
-        phase4_refresh_optimization="v1",
-        phase4_row_executor="streaming_v1",
-        phase1_trace_batch_policy="cap_effective_batches",
-        phase1_trace_batch_size_max=32,
-        phase4_refresh_policy="deferred_v1",
-        phase4_refresh_interval_multiplier=2,
-        phase4_ranker="topk_v1",
-        row_store_cache_control="fadvise_dontneed_after_append_v1",
-        exact_encoder_residency="active_cpu",
-    )
-
-    assert result is sentinel
-    assert captured["phase4_scheduler_mode"] == "planner_v1"
-    assert captured["phase4_scheduler_debug"] is True
-    assert captured["phase4_scheduler_telemetry_detail"] == "debug"
-    assert captured["phase4_refresh_optimization"] == "v1"
-    assert captured["phase4_row_executor"] == "streaming_v1"
-    assert captured["phase1_trace_batch_policy"] == "cap_effective_batches"
-    assert captured["phase1_trace_batch_size_max"] == 32
-    assert captured["phase4_refresh_policy"] == "deferred_v1"
-    assert captured["phase4_refresh_interval_multiplier"] == 2
-    assert captured["phase4_ranker"] == "topk_v1"
-    assert captured["row_store_cache_control"] == "fadvise_dontneed_after_append_v1"
-    assert captured["exact_encoder_residency"] == "active_cpu"
-
-
-def test_top_level_attribute_accepts_default_phase4_scheduler_args_on_transformerlens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def _fake_attribute(**kwargs):
-        captured.update(kwargs)
-        return sentinel
-
-    monkeypatch.setattr(
-        "circuit_tracer.attribution.attribute_transformerlens.attribute",
-        _fake_attribute,
-    )
-
-    class _DummyModel:
-        backend = "transformerlens"
-
-    result = attribute_top_level(
-        prompt="hello",
-        model=cast(object, _DummyModel()),
-        phase4_scheduler_mode="locality",
-        phase4_scheduler_debug=False,
-        phase4_scheduler_telemetry_detail="normal",
-        phase4_refresh_optimization="v1",
-        phase4_row_executor="batched",
-        phase1_trace_batch_policy="legacy",
-        phase1_trace_batch_size_max=None,
-        phase4_refresh_policy="standard",
-        phase4_refresh_interval_multiplier=1,
-        phase4_ranker="argsort",
-        row_store_cache_control="off",
-        exact_encoder_residency="lazy",
-    )
-
-    assert result is sentinel
-    assert "phase4_scheduler_mode" not in captured
-    assert "phase4_scheduler_debug" not in captured
-    assert "phase4_scheduler_telemetry_detail" not in captured
-    assert "phase4_refresh_optimization" not in captured
-    assert "phase4_row_executor" not in captured
-    assert "phase1_trace_batch_policy" not in captured
-    assert "phase1_trace_batch_size_max" not in captured
-    assert "phase4_refresh_policy" not in captured
-    assert "phase4_refresh_interval_multiplier" not in captured
-    assert "phase4_ranker" not in captured
-    assert "row_store_cache_control" not in captured
-    assert "exact_encoder_residency" not in captured
-
-
-@pytest.mark.parametrize(
-    "scheduler_kwargs",
-    [
-        {"phase4_scheduler_mode": "planner_v1"},
-        {"phase4_scheduler_mode": "planner_v2"},
-        {"phase4_scheduler_debug": True},
-        {"phase4_scheduler_telemetry_detail": "summary"},
-        {"phase4_refresh_optimization": "off"},
-        {"phase4_row_executor": "streaming_v1"},
-        {"phase1_trace_batch_policy": "cap_effective_batches"},
-        {"phase1_trace_batch_size_max": 8},
-        {"phase4_refresh_policy": "deferred_v1"},
-        {"phase4_refresh_interval_multiplier": 2},
-        {"phase4_ranker": "topk_v1"},
-        {"row_store_cache_control": "fadvise_dontneed_after_append_v1"},
-        {"exact_encoder_residency": "active_cpu"},
-    ],
-)
-def test_top_level_attribute_rejects_non_default_phase4_scheduler_args_on_transformerlens(
-    scheduler_kwargs: dict[str, object],
-) -> None:
-    class _DummyModel:
-        backend = "transformerlens"
-
-    with pytest.raises(
-        ValueError,
-        match=r"Phase-4 execution settings are only supported for the NNSight backend",
-    ):
-        attribute_top_level(
-            prompt="hello",
-            model=cast(object, _DummyModel()),
-            **scheduler_kwargs,
-        )
-
-
 def test_chunked_feature_replay_windows_match_full_replay() -> None:
     grads_by_output_layer = [
         torch.tensor(
@@ -3491,11 +3545,11 @@ def test_chunked_feature_replay_windows_match_full_replay() -> None:
         None,
     ]
 
-    full_ctx, _ = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    full_ctx, _ = _make_chunked_context(_make_nnsight_context, enable_cache=True)
     full_ctx._compute_chunked_feature_attributions_from_grads(grads_by_output_layer)
     expected = full_ctx._batch_buffer.clone()
 
-    windowed_ctx, _ = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    windowed_ctx, _ = _make_chunked_context(_make_nnsight_context, enable_cache=True)
     windowed_ctx._compute_chunked_feature_attributions_from_grads(
         [grads_by_output_layer[0], None, None]
     )
@@ -3504,6 +3558,98 @@ def test_chunked_feature_replay_windows_match_full_replay() -> None:
     )
 
     assert torch.allclose(windowed_ctx._batch_buffer, expected)
+
+
+def test_depth_one_decoder_prefetch_preserves_chunked_replay_values_and_order() -> None:
+    grads_by_output_layer = [
+        torch.tensor(
+            [
+                [[1.0, 10.0], [2.0, 20.0]],
+                [[3.0, 30.0], [4.0, 40.0]],
+            ]
+        ),
+        torch.tensor(
+            [
+                [[5.0, 50.0], [6.0, 60.0]],
+                [[7.0, 70.0], [8.0, 80.0]],
+            ]
+        ),
+        None,
+    ]
+    synchronous_ctx, synchronous_provider = _make_chunked_context(
+        _make_nnsight_context, enable_cache=False
+    )
+    synchronous_ctx._compute_chunked_feature_attributions_from_grads(
+        grads_by_output_layer
+    )
+
+    prefetched_ctx, prefetched_provider = _make_chunked_context(
+        _make_nnsight_context, enable_cache=False
+    )
+    prefetched_ctx.decoder_page_prefetch_depth = 1
+    prefetched_ctx._compute_chunked_feature_attributions_from_grads(
+        grads_by_output_layer
+    )
+
+    assert torch.equal(prefetched_ctx._batch_buffer, synchronous_ctx._batch_buffer)
+    assert prefetched_provider.load_calls == synchronous_provider.load_calls
+    assert [event for event, _ in prefetched_provider.prefetch_events].count(
+        "schedule"
+    ) == 1
+    assert [event for event, _ in prefetched_provider.prefetch_events].count(
+        "consume"
+    ) == 1
+
+
+def test_feature_vjp_tape_reuses_each_decoder_page_across_batches() -> None:
+    grads = (
+        torch.tensor(
+            [
+                [[1.0, 10.0], [2.0, 20.0]],
+                [[3.0, 30.0], [4.0, 40.0]],
+            ]
+        ),
+        torch.tensor(
+            [
+                [[5.0, 50.0], [6.0, 60.0]],
+                [[7.0, 70.0], [8.0, 80.0]],
+            ]
+        ),
+        None,
+    )
+    sequential_ctx, sequential_provider = _make_chunked_context(
+        _make_nnsight_context, enable_cache=False
+    )
+    sequential_ctx._compute_chunked_feature_attributions_from_grads(list(grads))
+    first = sequential_ctx._batch_buffer.clone()
+    sequential_ctx._batch_buffer.zero_()
+    sequential_ctx._compute_chunked_feature_attributions_from_grads(list(grads))
+    second = sequential_ctx._batch_buffer.clone()
+
+    tape_ctx, tape_provider = _make_chunked_context(
+        _make_nnsight_context, enable_cache=False
+    )
+    tape_ctx._batch_buffer = None
+    entries = tuple(
+        FeatureVjpTapeEntry(
+            batch_call_index=index,
+            gradients=grads,
+            row_buffer=torch.zeros(tape_ctx._row_size, 2),
+            batch_size=2,
+            host_nbytes=1,
+            device_nbytes=0,
+            row_nbytes=0,
+            total_nbytes=1,
+            pinned_host_nbytes=0,
+            pageable_host_nbytes=1,
+        )
+        for index in (1, 2)
+    )
+    replayed = tape_ctx.replay_feature_vjp_tape(entries)
+
+    assert torch.equal(replayed[0], first.T)
+    assert torch.equal(replayed[1], second.T)
+    assert len(sequential_provider.load_calls) == 2 * len(tape_provider.load_calls)
 
 
 def test_chunked_attr_fallback_handles_nonmonotonic_chunk_ids_within_layer() -> None:
@@ -3526,7 +3672,7 @@ def test_chunked_attr_fallback_handles_nonmonotonic_chunk_ids_within_layer() -> 
         chunk_size=2,
         enable_cache=True,
     )
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(2, 3, 2),
         token_vectors=torch.zeros(3, 2),
@@ -3592,7 +3738,7 @@ def test_chunked_attr_monotonic_chunk_fast_path_matches_reference() -> None:
         chunk_size=2,
         enable_cache=True,
     )
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(2, 4, 2),
         token_vectors=torch.zeros(4, 2),
@@ -3655,7 +3801,7 @@ def test_decoder_cache_stays_enabled_on_churn() -> None:
         {0: torch.ones(n_chunks, 1, 2, dtype=torch.float32)},
         cache_max_bytes=8,
     )
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(1, n_chunks, 2),
         token_vectors=torch.zeros(n_chunks, 2),
@@ -3700,7 +3846,7 @@ def test_decoder_cache_guardrail_keeps_useful_cache_enabled() -> None:
         {0: torch.ones(n_chunks, 1, 2, dtype=torch.float32)},
         cache_max_bytes=64,
     )
-    ctx = NNSightAttributionContext(
+    ctx = _make_nnsight_context(
         activation_matrix=activation_matrix,
         error_vectors=torch.zeros(1, n_chunks, 2),
         token_vectors=torch.zeros(n_chunks, 2),
@@ -3730,7 +3876,7 @@ def test_decoder_cache_guardrail_keeps_useful_cache_enabled() -> None:
 
 
 def test_context_cleanup_is_idempotent_and_clears_buffers() -> None:
-    ctx, provider = _make_chunked_context(NNSightAttributionContext, enable_cache=True)
+    ctx, provider = _make_chunked_context(_make_nnsight_context, enable_cache=True)
     ctx.get_error_vectors_for_layer(1, device=torch.device("cpu"))
     ctx.cleanup()
     ctx.cleanup()

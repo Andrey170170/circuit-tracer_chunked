@@ -1,11 +1,11 @@
 import pytest
 import torch
 
-from circuit_tracer.attribution.attribute_nnsight import (
-    _build_phase4_frontier_buffer_decision,
+from circuit_tracer.attribution.nnsight.phase4_policy import (
     _compute_phase4_rank_selection_max_feature_nodes_cap_bound,
     _select_phase4_frontier_rank_selection,
 )
+from circuit_tracer.attribution.nnsight.phase_support import _build_phase4_frontier_buffer_decision
 
 
 def _decision(**kwargs):
