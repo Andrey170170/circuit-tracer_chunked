@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import time
 import torch
+
+from circuit_tracer.observability.device_timing import Phase4TimingSubstage
 from circuit_tracer.attribution.nnsight.phase4_policy import (
     _build_phase4_batch_locality_summary,
     _compute_phase4_locality_shaped_batch_end,
@@ -69,29 +71,6 @@ class _CapturedExecutionBatch:
     attrs: dict[str, object]
 
 
-def _start_cuda_kernel_timer(state):
-    runtime_device = getattr(getattr(state, "model", None), "device", None)
-    if (
-        state.config.diagnostic_stop_after_batches is None
-        or not torch.cuda.is_available()
-        or getattr(runtime_device, "type", None) != "cuda"
-    ):
-        return None
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    return start, end
-
-
-def _finish_cuda_kernel_timer(timer) -> float | None:
-    if timer is None:
-        return None
-    start, end = timer
-    end.record()
-    end.synchronize()
-    return float(start.elapsed_time(end))
-
-
 def _pack_semantic_batches(
     semantic_batches: list[_SemanticBatch], *, execution_batch_max_rows: int
 ) -> list[_ExecutionBatch]:
@@ -146,67 +125,8 @@ def _pack_semantic_batches(
     return execution_batches
 
 
-def produce_feature_batch(state, *, defer_feature_vjps: bool = False):
-    """Materialize encoder vectors and produce one feature-row microbatch."""
-    state.chunk_pending_end = state.chunk_pending_start + int(state.idx_batch.numel())
-    state.n_visited += len(state.idx_batch)
-    state.phase4_execution_batch_count += 1
-    state.execution_batch_index = int(state.phase4_execution_batch_count)
-    if state.executor_physically_coalesced:
-        state.phase4_coalesced_execution_batch_count += 1
-    state.ctx_before = state.diagnostic_snapshot(state.ctx) if state.profile else None
-    state.transcoder_before = (
-        state.diagnostic_snapshot(state.model.transcoders) if state.profile else None
-    )
-    state.batch_start = time.perf_counter()
-    state.batch_resource_sampled = should_sample_phase4_resources(
-        sample_index=state.execution_batch_index,
-        final=state.n_visited >= state.actual_max_feature_nodes,
-    )
-    state.batch_memory_before = (
-        state.memory_snapshot() if state.batch_resource_sampled else {}
-    )
-    state.encoder_vectors_source_device = None
-    state.encoder_vectors_source_dtype = None
-    if getattr(state.ctx, "encoder_vecs", None) is not None and state.ctx.encoder_vecs.numel() > 0:
-        state.encoder_vectors_source_device = str(state.ctx.encoder_vecs.device.type)
-        state.encoder_vectors_source_dtype = state.ctx.encoder_vecs.dtype
-    state.encoder_materialize_start = time.perf_counter()
-    state.encoder_vectors = state.ctx.materialize_encoder_vectors(state.idx_batch)
-    state.executor_encoder_materialize_elapsed_ms = (
-        time.perf_counter() - state.encoder_materialize_start
-    ) * 1000.0
-    state.encoder_vectors_transfer_bytes = (
-        _tensor_nbytes_estimate(state.encoder_vectors)
-        if state.encoder_vectors_source_device is not None
-        and (
-            state.encoder_vectors_source_device != state.encoder_vectors.device.type
-            or state.encoder_vectors_source_dtype != state.encoder_vectors.dtype
-        )
-        else 0
-    )
-    state.encoder_vectors_transfer_telemetry = {
-        "encoder_vectors_source": state.encoder_vectors_source_device,
-        "encoder_vectors_destination": str(state.encoder_vectors.device.type),
-        "encoder_vectors_dtype_source": str(state.encoder_vectors_source_dtype)
-        if state.encoder_vectors_source_dtype is not None
-        else None,
-        "encoder_vectors_dtype_destination": str(state.encoder_vectors.dtype),
-        "encoder_vectors_bytes": int(_tensor_nbytes_estimate(state.encoder_vectors)),
-        "encoder_vectors_transfer_bytes": int(state.encoder_vectors_transfer_bytes),
-        "encoder_vectors_materialize_elapsed_ms": float(
-            state.executor_encoder_materialize_elapsed_ms
-        ),
-    }
-    if state.encoder_vectors_source_device == "cpu" and state.encoder_vectors.device.type == "cuda":
-        state.phase4_cpu_to_gpu_bytes_total += int(state.encoder_vectors_transfer_bytes)
-    state.compute_batch_start = time.perf_counter()
-    cuda_kernel_timer = _start_cuda_kernel_timer(state)
-    state.no_retention = state.config.feature_row_retention == "none_recompute"
-    state.tiled_production = (
-        state.config.full_retention_backend == "column_tiled_v1" or state.no_retention
-    )
-    state.tiled_feature_telemetry: dict[str, int | float] = {}
+def _produce_feature_rows(state, *, defer_feature_vjps: bool) -> None:
+    """Run the selected feature-row producer inside its owned timing boundary."""
     if defer_feature_vjps:
         if state.tiled_production:
             raise RuntimeError("FeatureVjpTape does not support tiled row production")
@@ -255,20 +175,75 @@ def produce_feature_batch(state, *, defer_feature_vjps: bool = False):
             retain_graph=state.n_visited < state.actual_max_feature_nodes,
             phase_label="phase4_features",
         )
-    state.cuda_kernel_elapsed_ms = _finish_cuda_kernel_timer(cuda_kernel_timer)
-    state.cuda_kernel_timing_available = state.cuda_kernel_elapsed_ms is not None
-    state.cuda_kernel_timing_unavailable_reason = (
-        None
-        if state.cuda_kernel_timing_available
-        else "cuda_unavailable_or_not_diagnostic"
+
+
+def produce_feature_batch(state, *, defer_feature_vjps: bool = False):
+    """Materialize encoder vectors and produce one feature-row microbatch."""
+    state.chunk_pending_end = state.chunk_pending_start + int(state.idx_batch.numel())
+    state.n_visited += len(state.idx_batch)
+    state.phase4_execution_batch_count += 1
+    state.execution_batch_index = int(state.phase4_execution_batch_count)
+    if state.executor_physically_coalesced:
+        state.phase4_coalesced_execution_batch_count += 1
+    state.ctx_before = state.diagnostic_snapshot(state.ctx) if state.profile else None
+    state.transcoder_before = (
+        state.diagnostic_snapshot(state.model.transcoders) if state.profile else None
     )
-    state.executor_compute_batch_elapsed_ms = (
-        time.perf_counter() - state.compute_batch_start
-    ) * 1000.0
+    state.batch_start = time.perf_counter()
+    state.batch_resource_sampled = should_sample_phase4_resources(
+        sample_index=state.execution_batch_index,
+        final=state.n_visited >= state.actual_max_feature_nodes,
+    )
+    state.batch_memory_before = state.memory_snapshot() if state.batch_resource_sampled else {}
+    state.encoder_vectors_source_device = None
+    state.encoder_vectors_source_dtype = None
+    if getattr(state.ctx, "encoder_vecs", None) is not None and state.ctx.encoder_vecs.numel() > 0:
+        state.encoder_vectors_source_device = str(state.ctx.encoder_vecs.device.type)
+        state.encoder_vectors_source_dtype = state.ctx.encoder_vecs.dtype
+    encoder_timing = state.phase4_device_timing.measure(
+        Phase4TimingSubstage.EXECUTOR_ENCODER_MATERIALIZE
+    )
+    with encoder_timing:
+        state.encoder_vectors = state.ctx.materialize_encoder_vectors(state.idx_batch)
+    state.executor_encoder_materialize_elapsed_ms = encoder_timing.wall_elapsed_ms
+    state.encoder_vectors_transfer_bytes = (
+        _tensor_nbytes_estimate(state.encoder_vectors)
+        if state.encoder_vectors_source_device is not None
+        and (
+            state.encoder_vectors_source_device != state.encoder_vectors.device.type
+            or state.encoder_vectors_source_dtype != state.encoder_vectors.dtype
+        )
+        else 0
+    )
+    state.encoder_vectors_transfer_telemetry = {
+        "encoder_vectors_source": state.encoder_vectors_source_device,
+        "encoder_vectors_destination": str(state.encoder_vectors.device.type),
+        "encoder_vectors_dtype_source": str(state.encoder_vectors_source_dtype)
+        if state.encoder_vectors_source_dtype is not None
+        else None,
+        "encoder_vectors_dtype_destination": str(state.encoder_vectors.dtype),
+        "encoder_vectors_bytes": int(_tensor_nbytes_estimate(state.encoder_vectors)),
+        "encoder_vectors_transfer_bytes": int(state.encoder_vectors_transfer_bytes),
+        "encoder_vectors_materialize_elapsed_ms": float(
+            state.executor_encoder_materialize_elapsed_ms
+        ),
+    }
+    if state.encoder_vectors_source_device == "cpu" and state.encoder_vectors.device.type == "cuda":
+        state.phase4_cpu_to_gpu_bytes_total += int(state.encoder_vectors_transfer_bytes)
+    state.no_retention = state.config.feature_row_retention == "none_recompute"
+    state.tiled_production = (
+        state.config.full_retention_backend == "column_tiled_v1" or state.no_retention
+    )
+    state.tiled_feature_telemetry: dict[str, int | float] = {}
+    compute_timing = state.phase4_device_timing.measure(Phase4TimingSubstage.EXECUTOR_COMPUTE_BATCH)
+    with compute_timing:
+        _produce_feature_rows(state, defer_feature_vjps=defer_feature_vjps)
+    state.executor_compute_batch_elapsed_ms = compute_timing.wall_elapsed_ms
+    state.cuda_kernel_elapsed_ms = None
+    state.cuda_kernel_timing_available = False
+    state.cuda_kernel_timing_unavailable_reason = "deferred_to_phase4_completion"
     state.feature_vjp_capture_elapsed_ms = (
-        (time.perf_counter() - state.batch_start) * 1000.0
-        if defer_feature_vjps
-        else 0.0
+        (time.perf_counter() - state.batch_start) * 1000.0 if defer_feature_vjps else 0.0
     )
     state.feature_vjp_deferred_commit = defer_feature_vjps
 
@@ -419,9 +394,7 @@ def capture_decoder_prefetch_terminal_state(state) -> None:
                 state.phase4_feature_vjp_actual_decoder_counters[key] = value
     if snapshot is not None:
         for key in _DECODER_PREFETCH_HIGH_WATERMARK_KEYS:
-            state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[key] = (
-                snapshot[key]
-            )
+            state.phase4_feature_vjp_actual_decoder_prefetch_high_watermarks[key] = snapshot[key]
         for key in _DECODER_PREFETCH_CURRENT_KEYS:
             state.phase4_feature_vjp_actual_decoder_prefetch_current[key] = snapshot[key]
 
@@ -435,30 +408,21 @@ def _finish_captured_window(
         return
     decoder_counters_before = _decoder_counters(state.model.transcoders)
     decoder_prefetch_before = _decoder_prefetch_snapshot(state.model.transcoders)
-    replay_started = time.perf_counter()
+    replay_timing = state.phase4_device_timing.measure(Phase4TimingSubstage.EXECUTOR_COMPUTE_BATCH)
     try:
-        replay_cuda_timer = None
-        if (
-            state.config.diagnostic_stop_after_batches is not None
-            and torch.cuda.is_available()
-        ):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            replay_cuda_timer = (start, end)
-        rows_by_batch = state.ctx.replay_feature_vjp_tape(
-            tuple(item.entry for item in captured),
-            phase_label="phase4_features",
-        )
-        replay_cuda_elapsed_ms = _finish_cuda_kernel_timer(replay_cuda_timer)
+        with replay_timing:
+            rows_by_batch = state.ctx.replay_feature_vjp_tape(
+                tuple(item.entry for item in captured),
+                phase_label="phase4_features",
+            )
     except BaseException:
         tape.clear()
         captured.clear()
         raise
-    replay_elapsed_ms = (time.perf_counter() - replay_started) * 1000.0
+    replay_elapsed_ms = replay_timing.wall_elapsed_ms
     _record_replay_cuda_window(
         state,
-        elapsed_ms=replay_cuda_elapsed_ms,
+        elapsed_ms=None,
         batch_count=len(captured),
     )
     decoder_counters_after = _decoder_counters(state.model.transcoders)
@@ -478,9 +442,9 @@ def _finish_captured_window(
                 decoder_prefetch_after[key],
             )
         for key in _DECODER_PREFETCH_CURRENT_KEYS:
-            state.phase4_feature_vjp_actual_decoder_prefetch_current[key] = (
-                decoder_prefetch_after[key]
-            )
+            state.phase4_feature_vjp_actual_decoder_prefetch_current[key] = decoder_prefetch_after[
+                key
+            ]
     final_n_visited = state.n_visited
     final_execution_count = state.phase4_execution_batch_count
     final_scheduler_reference_count = state.phase4_scheduler_reference_batch_count
@@ -516,18 +480,14 @@ def _finish_captured_window(
     state.phase4_executor_compute_batch_elapsed_ms_total += replay_elapsed_ms
     state.phase4_feature_vjp_tape_window_count += 1
     state.phase4_feature_vjp_tape_batch_count += len(captured)
-    state.phase4_feature_vjp_tape_bytes_total += sum(
-        item.entry.total_nbytes for item in captured
-    )
+    state.phase4_feature_vjp_tape_bytes_total += sum(item.entry.total_nbytes for item in captured)
     state.phase4_feature_vjp_tape_host_bytes_total += sum(
         item.entry.host_nbytes for item in captured
     )
     state.phase4_feature_vjp_tape_device_bytes_total += sum(
         item.entry.device_nbytes for item in captured
     )
-    state.phase4_feature_vjp_tape_row_bytes_total += sum(
-        item.entry.row_nbytes for item in captured
-    )
+    state.phase4_feature_vjp_tape_row_bytes_total += sum(item.entry.row_nbytes for item in captured)
     state.phase4_feature_vjp_tape_pinned_host_bytes_total += sum(
         item.entry.pinned_host_nbytes for item in captured
     )
@@ -584,7 +544,7 @@ def _record_replay_cuda_window(state, *, elapsed_ms: float | None, batch_count: 
                 "cuda_kernel_elapsed_ms": elapsed_ms,
                 "cuda_kernel_timing_available": elapsed_ms is not None,
                 "cuda_kernel_timing_unavailable_reason": (
-                    None if elapsed_ms is not None else "cuda_unavailable"
+                    None if elapsed_ms is not None else "deferred_to_phase4_completion"
                 ),
             },
             wall_clock=False,
@@ -600,9 +560,7 @@ def record_feature_batch_evidence(state):
             state.batch_elapsed_ms = (time.perf_counter() - state.batch_start) * 1000.0
             state.telemetry_observer.observe(
                 BatchProfile(
-                    "Phase 4 commit"
-                    if state.feature_vjp_deferred_commit
-                    else "Phase 4",
+                    "Phase 4 commit" if state.feature_vjp_deferred_commit else "Phase 4",
                     state.batch_number,
                     None,
                     state.batch_elapsed_ms / 1000.0,
@@ -622,9 +580,7 @@ def record_feature_batch_evidence(state):
             )
     state.batch_number = state.execution_batch_index
     state.batch_elapsed_ms = (time.perf_counter() - state.batch_start) * 1000.0
-    state.batch_memory_after = (
-        state.memory_snapshot() if state.batch_resource_sampled else {}
-    )
+    state.batch_memory_after = state.memory_snapshot() if state.batch_resource_sampled else {}
     state.phase4_feature_batch_elapsed_ms_total += state.batch_elapsed_ms
     state.phase4_executor_encoder_materialize_elapsed_ms_total += (
         state.executor_encoder_materialize_elapsed_ms
@@ -675,9 +631,7 @@ def record_feature_batch_evidence(state):
         "phase4_execution_batch_split": bool(state.executor_physically_split),
         "phase4_execution_pending_start_index": int(state.chunk_pending_start),
         "phase4_execution_pending_end_index": int(state.chunk_pending_end),
-        "phase4_feature_vjp_capture_elapsed_ms": float(
-            state.feature_vjp_capture_elapsed_ms
-        ),
+        "phase4_feature_vjp_capture_elapsed_ms": float(state.feature_vjp_capture_elapsed_ms),
         "phase4_feature_vjp_commit_elapsed_ms": float(state.batch_elapsed_ms),
         "phase4_batch_elapsed_scope": (
             "commit_only" if state.feature_vjp_deferred_commit else "full_batch"
@@ -827,17 +781,14 @@ def execute_pending_frontier(state):
     )
     tape_enabled = bool(state.config.feature_vjp_tape_enabled)
     tape = FeatureVjpTape(
-        max_batches=(
-            state.config.feature_vjp_tape_batch_window if tape_enabled else 1
-        ),
+        max_batches=(state.config.feature_vjp_tape_batch_window if tape_enabled else 1),
         max_bytes=(state.config.feature_vjp_tape_max_bytes if tape_enabled else 0),
     )
     captured: list[_CapturedExecutionBatch] = []
     for execution_batch in execution_batches:
         if (
             state.config.diagnostic_stop_after_batches is not None
-            and state.phase4_execution_batch_count
-            >= state.config.diagnostic_stop_after_batches
+            and state.phase4_execution_batch_count >= state.config.diagnostic_stop_after_batches
         ):
             break
         first_semantic = execution_batch.semantic_batches[0]
@@ -888,9 +839,7 @@ def execute_pending_frontier(state):
                 tape.clear()
                 captured.clear()
                 raise
-            captured.append(
-                _CapturedExecutionBatch(entry=entry, attrs=_capture_batch_attrs(state))
-            )
+            captured.append(_CapturedExecutionBatch(entry=entry, attrs=_capture_batch_attrs(state)))
             if tape.batch_count == tape.max_batches:
                 _finish_captured_window(state, tape, captured)
             continue

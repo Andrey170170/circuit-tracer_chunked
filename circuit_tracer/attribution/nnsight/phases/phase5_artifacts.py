@@ -349,6 +349,13 @@ def package_compact_artifacts(
             "scan": inputs.runtime.model.scan,
         }
     )
+    artifact.update(
+        {
+            key: value
+            for key, value in inputs.diagnostics.phase4_execution_metadata.items()
+            if key.startswith("phase4_timing_")
+        }
+    )
     for prefix, metadata in (
         ("phase0_replay", inputs.replay.phase0_replay_metadata),
         ("phase3_gradient_replay", inputs.replay.phase3_gradient_replay_metadata),

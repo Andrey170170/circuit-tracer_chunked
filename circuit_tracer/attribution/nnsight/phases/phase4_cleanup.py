@@ -37,6 +37,9 @@ def finish_phase4(state):
         )
     )
     state.phase4_elapsed_ms = (time.perf_counter() - state.phase4_start) * 1000.0
+    state.phase4_device_timing_summary = state.phase4_device_timing.resolve()
+    state.phase4_device_timing_attrs = state.phase4_device_timing_summary.as_attrs(prefix="phase4")
+    state.phase4_execution_metadata.update(state.phase4_device_timing_attrs)
     state.telemetry_observer.observe(
         TraceEvent(
             scope="phase",
@@ -98,6 +101,7 @@ def finish_phase4(state):
                 "phase4_executor_row_store_write_elapsed_ms_total": float(
                     state.phase4_executor_row_store_write_elapsed_ms_total
                 ),
+                **state.phase4_device_timing_attrs,
                 "phase4_gpu_to_cpu_bytes_total": int(state.phase4_gpu_to_cpu_bytes_total),
                 "phase4_row_reduction_gpu_to_cpu_bytes_saved_total": int(
                     state.phase4_row_reduction_gpu_to_cpu_bytes_saved_total

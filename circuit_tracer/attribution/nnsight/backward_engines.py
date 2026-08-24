@@ -75,6 +75,31 @@ class BackwardBatchEngine(Protocol):
     ) -> BatchExecutionResult: ...
 
 
+def _build_vjp_execution_evidence(
+    *,
+    kernel_mode: VjpKernelMode,
+    invocation_count: int,
+    source_layer_group_count: int,
+) -> dict[str, object]:
+    """Describe the VJP API that actually completed without overstating fallback visibility."""
+    is_batched = kernel_mode == "autograd_batched"
+    return {
+        "schema_version": 1,
+        "requested_path": str(kernel_mode),
+        "effective_invocation": "torch.autograd.grad",
+        "is_grads_batched": bool(is_batched),
+        "successful_invocation_count": int(invocation_count),
+        "source_layer_group_count": int(source_layer_group_count),
+        "observation_method": "direct_call_contract_and_success",
+        "fallback_state": "unknown" if is_batched else "not_applicable",
+        "fallback_state_reason": (
+            "pytorch_has_no_programmatic_per_invocation_vmap_fallback_signal"
+            if is_batched
+            else "serial_autograd_does_not_use_vmap"
+        ),
+    }
+
+
 def _require_saved_gradient(tensor: torch.Tensor, *, label: str) -> torch.Tensor:
     gradient = tensor.grad
     if gradient is None:
@@ -313,10 +338,6 @@ class SingleForwardBatchedVjpEngine:
     def vjp_kernel_mode(self) -> VjpKernelMode:
         return "autograd_batched"
 
-    @property
-    def vmap_fallback_observation(self) -> str:
-        return "pytorch_runtime_warning_only"
-
     def _compute_gradients(
         self,
         *,
@@ -543,6 +564,11 @@ class SingleForwardBatchedVjpEngine:
                     source_layer=None,
                     cause=cause,
                 ) from cause
+        vjp_execution_evidence = _build_vjp_execution_evidence(
+            kernel_mode=self.vjp_kernel_mode,
+            invocation_count=autograd_call_count,
+            source_layer_group_count=len(source_layers),
+        )
         engine_attrs: dict[str, object] = {
             "backward_engine_mode": self.mode,
             "forward_graph_mode": self.forward_graph_mode,
@@ -557,7 +583,13 @@ class SingleForwardBatchedVjpEngine:
             "contraction_elapsed_ms": contraction_ms,
             "cotangent_total_nbytes": cotangent_total_nbytes,
             "cotangent_peak_nbytes": cotangent_peak_nbytes,
-            "vmap_fallback_observation": self.vmap_fallback_observation,
+            "vjp_execution_evidence": vjp_execution_evidence,
+            "vjp_requested_path": vjp_execution_evidence["requested_path"],
+            "vjp_effective_invocation": vjp_execution_evidence["effective_invocation"],
+            "vjp_is_grads_batched": vjp_execution_evidence["is_grads_batched"],
+            "vjp_fallback_state": vjp_execution_evidence["fallback_state"],
+            "vjp_fallback_observation_method": vjp_execution_evidence["observation_method"],
+            "vjp_fallback_state_reason": vjp_execution_evidence["fallback_state_reason"],
         }
         return BatchExecutionResult(
             rows=combined_row_buffer.T,
@@ -586,10 +618,6 @@ class SingleForwardSerialVjpEngine(SingleForwardBatchedVjpEngine):
     @property
     def vjp_kernel_mode(self) -> VjpKernelMode:
         return "autograd_serial"
-
-    @property
-    def vmap_fallback_observation(self) -> str:
-        return "not_applicable"
 
     def _compute_gradients(
         self,

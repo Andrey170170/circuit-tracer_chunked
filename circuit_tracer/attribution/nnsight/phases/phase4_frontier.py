@@ -21,6 +21,7 @@ from circuit_tracer.attribution.nnsight.telemetry import (
     _record_cross_cluster_checkpoint,
 )
 from circuit_tracer.observability.events import MemoryBoundary
+from circuit_tracer.observability.device_timing import DeferredDeviceTimer
 from circuit_tracer.attribution.nnsight.phases.phase4_influence import (
     rank_feature_frontier,
     recompute_feature_influences,
@@ -36,6 +37,10 @@ def _configure_phase4_schedule(state):
     """Resolve scheduling cadence and entry evidence."""
     state.logger.info("Phase 4: Computing feature attributions")
     state.phase4_start = time.perf_counter()
+    state.phase4_device_timing = DeferredDeviceTimer(
+        getattr(state.model, "device", None),
+        synchronization_scope="phase4_completion_single_boundary",
+    )
     state.phase4_frontier_buffer_metadata["initial_target_feature_nodes"] = int(
         state.actual_max_feature_nodes
     )
@@ -92,15 +97,9 @@ def _configure_phase4_schedule(state):
             "feature_vjp_tape_batch_window_effective": int(
                 state.config.feature_vjp_tape_batch_window
             ),
-            "feature_vjp_tape_max_bytes_effective": int(
-                state.config.feature_vjp_tape_max_bytes
-            ),
-            "feature_vjp_tape_fallback_reason": (
-                state.config.feature_vjp_tape_fallback_reason
-            ),
-            "feature_vjp_tape_byte_cap_scope": (
-                "simultaneous_host_device_and_row_ownership"
-            ),
+            "feature_vjp_tape_max_bytes_effective": int(state.config.feature_vjp_tape_max_bytes),
+            "feature_vjp_tape_fallback_reason": (state.config.feature_vjp_tape_fallback_reason),
+            "feature_vjp_tape_byte_cap_scope": ("simultaneous_host_device_and_row_ownership"),
         }
     )
     state.logger.info(
@@ -393,9 +392,7 @@ def plan_feature_frontier(state):
         streaming_chunk_reuse_stats=state.streaming_chunk_reuse_stats,
         feature_row_store_read_stats=state.feature_row_store_read_stats,
     )
-    state.refresh_memory_after = (
-        state.memory_snapshot() if state.refresh_resource_sampled else {}
-    )
+    state.refresh_memory_after = state.memory_snapshot() if state.refresh_resource_sampled else {}
     state.refresh_elapsed_ms = (time.perf_counter() - state.refresh_start) * 1000.0
     state.phase4_refresh_elapsed_ms_total += state.refresh_elapsed_ms
 

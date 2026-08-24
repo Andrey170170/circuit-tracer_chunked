@@ -34,9 +34,7 @@ def recompute_feature_influences(state):
     state.refresh_resource_sampled = should_sample_phase4_resources(
         sample_index=state.refresh_index + 1,
     )
-    state.refresh_memory_before = (
-        state.memory_snapshot() if state.refresh_resource_sampled else {}
-    )
+    state.refresh_memory_before = state.memory_snapshot() if state.refresh_resource_sampled else {}
     state.feature_row_store_snapshot_before = (
         state.feature_row_store.get_diagnostic_snapshot()
         if state.use_compact_feature_row_store and state.feature_row_store is not None
@@ -143,6 +141,7 @@ def recompute_feature_influences(state):
                 row_reader_returns_prepared=state.refresh_prepared_row_reader,
                 active_row_accumulation=state.phase4_refresh_active_row_accumulation_effective,
                 row_batch_reader=state.refresh_row_batch_reader,
+                device_timing=state.phase4_device_timing,
             )
         state.refresh_row_store_read_elapsed_ms = _safe_float(
             state.streaming_chunk_reuse_stats.get("row_reader_elapsed_ms_total")

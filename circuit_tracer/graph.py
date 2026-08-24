@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
 from typing import NamedTuple
 import time
 import warnings
@@ -15,6 +16,10 @@ from circuit_tracer.utils.tl_nnsight_mapping import (
     UnifiedConfig,
 )
 from circuit_tracer.attribution.targets import LogitTarget
+from circuit_tracer.observability.device_timing import (
+    DeferredDeviceTimer,
+    Phase4TimingSubstage,
+)
 
 
 class Graph:
@@ -708,6 +713,7 @@ def compute_partial_feature_influences_streaming(
     row_reader_returns_prepared: bool = False,
     active_row_accumulation: str = "zero_fill",
     row_batch_reader: (Callable[[list[tuple[int, int]]], Iterator[torch.Tensor]] | None) = None,
+    device_timing: DeferredDeviceTimer | None = None,
 ) -> torch.Tensor:
     """Compute feature-only partial influences from streamed dense row chunks.
 
@@ -857,20 +863,35 @@ def compute_partial_feature_influences_streaming(
         nonlocal transfer_cast_abs_elapsed_ms_total
         if chunk.device != device:
             transfer_cast_abs_start = time.perf_counter()
-            chunk = chunk.to(device)
+            with (
+                device_timing.measure(Phase4TimingSubstage.REFRESH_TRANSFER_CAST_ABS)
+                if device_timing is not None
+                else nullcontext()
+            ):
+                chunk = chunk.to(device)
             transfer_cast_abs_elapsed_ms_total += (
                 time.perf_counter() - transfer_cast_abs_start
             ) * 1000.0
         if chunk.dtype != dtype:
             transfer_cast_abs_start = time.perf_counter()
-            chunk = chunk.to(dtype=dtype)
+            with (
+                device_timing.measure(Phase4TimingSubstage.REFRESH_TRANSFER_CAST_ABS)
+                if device_timing is not None
+                else nullcontext()
+            ):
+                chunk = chunk.to(dtype=dtype)
             transfer_cast_abs_elapsed_ms_total += (
                 time.perf_counter() - transfer_cast_abs_start
             ) * 1000.0
         if row_reader_returns_prepared:
             return chunk
         transfer_cast_abs_start = time.perf_counter()
-        chunk = chunk.abs()
+        with (
+            device_timing.measure(Phase4TimingSubstage.REFRESH_TRANSFER_CAST_ABS)
+            if device_timing is not None
+            else nullcontext()
+        ):
+            chunk = chunk.abs()
         transfer_cast_abs_elapsed_ms_total += (
             time.perf_counter() - transfer_cast_abs_start
         ) * 1000.0
@@ -939,7 +960,12 @@ def compute_partial_feature_influences_streaming(
                 cache_lookup_elapsed_ms_total += (time.perf_counter() - cache_lookup_start) * 1000.0
                 if cached_chunk is None:
                     row_reader_start = time.perf_counter()
-                    chunk = row_reader(start, end)
+                    with (
+                        device_timing.measure(Phase4TimingSubstage.REFRESH_ROW_STORE_READ)
+                        if device_timing is not None
+                        else nullcontext()
+                    ):
+                        chunk = row_reader(start, end)
                     row_reader_elapsed_ms_total += (time.perf_counter() - row_reader_start) * 1000.0
                     row_reader_call_count += 1
                     row_reader_row_count += int(end - start)
@@ -976,20 +1002,30 @@ def compute_partial_feature_influences_streaming(
                     chunk_cache_hit_count += 1
 
                 normalization_start = time.perf_counter()
-                normalized_row_weights = _normalize_row_weights_from_denominator(
-                    chunk_row_weights,
-                    denom_mode=denom_mode,
-                    denom_primary=denom_primary[start:end],
-                    denom_secondary=(
-                        denom_secondary[start:end] if denom_secondary is not None else None
-                    ),
-                )
+                with (
+                    device_timing.measure(Phase4TimingSubstage.REFRESH_INFLUENCE_NORMALIZATION)
+                    if device_timing is not None
+                    else nullcontext()
+                ):
+                    normalized_row_weights = _normalize_row_weights_from_denominator(
+                        chunk_row_weights,
+                        denom_mode=denom_mode,
+                        denom_primary=denom_primary[start:end],
+                        denom_secondary=(
+                            denom_secondary[start:end] if denom_secondary is not None else None
+                        ),
+                    )
                 normalization_elapsed_ms_total += (
                     time.perf_counter() - normalization_start
                 ) * 1000.0
 
                 matmul_start = time.perf_counter()
-                next_feature_prod += normalized_row_weights @ chunk
+                with (
+                    device_timing.measure(Phase4TimingSubstage.REFRESH_INFLUENCE_MATMUL)
+                    if device_timing is not None
+                    else nullcontext()
+                ):
+                    next_feature_prod += normalized_row_weights @ chunk
                 matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
         else:
             if row_batch_reader is not None:
@@ -1013,7 +1049,12 @@ def compute_partial_feature_influences_streaming(
                 for sub_start, sub_end in iteration_ranges:
                     row_reader_start = time.perf_counter()
                     try:
-                        subchunk = next(batch_iterator)
+                        with (
+                            device_timing.measure(Phase4TimingSubstage.REFRESH_ROW_STORE_READ)
+                            if device_timing is not None
+                            else nullcontext()
+                        ):
+                            subchunk = next(batch_iterator)
                     except StopIteration as exc:
                         raise ValueError(
                             "row_batch_reader returned fewer tensors than requested ranges"
@@ -1032,21 +1073,31 @@ def compute_partial_feature_influences_streaming(
                         )
                     subchunk = _prepare_chunk(subchunk)
                     normalization_start = time.perf_counter()
-                    sub_weights = _normalize_row_weights_from_denominator(
-                        row_weights[sub_start:sub_end],
-                        denom_mode=denom_mode,
-                        denom_primary=denom_primary[sub_start:sub_end],
-                        denom_secondary=(
-                            denom_secondary[sub_start:sub_end]
-                            if denom_secondary is not None
-                            else None
-                        ),
-                    )
+                    with (
+                        device_timing.measure(Phase4TimingSubstage.REFRESH_INFLUENCE_NORMALIZATION)
+                        if device_timing is not None
+                        else nullcontext()
+                    ):
+                        sub_weights = _normalize_row_weights_from_denominator(
+                            row_weights[sub_start:sub_end],
+                            denom_mode=denom_mode,
+                            denom_primary=denom_primary[sub_start:sub_end],
+                            denom_secondary=(
+                                denom_secondary[sub_start:sub_end]
+                                if denom_secondary is not None
+                                else None
+                            ),
+                        )
                     normalization_elapsed_ms_total += (
                         time.perf_counter() - normalization_start
                     ) * 1000.0
                     direct_start = time.perf_counter()
-                    next_feature_prod += sub_weights @ subchunk
+                    with (
+                        device_timing.measure(Phase4TimingSubstage.REFRESH_DIRECT_ACCUMULATION)
+                        if device_timing is not None
+                        else nullcontext()
+                    ):
+                        next_feature_prod += sub_weights @ subchunk
                     direct_accumulation_elapsed_ms_total += (
                         time.perf_counter() - direct_start
                     ) * 1000.0
@@ -1083,7 +1134,12 @@ def compute_partial_feature_influences_streaming(
                     chunk_cache_miss_count += 1
                     for sub_start, sub_end in active_row_subranges:
                         row_reader_start = time.perf_counter()
-                        subchunk = row_reader(sub_start, sub_end)
+                        with (
+                            device_timing.measure(Phase4TimingSubstage.REFRESH_ROW_STORE_READ)
+                            if device_timing is not None
+                            else nullcontext()
+                        ):
+                            subchunk = row_reader(sub_start, sub_end)
                         row_reader_elapsed_ms_total += (
                             time.perf_counter() - row_reader_start
                         ) * 1000.0
@@ -1100,21 +1156,33 @@ def compute_partial_feature_influences_streaming(
                             )
                         subchunk = _prepare_chunk(subchunk)
                         normalization_start = time.perf_counter()
-                        sub_weights = _normalize_row_weights_from_denominator(
-                            row_weights[sub_start:sub_end],
-                            denom_mode=denom_mode,
-                            denom_primary=denom_primary[sub_start:sub_end],
-                            denom_secondary=(
-                                denom_secondary[sub_start:sub_end]
-                                if denom_secondary is not None
-                                else None
-                            ),
-                        )
+                        with (
+                            device_timing.measure(
+                                Phase4TimingSubstage.REFRESH_INFLUENCE_NORMALIZATION
+                            )
+                            if device_timing is not None
+                            else nullcontext()
+                        ):
+                            sub_weights = _normalize_row_weights_from_denominator(
+                                row_weights[sub_start:sub_end],
+                                denom_mode=denom_mode,
+                                denom_primary=denom_primary[sub_start:sub_end],
+                                denom_secondary=(
+                                    denom_secondary[sub_start:sub_end]
+                                    if denom_secondary is not None
+                                    else None
+                                ),
+                            )
                         normalization_elapsed_ms_total += (
                             time.perf_counter() - normalization_start
                         ) * 1000.0
                         direct_start = time.perf_counter()
-                        next_feature_prod += sub_weights @ subchunk
+                        with (
+                            device_timing.measure(Phase4TimingSubstage.REFRESH_DIRECT_ACCUMULATION)
+                            if device_timing is not None
+                            else nullcontext()
+                        ):
+                            next_feature_prod += sub_weights @ subchunk
                         direct_accumulation_elapsed_ms_total += (
                             time.perf_counter() - direct_start
                         ) * 1000.0
@@ -1128,7 +1196,12 @@ def compute_partial_feature_influences_streaming(
                     ) * 1000.0
                     for sub_start, sub_end in active_row_subranges:
                         row_reader_start = time.perf_counter()
-                        subchunk = row_reader(sub_start, sub_end)
+                        with (
+                            device_timing.measure(Phase4TimingSubstage.REFRESH_ROW_STORE_READ)
+                            if device_timing is not None
+                            else nullcontext()
+                        ):
+                            subchunk = row_reader(sub_start, sub_end)
                         row_reader_elapsed_ms_total += (
                             time.perf_counter() - row_reader_start
                         ) * 1000.0
@@ -1172,20 +1245,30 @@ def compute_partial_feature_influences_streaming(
                     chunk_cache_hit_count += 1
 
                 normalization_start = time.perf_counter()
-                normalized_row_weights = _normalize_row_weights_from_denominator(
-                    chunk_row_weights,
-                    denom_mode=denom_mode,
-                    denom_primary=denom_primary[start:end],
-                    denom_secondary=(
-                        denom_secondary[start:end] if denom_secondary is not None else None
-                    ),
-                )
+                with (
+                    device_timing.measure(Phase4TimingSubstage.REFRESH_INFLUENCE_NORMALIZATION)
+                    if device_timing is not None
+                    else nullcontext()
+                ):
+                    normalized_row_weights = _normalize_row_weights_from_denominator(
+                        chunk_row_weights,
+                        denom_mode=denom_mode,
+                        denom_primary=denom_primary[start:end],
+                        denom_secondary=(
+                            denom_secondary[start:end] if denom_secondary is not None else None
+                        ),
+                    )
                 normalization_elapsed_ms_total += (
                     time.perf_counter() - normalization_start
                 ) * 1000.0
 
                 matmul_start = time.perf_counter()
-                next_feature_prod += normalized_row_weights @ chunk
+                with (
+                    device_timing.measure(Phase4TimingSubstage.REFRESH_INFLUENCE_MATMUL)
+                    if device_timing is not None
+                    else nullcontext()
+                ):
+                    next_feature_prod += normalized_row_weights @ chunk
                 matmul_elapsed_ms_total += (time.perf_counter() - matmul_start) * 1000.0
 
         if not bool(next_feature_prod.any()):

@@ -19,7 +19,6 @@ from circuit_tracer.attribution.nnsight.phases.phase4_batches import (
     _DECODER_DELTA_COUNTER_KEYS,
     _DECODER_PREFETCH_CURRENT_KEYS,
     _DECODER_PREFETCH_HIGH_WATERMARK_KEYS,
-    _start_cuda_kernel_timer,
 )
 from circuit_tracer.observability.events import (
     BatchProfile,
@@ -170,37 +169,6 @@ def _inputs(observer: FakeObserver) -> Phase4Inputs:
     )
 
 
-def test_cuda_kernel_timer_uses_runtime_cuda_when_encoder_vectors_are_cpu(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    recorded: list[str] = []
-
-    class FakeEvent:
-        def __init__(self, *, enable_timing: bool) -> None:
-            assert enable_timing
-
-        def record(self) -> None:
-            recorded.append("record")
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
-    state = SimpleNamespace(
-        config=SimpleNamespace(diagnostic_stop_after_batches=1),
-        model=SimpleNamespace(device=torch.device("cuda")),
-        encoder_vectors=torch.zeros(1),
-    )
-
-    timer = _start_cuda_kernel_timer(state)
-
-    assert timer is not None
-    assert recorded == ["record"]
-
-    state.config.diagnostic_stop_after_batches = None
-
-    assert _start_cuda_kernel_timer(state) is None
-    assert recorded == ["record"]
-
-
 def test_phase4_returns_boundary_state_without_replacing_owned_buffers() -> None:
     observer = FakeObserver()
     inputs = _inputs(observer)
@@ -224,6 +192,20 @@ def test_phase4_returns_boundary_state_without_replacing_owned_buffers() -> None
     )
     assert (
         result.phase4_execution_metadata["phase4_feature_vjp_actual_decoder_load_bytes_total"] == 0
+    )
+    assert result.phase4_execution_metadata["phase4_timing_backend"] == "wall_clock_v1"
+    assert result.phase4_execution_metadata["phase4_timing_device"] == "cpu"
+    assert (
+        result.phase4_execution_metadata["phase4_timing_contract_version"]
+        == "phase4_device_timing_v2"
+    )
+    assert (
+        result.phase4_execution_metadata["phase4_timing_synchronization_scope"]
+        == "phase4_completion_single_boundary"
+    )
+    assert (
+        result.phase4_execution_metadata["phase4_timing_accounting_scope"]
+        == "non_overlapping_ranges_complete_strata_cuda_estimate_v2"
     )
     assert result.cross_cluster_debug_summary is inputs.cross_cluster_debug_summary
     assert result.cross_cluster_debug_checkpoints is inputs.cross_cluster_debug_checkpoints

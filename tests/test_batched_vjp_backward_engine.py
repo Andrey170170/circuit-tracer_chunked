@@ -155,6 +155,20 @@ def test_single_forward_batched_vjp_matches_serial_mixed_layer_reference() -> No
     assert result.engine_attrs["forward_lane_count"] == 1
     assert result.engine_attrs["source_layer_group_count"] == 2
     assert result.engine_attrs["autograd_call_count"] == 2
+    assert result.engine_attrs["vjp_requested_path"] == "autograd_batched"
+    assert result.engine_attrs["vjp_effective_invocation"] == "torch.autograd.grad"
+    assert result.engine_attrs["vjp_is_grads_batched"] is True
+    assert result.engine_attrs["vjp_fallback_state"] == "unknown"
+    assert (
+        result.engine_attrs["vjp_fallback_observation_method"] == "direct_call_contract_and_success"
+    )
+    evidence = cast(dict[str, object], result.engine_attrs["vjp_execution_evidence"])
+    assert evidence["successful_invocation_count"] == 2
+    assert evidence["source_layer_group_count"] == 2
+    assert evidence["fallback_state_reason"] == (
+        "pytorch_has_no_programmatic_per_invocation_vmap_fallback_signal"
+    )
+    assert "vmap_fallback_observation" not in result.engine_attrs
 
 
 def test_single_forward_serial_and_batched_vjp_match_on_same_graph() -> None:
@@ -179,7 +193,8 @@ def test_single_forward_serial_and_batched_vjp_match_on_same_graph() -> None:
     assert serial.engine_attrs["forward_lane_count"] == 1
     assert serial.engine_attrs["source_layer_group_count"] == 2
     assert serial.engine_attrs["autograd_call_count"] == 3
-    assert serial.engine_attrs["vmap_fallback_observation"] == "not_applicable"
+    assert serial.engine_attrs["vjp_is_grads_batched"] is False
+    assert serial.engine_attrs["vjp_fallback_state"] == "not_applicable"
     assert batched.engine_attrs["vjp_kernel_mode"] == "autograd_batched"
     assert batched.engine_attrs["autograd_call_count"] == 2
 

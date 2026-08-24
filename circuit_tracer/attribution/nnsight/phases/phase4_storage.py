@@ -3,6 +3,8 @@
 from __future__ import annotations
 import time
 import torch
+
+from circuit_tracer.observability.device_timing import Phase4TimingSubstage
 from circuit_tracer.attribution.nnsight.phase_support import (
     _build_matrix_abs_stats,
     _build_phase4_normalization_stats,
@@ -73,25 +75,33 @@ def reduce_feature_rows(state):
     elif state.phase4_row_reduction_config.effective_mode == "gpu_v1":
         if not state.use_compact_feature_row_store:
             raise RuntimeError("phase4_row_reduction='gpu_v1' requires compact Phase-4 row store")
-        state.cpu_staging_start = time.perf_counter()
-        state.feature_row_slice, state.feature_rows_cpu_staging = _copy_feature_rows_to_cpu_staging(
-            state.rows,
-            total_active_feats=state.total_active_feats,
-            staging_buffer=state.feature_rows_cpu_staging,
+        cpu_staging_timing = state.phase4_device_timing.measure(
+            Phase4TimingSubstage.EXECUTOR_CPU_STAGING
         )
-        state.executor_cpu_staging_elapsed_ms = (
-            time.perf_counter() - state.cpu_staging_start
-        ) * 1000.0
+        with cpu_staging_timing:
+            (
+                state.feature_row_slice,
+                state.feature_rows_cpu_staging,
+            ) = _copy_feature_rows_to_cpu_staging(
+                state.rows,
+                total_active_feats=state.total_active_feats,
+                staging_buffer=state.feature_rows_cpu_staging,
+            )
+        state.executor_cpu_staging_elapsed_ms = cpu_staging_timing.wall_elapsed_ms
         state.row_input_slice = state.rows[:, : state.logit_offset]
-        state.denominator_start = time.perf_counter()
-        state.row_abs_max_gpu, state.row_l1_scaled_gpu = _compute_row_denominator_scaled_l1(
-            state.row_input_slice,
-            dtype=state.exact_trace_internal_dtype_resolved,
-            preserve_device=True,
+        denominator_timing = state.phase4_device_timing.measure(
+            Phase4TimingSubstage.EXECUTOR_DENOMINATOR
         )
-        state.executor_denominator_elapsed_ms = (
-            time.perf_counter() - state.denominator_start
-        ) * 1000.0
+        with denominator_timing:
+            (
+                state.row_abs_max_gpu,
+                state.row_l1_scaled_gpu,
+            ) = _compute_row_denominator_scaled_l1(
+                state.row_input_slice,
+                dtype=state.exact_trace_internal_dtype_resolved,
+                preserve_device=True,
+            )
+        state.executor_denominator_elapsed_ms = denominator_timing.wall_elapsed_ms
         state.executor_row_transfer_telemetry = _build_phase4_gpu_row_reduction_transfer_telemetry(
             rows=state.rows,
             feature_row_slice=state.feature_row_slice,
@@ -101,13 +111,14 @@ def reduce_feature_rows(state):
         state.row_denominator_scaled_l1 = (state.row_abs_max_gpu, state.row_l1_scaled_gpu)
         state.nonfeature_row_slice = state.rows[:, state.total_active_feats : state.logit_offset]
     else:
-        state.cpu_staging_start = time.perf_counter()
-        state.rows_cpu, state.rows_cpu_staging = _copy_rows_to_cpu_staging(
-            state.rows, staging_buffer=state.rows_cpu_staging
+        cpu_staging_timing = state.phase4_device_timing.measure(
+            Phase4TimingSubstage.EXECUTOR_CPU_STAGING
         )
-        state.executor_cpu_staging_elapsed_ms = (
-            time.perf_counter() - state.cpu_staging_start
-        ) * 1000.0
+        with cpu_staging_timing:
+            state.rows_cpu, state.rows_cpu_staging = _copy_rows_to_cpu_staging(
+                state.rows, staging_buffer=state.rows_cpu_staging
+            )
+        state.executor_cpu_staging_elapsed_ms = cpu_staging_timing.wall_elapsed_ms
         state.row_input_slice = state.rows_cpu[:, : state.logit_offset]
         state.feature_row_slice = state.rows_cpu[:, : state.total_active_feats]
         state.nonfeature_row_slice = state.rows_cpu[
@@ -119,14 +130,18 @@ def reduce_feature_rows(state):
             row_input_slice=state.row_input_slice,
             feature_row_slice=state.feature_row_slice,
         )
-        state.denominator_start = time.perf_counter()
-        state.row_abs_max_cpu, state.row_l1_scaled_cpu = _compute_row_denominator_scaled_l1(
-            state.row_input_slice, dtype=state.exact_trace_internal_dtype_resolved
+        denominator_timing = state.phase4_device_timing.measure(
+            Phase4TimingSubstage.EXECUTOR_DENOMINATOR
         )
+        with denominator_timing:
+            (
+                state.row_abs_max_cpu,
+                state.row_l1_scaled_cpu,
+            ) = _compute_row_denominator_scaled_l1(
+                state.row_input_slice, dtype=state.exact_trace_internal_dtype_resolved
+            )
         state.row_denominator_scaled_l1 = (state.row_abs_max_cpu, state.row_l1_scaled_cpu)
-        state.executor_denominator_elapsed_ms = (
-            time.perf_counter() - state.denominator_start
-        ) * 1000.0
+        state.executor_denominator_elapsed_ms = denominator_timing.wall_elapsed_ms
     if state.executor_row_transfer_telemetry["row_transfer_source"] == "cuda":
         state.phase4_gpu_to_cpu_bytes_total += int(
             state.executor_row_transfer_telemetry["row_transfer_bytes"]
@@ -189,35 +204,37 @@ def commit_feature_rows(state):
     elif state.use_compact_feature_row_store and (not state.tiled_production):
         assert state.feature_row_store is not None
         assert state.nonfeature_row_store is not None
-        state.row_store_write_start = time.perf_counter()
-        feature_append_kwargs = {}
-        if bool(getattr(state.feature_row_store, "accepts_resident_feature_rows", False)):
-            feature_append_kwargs["resident_feature_rows"] = state.rows[
-                :, : state.total_active_feats
-            ]
-        state.row_store_append_telemetry = state.feature_row_store.append_rows(
-            row_start=state.st,
-            feature_rows=state.feature_row_slice,
-            row_denominator_scaled_l1=state.row_denominator_scaled_l1,
-            phase="phase4",
-            **feature_append_kwargs,
+        row_store_timing = state.phase4_device_timing.measure(
+            Phase4TimingSubstage.EXECUTOR_ROW_STORE_WRITE
         )
-        state.nonfeature_row_store.append_rows(
-            row_start=state.st,
-            feature_rows=state.nonfeature_row_slice,
-            row_denominator_scaled_l1=state.row_denominator_scaled_l1,
-            phase="phase4",
-        )
-        state.executor_row_store_write_elapsed_ms = (
-            time.perf_counter() - state.row_store_write_start
-        ) * 1000.0
+        with row_store_timing:
+            feature_append_kwargs = {}
+            if bool(getattr(state.feature_row_store, "accepts_resident_feature_rows", False)):
+                feature_append_kwargs["resident_feature_rows"] = state.rows[
+                    :, : state.total_active_feats
+                ]
+            state.row_store_append_telemetry = state.feature_row_store.append_rows(
+                row_start=state.st,
+                feature_rows=state.feature_row_slice,
+                row_denominator_scaled_l1=state.row_denominator_scaled_l1,
+                phase="phase4",
+                **feature_append_kwargs,
+            )
+            state.nonfeature_row_store.append_rows(
+                row_start=state.st,
+                feature_rows=state.nonfeature_row_slice,
+                row_denominator_scaled_l1=state.row_denominator_scaled_l1,
+                phase="phase4",
+            )
+        state.executor_row_store_write_elapsed_ms = row_store_timing.wall_elapsed_ms
     elif not state.use_compact_feature_row_store:
         assert state.phase4_row_reduction_config.effective_mode == "off"
-        state.row_store_write_start = time.perf_counter()
-        state.edge_matrix[state.st : state.end, : state.logit_offset] = state.rows_cpu
-        state.executor_row_store_write_elapsed_ms = (
-            time.perf_counter() - state.row_store_write_start
-        ) * 1000.0
+        row_store_timing = state.phase4_device_timing.measure(
+            Phase4TimingSubstage.EXECUTOR_ROW_STORE_WRITE
+        )
+        with row_store_timing:
+            state.edge_matrix[state.st : state.end, : state.logit_offset] = state.rows_cpu
+        state.executor_row_store_write_elapsed_ms = row_store_timing.wall_elapsed_ms
         state.row_store_append_telemetry = None
     else:
         state.executor_row_store_write_elapsed_ms = 0.0
