@@ -751,6 +751,76 @@ def test_transformerlens_chunked_attr_reuses_decoder_block_loads() -> None:
     _assert_chunked_attr_helper(TransformerLensAttributionContext)
 
 
+def test_transformerlens_chunked_attr_stages_cpu_decoder_page_to_execution_device() -> None:
+    pytest.importorskip("transformer_lens")
+
+    class UnstagedDecoderVectors:
+        def __init__(self, values: torch.Tensor) -> None:
+            self.values = values
+
+        def __getitem__(self, _index):
+            raise RuntimeError(
+                "indices should be either on cpu or on the same device as the indexed tensor"
+            )
+
+    class CpuDecoderPage:
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        def __init__(self, values: torch.Tensor) -> None:
+            self.values = values
+
+        def __getitem__(self, index):
+            return UnstagedDecoderVectors(self.values[index])
+
+        def to(self, *, device, dtype, non_blocking=False):
+            assert device == torch.device("meta")
+            assert dtype == torch.float32
+            assert non_blocking is False
+            return self.values.to(device=device, dtype=dtype)
+
+    class CpuPageProvider(FakeDecoderProvider):
+        def get_decoder_chunk(self, *args, **kwargs):
+            return CpuDecoderPage(super().get_decoder_chunk(*args, **kwargs))
+
+    activation_matrix = torch.sparse_coo_tensor(
+        indices=torch.tensor([[0], [0], [0]]),
+        values=torch.tensor([2.0]),
+        size=(1, 1, 1),
+        check_invariants=True,
+    ).coalesce()
+    provider = CpuPageProvider(
+        {0: torch.tensor([[[3.0, 4.0]]])},
+        chunk_size=1,
+        enable_cache=False,
+        decoder_output_topology="same_layer",
+    )
+    ctx = TransformerLensAttributionContext(
+        activation_matrix=activation_matrix,
+        error_vectors=torch.zeros(1, 1, 2),
+        token_vectors=torch.zeros(1, 2),
+        decoder_vecs=torch.empty((0, 2)),
+        encoder_vecs=torch.zeros((1, 2)),
+        encoder_to_decoder_map=torch.empty((0,), dtype=torch.long),
+        decoder_locations=torch.empty((2, 0), dtype=torch.long),
+        logits=torch.zeros(1),
+        decoder_provider=provider,
+        chunked_decoder_state={
+            "source_layers": activation_matrix.indices()[0],
+            "positions": activation_matrix.indices()[1],
+            "feature_ids": activation_matrix.indices()[2],
+            "activation_values": activation_matrix.values(),
+        },
+    )
+    ctx._batch_buffer = torch.zeros(ctx._row_size, 1, device="meta")
+
+    ctx._compute_chunked_feature_attributions_from_grads(
+        [torch.tensor([[[5.0, 6.0]]])]
+    )
+
+    assert ctx._batch_buffer.device.type == "meta"
+
+
 def _assert_chunked_attr_subchunks_large_decoder_bucket(context_factory) -> None:
     activation_matrix = torch.sparse_coo_tensor(
         indices=torch.tensor([[0, 0, 0, 0, 0], [0, 1, 2, 3, 4], [0, 1, 0, 1, 0]]),

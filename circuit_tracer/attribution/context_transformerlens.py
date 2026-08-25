@@ -316,10 +316,16 @@ class AttributionContext:
                     chunk_id,
                     decoder_cache=self.decoder_chunk_cache,
                 )
+                execution_device = self._batch_buffer.device
+                decoder_chunk = decoder_chunk.to(
+                    device=execution_device,
+                    dtype=self._batch_buffer.dtype,
+                    non_blocking=execution_device.type == "cuda",
+                )
                 chunk_activations = activation_values[chunk_rows].to(
-                    device=decoder_chunk.device,
-                    dtype=decoder_chunk.dtype,
-                    non_blocking=decoder_chunk.device.type == "cuda",
+                    device=execution_device,
+                    dtype=self._batch_buffer.dtype,
+                    non_blocking=execution_device.type == "cuda",
                 )[:, None]
                 total_row_subchunks = max(
                     (len(chunk_rows) + row_subchunk_size - 1) // row_subchunk_size,
@@ -333,9 +339,9 @@ class AttributionContext:
                         grads = output_layer_grads[output_layer]
                         assert grads is not None
                         typed_grads = grads.to(
-                            device=decoder_chunk.device,
-                            dtype=decoder_chunk.dtype,
-                            non_blocking=decoder_chunk.device.type == "cuda",
+                            device=execution_device,
+                            dtype=self._batch_buffer.dtype,
+                            non_blocking=execution_device.type == "cuda",
                         )
                         grad_cache[output_layer] = typed_grads
 
