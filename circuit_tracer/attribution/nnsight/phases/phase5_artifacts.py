@@ -6,6 +6,22 @@ from typing import Any, cast
 
 from circuit_tracer.attribution.nnsight.phases.phase5_compact import CompactGraphAssembly
 from circuit_tracer.attribution.nnsight.phases.phase5_types import Phase5Config, Phase5Inputs
+from circuit_tracer.attribution.nnsight.row_denominator_evidence import (
+    verify_row_denominator_evidence,
+)
+
+
+def build_correctness_row_denominator_evidence(
+    *, inputs: Phase5Inputs, config: Phase5Config
+) -> dict[str, object]:
+    """Verify stored denominator bytes against row-derived Phase 3/4 digests."""
+
+    if not config.output_policy.use_compact_feature_row_store:
+        return verify_row_denominator_evidence(None, expected_rows=config.graph_limits.st)
+    return verify_row_denominator_evidence(
+        inputs.graph.feature_row_store,
+        expected_rows=config.graph_limits.st,
+    )
 
 
 def _execution_policy_metadata(prefix: str, policy: Any) -> dict[str, object]:
@@ -349,6 +365,10 @@ def package_compact_artifacts(
             "scan": inputs.runtime.model.scan,
         }
     )
+    if output.capture_feature_semantic_descriptors:
+        artifact["correctness_row_denominator_evidence"] = (
+            build_correctness_row_denominator_evidence(inputs=inputs, config=config)
+        )
     artifact.update(
         {
             key: value

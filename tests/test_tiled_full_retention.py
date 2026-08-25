@@ -12,6 +12,10 @@ from circuit_tracer.attribution.nnsight.tiled_rows import (
     produce_tiled_rows_no_retention,
 )
 from circuit_tracer.attribution.nnsight.replay import _compute_row_denominator_scaled_l1
+from circuit_tracer.attribution.nnsight.row_denominator_evidence import (
+    enable_row_denominator_audit,
+    verify_row_denominator_evidence,
+)
 from circuit_tracer.graph import (
     compute_partial_feature_influences_streaming,
     compute_partial_feature_influences_tiled,
@@ -168,6 +172,7 @@ def test_true_tiled_production_streams_tiles_and_matches_full_row_denominator() 
     nonfeature = _ColumnTiledFeatureRowStore(
         n_rows=1, n_feature_columns=2, column_tile_size=2, dtype=torch.float64
     )
+    enable_row_denominator_audit(feature)
     try:
         produced_nonfeature, denominator = produce_and_store_tiled_rows(
             ctx=ctx,
@@ -194,6 +199,13 @@ def test_true_tiled_production_streams_tiles_and_matches_full_row_denominator() 
         assert snapshot["feature_tile_count"] == 3
         assert snapshot["max_produced_tile_bytes"] <= 2 * 8
         assert nonfeature.get_diagnostic_snapshot()["nonfeature_tile_count"] == 1
+        assert verify_row_denominator_evidence(feature, expected_rows=1) == {
+            "complete": True,
+            "policy_id": "canonical_scaled_l1_row_evidence_sha256_v2",
+            "rows_checked": 1,
+            "violation_count": 0,
+            "authoritative_batch_count": 1,
+        }
     finally:
         feature.cleanup()
         nonfeature.cleanup()

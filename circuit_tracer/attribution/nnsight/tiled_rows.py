@@ -8,6 +8,9 @@ from typing import Any
 import torch
 
 from circuit_tracer.attribution.nnsight.replay import _compute_row_denominator_scaled_l1
+from circuit_tracer.attribution.nnsight.row_denominator_evidence import (
+    record_authoritative_row_denominator,
+)
 
 
 _CANONICAL_DENOMINATOR_CHUNK_SIZE = 4096
@@ -154,6 +157,11 @@ def produce_and_store_tiled_rows(
         telemetry["feature_denominator_elapsed_ms"] = float(
             telemetry.get("feature_denominator_elapsed_ms", 0.0)
         ) + (time.perf_counter() - denominator_start) * 1000.0
+    record_authoritative_row_denominator(
+        feature_row_store,
+        row_start=row_start,
+        denominator=denominator,
+    )
     feature_row_store.set_row_denominator(row_start=row_start, value=denominator)
     nonfeature_row_store.append_tile(
         row_start=row_start, column_start=0, values=nonfeature, nonfeature=True, phase=phase_label

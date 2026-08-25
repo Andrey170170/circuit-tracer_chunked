@@ -7,6 +7,9 @@ import time
 from typing import Any
 
 import torch
+from circuit_tracer.attribution.nnsight.row_denominator_evidence import (
+    enable_row_denominator_audit,
+)
 
 from circuit_tracer.attribution.nnsight.row_store import _FileBackedFeatureRowStore
 from circuit_tracer.attribution.targets import AttributionTargets
@@ -108,6 +111,8 @@ class Phase3Result:
 def run_phase3(*, inputs: Phase3Inputs, config: Phase3Config) -> Phase3Result:
     """Run ordered logit attribution, replay capture, and frontier selection."""
     inputs.logger.info("Phase 3: Computing logit attributions")
+    if config.capture_feature_semantic_descriptors_enabled:
+        enable_row_denominator_audit(inputs.feature_row_store)
     phase_start = time.perf_counter()
     inputs.telemetry_observer.observe(MemoryBoundary("Phase 3 start", inputs.model.device))
     batches = run_logit_batches(inputs=inputs, config=config, phase_start=phase_start)

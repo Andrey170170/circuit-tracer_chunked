@@ -12,6 +12,9 @@ from circuit_tracer.attribution.nnsight.phase_support import (
     _copy_rows_to_cpu_staging,
 )
 from circuit_tracer.attribution.nnsight.replay import _compute_row_denominator_scaled_l1
+from circuit_tracer.attribution.nnsight.row_denominator_evidence import (
+    record_authoritative_row_denominator,
+)
 from circuit_tracer.attribution.nnsight.telemetry import (
     _build_phase4_gpu_row_reduction_transfer_telemetry,
     _build_row_transfer_telemetry,
@@ -159,6 +162,14 @@ def reduce_feature_rows(state):
 
 def commit_feature_rows(state):
     """Commit feature and nonfeature rows to owned storage."""
+    if state.use_compact_feature_row_store and (
+        not state.tiled_production or state.no_retention
+    ):
+        record_authoritative_row_denominator(
+            state.feature_row_store,
+            row_start=state.st,
+            denominator=state.row_denominator_scaled_l1,
+        )
     if state.anomaly_debug_result is not None and state.phase4_execution_batch_count <= 2:
         state.feature_row_batches = state.anomaly_debug_result.setdefault(
             "phase4_feature_row_batches", []

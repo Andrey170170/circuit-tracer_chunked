@@ -13,6 +13,8 @@ from circuit_tracer.attribution.nnsight.replay import (
     _hash_index_tensor,
 )
 
+_SEMANTIC_DESCRIPTOR_TRANSIENT_MAX_BYTES = 64 * 1024 * 1024
+
 _NNSIGHT_BACKEND_FILE = __file__.replace("phase_support.py", "backend.py")
 
 def _resolve_internal_precision_requested(
@@ -815,6 +817,7 @@ def _build_feature_semantic_descriptors_payload(
     semantic_descriptor_top_k: int,
     semantic_descriptor_dim: int,
 ) -> dict[str, object]:
+    transient_max_bytes = _SEMANTIC_DESCRIPTOR_TRANSIENT_MAX_BYTES
     top_k = int(semantic_descriptor_top_k)
     descriptor_dim = int(semantic_descriptor_dim)
     if top_k <= 0:
@@ -844,6 +847,15 @@ def _build_feature_semantic_descriptors_payload(
     valid_frontier_post = frontier_post_cpu[
         (frontier_post_cpu >= 0) & (frontier_post_cpu < feature_count)
     ]
+    transient_required_bytes = sum(
+        int(value.numel() * value.element_size())
+        for value in (seed_influences_cpu, valid_frontier_pre, valid_frontier_post)
+    )
+    if transient_required_bytes > transient_max_bytes:
+        raise MemoryError(
+            "semantic descriptor Phase3-to-Phase5 handoff exceeds its explicit "
+            f"memory bound ({transient_required_bytes} > {transient_max_bytes} bytes)"
+        )
 
     seed_rank_full = torch.full((feature_count,), -1, dtype=torch.int64)
     top_seed_mask_full = torch.zeros(feature_count, dtype=torch.bool)
@@ -914,7 +926,7 @@ def _build_feature_semantic_descriptors_payload(
         descriptor_dim=descriptor_dim,
     )
 
-    return {
+    payload: dict[str, object] = {
         "status": str(status),
         "descriptor_version": "v1",
         "descriptor_kind": "fallback_identity_metadata_v1",
@@ -937,12 +949,164 @@ def _build_feature_semantic_descriptors_payload(
         "phase4_selection_available": False,
         "seed_influence_available": bool(seed_influence_available),
         "semantic_sketch": semantic_sketch,
+        "candidate_bound_kind": "final_selected_plus_seed_near_cutoff_controls_v1",
+        "semantic_descriptor_control_limit": int(top_k),
+        "semantic_descriptor_transient_policy_id": "bounded_seed_frontier_handoff_v1",
+        "semantic_descriptor_transient_max_bytes": transient_max_bytes,
+        "semantic_descriptor_transient_required_bytes": transient_required_bytes,
+        "semantic_descriptor_transient_array_count": 3,
+        "semantic_descriptor_transient_admitted": True,
+        "semantic_descriptor_transient_released": False,
     }
+    # Only the seed score vector is full-active. The two locality vectors are
+    # bounded by the Phase-3 frontier. Admission above covers their combined
+    # retained bytes before any handoff state crosses into Phase 4.
+    payload.update(
+        {
+            "_transient_seed_influence": seed_influences_cpu,
+            "_transient_frontier_pre_locality": valid_frontier_pre,
+            "_transient_frontier_post_locality": valid_frontier_post,
+        }
+    )
+    return payload
 
 
 def _annotate_phase4_selection_on_feature_semantic_descriptors(
-    payload: dict[str, object], *, selected_features: torch.Tensor
+    payload: dict[str, object],
+    *,
+    selected_features: torch.Tensor,
+    active_features: torch.Tensor | None = None,
+    activation_values: torch.Tensor | None = None,
 ) -> None:
+    transient_names = (
+        "_transient_seed_influence",
+        "_transient_frontier_pre_locality",
+        "_transient_frontier_post_locality",
+    )
+    transient = [payload.get(name) for name in transient_names]
+    if all(isinstance(value, torch.Tensor) for value in transient):
+        if not isinstance(active_features, torch.Tensor) or not isinstance(
+            activation_values, torch.Tensor
+        ):
+            raise TypeError(
+                "bounded semantic descriptor finalization requires Phase-5 active features"
+            )
+
+        def _cpu_transient(name: str) -> torch.Tensor:
+            value = payload.get(name)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"missing semantic descriptor transient: {name}")
+            return value.detach().to(device="cpu")
+
+        active_features = active_features.detach().to(device="cpu", dtype=torch.int64)
+        activation_value = activation_values.detach().to(device="cpu", dtype=torch.float32)
+        seed_influence = _cpu_transient("_transient_seed_influence")
+        frontier_pre_locality = _cpu_transient("_transient_frontier_pre_locality")
+        frontier_post_locality = _cpu_transient("_transient_frontier_post_locality")
+        feature_count = int(active_features.shape[0])
+        if activation_value.numel() != feature_count or seed_influence.numel() != feature_count:
+            raise ValueError("semantic descriptor handoff vectors do not align")
+        seed_rank = torch.full((feature_count,), -1, dtype=torch.int64)
+        is_top_seed = torch.zeros(feature_count, dtype=torch.bool)
+        if bool(payload.get("seed_influence_available", False)) and feature_count > 0:
+            ranked = torch.argsort(seed_influence, descending=True)
+            seed_rank[ranked] = torch.arange(feature_count, dtype=torch.int64)
+            raw_top_k = payload.get("semantic_descriptor_top_k", 0)
+            if isinstance(raw_top_k, bool) or not isinstance(raw_top_k, int):
+                raise TypeError("semantic descriptor top-k must be an integer")
+            is_top_seed[ranked[: min(feature_count, raw_top_k)]] = True
+        frontier_pre_rank = torch.full((feature_count,), -1, dtype=torch.int64)
+        for rank, feature_idx in enumerate(frontier_pre_locality.tolist()):
+            if frontier_pre_rank[feature_idx] < 0:
+                frontier_pre_rank[feature_idx] = rank
+        frontier_post_rank = torch.full((feature_count,), -1, dtype=torch.int64)
+        for rank, feature_idx in enumerate(frontier_post_locality.tolist()):
+            if frontier_post_rank[feature_idx] < 0:
+                frontier_post_rank[feature_idx] = rank
+        selected_cpu = selected_features.detach().to(device="cpu", dtype=torch.int64)
+        selected_rows = [int(value) for value in selected_cpu.tolist()]
+        if len(set(selected_rows)) != len(selected_rows) or any(
+            value < 0 or value >= feature_count for value in selected_rows
+        ):
+            raise ValueError("selected semantic descriptor rows are invalid")
+        raw_control_limit = payload.get("semantic_descriptor_control_limit", 0)
+        if isinstance(raw_control_limit, bool) or not isinstance(raw_control_limit, int):
+            raise TypeError("semantic descriptor control limit must be an integer")
+        control_limit = raw_control_limit
+        if control_limit < 0:
+            raise ValueError("semantic descriptor control limit must be non-negative")
+        selected_set = set(selected_rows)
+        control_rows = [index for index in range(feature_count) if index not in selected_set]
+        available_seed_ranks = seed_rank >= 0
+        if bool(available_seed_ranks.any().item()):
+            top_rows = torch.where(is_top_seed)[0]
+            cutoff_rank = (
+                int(seed_rank[top_rows].max().item()) if top_rows.numel() else 0
+            )
+            control_rows.sort(
+                key=lambda index: (
+                    abs(int(seed_rank[index].item()) - cutoff_rank),
+                    int(seed_rank[index].item()),
+                    index,
+                )
+            )
+        else:
+            control_rows.sort()
+        control_rows = control_rows[:control_limit]
+        emitted_rows = selected_rows + control_rows
+        row_indices = torch.tensor(emitted_rows, dtype=torch.int64)
+        candidate_features = active_features[row_indices].to(dtype=torch.int64)
+        candidate_activation = activation_value[row_indices].to(dtype=torch.float32)
+        candidate_seed_influence = seed_influence[row_indices].to(dtype=torch.float64)
+        candidate_seed_rank = seed_rank[row_indices].to(dtype=torch.int64)
+        candidate_is_top_seed = is_top_seed[row_indices].to(dtype=torch.bool)
+        candidate_frontier_pre_rank = frontier_pre_rank[row_indices].to(dtype=torch.int64)
+        candidate_frontier_post_rank = frontier_post_rank[row_indices].to(dtype=torch.int64)
+        selected_count = len(selected_rows)
+        selected_mask = torch.zeros(len(emitted_rows), dtype=torch.bool)
+        selected_mask[:selected_count] = True
+        selected_rank = torch.full((len(emitted_rows),), -1, dtype=torch.int64)
+        selected_rank[:selected_count] = torch.arange(selected_count, dtype=torch.int64)
+        raw_descriptor_dim = payload.get("descriptor_dim", 0)
+        if isinstance(raw_descriptor_dim, bool) or not isinstance(raw_descriptor_dim, int):
+            raise TypeError("semantic descriptor dimension must be an integer")
+        descriptor_dim = raw_descriptor_dim
+        semantic_sketch = _build_semantic_sketch_fallback(
+            candidate_features=candidate_features,
+            activation_value=candidate_activation,
+            seed_influence=candidate_seed_influence,
+            seed_rank=candidate_seed_rank,
+            frontier_pre_rank=candidate_frontier_pre_rank,
+            frontier_post_rank=candidate_frontier_post_rank,
+            is_top_seed=candidate_is_top_seed,
+            is_frontier_pre=candidate_frontier_pre_rank >= 0,
+            is_frontier_post=candidate_frontier_post_rank >= 0,
+            descriptor_dim=descriptor_dim,
+        )
+        payload.update(
+            {
+                "candidate_count": len(emitted_rows),
+                "candidate_features": candidate_features,
+                "candidate_row_indices": row_indices,
+                "activation_value": candidate_activation,
+                "seed_influence": candidate_seed_influence,
+                "seed_rank": candidate_seed_rank,
+                "is_top_seed": candidate_is_top_seed,
+                "is_frontier_pre": candidate_frontier_pre_rank >= 0,
+                "frontier_pre_rank": candidate_frontier_pre_rank,
+                "is_frontier_post": candidate_frontier_post_rank >= 0,
+                "frontier_post_rank": candidate_frontier_post_rank,
+                "is_selected_phase4": selected_mask,
+                "phase4_selected_rank": selected_rank,
+                "phase4_selection_available": True,
+                "semantic_sketch": semantic_sketch,
+            }
+        )
+        for name in transient_names:
+            payload.pop(name, None)
+        payload["semantic_descriptor_transient_released"] = True
+        return
+
     candidate_row_indices = payload.get("candidate_row_indices")
     if not isinstance(candidate_row_indices, torch.Tensor):
         return

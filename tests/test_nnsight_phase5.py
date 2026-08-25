@@ -26,6 +26,10 @@ import circuit_tracer.attribution.nnsight.phases.phase5_full as phase5_full
 import circuit_tracer.attribution.nnsight.phases.phase5_artifacts as phase5_artifacts
 import circuit_tracer.attribution.nnsight.phases.phase5_publication as phase5_publication
 import circuit_tracer.attribution.nnsight.phase_support as phase_support
+from circuit_tracer.attribution.nnsight.row_denominator_evidence import (
+    enable_row_denominator_audit,
+    record_authoritative_row_denominator,
+)
 from circuit_tracer.attribution.nnsight.execution import (
     _decoder_row_execution_metadata,
 )
@@ -51,11 +55,18 @@ class FakeObserver:
 
 class FakeRowStore:
     def __init__(
-        self, *, n_feature_columns: int, values: dict[tuple[int, int], torch.Tensor]
+        self,
+        *,
+        n_feature_columns: int,
+        values: dict[tuple[int, int], torch.Tensor],
+        row_abs_max: torch.Tensor | None = None,
+        row_l1_scaled: torch.Tensor | None = None,
     ) -> None:
         self.n_feature_columns = n_feature_columns
         self.nbytes = 321
         self.values = values
+        self.row_abs_max = row_abs_max
+        self.row_l1_scaled = row_l1_scaled
         self.calls: list[tuple[int, int, torch.Tensor, str]] = []
 
     def materialize_dense_feature_slice(
@@ -417,7 +428,9 @@ def test_phase5_annotates_descriptors_and_records_cross_cluster_checkpoints(
     monkeypatch.setattr(
         phase_support,
         "_annotate_phase4_selection_on_feature_semantic_descriptors",
-        lambda payload, *, selected_features: annotation_calls.append(selected_features.clone()),
+        lambda payload, *, selected_features, active_features, activation_values: (
+            annotation_calls.append(selected_features.clone())
+        ),
     )
 
     def record_checkpoint(**kwargs: object) -> None:
@@ -450,6 +463,13 @@ def test_phase5_annotates_descriptors_and_records_cross_cluster_checkpoints(
 
     assert [selected.tolist() for selected in annotation_calls] == [[0]]
     assert result.output["feature_semantic_descriptors"] is descriptors
+    assert result.output["correctness_row_denominator_evidence"] == {
+        "complete": False,
+        "policy_id": "canonical_scaled_l1_row_evidence_sha256_v2",
+        "rows_checked": 0,
+        "violation_count": 0,
+        "authoritative_batch_count": 0,
+    }
     assert summary == {
         "status": "captured",
         "checkpoint_stream_count": 2,
@@ -461,6 +481,118 @@ def test_phase5_annotates_descriptors_and_records_cross_cluster_checkpoints(
     ]
     assert result.output["cross_cluster_debug_summary"] is summary
     assert result.output["cross_cluster_debug_checkpoints"] is checkpoints
+
+
+def test_correctness_row_denominator_evidence_checks_complete_store_prefix() -> None:
+    inputs = _inputs(FakeObserver(), [], [])
+    store = FakeRowStore(
+        n_feature_columns=1,
+        values={},
+        row_abs_max=torch.tensor([2.0, 0.0, float("nan"), -1.0]),
+        row_l1_scaled=torch.tensor([1.5, 0.0, 0.0, 3.0]),
+    )
+    inputs = replace(inputs, graph=replace(inputs.graph, feature_row_store=store))
+    enable_row_denominator_audit(store)
+    record_authoritative_row_denominator(
+        store,
+        row_start=0,
+        denominator=(store.row_abs_max[:2].clone(), store.row_l1_scaled[:2].clone()),
+    )
+    config = replace(
+        _config(),
+        output_policy=replace(
+            _config().output_policy,
+            use_compact_feature_row_store=True,
+            capture_feature_semantic_descriptors=True,
+        ),
+    )
+
+    evidence = phase5_artifacts.build_correctness_row_denominator_evidence(
+        inputs=inputs,
+        config=config,
+    )
+
+    assert evidence == {
+        "complete": True,
+        "policy_id": "canonical_scaled_l1_row_evidence_sha256_v2",
+        "rows_checked": 2,
+        "violation_count": 0,
+        "authoritative_batch_count": 1,
+    }
+
+
+def test_correctness_row_denominator_evidence_counts_invalid_rows_and_partial_state() -> None:
+    inputs = _inputs(FakeObserver(), [], [])
+    store = FakeRowStore(
+        n_feature_columns=1,
+        values={},
+        row_abs_max=torch.tensor([float("nan"), -1.0, 0.0]),
+        row_l1_scaled=torch.tensor([1.0, -2.0, 4.0]),
+    )
+    inputs = replace(inputs, graph=replace(inputs.graph, feature_row_store=store))
+    enable_row_denominator_audit(store)
+    record_authoritative_row_denominator(
+        store,
+        row_start=0,
+        denominator=(store.row_abs_max.clone(), store.row_l1_scaled.clone()),
+    )
+    config = replace(
+        _config(),
+        output_policy=replace(
+            _config().output_policy,
+            use_compact_feature_row_store=True,
+            capture_feature_semantic_descriptors=True,
+        ),
+        graph_limits=GraphAssemblyLimits(1, 1, 4, 3, 6, 3),
+    )
+
+    evidence = phase5_artifacts.build_correctness_row_denominator_evidence(
+        inputs=inputs,
+        config=config,
+    )
+
+    assert evidence == {
+        "complete": False,
+        "policy_id": "canonical_scaled_l1_row_evidence_sha256_v2",
+        "rows_checked": 3,
+        "violation_count": 3,
+        "authoritative_batch_count": 1,
+    }
+
+
+def test_correctness_row_denominator_evidence_rejects_finite_stored_drift() -> None:
+    inputs = _inputs(FakeObserver(), [], [])
+    store = FakeRowStore(
+        n_feature_columns=1,
+        values={},
+        row_abs_max=torch.tensor([2.0, 3.0]),
+        row_l1_scaled=torch.tensor([1.5, 1.25]),
+    )
+    enable_row_denominator_audit(store)
+    record_authoritative_row_denominator(
+        store,
+        row_start=0,
+        denominator=(store.row_abs_max.clone(), store.row_l1_scaled.clone()),
+    )
+    store.row_l1_scaled[1] = 1.5
+    inputs = replace(inputs, graph=replace(inputs.graph, feature_row_store=store))
+    config = replace(
+        _config(),
+        output_policy=replace(
+            _config().output_policy,
+            use_compact_feature_row_store=True,
+            capture_feature_semantic_descriptors=True,
+        ),
+    )
+
+    evidence = phase5_artifacts.build_correctness_row_denominator_evidence(
+        inputs=inputs,
+        config=config,
+    )
+
+    assert evidence["complete"] is True
+    assert evidence["rows_checked"] == 2
+    assert evidence["violation_count"] == 2
 
 
 def test_active_row_publication_preserves_fused_seed_evidence() -> None:

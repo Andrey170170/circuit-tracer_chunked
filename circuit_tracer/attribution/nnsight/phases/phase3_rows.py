@@ -13,6 +13,9 @@ from circuit_tracer.attribution.nnsight.phase_support import (
     _resolve_phase3_effective_row_state,
 )
 from circuit_tracer.attribution.nnsight.replay import _compute_row_abs_sums
+from circuit_tracer.attribution.nnsight.row_denominator_evidence import (
+    record_authoritative_row_denominator,
+)
 from circuit_tracer.attribution.nnsight.row_replay import RowRecipe, RowRecipeLedger
 from circuit_tracer.attribution.nnsight.row_store import _FileBackedFeatureRowStore
 from circuit_tracer.attribution.nnsight.telemetry import (
@@ -370,6 +373,12 @@ def commit_effective_rows(
 ) -> float:
     """Commit rows to exactly one retention backend and assign node indices."""
     start = time.perf_counter()
+    if use_compact_store and (not produced.tiled_production or produced.no_retention):
+        record_authoritative_row_denominator(
+            feature_row_store,
+            row_start=row_start,
+            denominator=rows.denominator,
+        )
     if produced.no_retention:
         assert isinstance(feature_row_store, RowRecipeLedger)
         assert isinstance(nonfeature_row_store, RowRecipeLedger)

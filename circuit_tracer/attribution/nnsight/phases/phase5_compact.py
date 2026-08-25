@@ -40,7 +40,10 @@ def select_graph_features(*, inputs: Phase5Inputs, config: Phase5Config) -> Sele
         )
 
         _annotate_phase4_selection_on_feature_semantic_descriptors(
-            descriptors, selected_features=selected
+            descriptors,
+            selected_features=selected,
+            active_features=inputs.graph.activation_matrix.indices().T,
+            activation_values=inputs.graph.activation_matrix.values(),
         )
     cpu = selected.detach().to(device="cpu", dtype=torch.long) if config.output_policy.compact_output else None
     return SelectedGraphFeatures(selected, cpu)

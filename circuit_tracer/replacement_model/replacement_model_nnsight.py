@@ -3,9 +3,10 @@ import hashlib
 from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import partial
 import time
-from typing import Callable, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 import torch
 from torch import nn
@@ -33,6 +34,15 @@ from circuit_tracer.observability.events import TraceObserver
 from circuit_tracer.tracing.plan import BackwardEngineMode
 from circuit_tracer.utils import get_default_device
 from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
+from circuit_tracer.verification.contracts import FeatureNode, InterventionSemantics
+from circuit_tracer.verification.nnsight_runtime import (
+    CaptureOrigin,
+    NNSightVariantPlan,
+    SelectiveProbeCapture,
+    _invoke_ordered_hook_families,
+    _provider_activation_delta,
+    _skip_transcoder_correction,
+)
 
 NNSIGHT_CONFIG.APP.PYMOUNT = False
 NNSIGHT_CONFIG.APP.CROSS_INVOKER = False
@@ -170,6 +180,20 @@ Intervention = tuple[
 ]
 
 
+@dataclass
+class _VerificationFreezeState:
+    attention: dict[int, Any]
+    feature_output: dict[int, Any]
+    layernorm: dict[tuple[int, int], Any]
+    feature_input: dict[int, Any]
+
+    def clear(self) -> None:
+        self.attention.clear()
+        self.feature_output.clear()
+        self.layernorm.clear()
+        self.feature_input.clear()
+
+
 class EnvoyWrapper:
     def __init__(self, envoy, input_output: Literal["input", "output"]):
         self.envoy = envoy
@@ -198,6 +222,8 @@ class NNSightReplacementModel(LanguageModel):
     scan: str | list[str] | None
     backend: Literal["nnsight"]
     model_adapter: NNSightModelAdapter
+    # Fail closed until a model-backed NNSight gate proves intervened-forward ordering.
+    verification_intervened_capture_ordering_qualified = False
 
     @classmethod
     def from_config(
@@ -501,6 +527,372 @@ class NNSightReplacementModel(LanguageModel):
                 self.config.text_config.final_logit_softcapping = current_softcap  # type: ignore
         else:
             yield
+
+    def _verification_tokens(self, prompt_token_ids: tuple[int, ...]) -> torch.Tensor:
+        """Preserve the already-tokenized trace identity without adding special tokens."""
+
+        return torch.tensor(prompt_token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+
+    @contextmanager
+    def _verification_probe_scope(self):
+        if getattr(self, "_verification_probe_active", False):
+            raise RuntimeError("a selective verification trace is already active")
+        self._verification_probe_active = True
+        try:
+            yield
+        finally:
+            self.__dict__.pop("_verification_probe_active", None)
+
+    def _verification_encode_layers(
+        self,
+        retained_nodes: tuple[FeatureNode, ...],
+        *,
+        barrier=None,
+        barrier_layers: set[int] | None = None,
+    ) -> dict[int, Any]:
+        """Encode one layer at a time; tensors remain transient NNSight graph values."""
+
+        provider: Any = (
+            self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
+        )
+        layers = sorted({node.layer for node in retained_nodes})
+        activations: dict[int, Any] = {}
+        for layer in layers:
+            feature_input = self.get_feature_input_loc(layer).output
+            activations[layer] = (
+                provider.encode_layer(  # type: ignore[attr-defined]
+                    feature_input,
+                    layer,
+                    apply_activation_function=False,
+                )
+                .detach()
+                .squeeze(0)
+            )
+            activations[layer][self.zero_positions] = 0  # type: ignore[index]
+            if barrier is not None and barrier_layers is not None and layer in barrier_layers:
+                barrier()
+        return activations
+
+    @staticmethod
+    def _verification_save_feature_values(
+        activations: dict[int, Any], retained_nodes: tuple[FeatureNode, ...]
+    ) -> tuple[tuple[FeatureNode, Any], ...]:
+        return tuple(
+            (node, save(activations[node.layer][node.position, node.feature]))  # type: ignore[index]
+            for node in retained_nodes
+        )
+
+    @torch.no_grad
+    def _verification_capture_baseline(
+        self,
+        prompt_token_ids: tuple[int, ...],
+        retained_nodes: tuple[FeatureNode, ...],
+        *,
+        target_position: int,
+        target_token_id: int,
+        retain_attention_state: bool,
+        retain_direct_freeze_state: bool,
+    ) -> SelectiveProbeCapture:
+        """Capture scalar evidence plus only the dense state required by frozen semantics."""
+
+        tokens = self._verification_tokens(prompt_token_ids)
+        state = _VerificationFreezeState({}, {}, {}, {})
+        with (
+            self._verification_probe_scope(),
+            torch.inference_mode(),
+            self.zero_softcap(),
+            self.trace() as tracer,
+        ):
+            with tracer.invoke(tokens):
+                activations = self._verification_encode_layers(retained_nodes)
+                logits = self.output.logits[0, target_position - 1]
+                target_logit = save(logits[target_token_id])
+                mean_logit = save(logits.mean())
+                feature_values = self._verification_save_feature_values(activations, retained_nodes)
+            def capture_attention() -> None:
+                if retain_attention_state:
+                    for layer, location in enumerate(self.attention_locs):
+                        state.attention[layer] = save(location.output.detach())  # type: ignore
+
+            layernorm_actions = []
+            if retain_direct_freeze_state:
+                for group, locations in enumerate(self.layernorm_scale_locs):
+                    def capture_layernorm(group=group, locations=locations) -> None:
+                        for layer, location in enumerate(locations):
+                            state.layernorm[group, layer] = save(location.output.detach())  # type: ignore
+
+                    layernorm_actions.append(capture_layernorm)
+
+            def capture_feature_input() -> None:
+                if retain_direct_freeze_state and self.skip_transcoder:
+                        for layer, location in enumerate(self.feature_input_locs):
+                            state.feature_input[layer] = save(location.output)  # type: ignore
+
+            def capture_feature_output() -> None:
+                if retain_direct_freeze_state:
+                    for layer, location in enumerate(self.feature_output_locs):
+                        state.feature_output[layer] = save(location.output.detach())  # type: ignore
+
+            _invoke_ordered_hook_families(
+                tracer,
+                attention=capture_attention if retain_attention_state else None,
+                layernorm_groups=tuple(layernorm_actions),
+                feature_input=(
+                    capture_feature_input
+                    if retain_direct_freeze_state and self.skip_transcoder
+                    else None
+                ),
+                feature_output=(capture_feature_output if retain_direct_freeze_state else None),
+            )
+        return SelectiveProbeCapture(
+            target_logit,
+            mean_logit,
+            feature_values,
+            CaptureOrigin.BASELINE_FORWARD,
+            state,
+        )
+
+    def _verification_freeze_attention(
+        self,
+        state: _VerificationFreezeState,
+    ) -> None:
+        for layer, location in enumerate(self.attention_locs):
+            location.output = state.attention[layer]  # type: ignore
+
+    def _verification_freeze_layernorm_group(
+        self,
+        state: _VerificationFreezeState,
+        group: int,
+        locations,
+    ) -> None:
+        for layer, location in enumerate(locations):
+            location.output = state.layernorm[group, layer]  # type: ignore
+
+    def _verification_compute_skip_diffs(
+        self,
+        state: _VerificationFreezeState,
+    ) -> dict[int, Any]:
+        provider: Any = (
+            self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
+        )
+        skip_diffs: dict[int, Any] = {}
+        for layer, location in enumerate(self.feature_input_locs):
+            skip_diffs[layer] = _skip_transcoder_correction(
+                provider,
+                layer,
+                state.feature_input[layer],
+                location.output,
+            )
+        return skip_diffs
+
+    def _verification_freeze_feature_outputs(
+        self,
+        state: _VerificationFreezeState,
+        skip_diffs: dict[int, Any],
+        *,
+        direct_effects_barrier=None,
+    ) -> None:
+        for layer, location in enumerate(self.feature_output_locs):
+            correction = skip_diffs.get(layer, 0)
+            location.output = state.feature_output[layer] + correction  # type: ignore
+            if direct_effects_barrier is not None:
+                direct_effects_barrier()
+
+    @torch.no_grad
+    def _verification_inject(
+        self,
+        plan: NNSightVariantPlan,
+        activation_matrix: dict[int, Any],
+        *,
+        target_position: int,
+        target_token_id: int,
+        activation_barrier=None,
+        direct_effects_barrier=None,
+    ) -> tuple[Any, Any]:
+        provider: Any = (
+            self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
+        )
+        interventions_by_layer: dict[int, list[Any]] = defaultdict(list)
+        for intervention in plan.interventions:
+            interventions_by_layer[intervention.node.layer].append(intervention)
+        deltas_by_layer_position: dict[int, dict[int, Any]] = defaultdict(dict)
+        for layer in range(self.cfg.n_layers):
+            if interventions_by_layer[layer]:
+                if plan.semantics is InterventionSemantics.PROPAGATED_FROZEN_ATTENTION:
+                    assert activation_barrier is not None
+                    activation_barrier()
+                for intervention in interventions_by_layer[layer]:
+                    if intervention.exact_graph_delta is not None:
+                        if intervention.graph_baseline_value is None:
+                            raise RuntimeError("direct intervention lacks graph baseline")
+                        baseline_value = torch.tensor(
+                            intervention.graph_baseline_value,
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
+                    else:
+                        baseline_value = activation_matrix[layer][  # type: ignore[index]
+                            intervention.node.position,
+                            intervention.node.feature,
+                        ]
+                    decoder_delta = _provider_activation_delta(
+                        provider,
+                        layer,
+                        baseline_value,
+                        intervention.absolute_value,
+                    )
+                    feature_ids = torch.tensor(
+                        [intervention.node.feature], dtype=torch.long, device=self.device
+                    )
+                    decoder = provider._get_decoder_vectors(layer, feature_ids)  # type: ignore[attr-defined]
+                    if decoder.ndim == 2:
+                        if intervention.output_layers != (layer,):
+                            raise RuntimeError("PLT decoder write topology mismatch")
+                        writes = deltas_by_layer_position[layer]
+                        contribution = decoder[0] * decoder_delta
+                        writes[intervention.node.position] = (
+                            writes.get(intervention.node.position, 0) + contribution
+                        )
+                    elif decoder.ndim == 3:
+                        if decoder.shape[1] != len(intervention.output_layers):
+                            raise RuntimeError("CLT decoder write topology mismatch")
+                        for slot, output_layer in enumerate(intervention.output_layers):
+                            writes = deltas_by_layer_position[output_layer]
+                            contribution = decoder[0, slot] * decoder_delta
+                            writes[intervention.node.position] = (
+                                writes.get(intervention.node.position, 0) + contribution
+                            )
+                    else:
+                        raise RuntimeError("unsupported decoder vector rank")
+            if direct_effects_barrier is not None:
+                direct_effects_barrier()
+            if deltas_by_layer_position.get(layer):
+                output = self.get_feature_output_loc(layer).output  # type: ignore
+                positions = sorted(deltas_by_layer_position[layer])
+                selected_deltas = torch.stack(
+                    [deltas_by_layer_position[layer][position] for position in positions]
+                )
+                output[:, positions, :] = output[:, positions, :] + selected_deltas.unsqueeze(0)  # type: ignore
+                del deltas_by_layer_position[layer]
+        logits = self.output.logits[0, target_position - 1]
+        return save(logits[target_token_id]), save(logits.mean())
+
+    @torch.no_grad
+    def _verification_run_variant(
+        self,
+        prompt_token_ids: tuple[int, ...],
+        plan: NNSightVariantPlan,
+        baseline_state: object | None,
+        *,
+        target_position: int,
+        target_token_id: int,
+    ) -> SelectiveProbeCapture:
+        """Run one isolated variant without ever saving a full feature activation tensor."""
+
+        tokens = self._verification_tokens(prompt_token_ids)
+        retained_nodes = tuple(sorted(set(plan.observed_nodes) | set(plan.retain_intervention_nodes)))
+        intervention_layers = {item.node.layer for item in plan.interventions}
+        with (
+            self._verification_probe_scope(),
+            torch.inference_mode(),
+            self.zero_softcap(),
+            self.trace() as tracer,
+        ):
+            activation_barrier = (
+                tracer.barrier(2)
+                if plan.interventions and not plan.freeze_feature_outputs
+                else None
+            )
+            direct_barrier = tracer.barrier(2) if plan.freeze_feature_outputs else None
+            with tracer.invoke(tokens):
+                activations = self._verification_encode_layers(
+                    retained_nodes,
+                    barrier=activation_barrier,
+                    barrier_layers=intervention_layers,
+                )
+            if plan.interventions:
+                if not isinstance(baseline_state, _VerificationFreezeState):
+                    raise RuntimeError("verification baseline freeze state is unavailable")
+                skip_diffs: dict[int, Any] = {}
+
+                def freeze_attention() -> None:
+                    self._verification_freeze_attention(baseline_state)
+
+                layernorm_actions = []
+                if plan.freeze_layernorm_denominators:
+                    for group, locations in enumerate(self.layernorm_scale_locs):
+                        def freeze_layernorm(group=group, locations=locations) -> None:
+                            self._verification_freeze_layernorm_group(
+                                baseline_state, group, locations
+                            )
+
+                        layernorm_actions.append(freeze_layernorm)
+
+                def compute_skip_diffs() -> None:
+                    skip_diffs.update(self._verification_compute_skip_diffs(baseline_state))
+
+                def freeze_feature_outputs() -> None:
+                    self._verification_freeze_feature_outputs(
+                        baseline_state,
+                        skip_diffs,
+                        direct_effects_barrier=direct_barrier,
+                    )
+
+                _invoke_ordered_hook_families(
+                    tracer,
+                    attention=freeze_attention if plan.freeze_attention else None,
+                    layernorm_groups=tuple(layernorm_actions),
+                    feature_input=(
+                        compute_skip_diffs
+                        if plan.freeze_feature_outputs and self.skip_transcoder
+                        else None
+                    ),
+                    feature_output=(
+                        freeze_feature_outputs if plan.freeze_feature_outputs else None
+                    ),
+                )
+                with tracer.invoke():
+                    target_logit, mean_logit = self._verification_inject(
+                        plan,
+                        activations,
+                        target_position=target_position,
+                        target_token_id=target_token_id,
+                        activation_barrier=activation_barrier,
+                        direct_effects_barrier=direct_barrier,
+                    )
+            else:
+                with tracer.invoke():
+                    logits = self.output.logits[0, target_position - 1]
+                    target_logit = save(logits[target_token_id])
+                    mean_logit = save(logits.mean())
+            with tracer.invoke():
+                feature_values = self._verification_save_feature_values(
+                    activations, retained_nodes
+                )
+        return SelectiveProbeCapture(
+            target_logit,
+            mean_logit,
+            feature_values,
+            CaptureOrigin.INTERVENED_FORWARD,
+        )
+
+    def _verification_release(self, baseline_state: object | None) -> None:
+        if isinstance(baseline_state, _VerificationFreezeState):
+            baseline_state.clear()
+
+    def _verification_health_check(self, baseline_state: object | None) -> bool:
+        if getattr(self, "_verification_probe_active", False):
+            return False
+        if baseline_state is None:
+            return True
+        if not isinstance(baseline_state, _VerificationFreezeState):
+            return False
+        return not (
+            baseline_state.attention
+            or baseline_state.feature_output
+            or baseline_state.layernorm
+            or baseline_state.feature_input
+        )
 
     def ensure_tokenized(self, prompt: str | torch.Tensor | list[int]) -> torch.Tensor:
         """Convert prompt to 1-D tensor of token ids with proper special token handling.
