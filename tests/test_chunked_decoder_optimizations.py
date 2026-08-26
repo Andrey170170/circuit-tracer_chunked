@@ -3084,6 +3084,7 @@ def test_build_feature_semantic_descriptors_payload_is_bounded_and_deterministic
     assert payload["descriptor_kind"] == "fallback_identity_metadata_v1"
     assert payload["descriptor_dim"] == 8
     assert payload["semantic_descriptor_top_k"] == 3
+    assert payload["semantic_descriptor_control_limit"] == 3
     assert payload["candidate_count"] == 3
     assert payload["total_active_features"] == 5
     assert cast(torch.Tensor, payload["candidate_features"]).shape == (3, 3)
@@ -3142,6 +3143,29 @@ def test_build_feature_semantic_descriptors_refuses_unadmitted_handoff(
             semantic_descriptor_top_k=1,
             semantic_descriptor_dim=4,
         )
+
+
+def test_semantic_descriptor_controls_are_capped_at_eight() -> None:
+    payload = _build_feature_semantic_descriptors_payload(
+        active_features=torch.stack(
+            (
+                torch.zeros(12, dtype=torch.int64),
+                torch.arange(12, dtype=torch.int64),
+                torch.arange(12, dtype=torch.int64),
+            ),
+            dim=1,
+        ),
+        activation_values=torch.ones(12),
+        seed_feature_influences=torch.arange(12, dtype=torch.float64),
+        frontier_pre_locality=torch.arange(12),
+        frontier_post_locality=torch.arange(12),
+        total_active_features=12,
+        status="captured",
+        semantic_descriptor_top_k=12,
+        semantic_descriptor_dim=8,
+    )
+
+    assert payload["semantic_descriptor_control_limit"] == 8
 
 
 def test_build_feature_semantic_descriptors_payload_handles_missing_seed_scores() -> None:

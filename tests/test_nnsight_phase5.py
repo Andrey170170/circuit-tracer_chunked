@@ -25,6 +25,7 @@ from circuit_tracer.attribution.nnsight.phases.phase5 import (
 import circuit_tracer.attribution.nnsight.phases.phase5_full as phase5_full
 import circuit_tracer.attribution.nnsight.phases.phase5_artifacts as phase5_artifacts
 import circuit_tracer.attribution.nnsight.phases.phase5_publication as phase5_publication
+import circuit_tracer.attribution.nnsight.phases.phase5_decoder_descriptors as phase5_decoder_descriptors
 import circuit_tracer.attribution.nnsight.phase_support as phase_support
 from circuit_tracer.attribution.nnsight.row_denominator_evidence import (
     enable_row_denominator_audit,
@@ -432,12 +433,22 @@ def test_phase5_annotates_descriptors_and_records_cross_cluster_checkpoints(
             annotation_calls.append(selected_features.clone())
         ),
     )
+    projection_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        phase5_decoder_descriptors,
+        "attach_projected_decoder_signatures",
+        lambda payload, *, active_decoder_rows, decoder_provider: projection_calls.append(
+            payload
+        ),
+    )
 
     def record_checkpoint(**kwargs: object) -> None:
         checkpoints.append({"name": kwargs["checkpoint_name"], "phase": kwargs["phase"]})
 
     monkeypatch.setattr(phase5_publication, "_record_cross_cluster_checkpoint", record_checkpoint)
     inputs = _inputs(FakeObserver(), published, released)
+    inputs.runtime.ctx.require_sealed_active_decoder_rows = lambda: object()
+    inputs.runtime.ctx.decoder_provider = object()
     inputs = replace(
         inputs,
         diagnostics=replace(
@@ -462,6 +473,7 @@ def test_phase5_annotates_descriptors_and_records_cross_cluster_checkpoints(
     )
 
     assert [selected.tolist() for selected in annotation_calls] == [[0]]
+    assert projection_calls == [descriptors]
     assert result.output["feature_semantic_descriptors"] is descriptors
     assert result.output["correctness_row_denominator_evidence"] == {
         "complete": False,

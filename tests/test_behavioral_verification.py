@@ -537,6 +537,14 @@ class _MockHFConfig:
     vocab_size = 256
 
 
+class _MockGemma3TextConfig:
+    vocab_size = 256
+
+
+class _MockGemma3Config:
+    text_config = _MockGemma3TextConfig()
+
+
 class _MockSelectiveNNSightModel:
     backend = "nnsight"
     transcoders = _MockProvider()
@@ -681,6 +689,22 @@ def test_nnsight_adapter_retains_only_selective_union_isolates_variants_and_clea
         )
         for observation in result.observations
     )
+
+
+def test_nnsight_adapter_executes_with_gemma3_nested_text_config() -> None:
+    request = _execution_request(_request(max_variants=1))
+    model = _MockSelectiveNNSightModel()
+    model.config = _MockGemma3Config()
+
+    result = NNSightInterventionRuntime(
+        model,
+        synchronize=lambda model: None,
+        ordering_admission_mode=OrderingAdmissionMode.CANDIDATE_SMOKE,
+    ).evaluate(request)
+
+    assert result.status is RuntimeExecutionStatus.COMPLETE
+    assert result.refusal is None
+    assert model.baseline_calls
 
 
 def test_nnsight_adapter_refuses_unsupported_backend_without_starting_trace() -> None:

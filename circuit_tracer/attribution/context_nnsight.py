@@ -818,6 +818,19 @@ class AttributionContext:
         )
         return owner.active_row_bytes
 
+    def require_sealed_active_decoder_rows(self) -> ActiveDecoderRows:
+        """Return resident decoder evidence without transferring ownership.
+
+        Descriptor capture is intentionally downstream of the checkpoint
+        transition.  Refusing absent or unsealed residency keeps that capture
+        from silently reopening decoder pages or reading mutable state.
+        """
+
+        owner = self._validated_active_decoder_rows()
+        if owner is None or not owner.sealed:
+            raise RuntimeError("sealed active decoder rows are unavailable")
+        return owner
+
     def close_owned_decoder_resources_for_checkpoint_transition(self) -> None:
         """Close in-flight decoder ownership and clear only context-owned caches."""
 

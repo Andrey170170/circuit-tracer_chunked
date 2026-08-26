@@ -210,6 +210,16 @@ def _default_synchronize(model: Any) -> None:
         torch.cuda.synchronize(device)
 
 
+def _hf_config_dimension(config: object, name: str) -> int:
+    for candidate in (config, getattr(config, "text_config", None)):
+        if candidate is None:
+            continue
+        value = getattr(candidate, name, None)
+        if value is not None:
+            return int(value)
+    raise AttributeError(f"model config has no {name}")
+
+
 class NNSightInterventionRuntime:
     """Production adapter with selective retention and cooperative deadline admission."""
 
@@ -305,7 +315,7 @@ class NNSightInterventionRuntime:
         try:
             n_layers = int(getattr(self._model.cfg, "n_layers"))
             d_transcoder = int(getattr(provider, "d_transcoder"))
-            vocab_size = int(getattr(self._model.config, "vocab_size"))
+            vocab_size = _hf_config_dimension(self._model.config, "vocab_size")
         except (AttributeError, TypeError, ValueError) as error:
             return InterventionExecutionResult(
                 RuntimeExecutionStatus.REFUSED,

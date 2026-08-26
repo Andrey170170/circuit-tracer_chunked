@@ -7,7 +7,10 @@ import torch
 
 from circuit_tracer.attribution.context_nnsight import AttributionContext
 import circuit_tracer.attribution.nnsight.active_decoder_rows as active_decoder_rows_module
+import circuit_tracer.attribution.nnsight.phases.phase5_decoder_descriptors as descriptor_module
 from circuit_tracer.attribution.nnsight.active_decoder_rows import (
+    ActiveDecoderLayerRows,
+    ActiveDecoderRows,
     ActiveDecoderRowMemorySnapshot,
     resolve_active_decoder_row_admission,
 )
@@ -16,6 +19,9 @@ from circuit_tracer.attribution.nnsight.context_state import (
     ContextExecutionPolicy,
     ContextNumericPolicy,
     DecoderRuntime,
+)
+from circuit_tracer.attribution.nnsight.phases.phase5_decoder_descriptors import (
+    project_active_decoder_signatures,
 )
 from circuit_tracer.tracing.plan import FrontierExpansionPlan
 from circuit_tracer.transcoder.attribution_result import DecoderRowSeed, DecoderRowSeedLayer
@@ -308,6 +314,140 @@ def test_plt_active_row_build_matches_selected_provider_rows() -> None:
         provider.blocks[layer].numel() * provider.blocks[layer].element_size()
         for layer in provider.blocks
     )
+
+
+def test_sealed_active_decoder_rows_read_accessor_fails_closed() -> None:
+    provider = _provider()
+    ctx = _context(provider)
+
+    with pytest.raises(RuntimeError, match="sealed active decoder rows"):
+        ctx.require_sealed_active_decoder_rows()
+
+    assert ctx.prepare_active_decoder_rows(
+        requested=True,
+        enabled=True,
+        max_bytes=10_000,
+    )
+    with pytest.raises(RuntimeError, match="sealed active decoder rows"):
+        ctx.require_sealed_active_decoder_rows()
+
+    ctx.seal_active_decoder_rows_for_checkpoint_transition()
+    owner = ctx.require_sealed_active_decoder_rows()
+    assert owner is ctx._active_decoder_rows
+    assert owner.sealed is True
+
+
+def test_project_active_decoder_signatures_is_deterministic_bounded_and_no_reload() -> None:
+    provider = _provider()
+    ctx = _context(provider)
+    assert ctx.prepare_active_decoder_rows(
+        requested=True,
+        enabled=True,
+        max_bytes=10_000,
+    )
+    ctx.seal_active_decoder_rows_for_checkpoint_transition()
+    owner = ctx.require_sealed_active_decoder_rows()
+    active_features = ctx.activation_matrix.indices().T.detach().cpu()
+    candidate_rows = torch.tensor([0, 2, 4], dtype=torch.int64)
+    load_count = len(provider.load_calls)
+
+    first = project_active_decoder_signatures(
+        active_decoder_rows=owner,
+        decoder_provider=provider,
+        candidate_row_indices=candidate_rows,
+        candidate_features=active_features[candidate_rows],
+        descriptor_dim=8,
+    )
+    second = project_active_decoder_signatures(
+        active_decoder_rows=owner,
+        decoder_provider=provider,
+        candidate_row_indices=candidate_rows,
+        candidate_features=active_features[candidate_rows],
+        descriptor_dim=8,
+    )
+
+    assert len(provider.load_calls) == load_count
+    assert first.descriptor_kind == "active_decoder_countsketch_v1"
+    assert first.descriptor_scope == "active_occurrence_downstream_decoder_rows_v1"
+    assert first.sketch.shape == (3, 8)
+    assert torch.allclose(first.sketch.norm(dim=1), torch.ones(3), atol=1e-6)
+    assert torch.equal(first.sketch, second.sketch)
+    assert first.decoder_source_fingerprint == second.decoder_source_fingerprint
+    assert first.decoder_evidence_fingerprint == second.decoder_evidence_fingerprint
+    assert first.projection_fingerprint == second.projection_fingerprint
+    assert first.required_bytes <= first.max_bytes
+    assert first.workspace_peak_bytes <= first.max_bytes
+
+
+def test_project_active_decoder_signatures_near_bound_width_has_derived_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider()
+    monkeypatch.setattr(descriptor_module, "PROJECTION_MAX_BYTES", 1024 * 1024)
+    width = 15_000
+    rows = torch.ones((1, 1, width), dtype=torch.float32)
+    owner = ActiveDecoderRows(
+        layers=(
+            ActiveDecoderLayerRows(
+                source_layer=0,
+                global_row_start=0,
+                global_row_end=1,
+                output_layers=(0,),
+                rows=rows,
+            ),
+        ),
+        state_signature=(),
+        estimated_bytes=int(rows.numel() * rows.element_size()),
+        build_seconds=0.0,
+        build_traversal_bytes=0,
+        build_decoder_load_count=0,
+        build_decoder_load_bytes=0,
+        sealed=True,
+    )
+
+    projection = project_active_decoder_signatures(
+        active_decoder_rows=owner,
+        decoder_provider=provider,
+        candidate_row_indices=torch.tensor([0]),
+        candidate_features=torch.tensor([[0, 0, 1]]),
+        descriptor_dim=64,
+    )
+
+    expected_coordinate_peak = (
+        width * descriptor_module.PROJECTION_COORDINATE_PEAK_BYTES_PER_COLUMN
+    )
+    assert projection.workspace_peak_bytes >= expected_coordinate_peak
+    assert projection.required_bytes > 900_000
+    assert projection.required_bytes <= projection.max_bytes
+
+    refused_width = 17_000
+    refused_rows = torch.ones((1, 1, refused_width), dtype=torch.float32)
+    refused_owner = ActiveDecoderRows(
+        layers=(
+            ActiveDecoderLayerRows(
+                source_layer=0,
+                global_row_start=0,
+                global_row_end=1,
+                output_layers=(0,),
+                rows=refused_rows,
+            ),
+        ),
+        state_signature=(),
+        estimated_bytes=int(refused_rows.numel() * refused_rows.element_size()),
+        build_seconds=0.0,
+        build_traversal_bytes=0,
+        build_decoder_load_count=0,
+        build_decoder_load_bytes=0,
+        sealed=True,
+    )
+    with pytest.raises(MemoryError, match="coordinate generation"):
+        project_active_decoder_signatures(
+            active_decoder_rows=refused_owner,
+            decoder_provider=provider,
+            candidate_row_indices=torch.tensor([0]),
+            candidate_features=torch.tensor([[0, 0, 1]]),
+            descriptor_dim=64,
+        )
 
 
 @pytest.mark.parametrize("produced_range", [None, (1, 5)])

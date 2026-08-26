@@ -45,6 +45,24 @@ def select_graph_features(*, inputs: Phase5Inputs, config: Phase5Config) -> Sele
             active_features=inputs.graph.activation_matrix.indices().T,
             activation_values=inputs.graph.activation_matrix.values(),
         )
+        from circuit_tracer.attribution.nnsight.phases.phase5_decoder_descriptors import (
+            attach_projected_decoder_signatures,
+        )
+
+        ctx = inputs.runtime.ctx
+        try:
+            owner = ctx.require_sealed_active_decoder_rows()
+        except (AttributeError, RuntimeError):
+            owner = None
+        if owner is not None:
+            provider = getattr(ctx, "decoder_provider", None)
+            if provider is None:
+                raise RuntimeError("resident decoder rows are missing their active provider")
+            attach_projected_decoder_signatures(
+                descriptors,
+                active_decoder_rows=owner,
+                decoder_provider=provider,
+            )
     cpu = selected.detach().to(device="cpu", dtype=torch.long) if config.output_policy.compact_output else None
     return SelectedGraphFeatures(selected, cpu)
 

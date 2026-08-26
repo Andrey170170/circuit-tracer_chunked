@@ -950,7 +950,7 @@ def _build_feature_semantic_descriptors_payload(
         "seed_influence_available": bool(seed_influence_available),
         "semantic_sketch": semantic_sketch,
         "candidate_bound_kind": "final_selected_plus_seed_near_cutoff_controls_v1",
-        "semantic_descriptor_control_limit": int(top_k),
+        "semantic_descriptor_control_limit": min(8, int(top_k)),
         "semantic_descriptor_transient_policy_id": "bounded_seed_frontier_handoff_v1",
         "semantic_descriptor_transient_max_bytes": transient_max_bytes,
         "semantic_descriptor_transient_required_bytes": transient_required_bytes,
