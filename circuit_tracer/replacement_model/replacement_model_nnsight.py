@@ -597,6 +597,9 @@ class NNSightReplacementModel(LanguageModel):
 
         tokens = self._verification_tokens(prompt_token_ids)
         state = _VerificationFreezeState({}, {}, {}, {})
+        # NNSight mediator locals do not escape ``invoke`` like ordinary Python
+        # locals.  Mutate an outer collection with the explicitly saved handles.
+        feature_value_handles: list[tuple[FeatureNode, Any]] = []
         with (
             self._verification_probe_scope(),
             torch.inference_mode(),
@@ -608,7 +611,9 @@ class NNSightReplacementModel(LanguageModel):
                 logits = self.output.logits[0, target_position - 1]
                 target_logit = save(logits[target_token_id])
                 mean_logit = save(logits.mean())
-                feature_values = self._verification_save_feature_values(activations, retained_nodes)
+                feature_value_handles.extend(
+                    self._verification_save_feature_values(activations, retained_nodes)
+                )
             def capture_attention() -> None:
                 if retain_attention_state:
                     for layer, location in enumerate(self.attention_locs):
@@ -647,7 +652,7 @@ class NNSightReplacementModel(LanguageModel):
         return SelectiveProbeCapture(
             target_logit,
             mean_logit,
-            feature_values,
+            tuple(feature_value_handles),
             CaptureOrigin.BASELINE_FORWARD,
             state,
         )
@@ -792,6 +797,9 @@ class NNSightReplacementModel(LanguageModel):
         tokens = self._verification_tokens(prompt_token_ids)
         retained_nodes = tuple(sorted(set(plan.observed_nodes) | set(plan.retain_intervention_nodes)))
         intervention_layers = {item.node.layer for item in plan.interventions}
+        # Saved handles may escape through this outer collection; unsaved
+        # activation proxies must instead be re-created in each consuming invoke.
+        feature_value_handles: list[tuple[FeatureNode, Any]] = []
         with (
             self._verification_probe_scope(),
             torch.inference_mode(),
@@ -805,11 +813,7 @@ class NNSightReplacementModel(LanguageModel):
             )
             direct_barrier = tracer.barrier(2) if plan.freeze_feature_outputs else None
             with tracer.invoke(tokens):
-                activations = self._verification_encode_layers(
-                    retained_nodes,
-                    barrier=activation_barrier,
-                    barrier_layers=intervention_layers,
-                )
+                pass
             if plan.interventions:
                 if not isinstance(baseline_state, _VerificationFreezeState):
                     raise RuntimeError("verification baseline freeze state is unavailable")
@@ -852,6 +856,11 @@ class NNSightReplacementModel(LanguageModel):
                     ),
                 )
                 with tracer.invoke():
+                    activations = self._verification_encode_layers(
+                        retained_nodes,
+                        barrier=activation_barrier,
+                        barrier_layers=intervention_layers,
+                    )
                     target_logit, mean_logit = self._verification_inject(
                         plan,
                         activations,
@@ -866,13 +875,16 @@ class NNSightReplacementModel(LanguageModel):
                     target_logit = save(logits[target_token_id])
                     mean_logit = save(logits.mean())
             with tracer.invoke():
-                feature_values = self._verification_save_feature_values(
-                    activations, retained_nodes
+                observed_activations = self._verification_encode_layers(retained_nodes)
+                feature_value_handles.extend(
+                    self._verification_save_feature_values(
+                        observed_activations, retained_nodes
+                    )
                 )
         return SelectiveProbeCapture(
             target_logit,
             mean_logit,
-            feature_values,
+            tuple(feature_value_handles),
             CaptureOrigin.INTERVENED_FORWARD,
         )
 

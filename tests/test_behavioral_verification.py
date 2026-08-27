@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
+from nnsight import NNsight, save
 
 from circuit_tracer.verification import (
     AcceptedGraphView,
@@ -36,8 +39,12 @@ from circuit_tracer.verification import (
     verify_behavior,
 )
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
+from circuit_tracer.replacement_model.replacement_model_nnsight import (
+    NNSightReplacementModel,
+)
 from circuit_tracer.verification.nnsight_runtime import (
     CaptureOrigin,
+    NNSightInterventionPlan,
     NNSightVariantPlan,
     SelectiveProbeCapture,
     _invoke_ordered_hook_families,
@@ -618,6 +625,142 @@ class _MockSelectiveNNSightModel:
     def _verification_health_check(self, baseline_state: object) -> bool:
         self.health_checks += 1
         return not self.fail_release
+
+
+class _TinyRealNNSightVerificationHost:
+    def __init__(self) -> None:
+        self.model = NNsight(torch.nn.Linear(3, 5, bias=False))
+        self.zero_positions = slice(0, 0)
+        self.attention_locs = ()
+        self.layernorm_scale_locs = ()
+        self.feature_input_locs = ()
+        self.feature_output_locs = ()
+        self.skip_transcoder = False
+
+    def _verification_tokens(self, prompt_token_ids: tuple[int, ...]) -> torch.Tensor:
+        del prompt_token_ids
+        return torch.ones(1, 2, 3)
+
+    @contextmanager
+    def _verification_probe_scope(self):
+        yield
+
+    @contextmanager
+    def zero_softcap(self):
+        yield
+
+    def trace(self):
+        return self.model.trace()
+
+    @property
+    def output(self):
+        return SimpleNamespace(logits=self.model.output)
+
+    def _verification_encode_layers(self, retained_nodes, **kwargs):
+        del retained_nodes, kwargs
+        return {0: self.model.output}
+
+    _verification_save_feature_values = staticmethod(
+        NNSightReplacementModel._verification_save_feature_values
+    )
+
+    def _verification_inject(
+        self,
+        plan,
+        activations,
+        *,
+        target_position,
+        target_token_id,
+        activation_barrier,
+        direct_effects_barrier,
+    ):
+        del activation_barrier, direct_effects_barrier
+        intervention = plan.interventions[0]
+        node = intervention.node
+        activation = activations[node.layer][0, node.position, node.feature]
+        logits = self.output.logits[0, target_position - 1] + activation * 0
+        return save(logits[target_token_id]), save(logits.mean())
+
+
+def test_real_nnsight_baseline_returns_helper_saved_feature_values_across_invoke() -> None:
+    host = _TinyRealNNSightVerificationHost()
+    retained_node = FeatureNode(0, 0, 1)
+
+    capture = NNSightReplacementModel._verification_capture_baseline(
+        host,
+        (1, 2),
+        (retained_node,),
+        target_position=2,
+        target_token_id=1,
+        retain_attention_state=False,
+        retain_direct_freeze_state=False,
+    )
+
+    assert capture.origin is CaptureOrigin.BASELINE_FORWARD
+    assert tuple(node for node, _ in capture.feature_values) == (retained_node,)
+
+
+def test_real_nnsight_variant_returns_helper_saved_feature_values_across_invoke() -> None:
+    host = _TinyRealNNSightVerificationHost()
+    retained_node = FeatureNode(0, 0, 1)
+    plan = NNSightVariantPlan(
+        "no_op",
+        InterventionSemantics.DIRECT_FROZEN,
+        (),
+        (retained_node,),
+        (),
+        False,
+        False,
+        False,
+    )
+
+    capture = NNSightReplacementModel._verification_run_variant(
+        host,
+        (1, 2),
+        plan,
+        None,
+        target_position=2,
+        target_token_id=1,
+    )
+
+    assert capture.origin is CaptureOrigin.INTERVENED_FORWARD
+    assert tuple(node for node, _ in capture.feature_values) == (retained_node,)
+
+
+def test_real_nnsight_intervention_reencodes_inside_its_invoke() -> None:
+    host = _TinyRealNNSightVerificationHost()
+    retained_node = FeatureNode(0, 0, 1)
+    baseline = NNSightReplacementModel._verification_capture_baseline(
+        host,
+        (1, 2),
+        (retained_node,),
+        target_position=2,
+        target_token_id=1,
+        retain_attention_state=False,
+        retain_direct_freeze_state=False,
+    )
+    plan = NNSightVariantPlan(
+        "direct",
+        InterventionSemantics.DIRECT_FROZEN,
+        (NNSightInterventionPlan(retained_node, 2.0, 1.0, 1.0, (0,)),),
+        (retained_node,),
+        (retained_node,),
+        False,
+        False,
+        False,
+    )
+
+    capture = NNSightReplacementModel._verification_run_variant(
+        host,
+        (1, 2),
+        plan,
+        baseline.retained_state,
+        target_position=2,
+        target_token_id=1,
+    )
+
+    assert capture.origin is CaptureOrigin.INTERVENED_FORWARD
+    assert tuple(node for node, _ in capture.feature_values) == (retained_node,)
 
 
 def test_nnsight_translation_preserves_topology_and_exact_direct_delta() -> None:
