@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 import yaml
+from nnsight import Envoy
 from safetensors.torch import save_file
 
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
@@ -63,8 +66,9 @@ def test_legacy_normalization_ignores_only_missing_active_row_capability() -> No
     assert normalized_legacy != normalized_mismatch
 
 
-class _ConfiguredProvider:
+class _ConfiguredProvider(torch.nn.Module):
     def __init__(self, architecture: str) -> None:
+        super().__init__()
         self.n_layers = 2
         self.d_model = 4
         self.d_transcoder = 8
@@ -79,6 +83,20 @@ class _ConfiguredProvider:
             default_decoder_chunk_size=2,
             default_cross_batch_decoder_cache_bytes=0,
         )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value
+
+
+def test_provider_fingerprint_unwraps_nnsight_envoy() -> None:
+    provider = _ConfiguredProvider("plt")
+    wrapped_provider = Envoy(provider)
+
+    wrapped_fingerprint = provider_fingerprint(wrapped_provider)
+
+    assert wrapped_fingerprint == provider_fingerprint(provider)
+    assert wrapped_fingerprint["checkpoint_identity"] == "legacy-plt"
+    json.dumps(wrapped_fingerprint, sort_keys=True)
 
 
 @pytest.mark.parametrize("architecture", ["plt", "clt"])

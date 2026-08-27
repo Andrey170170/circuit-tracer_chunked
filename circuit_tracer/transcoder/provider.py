@@ -227,6 +227,12 @@ def provider_fingerprint(
     checkpoint_identity: object | None = None,
     dtype: object | None = None,
 ) -> dict[str, object]:
+    # NNSight exposes traced modules through an Envoy whose own ``scan`` is a
+    # method. Provider identity belongs to the wrapped module, not the tracing
+    # facade, so normalize that boundary before reading any fingerprint fields.
+    wrapped_module = getattr(obj, "_module", None)
+    if wrapped_module is not None:
+        obj = wrapped_module
     caps = get_transcoder_capabilities(obj)
     if checkpoint_identity is None:
         checkpoint_identity = getattr(obj, "scan", None)
