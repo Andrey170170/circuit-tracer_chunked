@@ -38,6 +38,7 @@ from circuit_tracer.verification import (
     TraceIdentity,
     VariantKind,
     plan_behavioral_variants,
+    select_necessity_features,
     verify_behavior,
 )
 from circuit_tracer.transcoder.provider import TranscoderCapabilities
@@ -56,11 +57,13 @@ from circuit_tracer.verification.nnsight_runtime import (
 )
 
 
-def _request(**policy: object) -> BehavioralVerificationRequest:
+def _request(*, include_alias: bool = False, **policy: object) -> BehavioralVerificationRequest:
     high = FeatureNode(2, 4, 10)
     negative = FeatureNode(4, 5, 11)
     other = FeatureNode(2, 6, 12)
     control = FeatureNode(2, 4, 99)
+    negative_control = FeatureNode(4, 5, 97)
+    other_control = FeatureNode(2, 6, 96)
     alias_control = FeatureNode(2, 7, 98)
     downstream_a = FeatureNode(6, 4, 200)
     downstream_b = FeatureNode(7, 5, 201)
@@ -70,8 +73,22 @@ def _request(**policy: object) -> BehavioralVerificationRequest:
         (
             FeatureEvidence(high, 2.0, 0.8, True, 0, (FeatureValue(downstream_a, 0.4),)),
             FeatureEvidence(negative, -3.0, -0.5, True, 1, (FeatureValue(downstream_b, -0.25),)),
-            FeatureEvidence(other, 1.0, 0.2, True, 2, (FeatureValue(downstream_c, 0.1),)),
-            FeatureEvidence(control, 2.1, 0.01, False),
+            FeatureEvidence(other, 1.0, 0.3, True, 2, (FeatureValue(downstream_c, 0.1),)),
+            FeatureEvidence(control, 2.1, 0.01, False, necessity_control_for=high),
+            FeatureEvidence(
+                negative_control,
+                -2.9,
+                -0.02,
+                False,
+                necessity_control_for=negative,
+            ),
+            FeatureEvidence(
+                other_control,
+                1.1,
+                0.015,
+                False,
+                necessity_control_for=other,
+            ),
             FeatureEvidence(alias_control, 1.8, 0.005, False),
         ),
     )
@@ -110,7 +127,7 @@ def _request(**policy: object) -> BehavioralVerificationRequest:
                 predicted_target_delta=-0.2,
                 control_candidates=(AliasControlCandidate(alias_control, 0.05),),
             ),
-        ),
+        ) if include_alias else (),
     )
 
 
@@ -147,7 +164,7 @@ def _exact_scripts(
     }
 def test_planner_uses_explicit_semantics_absolute_values_and_required_no_op() -> None:
     variants = plan_behavioral_variants(_request())
-    assert len(variants) == 8  # baseline capture is deliberately not counted
+    assert len(variants) == 10  # baseline capture is deliberately not counted
     assert variants[0].kind is VariantKind.NO_OP
     assert variants[0].interventions == ()
     direct = [item for item in variants if item.kind is VariantKind.DIRECT_DOUBLE]
@@ -164,18 +181,66 @@ def test_planner_uses_explicit_semantics_absolute_values_and_required_no_op() ->
         item.semantics is InterventionSemantics.PROPAGATED_FROZEN_ATTENTION
         for item in necessity
     )
-    assert [item.interventions[0].node.feature for item in necessity] == [10, 99]
+    assert [item.interventions[0].node.feature for item in necessity] == [10, 11, 12, 99, 97, 96]
+    assert all("pair" in item.variant_id for item in necessity)
     assert all(item.interventions[0].absolute_value == 0.0 for item in necessity)
+
+
+def test_churn_plan_reuses_necessity_source_and_adds_only_one_alias_variant() -> None:
+    variants = plan_behavioral_variants(_request(include_alias=True))
+    assert len(variants) == 8
+    assert not any(item.kind is VariantKind.DIRECT_DOUBLE for item in variants)
+    assert sum(item.kind is VariantKind.NECESSITY_HIGH for item in variants) == 3
+    assert sum(item.kind is VariantKind.NECESSITY_CONTROL for item in variants) == 3
     alias = next(item for item in variants if item.kind is VariantKind.ALIAS_SUBSTITUTION)
     assert alias.kind is VariantKind.ALIAS_SUBSTITUTION
     assert [item.absolute_value for item in alias.interventions] == [0.0, 5.0]
+
+
+def test_low_variant_limit_admits_only_complete_necessity_pairs() -> None:
+    assert [item.kind for item in plan_behavioral_variants(_request(max_variants=2))] == [
+        VariantKind.NO_OP
+    ]
+    variants = plan_behavioral_variants(_request(max_variants=3))
+    assert [item.kind for item in variants] == [
+        VariantKind.NO_OP,
+        VariantKind.NECESSITY_HIGH,
+        VariantKind.NECESSITY_CONTROL,
+    ]
+    assert "pair0" in variants[1].variant_id
+    assert "pair0" in variants[2].variant_id
+
+
+def test_required_necessity_anchor_is_included_deterministically() -> None:
+    request = _request()
+    required = FeatureNode(5, 7, 13)
+    graph = AcceptedGraphView(
+        request.graph.graph_fingerprint,
+        request.graph.features
+        + (
+            FeatureEvidence(required, 1.0, 0.26, True, 3),
+            FeatureEvidence(
+                FeatureNode(5, 7, 95),
+                1.1,
+                0.0,
+                False,
+                necessity_control_for=required,
+            ),
+        ),
+    )
+    selected = select_necessity_features(
+        graph,
+        sample_count=3,
+        required_nodes=(required,),
+    )
+    assert required in {item.node for item in selected}
 
 
 def test_limits_and_graph_identity_are_structural_caller_errors() -> None:
     with pytest.raises(ValueError, match="policy_id"):
         BehavioralProbePolicy(policy_id="unversioned")
     with pytest.raises(ValueError, match="max_variants"):
-        BehavioralProbePolicy(max_variants=9)
+        BehavioralProbePolicy(max_variants=11)
     with pytest.raises(ValueError, match="max_seconds"):
         BehavioralProbePolicy(max_seconds=121)
     request = _request()
@@ -301,14 +366,35 @@ def test_no_op_drift_or_unconfirmed_teardown_makes_evidence_unknown() -> None:
     assert "runtime teardown was not confirmed" in report.reasons
 
 
+def test_calibrated_no_op_drift_is_a_hard_contradiction() -> None:
+    calibration = FrozenBehavioralCalibration(
+        "no-op-v1",
+        "behavioral_closure_v1",
+        direct_max_relative_closure=0.10,
+    )
+    request = _request(calibration=calibration)
+    scripts = _exact_scripts(request)
+    scripts["no_op"] = ScriptedVariant(10.0 + 2e-6)
+    report = verify_behavior(
+        request,
+        DeterministicInterventionRuntime(_baseline(request), scripts),
+    )
+    assert report.no_op_passed is False
+    assert report.evidence_completeness is EvidenceCompleteness.UNKNOWN
+    assert report.verdict is FaithfulnessVerdict.CONTRADICTED
+
+
 def test_frozen_calibration_separates_complete_evidence_from_supported_verdict() -> None:
     calibration = FrozenBehavioralCalibration(
         calibration_id="granite-behavior-v1",
         policy_id="behavioral_closure_v1",
-        direct_max_mean_abs_closure=0.01,
-        direct_min_sign_agreement=1.0,
-        necessity_min_high_control_separation=0.5,
-        alias_max_mean_abs_closure=0.01,
+        direct_max_mean_relative_closure=0.05,
+        direct_max_relative_closure=0.10,
+        direct_min_sign_agreement=0.95,
+        downstream_max_mean_relative_closure=0.05,
+        downstream_max_p95_relative_closure=0.10,
+        necessity_min_predicted_realized_spearman=0.8,
+        necessity_min_median_high_control_effect_ratio=2.0,
     )
     request = _request(calibration=calibration)
     scripts = _exact_scripts(request)
@@ -322,15 +408,16 @@ def test_frozen_calibration_separates_complete_evidence_from_supported_verdict()
     assert report.verdict is FaithfulnessVerdict.SUPPORTED
     assert report.calibration_id == "granite-behavior-v1"
     assert report.metrics.direct_mean_abs_closure == pytest.approx(0.0)
+    assert report.metrics.direct_mean_relative_closure == pytest.approx(0.0)
+    assert report.metrics.direct_max_relative_closure == pytest.approx(0.0)
     assert report.metrics.direct_sign_agreement == pytest.approx(1.0)
-    assert report.metrics.necessity_high_vs_control_separation == pytest.approx(0.79)
-    assert report.metrics.alias_mean_abs_target_delta == pytest.approx(0.2)
-    assert report.metrics.alias_mean_abs_closure == pytest.approx(0.0)
-    assert report.alias_comparator_status is AliasComparatorStatus.COMPLETE
-    assert report.metrics.alias_substitution_vs_source_ablation == pytest.approx(0.6)
-    assert report.metrics.alias_control_vs_source_ablation == pytest.approx(0.8)
-    assert report.metrics.alias_substitution_advantage == pytest.approx(-0.2)
+    assert report.metrics.necessity_high_vs_control_separation == pytest.approx(0.485)
+    assert report.metrics.necessity_predicted_realized_spearman == pytest.approx(1.0)
+    assert report.metrics.necessity_median_high_control_effect_ratio == pytest.approx(0.5 / 0.015)
+    assert report.alias_comparator_status is AliasComparatorStatus.NOT_APPLICABLE
     assert report.metrics.downstream_mean_abs_closure == pytest.approx(0.0)
+    assert report.metrics.downstream_mean_relative_closure == pytest.approx(0.0)
+    assert report.metrics.downstream_p95_relative_closure == pytest.approx(0.0)
     first_direct = next(item for item in report.evidence if item.kind is VariantKind.DIRECT_DOUBLE)
     assert first_direct.downstream_closure[0].node == FeatureNode(6, 4, 200)
     assert first_direct.downstream_closure[0].predicted_delta == pytest.approx(0.4)
@@ -342,11 +429,11 @@ def test_frozen_calibration_separates_complete_evidence_from_supported_verdict()
     assert report.sufficiency is SufficiencyStatus.UNKNOWN
 
 
-def test_calibrated_failed_threshold_is_contradicted_and_missing_metric_is_inconclusive() -> None:
+def test_calibrated_failed_threshold_is_contradicted_and_missing_metric_is_unknown() -> None:
     direct_calibration = FrozenBehavioralCalibration(
         "direct-v1",
         "behavioral_closure_v1",
-        direct_max_mean_abs_closure=0.01,
+        direct_max_relative_closure=0.10,
     )
     request = _request(calibration=direct_calibration)
     variants = plan_behavioral_variants(request)
@@ -371,20 +458,53 @@ def test_calibrated_failed_threshold_is_contradicted_and_missing_metric_is_incon
     alias_calibration = FrozenBehavioralCalibration(
         "alias-v1",
         "behavioral_closure_v1",
-        alias_max_mean_abs_closure=0.1,
+        alias_max_relative_effect_error=0.2,
     )
     request_without_alias_probe = _request(
+        include_alias=True,
         calibration=alias_calibration,
-        max_variants=6,
+        max_variants=7,
     )
     variants = plan_behavioral_variants(request_without_alias_probe)
     scripts = _exact_scripts(request_without_alias_probe)
-    inconclusive = verify_behavior(
+    unknown = verify_behavior(
         request_without_alias_probe,
         DeterministicInterventionRuntime(_baseline(request_without_alias_probe), scripts),
     )
-    assert inconclusive.evidence_completeness is EvidenceCompleteness.COMPLETE
-    assert inconclusive.verdict is FaithfulnessVerdict.INCONCLUSIVE
+    assert unknown.evidence_completeness is EvidenceCompleteness.COMPLETE
+    assert unknown.verdict is FaithfulnessVerdict.UNKNOWN
+
+
+def test_calibrated_mean_review_band_is_inconclusive_but_hard_limit_passes() -> None:
+    calibration = FrozenBehavioralCalibration(
+        "review-v1",
+        "behavioral_closure_v1",
+        direct_max_mean_relative_closure=0.05,
+        direct_max_relative_closure=0.10,
+    )
+    request = _request(calibration=calibration)
+    scripts = _exact_scripts(request)
+    baseline = _baseline(request)
+    scripts.update(
+        {
+            variant.variant_id: ScriptedVariant(
+                baseline.target_value + 0.94 * variant.predicted_target_delta,
+                downstream_feature_values=scripts[
+                    variant.variant_id
+                ].downstream_feature_values,
+            )
+            for variant in plan_behavioral_variants(request)
+            if variant.kind is VariantKind.DIRECT_DOUBLE
+            and variant.predicted_target_delta is not None
+        }
+    )
+    report = verify_behavior(
+        request,
+        DeterministicInterventionRuntime(baseline, scripts),
+    )
+    assert report.metrics.direct_mean_relative_closure == pytest.approx(0.06)
+    assert report.metrics.direct_max_relative_closure == pytest.approx(0.06)
+    assert report.verdict is FaithfulnessVerdict.INCONCLUSIVE
 
 
 def test_all_public_numeric_evidence_rejects_nonfinite_values() -> None:
@@ -411,8 +531,8 @@ def test_necessity_claim_is_omitted_without_a_same_layer_control() -> None:
     assert VariantKind.NECESSITY_CONTROL not in kinds
 
 
-def test_alias_comparator_is_not_applicable_without_control_similarity_data() -> None:
-    request = _request()
+def test_alias_substitution_reuses_necessity_source_without_alias_control() -> None:
+    request = _request(include_alias=True)
     alias = request.aliases[0]
     without_controls = BehavioralVerificationRequest(
         request.identity,
@@ -428,14 +548,18 @@ def test_alias_comparator_is_not_applicable_without_control_similarity_data() ->
         ),
     )
     variants = plan_behavioral_variants(without_controls)
-    assert not any(item.kind.value.startswith("alias_") for item in variants)
+    assert sum(item.kind is VariantKind.ALIAS_SUBSTITUTION for item in variants) == 1
+    assert not any(
+        item.kind in (VariantKind.ALIAS_SOURCE_ABLATION, VariantKind.ALIAS_CONTROL)
+        for item in variants
+    )
     report = verify_behavior(
         without_controls,
         DeterministicInterventionRuntime(
             _baseline(without_controls), _exact_scripts(without_controls)
         ),
     )
-    assert report.alias_comparator_status is AliasComparatorStatus.NOT_APPLICABLE
+    assert report.alias_comparator_status is AliasComparatorStatus.COMPLETE
 
 
 def test_hook_families_get_separate_ordered_mediators() -> None:
@@ -1094,7 +1218,7 @@ def test_nnsight_adapter_refuses_unsupported_backend_without_starting_trace() ->
 def test_nnsight_adapter_refuses_unqualified_ordering_and_canonical_zero_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request = _execution_request(_request(max_variants=2))
+    request = _execution_request(_request(max_variants=3))
     model = _MockSelectiveNNSightModel()
     unqualified = NNSightInterventionRuntime(
         model, synchronize=lambda model: None
@@ -1204,7 +1328,7 @@ def test_nnsight_ordering_admission_is_canonical_fingerprinted_evidence() -> Non
 
 
 def test_report_json_is_canonical_versioned_and_fingerprinted() -> None:
-    request = _request(max_variants=4)
+    request = _request(include_alias=True)
     report = verify_behavior(
         request,
         DeterministicInterventionRuntime(
@@ -1216,7 +1340,7 @@ def test_report_json_is_canonical_versioned_and_fingerprinted() -> None:
     document = json.loads(first)
     assert first == second
     assert document["schema"] == "behavioral_faithfulness_report"
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     assert document["evidence_fingerprint"] == report.evidence_fingerprint
     assert document["report"]["trace_identity"]["provider_fingerprint"] == "provider-1"
     assert document["report"]["variant_recipes"][0]["kind"] == "no_op"
@@ -1237,11 +1361,11 @@ def test_report_json_is_canonical_versioned_and_fingerprinted() -> None:
     assert replace(report, alias_selections=(changed_alias,)).evidence_fingerprint != (
         report.evidence_fingerprint
     )
-    direct_recipe = next(
+    alias_recipe = next(
         item
         for item in document["report"]["variant_recipes"]
-        if item["kind"] == "direct_double"
+        if item["kind"] == "alias_substitution"
     )
-    assert direct_recipe["semantics"] == "direct_frozen"
-    assert direct_recipe["interventions"][0]["graph_baseline_value"] == 2.0
-    assert direct_recipe["interventions"][0]["graph_delta"] == 2.0
+    assert alias_recipe["semantics"] == "propagated_frozen_attention"
+    assert alias_recipe["interventions"][0]["graph_baseline_value"] == 2.0
+    assert alias_recipe["interventions"][0]["graph_delta"] == -2.0

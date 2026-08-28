@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-MAX_PROBE_VARIANTS = 8
+MAX_PROBE_VARIANTS = 10
 MAX_PROBE_SECONDS = 120.0
+DEFAULT_DIRECT_MIN_ABS_PREDICTED_TARGET_DELTA = 0.25
+DEFAULT_RELATIVE_ERROR_EPSILON = 1e-6
 
 
 class InterventionSemantics(str, Enum):
@@ -94,6 +96,7 @@ class FeatureEvidence:
     selected: bool
     selection_rank: int | None = None
     predicted_downstream_feature_deltas: tuple["FeatureValue", ...] = ()
+    necessity_control_for: FeatureNode | None = None
 
     def __post_init__(self) -> None:
         _finite("feature evidence", self.baseline_preactivation, self.target_influence)
@@ -101,6 +104,8 @@ class FeatureEvidence:
             raise ValueError("selected features require a rank and controls must not have one")
         if self.selection_rank is not None and self.selection_rank < 0:
             raise ValueError("selection_rank must be nonnegative")
+        if self.selected and self.necessity_control_for is not None:
+            raise ValueError("selected features cannot be necessity controls")
         nodes = tuple(item.node for item in self.predicted_downstream_feature_deltas)
         if len(set(nodes)) != len(nodes):
             raise ValueError("predicted downstream feature deltas must be unique")
@@ -119,6 +124,23 @@ class AcceptedGraphView:
             raise ValueError("accepted graph feature nodes must be unique")
         if not any(item.selected for item in self.features):
             raise ValueError("accepted graph must contain a selected feature")
+        feature_by_node = {item.node: item for item in self.features}
+        control_owners = [
+            item.necessity_control_for
+            for item in self.features
+            if item.necessity_control_for is not None
+        ]
+        if len(set(control_owners)) != len(control_owners):
+            raise ValueError("necessity controls must have unique selected owners")
+        for item in self.features:
+            owner_node = item.necessity_control_for
+            if owner_node is None:
+                continue
+            owner = feature_by_node.get(owner_node)
+            if owner is None or not owner.selected:
+                raise ValueError("necessity control owner must be a selected graph feature")
+            if owner.node.layer != item.node.layer:
+                raise ValueError("necessity controls must be matched within a layer")
 
 
 @dataclass(frozen=True)
@@ -245,18 +267,36 @@ class FrozenBehavioralCalibration:
 
     calibration_id: str
     policy_id: str
+    direct_min_abs_predicted_target_delta: float = (
+        DEFAULT_DIRECT_MIN_ABS_PREDICTED_TARGET_DELTA
+    )
+    relative_error_epsilon: float = DEFAULT_RELATIVE_ERROR_EPSILON
+    direct_max_mean_relative_closure: float | None = None
+    direct_max_relative_closure: float | None = None
     direct_max_mean_abs_closure: float | None = None
     direct_min_sign_agreement: float | None = None
+    downstream_max_mean_relative_closure: float | None = None
+    downstream_max_p95_relative_closure: float | None = None
+    necessity_min_predicted_realized_spearman: float | None = None
+    necessity_min_median_high_control_effect_ratio: float | None = None
     necessity_min_high_control_separation: float | None = None
+    alias_max_relative_effect_error: float | None = None
     alias_max_mean_abs_closure: float | None = None
 
     def __post_init__(self) -> None:
         if not self.calibration_id or not _versioned_policy_id(self.policy_id):
             raise ValueError("calibration identity fields must not be empty")
         thresholds = (
+            self.direct_max_mean_relative_closure,
+            self.direct_max_relative_closure,
             self.direct_max_mean_abs_closure,
             self.direct_min_sign_agreement,
+            self.downstream_max_mean_relative_closure,
+            self.downstream_max_p95_relative_closure,
+            self.necessity_min_predicted_realized_spearman,
+            self.necessity_min_median_high_control_effect_ratio,
             self.necessity_min_high_control_separation,
+            self.alias_max_relative_effect_error,
             self.alias_max_mean_abs_closure,
         )
         if all(value is None for value in thresholds):
@@ -266,8 +306,22 @@ class FrozenBehavioralCalibration:
                 _finite("calibration thresholds", value)
                 if value < 0:
                     raise ValueError("calibration thresholds must be nonnegative")
+        _finite(
+            "calibration numeric policy",
+            self.direct_min_abs_predicted_target_delta,
+            self.relative_error_epsilon,
+        )
+        if self.direct_min_abs_predicted_target_delta <= 0:
+            raise ValueError("direct eligibility threshold must be positive")
+        if self.relative_error_epsilon != DEFAULT_RELATIVE_ERROR_EPSILON:
+            raise ValueError("relative error epsilon must be exactly 1e-6 for v1")
         if self.direct_min_sign_agreement is not None and self.direct_min_sign_agreement > 1:
             raise ValueError("direct_min_sign_agreement must be at most one")
+        if (
+            self.necessity_min_predicted_realized_spearman is not None
+            and self.necessity_min_predicted_realized_spearman > 1
+        ):
+            raise ValueError("necessity Spearman threshold must be at most one")
 
 
 @dataclass(frozen=True)
@@ -277,12 +331,13 @@ class BehavioralProbePolicy:
     max_variants: int = MAX_PROBE_VARIANTS
     max_seconds: float = MAX_PROBE_SECONDS
     direct_sample_count: int = 3
+    necessity_sample_count: int = 3
     alias_sample_count: int = 1
     cleanup_reserve_seconds: float = 1.0
     predicted_baseline_seconds: float = 1.0
     predicted_variant_seconds: float = 1.0
-    no_op_absolute_tolerance: float = 1e-5
-    no_op_relative_tolerance: float = 1e-5
+    no_op_absolute_tolerance: float = 1e-6
+    no_op_relative_tolerance: float = 0.0
 
     def __post_init__(self) -> None:
         if not _versioned_policy_id(self.policy_id):
@@ -295,6 +350,7 @@ class BehavioralProbePolicy:
             raise ValueError(f"max_seconds must be in (0, {MAX_PROBE_SECONDS}]")
         values = (
             self.direct_sample_count,
+            self.necessity_sample_count,
             self.alias_sample_count,
             self.cleanup_reserve_seconds,
             self.predicted_baseline_seconds,
@@ -315,6 +371,16 @@ class BehavioralProbePolicy:
         )
         if self.cleanup_reserve_seconds >= self.max_seconds:
             raise ValueError("cleanup reserve must be smaller than the deadline")
+        if self.calibration is not None:
+            if self.direct_sample_count != 3 or self.necessity_sample_count != 3:
+                raise ValueError(
+                    "calibrated v1 verification requires three direct and necessity samples"
+                )
+            if (
+                self.no_op_absolute_tolerance != 1e-6
+                or self.no_op_relative_tolerance != 0.0
+            ):
+                raise ValueError("calibrated v1 requires an absolute 1e-6 no-op tolerance")
 
 
 @dataclass(frozen=True)
@@ -405,7 +471,7 @@ class InterventionExecutionRequest:
         if sum(item.kind is VariantKind.NO_OP for item in self.variants) != 1:
             raise ValueError("exactly one no-op is required")
         if len(self.variants) > MAX_PROBE_VARIANTS:
-            raise ValueError("at most eight variants are permitted")
+            raise ValueError(f"at most {MAX_PROBE_VARIANTS} variants are permitted")
         expected_nodes = tuple(
             sorted(
                 {
@@ -541,30 +607,49 @@ class DownstreamClosure:
 @dataclass(frozen=True)
 class BehavioralAggregateMetrics:
     direct_mean_abs_closure: float | None
+    direct_mean_relative_closure: float | None
+    direct_max_relative_closure: float | None
     direct_sign_agreement: float | None
     necessity_high_vs_control_separation: float | None
+    necessity_predicted_realized_spearman: float | None
+    necessity_median_high_control_effect_ratio: float | None
     alias_mean_abs_target_delta: float | None
     alias_mean_abs_closure: float | None
+    alias_relative_effect_error: float | None
     alias_substitution_vs_source_ablation: float | None
     alias_control_vs_source_ablation: float | None
     alias_substitution_advantage: float | None
     downstream_mean_abs_closure: float | None
+    downstream_mean_relative_closure: float | None
+    downstream_p95_relative_closure: float | None
 
     def __post_init__(self) -> None:
         values = (
             self.direct_mean_abs_closure,
+            self.direct_mean_relative_closure,
+            self.direct_max_relative_closure,
             self.direct_sign_agreement,
             self.necessity_high_vs_control_separation,
+            self.necessity_predicted_realized_spearman,
+            self.necessity_median_high_control_effect_ratio,
             self.alias_mean_abs_target_delta,
             self.alias_mean_abs_closure,
+            self.alias_relative_effect_error,
             self.alias_substitution_vs_source_ablation,
             self.alias_control_vs_source_ablation,
             self.alias_substitution_advantage,
             self.downstream_mean_abs_closure,
+            self.downstream_mean_relative_closure,
+            self.downstream_p95_relative_closure,
         )
         _finite("behavioral aggregate metrics", *(value for value in values if value is not None))
         if self.direct_sign_agreement is not None and not 0 <= self.direct_sign_agreement <= 1:
             raise ValueError("direct_sign_agreement must be in [0, 1]")
+        if (
+            self.necessity_predicted_realized_spearman is not None
+            and not -1 <= self.necessity_predicted_realized_spearman <= 1
+        ):
+            raise ValueError("necessity Spearman must be in [-1, 1]")
 
 
 @dataclass(frozen=True)

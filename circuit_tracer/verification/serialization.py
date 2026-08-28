@@ -8,7 +8,7 @@ from .contracts import BehavioralFaithfulnessReport, FeatureNode, FeatureValue
 
 
 SCHEMA = "behavioral_faithfulness_report"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _node(node: FeatureNode) -> dict[str, int]:
@@ -125,12 +125,21 @@ def _payload(report: BehavioralFaithfulnessReport) -> dict[str, Any]:
         ],
         "metrics": {
             "direct_mean_abs_closure": report.metrics.direct_mean_abs_closure,
+            "direct_mean_relative_closure": report.metrics.direct_mean_relative_closure,
+            "direct_max_relative_closure": report.metrics.direct_max_relative_closure,
             "direct_sign_agreement": report.metrics.direct_sign_agreement,
             "necessity_high_vs_control_separation": (
                 report.metrics.necessity_high_vs_control_separation
             ),
+            "necessity_predicted_realized_spearman": (
+                report.metrics.necessity_predicted_realized_spearman
+            ),
+            "necessity_median_high_control_effect_ratio": (
+                report.metrics.necessity_median_high_control_effect_ratio
+            ),
             "alias_mean_abs_target_delta": report.metrics.alias_mean_abs_target_delta,
             "alias_mean_abs_closure": report.metrics.alias_mean_abs_closure,
+            "alias_relative_effect_error": report.metrics.alias_relative_effect_error,
             "alias_substitution_vs_source_ablation": (
                 report.metrics.alias_substitution_vs_source_ablation
             ),
@@ -139,6 +148,12 @@ def _payload(report: BehavioralFaithfulnessReport) -> dict[str, Any]:
             ),
             "alias_substitution_advantage": report.metrics.alias_substitution_advantage,
             "downstream_mean_abs_closure": report.metrics.downstream_mean_abs_closure,
+            "downstream_mean_relative_closure": (
+                report.metrics.downstream_mean_relative_closure
+            ),
+            "downstream_p95_relative_closure": (
+                report.metrics.downstream_p95_relative_closure
+            ),
         },
         "evidence": [
             {

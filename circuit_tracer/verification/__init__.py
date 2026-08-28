@@ -1,4 +1,10 @@
-from .behavioral import plan_behavioral_variants, select_direct_features, verify_behavior
+from .behavioral import (
+    plan_behavioral_variants,
+    select_direct_features,
+    select_necessity_features,
+    select_necessity_pairs,
+    verify_behavior,
+)
 from .contracts import (
     AcceptedGraphView,
     AliasComparatorStatus,
@@ -48,5 +54,6 @@ __all__ = [
     "PreactivationIntervention", "RuntimeExecutionStatus", "RuntimeRefusal", "ScriptedVariant",
     "SufficiencyStatus", "TargetFunctional", "TargetState", "TraceIdentity", "VariantEvidence",
     "VariantKind", "VariantObservation", "plan_behavioral_variants", "select_direct_features",
+    "select_necessity_features", "select_necessity_pairs",
     "verify_behavior",
 ]
