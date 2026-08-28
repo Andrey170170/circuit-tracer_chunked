@@ -13,7 +13,10 @@ from circuit_tracer.attribution.sparsification import (
     filter_sparse_activations,
     select_candidate_feature_indices,
 )
-from circuit_tracer.transcoder.activation_functions import JumpReLU
+from circuit_tracer.transcoder.activation_functions import (
+    JumpReLU,
+    require_independent_feature_activation,
+)
 from circuit_tracer.transcoder.decoder_cache import DecoderChunkCache
 from circuit_tracer.transcoder.diagnostics import DiagnosticsMixin
 from circuit_tracer.transcoder.fingerprints import FingerprintMixin
@@ -334,6 +337,20 @@ class CrossLayerTranscoder(FingerprintMixin, DiagnosticsMixin, torch.nn.Module):
         else:
             features = self.activation_function(features)
         return features
+
+    def apply_activation_function_to_feature(
+        self, layer_id: int, feature_id: int, preactivations
+    ):
+        """Activate candidate preactivations for one feature without exposing provider shape."""
+        if not 0 <= feature_id < self.d_transcoder:
+            raise ValueError("feature_id is outside the provider feature axis")
+        require_independent_feature_activation(self.activation_function)
+        feature_mask = F.one_hot(
+            torch.tensor(feature_id, device=self.device),
+            num_classes=self.d_transcoder,
+        )
+        full_preactivations = preactivations.unsqueeze(-1) * feature_mask
+        return self.apply_activation_function(layer_id, full_preactivations)[..., feature_id]
 
     def encode_layer(self, x, layer_id, apply_activation_function=True):
         W_enc_layer = self._get_encoder_weights(layer_id)

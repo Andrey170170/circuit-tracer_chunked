@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 from nnsight import NNsight, save
+from nnsight.intervention.interleaver import Mediator
+from transformers import Gemma3Config, Gemma3ForConditionalGeneration, Gemma3TextConfig
 
 from circuit_tracer.verification import (
     AcceptedGraphView,
@@ -486,15 +488,28 @@ def test_hook_families_get_separate_ordered_mediators() -> None:
 def test_provider_activation_and_skip_semantics_are_applied_to_preactivations() -> None:
     class _Provider:
         @staticmethod
-        def apply_activation_function(layer: int, values: torch.Tensor) -> torch.Tensor:
+        def apply_activation_function_to_feature(
+            layer: int, feature: int, values: torch.Tensor
+        ) -> torch.Tensor:
+            del layer, feature
             return torch.relu(values)
+
+        @staticmethod
+        def encode_layer(
+            values: torch.Tensor,
+            layer: int,
+            *,
+            apply_activation_function: bool,
+        ) -> torch.Tensor:
+            del layer, apply_activation_function
+            return values
 
         @staticmethod
         def compute_skip(layer: int, values: torch.Tensor) -> torch.Tensor:
             return values * 2
 
     provider = _Provider()
-    assert _provider_activation_delta(provider, 0, torch.tensor(-1.0), 3.0).item() == 3.0
+    assert _provider_activation_delta(provider, 0, 0, torch.tensor(-1.0), 3.0).item() == 3.0
     correction = _skip_transcoder_correction(
         provider,
         0,
@@ -672,14 +687,138 @@ class _TinyRealNNSightVerificationHost:
         target_position,
         target_token_id,
         activation_barrier,
-        direct_effects_barrier,
+        direct_effects_barriers,
     ):
-        del activation_barrier, direct_effects_barrier
+        del activation_barrier, direct_effects_barriers
         intervention = plan.interventions[0]
         node = intervention.node
         activation = activations[node.layer][0, node.position, node.feature]
         logits = self.output.logits[0, target_position - 1] + activation * 0
         return save(logits[target_token_id]), save(logits.mean())
+
+
+class _TinyRealNNSightDirectFreezeHost(_TinyRealNNSightVerificationHost):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = NNsight(
+            torch.nn.Sequential(
+                torch.nn.Linear(3, 3, bias=False),
+                torch.nn.Linear(3, 5, bias=False),
+            )
+        )
+        self.feature_output_locs = (self.model[0], self.model[1])
+
+    _verification_freeze_feature_output = (
+        NNSightReplacementModel._verification_freeze_feature_output
+    )
+
+    def _verification_inject(
+        self,
+        plan,
+        activations,
+        *,
+        target_position,
+        target_token_id,
+        activation_barrier,
+        direct_effects_barriers,
+    ):
+        del activation_barrier
+        intervention = plan.interventions[0]
+        node = intervention.node
+        activation = activations[node.layer][0, node.position, node.feature]
+        for direct_effects_barrier in direct_effects_barriers:
+            direct_effects_barrier()
+        logits = self.output.logits[0, target_position - 1] + activation * 0
+        return save(logits[target_token_id]), save(logits.mean())
+
+
+class _TinyProductionInjectHost(_TinyRealNNSightVerificationHost):
+    """Small PLT-shaped host that exercises the production injection method."""
+
+    class _Provider:
+        skip_connection = False
+
+        @staticmethod
+        def apply_activation_function_to_feature(
+            layer: int, feature: int, values: torch.Tensor
+        ) -> torch.Tensor:
+            del layer, feature
+            return torch.relu(values)
+
+        @staticmethod
+        def encode_layer(
+            values: torch.Tensor,
+            layer: int,
+            *,
+            apply_activation_function: bool,
+        ) -> torch.Tensor:
+            del layer, apply_activation_function
+            return values * 1
+
+        @staticmethod
+        def _get_decoder_vectors(layer: int, feature_ids: torch.Tensor) -> torch.Tensor:
+            del layer
+            return torch.ones(
+                len(feature_ids),
+                8,
+                dtype=torch.float32,
+                device=feature_ids.device,
+            )
+
+    def __init__(self) -> None:
+        super().__init__()
+        config = Gemma3TextConfig(
+            vocab_size=17,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            max_position_embeddings=32,
+            layer_types=["sliding_attention"] * 4,
+            use_cache=False,
+        )
+        multimodal_config = Gemma3Config(
+            text_config=config,
+            vision_config={
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "image_size": 14,
+                "patch_size": 14,
+            },
+            image_token_index=16,
+        )
+        self.model = NNsight(Gemma3ForConditionalGeneration(multimodal_config).eval())
+        self.feature_output_locs = tuple(
+            self.model.model.language_model.layers[index].post_feedforward_layernorm
+            for index in range(4)
+        )
+        self.transcoders = self._Provider()
+        self.cfg = SimpleNamespace(n_layers=4)
+        self.dtype = torch.float32
+        self.device = torch.device("cpu")
+
+    def get_feature_output_loc(self, layer: int):
+        return self.model.model.language_model.layers[layer].post_feedforward_layernorm
+
+    def get_feature_input_loc(self, layer: int):
+        return self.model.model.language_model.layers[layer].pre_feedforward_layernorm
+
+    def _verification_tokens(self, prompt_token_ids: tuple[int, ...]) -> torch.Tensor:
+        return torch.tensor((prompt_token_ids,), dtype=torch.long)
+
+    @property
+    def output(self):
+        return SimpleNamespace(logits=self.model.output.logits)
+
+    _verification_encode_layers = NNSightReplacementModel._verification_encode_layers
+    _verification_freeze_feature_output = (
+        NNSightReplacementModel._verification_freeze_feature_output
+    )
+    _verification_inject = NNSightReplacementModel._verification_inject
 
 
 def test_real_nnsight_baseline_returns_helper_saved_feature_values_across_invoke() -> None:
@@ -761,6 +900,98 @@ def test_real_nnsight_intervention_reencodes_inside_its_invoke() -> None:
 
     assert capture.origin is CaptureOrigin.INTERVENED_FORWARD
     assert tuple(node for node, _ in capture.feature_values) == (retained_node,)
+
+
+def test_real_nnsight_direct_freeze_preserves_ordered_feature_outputs() -> None:
+    host = _TinyRealNNSightDirectFreezeHost()
+    retained_node = FeatureNode(0, 0, 1)
+    baseline = NNSightReplacementModel._verification_capture_baseline(
+        host,
+        (1, 2),
+        (retained_node,),
+        target_position=2,
+        target_token_id=1,
+        retain_attention_state=False,
+        retain_direct_freeze_state=True,
+    )
+    plan = NNSightVariantPlan(
+        "direct",
+        InterventionSemantics.DIRECT_FROZEN,
+        (NNSightInterventionPlan(retained_node, 2.0, 1.0, 1.0, (0,)),),
+        (retained_node,),
+        (retained_node,),
+        False,
+        True,
+        False,
+    )
+
+    try:
+        capture = NNSightReplacementModel._verification_run_variant(
+            host,
+            (1, 2),
+            plan,
+            baseline.retained_state,
+            target_position=2,
+            target_token_id=1,
+        )
+    except Exception as error:
+        message = str(error)
+        assert (
+            "ValueError: Execution complete but `model.1.output.i0` was not provided."
+            in message
+        )
+        assert "Did you call an Envoy out of order?" in message
+        raise
+
+    assert capture.origin is CaptureOrigin.INTERVENED_FORWARD
+    assert tuple(node for node, _ in capture.feature_values) == (retained_node,)
+
+
+def test_real_nnsight_production_inject_does_not_preencode_downstream_observations() -> None:
+    host = _TinyProductionInjectHost()
+    retained_node = FeatureNode(1, 0, 1)
+    downstream_node = FeatureNode(3, 0, 1)
+    baseline = NNSightReplacementModel._verification_capture_baseline(
+        host,
+        (1, 2),
+        (retained_node, downstream_node),
+        target_position=2,
+        target_token_id=1,
+        retain_attention_state=False,
+        retain_direct_freeze_state=True,
+    )
+    plan = NNSightVariantPlan(
+        "direct_early",
+        InterventionSemantics.DIRECT_FROZEN,
+        (NNSightInterventionPlan(retained_node, 2.0, 1.0, 1.0, (1,)),),
+        (downstream_node,),
+        (retained_node,),
+        False,
+        True,
+        False,
+    )
+    try:
+        capture = NNSightReplacementModel._verification_run_variant(
+            host,
+            (1, 2),
+            plan,
+            baseline.retained_state,
+            target_position=2,
+            target_token_id=1,
+        )
+    except Exception as error:
+        original = getattr(error, "original", None)
+        assert type(original) is Mediator.OutOfOrderError
+        assert (
+            "layers.1.post_feedforward_layernorm.output.i0" in str(error)
+        )
+        raise
+
+    assert capture.origin is CaptureOrigin.INTERVENED_FORWARD
+    assert tuple(node for node, _ in capture.feature_values) == (
+        retained_node,
+        downstream_node,
+    )
 
 
 def test_nnsight_translation_preserves_topology_and_exact_direct_delta() -> None:

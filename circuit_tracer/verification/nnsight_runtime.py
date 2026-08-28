@@ -183,12 +183,15 @@ def _feature_values(capture: SelectiveProbeCapture) -> tuple[FeatureValue, ...]:
 def _provider_activation_delta(
     provider: Any,
     layer: int,
+    feature: int,
     baseline_preactivation: Any,
     absolute_preactivation: float,
 ) -> Any:
     absolute = baseline_preactivation * 0 + absolute_preactivation
-    activated = provider.apply_activation_function(
-        layer, torch.stack((baseline_preactivation, absolute))
+    activated = provider.apply_activation_function_to_feature(
+        layer,
+        feature,
+        torch.stack((baseline_preactivation, absolute)),
     )
     return activated[1] - activated[0]
 

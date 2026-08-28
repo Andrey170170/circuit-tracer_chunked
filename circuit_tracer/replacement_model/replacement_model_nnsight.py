@@ -690,18 +690,19 @@ class NNSightReplacementModel(LanguageModel):
             )
         return skip_diffs
 
-    def _verification_freeze_feature_outputs(
+    def _verification_freeze_feature_output(
         self,
         state: _VerificationFreezeState,
         skip_diffs: dict[int, Any],
+        layer: int,
+        location: Any,
         *,
         direct_effects_barrier=None,
     ) -> None:
-        for layer, location in enumerate(self.feature_output_locs):
-            correction = skip_diffs.get(layer, 0)
-            location.output = state.feature_output[layer] + correction  # type: ignore
-            if direct_effects_barrier is not None:
-                direct_effects_barrier()
+        correction = skip_diffs.get(layer, 0)
+        location.output = state.feature_output[layer] + correction  # type: ignore
+        if direct_effects_barrier is not None:
+            direct_effects_barrier()
 
     @torch.no_grad
     def _verification_inject(
@@ -712,7 +713,7 @@ class NNSightReplacementModel(LanguageModel):
         target_position: int,
         target_token_id: int,
         activation_barrier=None,
-        direct_effects_barrier=None,
+        direct_effects_barriers=(),
     ) -> tuple[Any, Any]:
         provider: Any = (
             self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
@@ -743,6 +744,7 @@ class NNSightReplacementModel(LanguageModel):
                     decoder_delta = _provider_activation_delta(
                         provider,
                         layer,
+                        intervention.node.feature,
                         baseline_value,
                         intervention.absolute_value,
                     )
@@ -769,8 +771,8 @@ class NNSightReplacementModel(LanguageModel):
                             )
                     else:
                         raise RuntimeError("unsupported decoder vector rank")
-            if direct_effects_barrier is not None:
-                direct_effects_barrier()
+            if direct_effects_barriers:
+                direct_effects_barriers[layer]()
             if deltas_by_layer_position.get(layer):
                 output = self.get_feature_output_loc(layer).output  # type: ignore
                 positions = sorted(deltas_by_layer_position[layer])
@@ -796,7 +798,16 @@ class NNSightReplacementModel(LanguageModel):
 
         tokens = self._verification_tokens(prompt_token_ids)
         retained_nodes = tuple(sorted(set(plan.observed_nodes) | set(plan.retain_intervention_nodes)))
-        intervention_layers = {item.node.layer for item in plan.interventions}
+        activation_nodes = tuple(
+            sorted(
+                {
+                    item.node
+                    for item in plan.interventions
+                    if item.exact_graph_delta is None
+                }
+            )
+        )
+        intervention_layers = {node.layer for node in activation_nodes}
         # Saved handles may escape through this outer collection; unsaved
         # activation proxies must instead be re-created in each consuming invoke.
         feature_value_handles: list[tuple[FeatureNode, Any]] = []
@@ -811,7 +822,11 @@ class NNSightReplacementModel(LanguageModel):
                 if plan.interventions and not plan.freeze_feature_outputs
                 else None
             )
-            direct_barrier = tracer.barrier(2) if plan.freeze_feature_outputs else None
+            direct_barriers = (
+                tuple(tracer.barrier(2) for _ in self.feature_output_locs)
+                if plan.freeze_feature_outputs
+                else ()
+            )
             with tracer.invoke(tokens):
                 pass
             if plan.interventions:
@@ -835,13 +850,6 @@ class NNSightReplacementModel(LanguageModel):
                 def compute_skip_diffs() -> None:
                     skip_diffs.update(self._verification_compute_skip_diffs(baseline_state))
 
-                def freeze_feature_outputs() -> None:
-                    self._verification_freeze_feature_outputs(
-                        baseline_state,
-                        skip_diffs,
-                        direct_effects_barrier=direct_barrier,
-                    )
-
                 _invoke_ordered_hook_families(
                     tracer,
                     attention=freeze_attention if plan.freeze_attention else None,
@@ -851,13 +859,21 @@ class NNSightReplacementModel(LanguageModel):
                         if plan.freeze_feature_outputs and self.skip_transcoder
                         else None
                     ),
-                    feature_output=(
-                        freeze_feature_outputs if plan.freeze_feature_outputs else None
-                    ),
+                    feature_output=None,
                 )
+                if plan.freeze_feature_outputs:
+                    for layer, location in enumerate(self.feature_output_locs):
+                        with tracer.invoke():
+                            self._verification_freeze_feature_output(
+                                baseline_state,
+                                skip_diffs,
+                                layer,
+                                location,
+                                direct_effects_barrier=direct_barriers[layer],
+                            )
                 with tracer.invoke():
                     activations = self._verification_encode_layers(
-                        retained_nodes,
+                        activation_nodes,
                         barrier=activation_barrier,
                         barrier_layers=intervention_layers,
                     )
@@ -867,7 +883,7 @@ class NNSightReplacementModel(LanguageModel):
                         target_position=target_position,
                         target_token_id=target_token_id,
                         activation_barrier=activation_barrier,
-                        direct_effects_barrier=direct_barrier,
+                        direct_effects_barriers=direct_barriers,
                     )
             else:
                 with tracer.invoke():

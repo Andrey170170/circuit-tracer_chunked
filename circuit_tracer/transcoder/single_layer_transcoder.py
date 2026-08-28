@@ -19,7 +19,10 @@ from circuit_tracer.attribution.sparsification import (
     filter_sparse_activations,
     select_candidate_feature_indices,
 )
-from circuit_tracer.transcoder.activation_functions import JumpReLU
+from circuit_tracer.transcoder.activation_functions import (
+    JumpReLU,
+    require_independent_feature_activation,
+)
 from circuit_tracer.transcoder.attribution_result import (
     AttributionComponents,
     DecoderRowSeed,
@@ -1207,6 +1210,21 @@ class TranscoderSet(nn.Module):
 
     def apply_activation_function(self, layer_id, features):
         return self.transcoders[layer_id].activation_function(features)  # type: ignore
+
+    def apply_activation_function_to_feature(
+        self, layer_id: int, feature_id: int, preactivations
+    ):
+        """Activate candidate preactivations for one feature without exposing provider shape."""
+        if not 0 <= feature_id < self.d_transcoder:
+            raise ValueError("feature_id is outside the provider feature axis")
+        activation_function = self.transcoders[layer_id].activation_function
+        require_independent_feature_activation(activation_function)
+        feature_mask = F.one_hot(
+            torch.tensor(feature_id, device=self.transcoders[layer_id].device),
+            num_classes=self.d_transcoder,
+        )
+        full_preactivations = preactivations.unsqueeze(-1) * feature_mask
+        return self.apply_activation_function(layer_id, full_preactivations)[..., feature_id]
 
     def compute_skip(self, layer_id: int, inputs):
         return self.transcoders[layer_id].compute_skip(inputs)  # type: ignore
