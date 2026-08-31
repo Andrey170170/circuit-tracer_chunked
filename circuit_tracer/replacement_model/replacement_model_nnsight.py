@@ -38,7 +38,10 @@ from circuit_tracer.verification.contracts import FeatureNode, InterventionSeman
 from circuit_tracer.verification.nnsight_runtime import (
     CaptureOrigin,
     NNSightVariantPlan,
+    PropagationProbeCapture,
+    PropagationProbeSpec,
     SelectiveProbeCapture,
+    _activation_schedule_for_plan,
     _invoke_ordered_hook_families,
     _provider_activation_delta,
     _skip_transcoder_correction,
@@ -549,26 +552,42 @@ class NNSightReplacementModel(LanguageModel):
         *,
         barrier=None,
         barrier_layers: set[int] | None = None,
+        propagation_probe: PropagationProbeSpec | None = None,
+        propagation_feature_inputs: list[tuple[int, Any]] | None = None,
     ) -> dict[int, Any]:
         """Encode one layer at a time; tensors remain transient NNSight graph values."""
 
         provider: Any = (
             self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
         )
-        layers = sorted({node.layer for node in retained_nodes})
+        encoded_layers = {node.layer for node in retained_nodes}
+        layers = sorted(
+            encoded_layers
+            | (set(propagation_probe.layers) if propagation_probe is not None else set())
+        )
         activations: dict[int, Any] = {}
         for layer in layers:
             feature_input = self.get_feature_input_loc(layer).output
-            activations[layer] = (
-                provider.encode_layer(  # type: ignore[attr-defined]
-                    feature_input,
-                    layer,
-                    apply_activation_function=False,
+            if propagation_probe is not None and propagation_feature_inputs is not None:
+                propagation_feature_inputs.append(
+                    (
+                        layer,
+                        save(
+                            feature_input[0, propagation_probe.position].detach()
+                        ),
+                    )
                 )
-                .detach()
-                .squeeze(0)
-            )
-            activations[layer][self.zero_positions] = 0  # type: ignore[index]
+            if layer in encoded_layers:
+                activations[layer] = (
+                    provider.encode_layer(  # type: ignore[attr-defined]
+                        feature_input,
+                        layer,
+                        apply_activation_function=False,
+                    )
+                    .detach()
+                    .squeeze(0)
+                )
+                activations[layer][self.zero_positions] = 0  # type: ignore[index]
             if barrier is not None and barrier_layers is not None and layer in barrier_layers:
                 barrier()
         return activations
@@ -592,6 +611,7 @@ class NNSightReplacementModel(LanguageModel):
         target_token_id: int,
         retain_attention_state: bool,
         retain_direct_freeze_state: bool,
+        propagation_probe: PropagationProbeSpec | None = None,
     ) -> SelectiveProbeCapture:
         """Capture scalar evidence plus only the dense state required by frozen semantics."""
 
@@ -600,6 +620,7 @@ class NNSightReplacementModel(LanguageModel):
         # NNSight mediator locals do not escape ``invoke`` like ordinary Python
         # locals.  Mutate an outer collection with the explicitly saved handles.
         feature_value_handles: list[tuple[FeatureNode, Any]] = []
+        propagation_feature_inputs: list[tuple[int, Any]] = []
         with (
             self._verification_probe_scope(),
             torch.inference_mode(),
@@ -607,7 +628,11 @@ class NNSightReplacementModel(LanguageModel):
             self.trace() as tracer,
         ):
             with tracer.invoke(tokens):
-                activations = self._verification_encode_layers(retained_nodes)
+                activations = self._verification_encode_layers(
+                    retained_nodes,
+                    propagation_probe=propagation_probe,
+                    propagation_feature_inputs=propagation_feature_inputs,
+                )
                 logits = self.output.logits[0, target_position - 1]
                 target_logit = save(logits[target_token_id])
                 mean_logit = save(logits.mean())
@@ -655,6 +680,11 @@ class NNSightReplacementModel(LanguageModel):
             tuple(feature_value_handles),
             CaptureOrigin.BASELINE_FORWARD,
             state,
+            (
+                PropagationProbeCapture(tuple(propagation_feature_inputs))
+                if propagation_probe is not None
+                else None
+            ),
         )
 
     def _verification_freeze_attention(
@@ -716,6 +746,9 @@ class NNSightReplacementModel(LanguageModel):
         target_token_id: int,
         activation_barrier=None,
         direct_effects_barriers=(),
+        propagation_probe: PropagationProbeSpec | None = None,
+        propagation_feature_inputs: list[tuple[int, Any]] | None = None,
+        propagation_source_handles: dict[str, Any] | None = None,
     ) -> None:
         provider: Any = (
             self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
@@ -728,9 +761,27 @@ class NNSightReplacementModel(LanguageModel):
             observed_by_layer[node.layer].append(node)
         deltas_by_layer_position: dict[int, dict[int, Any]] = defaultdict(dict)
         for layer in range(self.cfg.n_layers):
+            if (
+                propagation_probe is not None
+                and propagation_feature_inputs is not None
+                and layer in propagation_probe.layers
+            ):
+                propagation_feature_inputs.append(
+                    (
+                        layer,
+                        save(
+                            self.get_feature_input_loc(layer)
+                            .output[0, propagation_probe.position]
+                            .detach()
+                        ),
+                    )
+                )
             if interventions_by_layer[layer]:
                 if plan.semantics is InterventionSemantics.PROPAGATED_FROZEN_ATTENTION:
-                    assert activation_barrier is not None
+                    if activation_barrier is None:
+                        raise RuntimeError(
+                            "propagated intervention requires an activation barrier"
+                        )
                     activation_barrier()
                 for intervention in interventions_by_layer[layer]:
                     if intervention.exact_graph_delta is not None:
@@ -776,6 +827,17 @@ class NNSightReplacementModel(LanguageModel):
                             )
                     else:
                         raise RuntimeError("unsupported decoder vector rank")
+                    if (
+                        propagation_probe is not None
+                        and propagation_source_handles is not None
+                        and layer == propagation_probe.source_layer
+                    ):
+                        propagation_source_handles["source_preactivation"] = save(
+                            baseline_value.detach()
+                        )
+                        propagation_source_handles["decoder_contribution"] = save(
+                            contribution.detach()
+                        )
             if observed_by_layer[layer]:
                 observed_nodes = tuple(observed_by_layer[layer])
                 observed_activations = self._verification_encode_layers(observed_nodes)
@@ -798,6 +860,18 @@ class NNSightReplacementModel(LanguageModel):
                     output[:, positions, :] + selected_deltas.unsqueeze(0)
                 )
                 location.output = updated  # type: ignore[attr-defined]
+                if (
+                    propagation_probe is not None
+                    and propagation_source_handles is not None
+                    and layer == propagation_probe.source_layer
+                ):
+                    position = propagation_probe.position
+                    propagation_source_handles["source_output_pre"] = save(
+                        output[0, position].detach()
+                    )
+                    propagation_source_handles["source_output_post"] = save(
+                        updated[0, position].detach()
+                    )
                 del deltas_by_layer_position[layer]
         logits = self.output.logits[0, target_position - 1]
         objective_handles.extend((save(logits[target_token_id]), save(logits.mean())))
@@ -811,24 +885,20 @@ class NNSightReplacementModel(LanguageModel):
         *,
         target_position: int,
         target_token_id: int,
+        propagation_probe: PropagationProbeSpec | None = None,
     ) -> SelectiveProbeCapture:
         """Run one isolated variant without ever saving a full feature activation tensor."""
 
         tokens = self._verification_tokens(prompt_token_ids)
-        activation_nodes = tuple(
-            sorted(
-                {
-                    item.node
-                    for item in plan.interventions
-                    if item.exact_graph_delta is None
-                }
-            )
-        )
+        activation_schedule = _activation_schedule_for_plan(plan)
+        activation_nodes = activation_schedule.activation_nodes
         intervention_layers = {node.layer for node in activation_nodes}
         # Saved handles may escape through this outer collection; unsaved
         # activation proxies must instead be re-created in each consuming invoke.
         feature_value_handles: list[tuple[FeatureNode, Any]] = []
         objective_handles: list[Any] = []
+        propagation_feature_inputs: list[tuple[int, Any]] = []
+        propagation_source_handles: dict[str, Any] = {}
         with (
             self._verification_probe_scope(),
             torch.inference_mode(),
@@ -836,8 +906,8 @@ class NNSightReplacementModel(LanguageModel):
             self.trace() as tracer,
         ):
             activation_barrier = (
-                tracer.barrier(2)
-                if plan.interventions and not plan.freeze_feature_outputs
+                tracer.barrier(activation_schedule.barrier_participants)
+                if activation_schedule.barrier_participants
                 else None
             )
             direct_barriers = (
@@ -900,16 +970,31 @@ class NNSightReplacementModel(LanguageModel):
                     activations = self._verification_encode_layers(
                         activation_nodes,
                     )
-                    self._verification_inject(
-                        plan,
-                        activations,
-                        objective_handles,
-                        feature_value_handles,
-                        target_position=target_position,
-                        target_token_id=target_token_id,
-                        activation_barrier=activation_barrier,
-                        direct_effects_barriers=direct_barriers,
-                    )
+                    if propagation_probe is None:
+                        self._verification_inject(
+                            plan,
+                            activations,
+                            objective_handles,
+                            feature_value_handles,
+                            target_position=target_position,
+                            target_token_id=target_token_id,
+                            activation_barrier=activation_barrier,
+                            direct_effects_barriers=direct_barriers,
+                        )
+                    else:
+                        self._verification_inject(
+                            plan,
+                            activations,
+                            objective_handles,
+                            feature_value_handles,
+                            target_position=target_position,
+                            target_token_id=target_token_id,
+                            activation_barrier=activation_barrier,
+                            direct_effects_barriers=direct_barriers,
+                            propagation_probe=propagation_probe,
+                            propagation_feature_inputs=propagation_feature_inputs,
+                            propagation_source_handles=propagation_source_handles,
+                        )
             else:
                 with tracer.invoke():
                     observed_activations = self._verification_encode_layers(
@@ -931,6 +1016,17 @@ class NNSightReplacementModel(LanguageModel):
             objective_handles[1],
             tuple(feature_value_handles),
             CaptureOrigin.INTERVENED_FORWARD,
+            propagation_probe=(
+                PropagationProbeCapture(
+                    tuple(propagation_feature_inputs),
+                    propagation_source_handles.get("source_preactivation"),
+                    propagation_source_handles.get("source_output_pre"),
+                    propagation_source_handles.get("decoder_contribution"),
+                    propagation_source_handles.get("source_output_post"),
+                )
+                if propagation_probe is not None
+                else None
+            ),
         )
 
     def _verification_release(self, baseline_state: object | None) -> None:

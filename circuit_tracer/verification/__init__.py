@@ -56,6 +56,13 @@ from .ordering_qualification import (
     validate_ordering_qualification_receipt,
     validate_serialized_ordering_qualification_receipt,
 )
+from .ordering_diagnostics import (
+    PropagationOrderingDiagnosticReceipt,
+    PropagationOrderingDiagnosticResult,
+    diagnose_propagated_ordering,
+    validate_propagated_ordering_diagnostic_receipt,
+    validate_serialized_propagated_ordering_diagnostic_receipt,
+)
 from .testing import DeterministicInterventionRuntime, ScriptedVariant
 
 __all__ = [
@@ -71,11 +78,15 @@ __all__ = [
     "OrderingQualificationRequest", "OrderingQualificationResult",
     "OrderingQualificationScope", "OrderingQualificationTolerance",
     "OrderingQualificationVerdict",
+    "PropagationOrderingDiagnosticReceipt", "PropagationOrderingDiagnosticResult",
     "PreactivationIntervention", "RuntimeExecutionStatus", "RuntimeRefusal", "ScriptedVariant",
     "SufficiencyStatus", "TargetFunctional", "TargetState", "TraceIdentity", "VariantEvidence",
     "VariantKind", "VariantObservation", "plan_behavioral_variants", "select_direct_features",
     "select_necessity_features", "select_necessity_pairs",
     "qualify_intervened_forward_ordering", "qualify_nnsight_ordering",
+    "diagnose_propagated_ordering",
+    "validate_propagated_ordering_diagnostic_receipt",
+    "validate_serialized_propagated_ordering_diagnostic_receipt",
     "validate_ordering_qualification_receipt", "validate_serialized_ordering_qualification_receipt",
     "verify_behavior",
 ]

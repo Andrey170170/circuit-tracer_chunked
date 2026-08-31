@@ -643,6 +643,36 @@ def test_provider_activation_and_skip_semantics_are_applied_to_preactivations() 
     assert torch.equal(correction, torch.tensor([2.0, 4.0]))
 
 
+def test_propagated_injection_refuses_a_missing_activation_barrier() -> None:
+    source = FeatureNode(0, 0, 0)
+    plan = NNSightVariantPlan(
+        "malformed_propagated",
+        InterventionSemantics.PROPAGATED_FROZEN_ATTENTION,
+        (NNSightInterventionPlan(source, 0.0, 1.0, -1.0, (0,)),),
+        (),
+        (source,),
+        True,
+        False,
+        False,
+    )
+    host = SimpleNamespace(
+        cfg=SimpleNamespace(n_layers=1),
+        transcoders=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="requires an activation barrier"):
+        NNSightReplacementModel._verification_inject(
+            host,
+            plan,
+            {},
+            [],
+            [],
+            target_position=1,
+            target_token_id=0,
+            activation_barrier=None,
+        )
+
+
 def _execution_request(request: BehavioralVerificationRequest) -> InterventionExecutionRequest:
     variants = plan_behavioral_variants(request)
     observed_nodes = tuple(

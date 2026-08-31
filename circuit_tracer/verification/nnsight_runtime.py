@@ -43,6 +43,15 @@ class NNSightVariantPlan:
     freeze_attention: bool
     freeze_feature_outputs: bool
     freeze_layernorm_denominators: bool
+    retain_live_source_for_schedule: bool = False
+
+
+@dataclass(frozen=True)
+class NNSightActivationSchedule:
+    activation_nodes: tuple[FeatureNode, ...]
+    prepass_invokes: int
+    intervention_invokes: int
+    barrier_participants: int
 
 
 @dataclass
@@ -54,6 +63,25 @@ class SelectiveProbeCapture:
     feature_values: tuple[tuple[FeatureNode, Any], ...]
     origin: "CaptureOrigin"
     retained_state: object | None = None
+    propagation_probe: "PropagationProbeCapture | None" = None
+
+
+@dataclass(frozen=True)
+class PropagationProbeSpec:
+    """Single-position feature-input checkpoints for ordering diagnosis."""
+
+    position: int
+    layers: tuple[int, ...]
+    source_layer: int
+
+
+@dataclass(frozen=True)
+class PropagationProbeCapture:
+    feature_inputs: tuple[tuple[int, Any], ...]
+    source_preactivation: Any | None = None
+    source_output_pre: Any | None = None
+    decoder_contribution: Any | None = None
+    source_output_post: Any | None = None
 
 
 class CaptureOrigin(str, Enum):
@@ -167,6 +195,36 @@ def _translate_variant(
         freeze_attention=bool(interventions),
         freeze_feature_outputs=direct,
         freeze_layernorm_denominators=direct,
+    )
+
+
+def _activation_nodes_for_plan(
+    plan: NNSightVariantPlan,
+) -> tuple[FeatureNode, ...]:
+    """Return sources whose live activation prepass participates in the schedule."""
+
+    return tuple(
+        sorted(
+            {
+                item.node
+                for item in plan.interventions
+                if item.exact_graph_delta is None
+                or plan.retain_live_source_for_schedule
+            }
+        )
+    )
+
+
+def _activation_schedule_for_plan(
+    plan: NNSightVariantPlan,
+) -> NNSightActivationSchedule:
+    activation_nodes = _activation_nodes_for_plan(plan)
+    uses_prepass = bool(activation_nodes) and not plan.freeze_feature_outputs
+    return NNSightActivationSchedule(
+        activation_nodes,
+        int(uses_prepass),
+        int(bool(plan.interventions)),
+        2 if uses_prepass else 0,
     )
 
 

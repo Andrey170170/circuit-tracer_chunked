@@ -25,6 +25,7 @@ from circuit_tracer.verification import (
     TargetState,
     TraceIdentity,
     VariantKind,
+    diagnose_propagated_ordering,
 )
 from circuit_tracer.verification.nnsight_runtime import NNSightInterventionRuntime
 from circuit_tracer.verification.ordering_qualification import (
@@ -240,7 +241,7 @@ def _request() -> OrderingQualificationRequest:
             "propagated",
             VariantKind.NECESSITY_HIGH,
             InterventionSemantics.PROPAGATED_FROZEN_ATTENTION,
-            (PreactivationIntervention(source, 5.0),),
+            (PreactivationIntervention(source, 5.0, 0.0, 5.0),),
             None,
             predicted,
         ),
@@ -287,6 +288,22 @@ def test_model_backed_gate_qualifies_independent_oracle_against_production() -> 
     assert receipt.qualification_fingerprint.startswith("sha256:")
     validate_ordering_qualification_receipt(_request(), receipt)
     validate_serialized_ordering_qualification_receipt(receipt.to_dict())
+
+
+def test_propagation_diagnostic_runs_common_delta_through_production_engines() -> None:
+    receipt = diagnose_propagated_ordering(_TinyGemma3PLTHost(), _request())
+
+    assert receipt.result.status == "complete"
+    assert receipt.result.layer_comparisons
+    assert receipt.result.first_common_delta_material_divergence_layer is None
+    assert all(
+        item.native_injection_identity.max_abs_error == 0.0
+        for item in receipt.result.source_writes
+    )
+    assert all(
+        item.common_injection_identity.max_abs_error == 0.0
+        for item in receipt.result.source_writes
+    )
 
 
 def test_receipt_validators_reject_typed_and_serialized_tampering() -> None:

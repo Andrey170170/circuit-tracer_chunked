@@ -44,7 +44,12 @@ from .contracts import (
     RuntimeRefusal,
     VariantObservation,
 )
-from .nnsight_runtime import NNSightInterventionRuntime, _provider_activation_delta
+from .nnsight_runtime import (
+    NNSightInterventionRuntime,
+    PropagationProbeCapture,
+    PropagationProbeSpec,
+    _provider_activation_delta,
+)
 from .runtime import InterventionRuntimePort
 
 
@@ -579,7 +584,14 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         *,
         plan: Any | None,
         baseline_state: _EagerBaselineState | None,
-    ) -> tuple[float, float, tuple[FeatureValue, ...], _EagerBaselineState | None]:
+        propagation_probe: PropagationProbeSpec | None = None,
+    ) -> tuple[
+        float,
+        float,
+        tuple[FeatureValue, ...],
+        _EagerBaselineState | None,
+        PropagationProbeCapture | None,
+    ]:
         prompt_length = len(request.identity.prompt_token_ids)
         device = torch.device(self._model.device)
         tokens = torch.tensor(
@@ -604,6 +616,8 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         collected_attention: list[torch.Tensor] = []
         collected_denominators: dict[int, torch.Tensor] = {}
         collected_outputs: dict[int, torch.Tensor] = {}
+        propagation_feature_inputs: dict[int, torch.Tensor] = {}
+        propagation_source: dict[str, Any] = {}
         attention_index = 0
         original_dropout = torch.nn.functional.dropout
 
@@ -666,6 +680,10 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         def input_hook(layer: int):
             def capture(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
                 values = _clone_tensor(output)
+                if propagation_probe is not None and layer in propagation_probe.layers:
+                    propagation_feature_inputs[layer] = values[
+                        0, propagation_probe.position
+                    ].detach().clone()
                 if retain_full_inputs:
                     current_inputs[layer] = values
                 layer_nodes = nodes_by_layer.get(layer, ())
@@ -708,9 +726,9 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
                 else:
                     values = values.clone()
                 for intervention in interventions_by_layer[layer]:
-                    if direct:
+                    if intervention.exact_graph_delta is not None:
                         if intervention.graph_baseline_value is None:
-                            raise RuntimeError("direct oracle intervention lacks graph baseline")
+                            raise RuntimeError("exact-delta oracle intervention lacks graph baseline")
                         baseline_value = torch.tensor(
                             intervention.graph_baseline_value,
                             dtype=getattr(self._model, "dtype"),
@@ -732,9 +750,30 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
                     if decoder.ndim != 2:
                         raise RuntimeError("PLT eager oracle received non-same-layer decoder")
                     contribution = decoder[0] * activation_delta
+                    if (
+                        propagation_probe is not None
+                        and layer == propagation_probe.source_layer
+                    ):
+                        position = propagation_probe.position
+                        propagation_source["source_preactivation"] = (
+                            baseline_value.detach().clone()
+                        )
+                        propagation_source["source_output_pre"] = (
+                            values[0, position].detach().clone()
+                        )
+                        propagation_source["decoder_contribution"] = (
+                            contribution.detach().clone()
+                        )
                     values[:, intervention.node.position, :] = (
                         values[:, intervention.node.position, :] + contribution
                     )
+                    if (
+                        propagation_probe is not None
+                        and layer == propagation_probe.source_layer
+                    ):
+                        propagation_source["source_output_post"] = (
+                            values[0, propagation_probe.position].detach().clone()
+                        )
                 return _replace_tensor_output(output, values)
 
             return intervene
@@ -748,7 +787,14 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
             for norm in self._norms:
                 stack.callback(norm.register_forward_hook(norm_hook).remove)
             for layer, module in enumerate(self._feature_inputs):
-                if retain_full_inputs or layer in nodes_by_layer:
+                if (
+                    retain_full_inputs
+                    or layer in nodes_by_layer
+                    or (
+                        propagation_probe is not None
+                        and layer in propagation_probe.layers
+                    )
+                ):
                     stack.callback(module.register_forward_hook(input_hook(layer)).remove)
             for layer, module in enumerate(self._feature_outputs):
                 stack.callback(module.register_forward_hook(output_hook(layer)).remove)
@@ -776,7 +822,16 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
                 current_inputs,
                 collected_outputs,
             )
-        return target_logit, mean_logit, tuple(features), state
+        probe_capture = None
+        if propagation_probe is not None:
+            probe_capture = PropagationProbeCapture(
+                tuple(sorted(propagation_feature_inputs.items())),
+                propagation_source.get("source_preactivation"),
+                propagation_source.get("source_output_pre"),
+                propagation_source.get("decoder_contribution"),
+                propagation_source.get("source_output_post"),
+            )
+        return target_logit, mean_logit, tuple(features), state, probe_capture
 
     def evaluate(self, request: InterventionExecutionRequest) -> InterventionExecutionResult:
         started = self._clock()
@@ -787,7 +842,7 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         status = RuntimeExecutionStatus.REFUSED
         cleanup_completed = False
         try:
-            target, mean, features, state = self._run_forward(
+            target, mean, features, state, _ = self._run_forward(
                 request, plan=None, baseline_state=None
             )
             baseline = BaselineCapture(target - mean, (target, mean), features)
@@ -804,7 +859,7 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
                 for variant in request.variants
             )
             for plan in plans:
-                target, mean, features, _ = self._run_forward(
+                target, mean, features, _, _ = self._run_forward(
                     request, plan=plan, baseline_state=state
                 )
                 observed = set(request.observed_downstream_nodes)
