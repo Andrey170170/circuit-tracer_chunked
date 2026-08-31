@@ -807,6 +807,8 @@ class _TinyRealNNSightVerificationHost:
         self,
         plan,
         activations,
+        objective_handles,
+        feature_value_handles,
         *,
         target_position,
         target_token_id,
@@ -814,11 +816,19 @@ class _TinyRealNNSightVerificationHost:
         direct_effects_barriers,
     ):
         del activation_barrier, direct_effects_barriers
+        retained = tuple(
+            node
+            for node in sorted(set(plan.observed_nodes) | set(plan.retain_intervention_nodes))
+            if node.layer in activations
+        )
+        feature_value_handles.extend(
+            self._verification_save_feature_values(activations, retained)
+        )
         intervention = plan.interventions[0]
         node = intervention.node
         activation = activations[node.layer][0, node.position, node.feature]
         logits = self.output.logits[0, target_position - 1] + activation * 0
-        return save(logits[target_token_id]), save(logits.mean())
+        objective_handles.extend((save(logits[target_token_id]), save(logits.mean())))
 
 
 class _TinyRealNNSightDirectFreezeHost(_TinyRealNNSightVerificationHost):
@@ -840,6 +850,8 @@ class _TinyRealNNSightDirectFreezeHost(_TinyRealNNSightVerificationHost):
         self,
         plan,
         activations,
+        objective_handles,
+        feature_value_handles,
         *,
         target_position,
         target_token_id,
@@ -847,13 +859,21 @@ class _TinyRealNNSightDirectFreezeHost(_TinyRealNNSightVerificationHost):
         direct_effects_barriers,
     ):
         del activation_barrier
+        retained = tuple(
+            node
+            for node in sorted(set(plan.observed_nodes) | set(plan.retain_intervention_nodes))
+            if node.layer in activations
+        )
+        feature_value_handles.extend(
+            self._verification_save_feature_values(activations, retained)
+        )
         intervention = plan.interventions[0]
         node = intervention.node
         activation = activations[node.layer][0, node.position, node.feature]
         for direct_effects_barrier in direct_effects_barriers:
             direct_effects_barrier()
         logits = self.output.logits[0, target_position - 1] + activation * 0
-        return save(logits[target_token_id]), save(logits.mean())
+        objective_handles.extend((save(logits[target_token_id]), save(logits.mean())))
 
 
 class _TinyProductionInjectHost(_TinyRealNNSightVerificationHost):

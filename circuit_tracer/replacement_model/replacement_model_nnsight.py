@@ -709,18 +709,23 @@ class NNSightReplacementModel(LanguageModel):
         self,
         plan: NNSightVariantPlan,
         activation_matrix: dict[int, Any],
+        objective_handles: list[Any],
+        feature_value_handles: list[tuple[FeatureNode, Any]],
         *,
         target_position: int,
         target_token_id: int,
         activation_barrier=None,
         direct_effects_barriers=(),
-    ) -> tuple[Any, Any]:
+    ) -> None:
         provider: Any = (
             self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
         )
         interventions_by_layer: dict[int, list[Any]] = defaultdict(list)
         for intervention in plan.interventions:
             interventions_by_layer[intervention.node.layer].append(intervention)
+        observed_by_layer: dict[int, list[FeatureNode]] = defaultdict(list)
+        for node in tuple(sorted(set(plan.observed_nodes) | set(plan.retain_intervention_nodes))):
+            observed_by_layer[node.layer].append(node)
         deltas_by_layer_position: dict[int, dict[int, Any]] = defaultdict(dict)
         for layer in range(self.cfg.n_layers):
             if interventions_by_layer[layer]:
@@ -771,18 +776,31 @@ class NNSightReplacementModel(LanguageModel):
                             )
                     else:
                         raise RuntimeError("unsupported decoder vector rank")
+            if observed_by_layer[layer]:
+                observed_nodes = tuple(observed_by_layer[layer])
+                observed_activations = self._verification_encode_layers(observed_nodes)
+                feature_value_handles.extend(
+                    self._verification_save_feature_values(
+                        observed_activations, observed_nodes
+                    )
+                )
             if direct_effects_barriers:
                 direct_effects_barriers[layer]()
             if deltas_by_layer_position.get(layer):
-                output = self.get_feature_output_loc(layer).output  # type: ignore
+                location = self.get_feature_output_loc(layer)
+                output = location.output  # type: ignore
                 positions = sorted(deltas_by_layer_position[layer])
                 selected_deltas = torch.stack(
                     [deltas_by_layer_position[layer][position] for position in positions]
                 )
-                output[:, positions, :] = output[:, positions, :] + selected_deltas.unsqueeze(0)  # type: ignore
+                updated = output.clone()
+                updated[:, positions, :] = (  # type: ignore[index]
+                    output[:, positions, :] + selected_deltas.unsqueeze(0)
+                )
+                location.output = updated  # type: ignore[attr-defined]
                 del deltas_by_layer_position[layer]
         logits = self.output.logits[0, target_position - 1]
-        return save(logits[target_token_id]), save(logits.mean())
+        objective_handles.extend((save(logits[target_token_id]), save(logits.mean())))
 
     @torch.no_grad
     def _verification_run_variant(
@@ -797,7 +815,6 @@ class NNSightReplacementModel(LanguageModel):
         """Run one isolated variant without ever saving a full feature activation tensor."""
 
         tokens = self._verification_tokens(prompt_token_ids)
-        retained_nodes = tuple(sorted(set(plan.observed_nodes) | set(plan.retain_intervention_nodes)))
         activation_nodes = tuple(
             sorted(
                 {
@@ -811,6 +828,7 @@ class NNSightReplacementModel(LanguageModel):
         # Saved handles may escape through this outer collection; unsaved
         # activation proxies must instead be re-created in each consuming invoke.
         feature_value_handles: list[tuple[FeatureNode, Any]] = []
+        objective_handles: list[Any] = []
         with (
             self._verification_probe_scope(),
             torch.inference_mode(),
@@ -871,15 +889,22 @@ class NNSightReplacementModel(LanguageModel):
                                 location,
                                 direct_effects_barrier=direct_barriers[layer],
                             )
+                if activation_barrier is not None:
+                    with tracer.invoke():
+                        self._verification_encode_layers(
+                            activation_nodes,
+                            barrier=activation_barrier,
+                            barrier_layers=intervention_layers,
+                        )
                 with tracer.invoke():
                     activations = self._verification_encode_layers(
                         activation_nodes,
-                        barrier=activation_barrier,
-                        barrier_layers=intervention_layers,
                     )
-                    target_logit, mean_logit = self._verification_inject(
+                    self._verification_inject(
                         plan,
                         activations,
+                        objective_handles,
+                        feature_value_handles,
                         target_position=target_position,
                         target_token_id=target_token_id,
                         activation_barrier=activation_barrier,
@@ -887,19 +912,23 @@ class NNSightReplacementModel(LanguageModel):
                     )
             else:
                 with tracer.invoke():
-                    logits = self.output.logits[0, target_position - 1]
-                    target_logit = save(logits[target_token_id])
-                    mean_logit = save(logits.mean())
-            with tracer.invoke():
-                observed_activations = self._verification_encode_layers(retained_nodes)
-                feature_value_handles.extend(
-                    self._verification_save_feature_values(
-                        observed_activations, retained_nodes
+                    observed_activations = self._verification_encode_layers(
+                        plan.observed_nodes
                     )
-                )
+                    feature_value_handles.extend(
+                        self._verification_save_feature_values(
+                            observed_activations, plan.observed_nodes
+                        )
+                    )
+                    logits = self.output.logits[0, target_position - 1]
+                    objective_handles.extend(
+                        (save(logits[target_token_id]), save(logits.mean()))
+                    )
+        if len(objective_handles) != 2:
+            raise RuntimeError("verification variant did not retain exactly two objective terms")
         return SelectiveProbeCapture(
-            target_logit,
-            mean_logit,
+            objective_handles[0],
+            objective_handles[1],
             tuple(feature_value_handles),
             CaptureOrigin.INTERVENED_FORWARD,
         )

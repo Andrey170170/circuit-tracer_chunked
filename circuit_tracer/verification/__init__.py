@@ -41,6 +41,21 @@ from .contracts import (
 )
 from .runtime import InterventionRuntimePort
 from .nnsight_runtime import NNSightInterventionRuntime
+from .ordering_qualification import (
+    Gemma3PLTEagerHookOracle,
+    OrderingComparison,
+    OrderingQualificationReceipt,
+    OrderingRefusalDiagnostic,
+    OrderingQualificationRequest,
+    OrderingQualificationResult,
+    OrderingQualificationScope,
+    OrderingQualificationTolerance,
+    OrderingQualificationVerdict,
+    qualify_intervened_forward_ordering,
+    qualify_nnsight_ordering,
+    validate_ordering_qualification_receipt,
+    validate_serialized_ordering_qualification_receipt,
+)
 from .testing import DeterministicInterventionRuntime, ScriptedVariant
 
 __all__ = [
@@ -51,9 +66,16 @@ __all__ = [
     "FaithfulnessVerdict", "FrozenBehavioralCalibration", "InterventionExecutionRequest", "InterventionExecutionResult",
     "InterventionRuntimePort", "InterventionSemantics", "InterventionVariant",
     "NNSightInterventionRuntime", "OrderingAdmissionMode",
+    "Gemma3PLTEagerHookOracle", "OrderingComparison", "OrderingQualificationReceipt",
+    "OrderingRefusalDiagnostic",
+    "OrderingQualificationRequest", "OrderingQualificationResult",
+    "OrderingQualificationScope", "OrderingQualificationTolerance",
+    "OrderingQualificationVerdict",
     "PreactivationIntervention", "RuntimeExecutionStatus", "RuntimeRefusal", "ScriptedVariant",
     "SufficiencyStatus", "TargetFunctional", "TargetState", "TraceIdentity", "VariantEvidence",
     "VariantKind", "VariantObservation", "plan_behavioral_variants", "select_direct_features",
     "select_necessity_features", "select_necessity_pairs",
+    "qualify_intervened_forward_ordering", "qualify_nnsight_ordering",
+    "validate_ordering_qualification_receipt", "validate_serialized_ordering_qualification_receipt",
     "verify_behavior",
 ]
