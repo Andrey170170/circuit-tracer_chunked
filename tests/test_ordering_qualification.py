@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -27,7 +29,10 @@ from circuit_tracer.verification import (
     VariantKind,
     diagnose_propagated_ordering,
 )
-from circuit_tracer.verification.nnsight_runtime import NNSightInterventionRuntime
+from circuit_tracer.verification.nnsight_runtime import (
+    NNSightInterventionRuntime,
+    QualificationExecutionCapture,
+)
 from circuit_tracer.verification.ordering_qualification import (
     Gemma3PLTEagerHookOracle,
     OrderingQualificationRequest,
@@ -72,6 +77,15 @@ class _IdentityPLTProvider:
         vectors[:, 0] = 2
         vectors[:, 1] = -1
         return vectors
+
+
+class _ShapeSensitivePLTProvider(_IdentityPLTProvider):
+    """Expose the native full-sequence versus selected-position shape drift."""
+
+    def encode_layer(self, values, layer, *, apply_activation_function):
+        del apply_activation_function
+        self.encoded_shapes.append((layer, tuple(values.shape)))
+        return values + values.shape[-2]
 
 
 class _TinyGemma3PLTHost:
@@ -206,6 +220,9 @@ class _TinyGemma3PLTHost:
     _verification_save_feature_values = staticmethod(
         NNSightReplacementModel._verification_save_feature_values
     )
+    _verification_save_selected_feature_inputs = (
+        NNSightReplacementModel._verification_save_selected_feature_inputs
+    )
     _verification_capture_baseline = NNSightReplacementModel._verification_capture_baseline
     _verification_freeze_attention = NNSightReplacementModel._verification_freeze_attention
     _verification_freeze_layernorm_group = (
@@ -266,12 +283,82 @@ def _request() -> OrderingQualificationRequest:
 
 
 class _StaticRuntime:
-    def __init__(self, result) -> None:
+    def __init__(self, result, *, capture_result=None) -> None:
         self.result = result
+        self.capture_result = capture_result or result
 
     def evaluate(self, request):
         del request
         return self.result
+
+    def evaluate_for_ordering_qualification(
+        self, request, *, selected_feature_input_nodes
+    ):
+        del request
+        baseline_values = (
+            {
+                item.node: item.preactivation
+                for item in self.capture_result.baseline.feature_values
+            }
+            if self.capture_result.baseline is not None
+            else {}
+        )
+        runs = {"baseline": baseline_values}
+        for observation in self.capture_result.observations:
+            values = dict(baseline_values)
+            values.update(
+                (item.node, item.preactivation)
+                for item in (
+                    *observation.downstream_feature_values,
+                    *observation.intervention_feature_values,
+                )
+            )
+            runs[observation.variant_id] = values
+        captures = {}
+        for run_id, values in runs.items():
+            vectors = []
+            for layer, position in sorted(
+                {(node.layer, node.position) for node in selected_feature_input_nodes}
+            ):
+                vector = torch.zeros(8, dtype=torch.bfloat16)
+                for node in selected_feature_input_nodes:
+                    if node.layer == layer and node.position == position:
+                        vector[node.feature] = values.get(node, baseline_values.get(node, 0.0))
+                vectors.append((layer, position, vector))
+            captures[run_id] = tuple(vectors)
+        return QualificationExecutionCapture(self.result, captures)
+
+
+class _CaptureMutatingRuntime(_StaticRuntime):
+    def __init__(self, result, mutation: str) -> None:
+        super().__init__(result)
+        self.mutation = mutation
+
+    def evaluate_for_ordering_qualification(
+        self, request, *, selected_feature_input_nodes
+    ):
+        capture = super().evaluate_for_ordering_qualification(
+            request,
+            selected_feature_input_nodes=selected_feature_input_nodes,
+        )
+        values = list(capture.selected_feature_inputs["baseline"])
+        layer, position, vector = values[0]
+        if self.mutation == "missing":
+            values.pop()
+        elif self.mutation == "duplicate":
+            values.append((layer, position, vector.clone()))
+        elif self.mutation == "wrong_shape":
+            values[0] = (layer, position, vector.unsqueeze(0))
+        elif self.mutation == "nonfinite":
+            changed = vector.clone()
+            changed[0] = torch.nan
+            values[0] = (layer, position, changed)
+        elif self.mutation == "shift":
+            values[0] = (layer, position, vector + 1)
+        else:
+            raise AssertionError(self.mutation)
+        capture.selected_feature_inputs["baseline"] = tuple(values)
+        return capture
 
 
 def test_model_backed_gate_qualifies_independent_oracle_against_production() -> None:
@@ -283,14 +370,85 @@ def test_model_backed_gate_qualifies_independent_oracle_against_production() -> 
     assert receipt.to_dict()["status"] == "qualified"
     assert (
         receipt.to_dict()["qualification_claim"]
-        == "intervened_forward_capture_ordering_with_graph_pinned_mutations_only"
+        == "intervened_forward_capture_ordering_with_joint_canonical_feature_projection"
     )
     assert receipt.request_evidence["qualification_policy"] == {
-        "propagated_mutation": "graph_pinned_preactivation_v1"
+        "propagated_mutation": "graph_pinned_preactivation_v1",
+        "feature_input_capture": "selected_feature_input_vectors_v1",
+        "feature_projection": "joint_canonical_provider_preactivation_v1",
+        "native_feature_values": "diagnostic_only_v1",
     }
     assert receipt.qualification_fingerprint.startswith("sha256:")
     validate_ordering_qualification_receipt(_request(), receipt)
     validate_serialized_ordering_qualification_receipt(receipt.to_dict())
+
+
+def test_gate_jointly_projects_selected_hidden_vectors_despite_native_shape_drift() -> None:
+    host = _TinyGemma3PLTHost()
+    host.transcoders = _ShapeSensitivePLTProvider()
+
+    receipt = qualify_nnsight_ordering(host, _request())
+
+    assert receipt.result.verdict is OrderingQualificationVerdict.QUALIFIED
+    assert receipt.to_dict()["qualification_claim"] == (
+        "intervened_forward_capture_ordering_with_joint_canonical_feature_projection"
+    )
+    assert receipt.request_evidence["qualification_policy"] == {
+        "propagated_mutation": "graph_pinned_preactivation_v1",
+        "feature_input_capture": "selected_feature_input_vectors_v1",
+        "feature_projection": "joint_canonical_provider_preactivation_v1",
+        "native_feature_values": "diagnostic_only_v1",
+    }
+    assert receipt.result.native_feature_diagnostics
+    assert any(not item.passed for item in receipt.result.native_feature_diagnostics)
+    assert all(item.passed for item in receipt.result.comparisons)
+    canonical_shape = 4 * (1 + len(_request().execution.variants))
+    joint_calls = [
+        (layer, shape)
+        for layer, shape in host.transcoders.encoded_shapes
+        if shape[1] == canonical_shape
+    ]
+    assert joint_calls == [(0, (1, canonical_shape, 8)), (1, (1, canonical_shape, 8))]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "wrong_shape", "nonfinite"])
+def test_gate_refuses_invalid_selected_feature_input_capture(mutation: str) -> None:
+    host = _TinyGemma3PLTHost()
+    request = _request()
+    production = NNSightInterventionRuntime(
+        host, ordering_admission_mode=OrderingAdmissionMode.CANDIDATE_SMOKE
+    ).evaluate(request.execution)
+
+    receipt = qualify_nnsight_ordering(
+        host,
+        request,
+        selective_runtime=_CaptureMutatingRuntime(production, mutation),
+        oracle_runtime=_StaticRuntime(production),
+    )
+
+    assert receipt.result.verdict is OrderingQualificationVerdict.REFUSED
+    assert receipt.result.reasons == ("canonical_projection_refused",)
+
+
+def test_gate_rejects_mutated_selective_hidden_vector() -> None:
+    host = _TinyGemma3PLTHost()
+    request = _request()
+    production = NNSightInterventionRuntime(
+        host, ordering_admission_mode=OrderingAdmissionMode.CANDIDATE_SMOKE
+    ).evaluate(request.execution)
+
+    receipt = qualify_nnsight_ordering(
+        host,
+        request,
+        selective_runtime=_CaptureMutatingRuntime(production, "shift"),
+        oracle_runtime=_StaticRuntime(production),
+    )
+
+    assert receipt.result.verdict is OrderingQualificationVerdict.REJECTED
+    assert any(
+        reason.startswith("comparison_failed:baseline.feature_input")
+        for reason in receipt.result.reasons
+    )
 
 
 class _RecordingQualificationHost(_TinyGemma3PLTHost):
@@ -426,6 +584,57 @@ def test_offline_validator_preserves_historical_v1_receipt_verification() -> Non
     }
 
     validate_serialized_ordering_qualification_receipt(legacy)
+
+
+def test_offline_validator_preserves_historical_v2_receipt_verification() -> None:
+    payload = qualify_nnsight_ordering(_TinyGemma3PLTHost(), _request()).to_dict()
+    payload["schema_version"] = 2
+    payload["qualification_claim"] = (
+        "intervened_forward_capture_ordering_with_graph_pinned_mutations_only"
+    )
+    payload["request_evidence"]["qualification_policy"] = {
+        "propagated_mutation": "graph_pinned_preactivation_v1"
+    }
+    payload["result"].pop("native_feature_diagnostics")
+
+    def fingerprint(value) -> str:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    payload["request_fingerprint"] = fingerprint(payload["request_evidence"])
+    science_request = {
+        key: payload["request_evidence"][key]
+        for key in (
+            "scope",
+            "tolerance",
+            "identity",
+            "target",
+            "variants",
+            "observed_downstream_nodes",
+            "qualification_policy",
+        )
+    }
+    qualification_evidence = {
+        "schema": payload["schema"],
+        "schema_version": 2,
+        "qualification_claim": payload["qualification_claim"],
+        "science_request_fingerprint": fingerprint(science_request),
+        "scope": payload["scope"],
+        "result": payload["result"],
+    }
+    payload["qualification_fingerprint"] = fingerprint(qualification_evidence)
+    payload["evidence_fingerprint"] = fingerprint(
+        {
+            **qualification_evidence,
+            "request_fingerprint": payload["request_fingerprint"],
+            "qualification_fingerprint": payload["qualification_fingerprint"],
+            "provenance": payload["provenance"],
+        }
+    )
+
+    validate_serialized_ordering_qualification_receipt(payload)
 
 
 def test_eager_oracle_encodes_only_requested_layers_and_positions() -> None:
@@ -705,7 +914,7 @@ def test_gate_rejects_near_zero_stale_downstream_capture() -> None:
 
     assert receipt.result.verdict is OrderingQualificationVerdict.REJECTED
     assert any(
-        reason.startswith("comparison_failed:variant.direct.downstream")
+        reason.startswith("comparison_failed:direct.canonical_feature")
         for reason in receipt.result.reasons
     )
 
@@ -750,7 +959,7 @@ def test_gate_rejects_near_zero_objective_difference_beyond_two_bf16_ulps() -> N
     )
 
 
-def test_gate_rejects_near_zero_feature_difference_beyond_two_bf16_ulps() -> None:
+def test_native_feature_difference_is_diagnostic_only() -> None:
     host = _TinyGemma3PLTHost()
     request = _request()
     production = NNSightInterventionRuntime(
@@ -786,14 +995,18 @@ def test_gate_rejects_near_zero_feature_difference_beyond_two_bf16_ulps() -> Non
     receipt = qualify_nnsight_ordering(
         host,
         request,
-        selective_runtime=_StaticRuntime(with_source_feature(0.001)),
-        oracle_runtime=_StaticRuntime(with_source_feature(0.0)),
+        selective_runtime=_StaticRuntime(
+            with_source_feature(0.001), capture_result=production
+        ),
+        oracle_runtime=_StaticRuntime(
+            with_source_feature(0.0), capture_result=production
+        ),
     )
 
-    assert receipt.result.verdict is OrderingQualificationVerdict.REJECTED
+    assert receipt.result.verdict is OrderingQualificationVerdict.QUALIFIED
     assert any(
-        reason.startswith("comparison_failed:baseline.feature")
-        for reason in receipt.result.reasons
+        item.path.startswith("baseline.feature") and not item.passed
+        for item in receipt.result.native_feature_diagnostics
     )
 
 

@@ -554,6 +554,8 @@ class NNSightReplacementModel(LanguageModel):
         barrier_layers: set[int] | None = None,
         propagation_probe: PropagationProbeSpec | None = None,
         propagation_feature_inputs: list[tuple[int, Any]] | None = None,
+        selected_feature_input_nodes: tuple[FeatureNode, ...] = (),
+        selected_feature_input_handles: list[tuple[int, int, Any]] | None = None,
     ) -> dict[int, Any]:
         """Encode one layer at a time; tensors remain transient NNSight graph values."""
 
@@ -564,10 +566,18 @@ class NNSightReplacementModel(LanguageModel):
         layers = sorted(
             encoded_layers
             | (set(propagation_probe.layers) if propagation_probe is not None else set())
+            | {node.layer for node in selected_feature_input_nodes}
         )
         activations: dict[int, Any] = {}
         for layer in layers:
             feature_input = self.get_feature_input_loc(layer).output
+            if selected_feature_input_handles is not None:
+                selected_feature_input_handles.extend(
+                    self._verification_save_selected_feature_inputs(
+                        selected_feature_input_nodes,
+                        layer=layer,
+                    )
+                )
             if propagation_probe is not None and propagation_feature_inputs is not None:
                 propagation_feature_inputs.append(
                     (
@@ -601,6 +611,28 @@ class NNSightReplacementModel(LanguageModel):
             for node in retained_nodes
         )
 
+    def _verification_save_selected_feature_inputs(
+        self,
+        nodes: tuple[FeatureNode, ...],
+        *,
+        layer: int | None = None,
+    ) -> tuple[tuple[int, int, Any], ...]:
+        keys = tuple(sorted({(node.layer, node.position) for node in nodes}))
+        if layer is not None:
+            keys = tuple(key for key in keys if key[0] == layer)
+        return tuple(
+            (
+                selected_layer,
+                position,
+                save(
+                    self.get_feature_input_loc(selected_layer)
+                    .output[0, position]
+                    .detach()
+                ),
+            )
+            for selected_layer, position in keys
+        )
+
     @torch.no_grad
     def _verification_capture_baseline(
         self,
@@ -612,6 +644,7 @@ class NNSightReplacementModel(LanguageModel):
         retain_attention_state: bool,
         retain_direct_freeze_state: bool,
         propagation_probe: PropagationProbeSpec | None = None,
+        selected_feature_input_nodes: tuple[FeatureNode, ...] = (),
     ) -> SelectiveProbeCapture:
         """Capture scalar evidence plus only the dense state required by frozen semantics."""
 
@@ -620,7 +653,16 @@ class NNSightReplacementModel(LanguageModel):
         # NNSight mediator locals do not escape ``invoke`` like ordinary Python
         # locals.  Mutate an outer collection with the explicitly saved handles.
         feature_value_handles: list[tuple[FeatureNode, Any]] = []
+        selected_feature_input_handles: list[tuple[int, int, Any]] = []
         propagation_feature_inputs: list[tuple[int, Any]] = []
+        qualification_capture_kwargs = (
+            {
+                "selected_feature_input_nodes": selected_feature_input_nodes,
+                "selected_feature_input_handles": selected_feature_input_handles,
+            }
+            if selected_feature_input_nodes
+            else {}
+        )
         with (
             self._verification_probe_scope(),
             torch.inference_mode(),
@@ -632,6 +674,7 @@ class NNSightReplacementModel(LanguageModel):
                     retained_nodes,
                     propagation_probe=propagation_probe,
                     propagation_feature_inputs=propagation_feature_inputs,
+                    **qualification_capture_kwargs,
                 )
                 logits = self.output.logits[0, target_position - 1]
                 target_logit = save(logits[target_token_id])
@@ -685,6 +728,7 @@ class NNSightReplacementModel(LanguageModel):
                 if propagation_probe is not None
                 else None
             ),
+            tuple(selected_feature_input_handles),
         )
 
     def _verification_freeze_attention(
@@ -749,6 +793,8 @@ class NNSightReplacementModel(LanguageModel):
         propagation_probe: PropagationProbeSpec | None = None,
         propagation_feature_inputs: list[tuple[int, Any]] | None = None,
         propagation_source_handles: dict[str, Any] | None = None,
+        selected_feature_input_nodes: tuple[FeatureNode, ...] = (),
+        selected_feature_input_handles: list[tuple[int, int, Any]] | None = None,
     ) -> None:
         provider: Any = (
             self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
@@ -761,6 +807,13 @@ class NNSightReplacementModel(LanguageModel):
             observed_by_layer[node.layer].append(node)
         deltas_by_layer_position: dict[int, dict[int, Any]] = defaultdict(dict)
         for layer in range(self.cfg.n_layers):
+            if selected_feature_input_handles is not None:
+                selected_feature_input_handles.extend(
+                    self._verification_save_selected_feature_inputs(
+                        selected_feature_input_nodes,
+                        layer=layer,
+                    )
+                )
             if (
                 propagation_probe is not None
                 and propagation_feature_inputs is not None
@@ -886,6 +939,7 @@ class NNSightReplacementModel(LanguageModel):
         target_position: int,
         target_token_id: int,
         propagation_probe: PropagationProbeSpec | None = None,
+        selected_feature_input_nodes: tuple[FeatureNode, ...] = (),
     ) -> SelectiveProbeCapture:
         """Run one isolated variant without ever saving a full feature activation tensor."""
 
@@ -899,6 +953,15 @@ class NNSightReplacementModel(LanguageModel):
         objective_handles: list[Any] = []
         propagation_feature_inputs: list[tuple[int, Any]] = []
         propagation_source_handles: dict[str, Any] = {}
+        selected_feature_input_handles: list[tuple[int, int, Any]] = []
+        qualification_capture_kwargs = (
+            {
+                "selected_feature_input_nodes": selected_feature_input_nodes,
+                "selected_feature_input_handles": selected_feature_input_handles,
+            }
+            if selected_feature_input_nodes
+            else {}
+        )
         with (
             self._verification_probe_scope(),
             torch.inference_mode(),
@@ -980,6 +1043,7 @@ class NNSightReplacementModel(LanguageModel):
                             target_token_id=target_token_id,
                             activation_barrier=activation_barrier,
                             direct_effects_barriers=direct_barriers,
+                            **qualification_capture_kwargs,
                         )
                     else:
                         self._verification_inject(
@@ -994,11 +1058,13 @@ class NNSightReplacementModel(LanguageModel):
                             propagation_probe=propagation_probe,
                             propagation_feature_inputs=propagation_feature_inputs,
                             propagation_source_handles=propagation_source_handles,
+                            **qualification_capture_kwargs,
                         )
             else:
                 with tracer.invoke():
                     observed_activations = self._verification_encode_layers(
-                        plan.observed_nodes
+                        plan.observed_nodes,
+                        **qualification_capture_kwargs,
                     )
                     feature_value_handles.extend(
                         self._verification_save_feature_values(
@@ -1027,6 +1093,7 @@ class NNSightReplacementModel(LanguageModel):
                 if propagation_probe is not None
                 else None
             ),
+            selected_feature_inputs=tuple(selected_feature_input_handles),
         )
 
     def _verification_release(self, baseline_state: object | None) -> None:

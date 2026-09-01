@@ -49,19 +49,27 @@ from .nnsight_runtime import (
     PropagatedMutationMode,
     PropagationProbeCapture,
     PropagationProbeSpec,
+    QualificationExecutionCapture,
     _provider_activation_delta,
 )
 from .runtime import InterventionRuntimePort
 
 
 RECEIPT_SCHEMA = "nnsight_intervened_forward_ordering_qualification"
-RECEIPT_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 3
+GRAPH_PINNED_RECEIPT_SCHEMA_VERSION = 2
 LEGACY_RECEIPT_SCHEMA_VERSION = 1
 QUALIFICATION_CLAIM = (
+    "intervened_forward_capture_ordering_with_joint_canonical_feature_projection"
+)
+GRAPH_PINNED_QUALIFICATION_CLAIM = (
     "intervened_forward_capture_ordering_with_graph_pinned_mutations_only"
 )
 LEGACY_QUALIFICATION_CLAIM = "intervened_forward_capture_ordering_only"
 PROPAGATED_MUTATION_POLICY = "graph_pinned_preactivation_v1"
+FEATURE_INPUT_CAPTURE_POLICY = "selected_feature_input_vectors_v1"
+FEATURE_PROJECTION_POLICY = "joint_canonical_provider_preactivation_v1"
+NATIVE_FEATURE_VALUES_POLICY = "diagnostic_only_v1"
 MAX_REFUSAL_MESSAGE_CHARS = 2_048
 
 
@@ -305,6 +313,7 @@ class OrderingQualificationResult:
     selective_cleanup_completed: bool
     oracle_cleanup_completed: bool
     refusal_diagnostics: tuple[OrderingRefusalDiagnostic, ...] = ()
+    native_feature_diagnostics: tuple[OrderingComparison, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -386,6 +395,9 @@ def _request_payload(request: OrderingQualificationRequest) -> dict[str, Any]:
         **_execution_request_payload(request),
         "qualification_policy": {
             "propagated_mutation": PROPAGATED_MUTATION_POLICY,
+            "feature_input_capture": FEATURE_INPUT_CAPTURE_POLICY,
+            "feature_projection": FEATURE_PROJECTION_POLICY,
+            "native_feature_values": NATIVE_FEATURE_VALUES_POLICY,
         },
     }
 
@@ -393,6 +405,8 @@ def _request_payload(request: OrderingQualificationRequest) -> dict[str, Any]:
 def _claim_for_schema_version(schema_version: int) -> str:
     if schema_version == LEGACY_RECEIPT_SCHEMA_VERSION:
         return LEGACY_QUALIFICATION_CLAIM
+    if schema_version == GRAPH_PINNED_RECEIPT_SCHEMA_VERSION:
+        return GRAPH_PINNED_QUALIFICATION_CLAIM
     if schema_version == RECEIPT_SCHEMA_VERSION:
         return QUALIFICATION_CLAIM
     raise ValueError("ordering qualification receipt schema version mismatch")
@@ -414,7 +428,7 @@ def _science_request_payload(
             "observed_downstream_nodes",
         )
     }
-    if schema_version >= 2:
+    if schema_version >= GRAPH_PINNED_RECEIPT_SCHEMA_VERSION:
         payload["qualification_policy"] = request_evidence.get("qualification_policy")
     return payload
 
@@ -449,6 +463,7 @@ def validate_serialized_ordering_qualification_receipt(
     schema_version = serialized.get("schema_version")
     if schema_version not in {
         LEGACY_RECEIPT_SCHEMA_VERSION,
+        GRAPH_PINNED_RECEIPT_SCHEMA_VERSION,
         RECEIPT_SCHEMA_VERSION,
     }:
         raise ValueError("ordering qualification receipt schema version mismatch")
@@ -464,7 +479,7 @@ def validate_serialized_ordering_qualification_receipt(
     request_evidence = serialized.get("request_evidence")
     if not isinstance(request_evidence, Mapping):
         raise ValueError("ordering qualification receipt request evidence is missing")
-    if schema_version == RECEIPT_SCHEMA_VERSION:
+    if schema_version >= GRAPH_PINNED_RECEIPT_SCHEMA_VERSION:
         policy = request_evidence.get("qualification_policy")
         if not isinstance(policy, Mapping) or policy.get(
             "propagated_mutation"
@@ -472,6 +487,13 @@ def validate_serialized_ordering_qualification_receipt(
             raise ValueError(
                 "ordering qualification receipt propagated mutation policy mismatch"
             )
+        if schema_version == RECEIPT_SCHEMA_VERSION and policy != {
+            "propagated_mutation": PROPAGATED_MUTATION_POLICY,
+            "feature_input_capture": FEATURE_INPUT_CAPTURE_POLICY,
+            "feature_projection": FEATURE_PROJECTION_POLICY,
+            "native_feature_values": NATIVE_FEATURE_VALUES_POLICY,
+        }:
+            raise ValueError("ordering qualification receipt projection policy mismatch")
     if request_evidence.get("scope") != serialized.get("scope"):
         raise ValueError("ordering qualification receipt request scope mismatch")
     if request_evidence.get("scope_bindings") != serialized.get("scope_bindings"):
@@ -639,6 +661,8 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         plan: Any | None,
         baseline_state: _EagerBaselineState | None,
         propagation_probe: PropagationProbeSpec | None = None,
+        selected_feature_input_nodes: tuple[FeatureNode, ...] = (),
+        selected_feature_inputs: list[tuple[int, int, torch.Tensor]] | None = None,
     ) -> tuple[
         float,
         float,
@@ -693,6 +717,11 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         for node in observed_nodes:
             nodes_by_layer.setdefault(node.layer, ())
             nodes_by_layer[node.layer] = (*nodes_by_layer[node.layer], node)
+        selected_keys_by_layer: dict[int, tuple[int, ...]] = {}
+        for node in selected_feature_input_nodes:
+            positions = set(selected_keys_by_layer.get(node.layer, ()))
+            positions.add(node.position)
+            selected_keys_by_layer[node.layer] = tuple(sorted(positions))
         retain_full_inputs = bool(getattr(self._provider, "skip_connection", False))
 
         def dropout_oracle(input: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
@@ -734,6 +763,11 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         def input_hook(layer: int):
             def capture(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
                 values = _clone_tensor(output)
+                if selected_feature_inputs is not None:
+                    selected_feature_inputs.extend(
+                        (layer, position, values[0, position].detach().clone())
+                        for position in selected_keys_by_layer.get(layer, ())
+                    )
                 if propagation_probe is not None and layer in propagation_probe.layers:
                     propagation_feature_inputs[layer] = values[
                         0, propagation_probe.position
@@ -848,6 +882,7 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
                         propagation_probe is not None
                         and layer in propagation_probe.layers
                     )
+                    or layer in selected_keys_by_layer
                 ):
                     stack.callback(module.register_forward_hook(input_hook(layer)).remove)
             for layer, module in enumerate(self._feature_outputs):
@@ -888,7 +923,27 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         return target_logit, mean_logit, tuple(features), state, probe_capture
 
     def evaluate(self, request: InterventionExecutionRequest) -> InterventionExecutionResult:
+        return self._evaluate(request, selected_feature_input_nodes=()).result
+
+    def evaluate_for_ordering_qualification(
+        self,
+        request: InterventionExecutionRequest,
+        *,
+        selected_feature_input_nodes: tuple[FeatureNode, ...],
+    ) -> QualificationExecutionCapture:
+        return self._evaluate(
+            request,
+            selected_feature_input_nodes=selected_feature_input_nodes,
+        )
+
+    def _evaluate(
+        self,
+        request: InterventionExecutionRequest,
+        *,
+        selected_feature_input_nodes: tuple[FeatureNode, ...],
+    ) -> QualificationExecutionCapture:
         started = self._clock()
+        selected_captures: dict[str, tuple[tuple[int, int, torch.Tensor], ...]] = {}
         state: _EagerBaselineState | None = None
         observations: list[VariantObservation] = []
         baseline: BaselineCapture | None = None
@@ -896,9 +951,16 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
         status = RuntimeExecutionStatus.REFUSED
         cleanup_completed = False
         try:
+            baseline_selected: list[tuple[int, int, torch.Tensor]] = []
             target, mean, features, state, _ = self._run_forward(
-                request, plan=None, baseline_state=None
+                request,
+                plan=None,
+                baseline_state=None,
+                selected_feature_input_nodes=selected_feature_input_nodes,
+                selected_feature_inputs=baseline_selected,
             )
+            if selected_feature_input_nodes:
+                selected_captures["baseline"] = tuple(baseline_selected)
             baseline = BaselineCapture(target - mean, (target, mean), features)
             capabilities = get_transcoder_capabilities(self._provider)
             from .nnsight_runtime import _translate_variant
@@ -914,9 +976,16 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
                 for variant in request.variants
             )
             for plan in plans:
+                variant_selected: list[tuple[int, int, torch.Tensor]] = []
                 target, mean, features, _, _ = self._run_forward(
-                    request, plan=plan, baseline_state=state
+                    request,
+                    plan=plan,
+                    baseline_state=state,
+                    selected_feature_input_nodes=selected_feature_input_nodes,
+                    selected_feature_inputs=variant_selected,
                 )
+                if selected_feature_input_nodes:
+                    selected_captures[plan.variant_id] = tuple(variant_selected)
                 observed = set(request.observed_downstream_nodes)
                 intervention = set(plan.retain_intervention_nodes)
                 observations.append(
@@ -944,14 +1013,17 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
                 )
             else:
                 cleanup_completed = True
-        return InterventionExecutionResult(
-            status,
-            baseline,
-            tuple(observations),
-            refusal,
-            self._clock() - started,
-            cleanup_completed,
-            ordering_admission_mode=OrderingAdmissionMode.CANDIDATE_SMOKE,
+        return QualificationExecutionCapture(
+            InterventionExecutionResult(
+                status,
+                baseline,
+                tuple(observations),
+                refusal,
+                self._clock() - started,
+                cleanup_completed,
+                ordering_admission_mode=OrderingAdmissionMode.CANDIDATE_SMOKE,
+            ),
+            selected_captures,
         )
 
 
@@ -1018,6 +1090,261 @@ def _has_meaningful_downstream_effect(
     return False
 
 
+@dataclass
+class _CanonicalProjectionEvidence:
+    vectors: dict[tuple[str, str, int, int], torch.Tensor]
+    features: dict[tuple[str, str, FeatureNode], float]
+
+    def clear(self) -> None:
+        self.vectors.clear()
+        self.features.clear()
+
+
+def _selected_feature_input_nodes(
+    request: OrderingQualificationRequest,
+) -> tuple[FeatureNode, ...]:
+    return tuple(
+        sorted(
+            set(request.execution.observed_downstream_nodes)
+            | {
+                intervention.node
+                for variant in request.execution.variants
+                for intervention in variant.interventions
+            }
+        )
+    )
+
+
+def _joint_canonical_projection(
+    provider: Any,
+    request: OrderingQualificationRequest,
+    captures: Sequence[tuple[str, QualificationExecutionCapture]],
+) -> _CanonicalProjectionEvidence:
+    selected_nodes = _selected_feature_input_nodes(request)
+    expected_vector_keys = {(node.layer, node.position) for node in selected_nodes}
+    expected_runs = (
+        "baseline",
+        *(variant.variant_id for variant in request.execution.variants),
+    )
+    vectors: dict[tuple[str, str, int, int], torch.Tensor] = {}
+    engine_order = {label: index for index, (label, _capture) in enumerate(captures)}
+    run_order = {run_id: index for index, run_id in enumerate(expected_runs)}
+    for engine, capture in captures:
+        if set(capture.selected_feature_inputs) != set(expected_runs):
+            raise ValueError(f"{engine} selected feature-input runs are incomplete")
+        for run_id in expected_runs:
+            raw_values = capture.selected_feature_inputs[run_id]
+            keyed: dict[tuple[int, int], torch.Tensor] = {}
+            for layer, position, value in raw_values:
+                key = (layer, position)
+                if key in keyed:
+                    raise ValueError(
+                        f"{engine}.{run_id} selected feature-input capture is duplicated"
+                    )
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(
+                        f"{engine}.{run_id} selected feature-input capture is not a tensor"
+                    )
+                if value.ndim != 1 or not value.is_floating_point():
+                    raise ValueError(
+                        f"{engine}.{run_id} selected feature-input capture has wrong shape"
+                    )
+                keyed[key] = value.detach()
+            if set(keyed) != expected_vector_keys:
+                raise ValueError(
+                    f"{engine}.{run_id} selected feature-input capture keys mismatch"
+                )
+            for (layer, position), value in keyed.items():
+                vectors[engine, run_id, layer, position] = value
+
+    features: dict[tuple[str, str, FeatureNode], float] = {}
+    layers = sorted({node.layer for node in selected_nodes})
+    for layer in layers:
+        records = sorted(
+            (
+                key,
+                value,
+            )
+            for key, value in vectors.items()
+            if key[2] == layer
+        )
+        records.sort(
+            key=lambda item: (
+                engine_order[item[0][0]],
+                run_order[item[0][1]],
+                item[0][3],
+            )
+        )
+        shapes = {tuple(value.shape) for _key, value in records}
+        dtypes = {value.dtype for _key, value in records}
+        devices = {value.device for _key, value in records}
+        if len(shapes) != 1 or len(dtypes) != 1 or len(devices) != 1:
+            raise ValueError(f"layer {layer} selected feature-input shapes disagree")
+        joint = torch.stack([value for _key, value in records], dim=0).unsqueeze(0)
+        if not bool(torch.isfinite(joint).all().item()):
+            raise ValueError(f"layer {layer} selected feature-input capture is nonfinite")
+        encoded = provider.encode_layer(
+            joint,
+            layer,
+            apply_activation_function=False,
+        )
+        if not isinstance(encoded, torch.Tensor) or encoded.ndim != 3:
+            raise ValueError(f"layer {layer} canonical feature projection has wrong shape")
+        if encoded.shape[:2] != joint.shape[:2]:
+            raise ValueError(f"layer {layer} canonical feature projection changed batch shape")
+        if not bool(torch.isfinite(encoded).all().item()):
+            raise ValueError(f"layer {layer} canonical feature projection is nonfinite")
+        joint_cpu = joint.detach().to(device="cpu", dtype=torch.float32).squeeze(0)
+        encoded_cpu = encoded.detach().to(device="cpu", dtype=torch.float32).squeeze(0)
+        for index, (key, _value) in enumerate(records):
+            engine, run_id, _layer, position = key
+            vectors[key] = joint_cpu[index]
+            for node in selected_nodes:
+                if node.layer != layer or node.position != position:
+                    continue
+                if node.feature >= encoded_cpu.shape[-1]:
+                    raise ValueError(
+                        f"layer {layer} canonical feature projection lacks feature"
+                    )
+                features[engine, run_id, node] = float(encoded_cpu[index, node.feature])
+    return _CanonicalProjectionEvidence(vectors, features)
+
+
+def _compare_vector(
+    comparisons: list[OrderingComparison],
+    *,
+    path: str,
+    oracle: torch.Tensor,
+    selective: torch.Tensor,
+    max_bf16_ulps: float,
+) -> None:
+    if oracle.shape != selective.shape:
+        comparisons.append(OrderingComparison(path, 0.0, math.inf, math.inf, math.inf, False))
+        return
+    oracle_values = oracle.detach().to(device="cpu", dtype=torch.float32).flatten()
+    selective_values = selective.detach().to(device="cpu", dtype=torch.float32).flatten()
+    absolute = (selective_values - oracle_values).abs()
+    allowed = torch.tensor(
+        [
+            max_bf16_ulps * max(_bf16_ulp(float(left)), _bf16_ulp(float(right)))
+            for left, right in zip(oracle_values, selective_values, strict=True)
+        ],
+        dtype=torch.float32,
+    )
+    max_absolute = float(absolute.max().item()) if absolute.numel() else 0.0
+    max_relative = float(
+        (absolute / oracle_values.abs().clamp_min(1e-12)).max().item()
+    ) if absolute.numel() else 0.0
+    comparisons.append(
+        OrderingComparison(
+            path,
+            float(oracle_values.abs().max().item()) if oracle_values.numel() else 0.0,
+            float(selective_values.abs().max().item()) if selective_values.numel() else 0.0,
+            max_absolute,
+            max_relative,
+            bool((absolute <= allowed).all().item()),
+        )
+    )
+
+
+def _with_canonical_pair_evidence(
+    request: OrderingQualificationRequest,
+    result: OrderingQualificationResult,
+    evidence: _CanonicalProjectionEvidence,
+    *,
+    oracle_engine: str,
+    selective_engine: str,
+    require_non_vacuity: bool,
+) -> OrderingQualificationResult:
+    if result.verdict is OrderingQualificationVerdict.REFUSED:
+        return result
+    comparisons = list(result.comparisons)
+    reasons = list(result.reasons)
+    selected_nodes = _selected_feature_input_nodes(request)
+    run_ids = (
+        "baseline",
+        *(variant.variant_id for variant in request.execution.variants),
+    )
+    for run_id in run_ids:
+        for layer, position in sorted({(node.layer, node.position) for node in selected_nodes}):
+            _compare_vector(
+                comparisons,
+                path=f"{run_id}.feature_input.{layer}.{position}",
+                oracle=evidence.vectors[oracle_engine, run_id, layer, position],
+                selective=evidence.vectors[selective_engine, run_id, layer, position],
+                max_bf16_ulps=request.tolerance.feature_max_bf16_ulps,
+            )
+        for node in selected_nodes:
+            _compare_value(
+                comparisons,
+                path=(
+                    f"{run_id}.canonical_feature."
+                    f"{node.layer}.{node.position}.{node.feature}"
+                ),
+                oracle=evidence.features[oracle_engine, run_id, node],
+                selective=evidence.features[selective_engine, run_id, node],
+                max_bf16_ulps=request.tolerance.feature_max_bf16_ulps,
+            )
+
+    no_op_id = request.execution.variants[0].variant_id
+    observed = set(request.execution.observed_downstream_nodes)
+    for engine in (oracle_engine, selective_engine):
+        for node in selected_nodes:
+            if node not in observed:
+                continue
+            _compare_value(
+                comparisons,
+                path=(
+                    f"{engine}.no_op_baseline.canonical_feature."
+                    f"{node.layer}.{node.position}.{node.feature}"
+                ),
+                oracle=evidence.features[engine, "baseline", node],
+                selective=evidence.features[engine, no_op_id, node],
+                max_bf16_ulps=request.tolerance.feature_max_bf16_ulps,
+            )
+
+    if require_non_vacuity:
+        for semantics in (
+            InterventionSemantics.DIRECT_FROZEN,
+            InterventionSemantics.PROPAGATED_FROZEN_ATTENTION,
+        ):
+            effect_observed = False
+            for variant in request.execution.variants:
+                if not variant.interventions or variant.semantics is not semantics:
+                    continue
+                source = variant.interventions[0].node
+                for node in request.execution.observed_downstream_nodes:
+                    if node.layer <= source.layer:
+                        continue
+                    baseline = evidence.features[oracle_engine, "baseline", node]
+                    changed = evidence.features[oracle_engine, variant.variant_id, node]
+                    floor = max(
+                        request.tolerance.downstream_effect_min_abs,
+                        request.tolerance.downstream_effect_min_bf16_ulps
+                        * max(_bf16_ulp(baseline), _bf16_ulp(changed)),
+                    )
+                    if abs(changed - baseline) > floor:
+                        effect_observed = True
+                        break
+                if effect_observed:
+                    break
+            if not effect_observed:
+                reasons.append(f"non_vacuous_effect_missing:{semantics.value}")
+    failed = tuple(item.path for item in comparisons if not item.passed)
+    reasons.extend(f"comparison_failed:{path}" for path in failed)
+    verdict = (
+        OrderingQualificationVerdict.QUALIFIED
+        if not reasons
+        else OrderingQualificationVerdict.REJECTED
+    )
+    return replace(
+        result,
+        verdict=verdict,
+        comparisons=tuple(comparisons),
+        reasons=tuple(dict.fromkeys(reasons)),
+    )
+
+
 def _compare_execution_results(
     request: OrderingQualificationRequest,
     oracle: InterventionExecutionResult,
@@ -1025,6 +1352,7 @@ def _compare_execution_results(
 ) -> OrderingQualificationResult:
     reasons: list[str] = []
     comparisons: list[OrderingComparison] = []
+    native_feature_diagnostics: list[OrderingComparison] = []
     refusal_diagnostics: list[OrderingRefusalDiagnostic] = []
     for label, result in (("oracle", oracle), ("selective", selective)):
         if result.status is not RuntimeExecutionStatus.COMPLETE:
@@ -1050,6 +1378,7 @@ def _compare_execution_results(
             selective.cleanup_completed,
             oracle.cleanup_completed,
             tuple(refusal_diagnostics),
+            (),
         )
 
     tolerance = request.tolerance
@@ -1064,11 +1393,11 @@ def _compare_execution_results(
     oracle_baseline_features = _feature_map(oracle.baseline.feature_values)
     selective_baseline_features = _feature_map(selective.baseline.feature_values)
     if oracle_baseline_features.keys() != selective_baseline_features.keys():
-        reasons.append("baseline_feature_key_mismatch")
+        pass
     else:
         for node in sorted(oracle_baseline_features):
             _compare_value(
-                comparisons,
+                native_feature_diagnostics,
                 path=f"baseline.feature.{node.layer}.{node.position}.{node.feature}",
                 oracle=oracle_baseline_features[node],
                 selective=selective_baseline_features[node],
@@ -1108,11 +1437,10 @@ def _compare_execution_results(
             oracle_features = _feature_map(oracle_values)
             selective_features = _feature_map(selective_values)
             if oracle_features.keys() != selective_features.keys():
-                reasons.append(f"variant_{variant_id}_{family}_feature_key_mismatch")
                 continue
             for node in sorted(oracle_features):
                 _compare_value(
-                    comparisons,
+                    native_feature_diagnostics,
                     path=(
                         f"variant.{variant_id}.{family}.feature."
                         f"{node.layer}.{node.position}.{node.feature}"
@@ -1154,11 +1482,11 @@ def _compare_execution_results(
         }
         no_op_downstream = _feature_map(no_op.downstream_feature_values)
         if baseline_downstream.keys() != no_op_downstream.keys():
-            reasons.append(f"{label}_no_op_baseline_feature_key_mismatch")
+            pass
         else:
             for node in sorted(baseline_downstream):
                 _compare_value(
-                    comparisons,
+                    native_feature_diagnostics,
                     path=(
                         f"{label}.no_op_baseline.downstream.feature."
                         f"{node.layer}.{node.position}.{node.feature}"
@@ -1168,32 +1496,6 @@ def _compare_execution_results(
                     max_bf16_ulps=tolerance.feature_max_bf16_ulps,
                 )
 
-    baseline_features = _feature_map(oracle.baseline.feature_values)
-    for semantics in (
-        InterventionSemantics.DIRECT_FROZEN,
-        InterventionSemantics.PROPAGATED_FROZEN_ATTENTION,
-    ):
-        candidates = tuple(
-            variant
-            for variant in request.execution.variants
-            if variant.interventions and variant.semantics is semantics
-        )
-        effect_observed = False
-        for variant in candidates:
-            observation = oracle_by_id.get(variant.variant_id)
-            if observation is None:
-                continue
-            source = variant.interventions[0].node
-            if _has_meaningful_downstream_effect(
-                baseline_features,
-                observation,
-                source=source,
-                tolerance=tolerance,
-            ):
-                effect_observed = True
-                break
-        if not effect_observed:
-            reasons.append(f"non_vacuous_effect_missing:{semantics.value}")
     failed = tuple(item.path for item in comparisons if not item.passed)
     reasons.extend(f"comparison_failed:{path}" for path in failed)
     verdict = (
@@ -1210,6 +1512,7 @@ def _compare_execution_results(
         selective.cleanup_completed,
         oracle.cleanup_completed,
         tuple(refusal_diagnostics),
+        tuple(native_feature_diagnostics),
     )
 
 
@@ -1224,6 +1527,7 @@ def _with_repeat_evidence(
     comparisons = list(primary.comparisons)
     reasons = list(primary.reasons)
     refusal_diagnostics = list(primary.refusal_diagnostics)
+    native_feature_diagnostics = list(primary.native_feature_diagnostics)
     verdict = primary.verdict
     for label, repeated in (
         ("oracle_repeat", oracle_repeat),
@@ -1239,6 +1543,17 @@ def _with_repeat_evidence(
                 comparison.passed,
             )
             for comparison in repeated.comparisons
+        )
+        native_feature_diagnostics.extend(
+            OrderingComparison(
+                f"{label}.{comparison.path}",
+                comparison.oracle_value,
+                comparison.selective_value,
+                comparison.absolute_error,
+                comparison.relative_error,
+                comparison.passed,
+            )
+            for comparison in repeated.native_feature_diagnostics
         )
         repeat_reasons = tuple(
             reason
@@ -1264,6 +1579,7 @@ def _with_repeat_evidence(
         primary.selective_cleanup_completed,
         primary.oracle_cleanup_completed,
         tuple(refusal_diagnostics),
+        tuple(native_feature_diagnostics),
     )
 
 
@@ -1297,21 +1613,125 @@ def qualify_intervened_forward_ordering(
         ordering_admission_mode=OrderingAdmissionMode.CANDIDATE_SMOKE,
         propagated_mutation_mode=PropagatedMutationMode.GRAPH_PINNED,
     )
-    # A-B-B-A ordering makes within-process recovery and repeatability evidence
-    # part of the qualification instead of relying only on fresh-process repeats.
-    oracle_result = oracle_adapter.evaluate(request.execution)
-    selective_result = selective_adapter.evaluate(request.execution)
-    selective_repeat_result = selective_adapter.evaluate(request.execution)
-    oracle_repeat_result = oracle_adapter.evaluate(request.execution)
-    result = _with_repeat_evidence(
-        _compare_execution_results(request, oracle_result, selective_result),
-        oracle_repeat=_compare_execution_results(
+    selected_nodes = _selected_feature_input_nodes(request)
+    captures: list[tuple[str, QualificationExecutionCapture]] = []
+    projection: _CanonicalProjectionEvidence | None = None
+    try:
+        # A-B-B-A ordering makes within-process recovery and repeatability evidence
+        # part of the qualification instead of relying only on fresh-process repeats.
+        for label, adapter in (
+            ("oracle", oracle_adapter),
+            ("selective", selective_adapter),
+            ("selective_repeat", selective_adapter),
+            ("oracle_repeat", oracle_adapter),
+        ):
+            evaluate = getattr(adapter, "evaluate_for_ordering_qualification", None)
+            if not callable(evaluate):
+                raise ValueError(
+                    f"{label} runtime lacks qualification feature-input capture"
+                )
+            capture = evaluate(
+                request.execution,
+                selected_feature_input_nodes=selected_nodes,
+            )
+            if not isinstance(capture, QualificationExecutionCapture):
+                raise ValueError(f"{label} runtime returned invalid qualification capture")
+            captures.append((label, capture))
+        capture_by_label = dict(captures)
+        oracle_result = capture_by_label["oracle"].result
+        selective_result = capture_by_label["selective"].result
+        selective_repeat_result = capture_by_label["selective_repeat"].result
+        oracle_repeat_result = capture_by_label["oracle_repeat"].result
+        primary_execution = _compare_execution_results(
+            request, oracle_result, selective_result
+        )
+        oracle_repeat_execution = _compare_execution_results(
             request, oracle_result, oracle_repeat_result
-        ),
-        selective_repeat=_compare_execution_results(
+        )
+        selective_repeat_execution = _compare_execution_results(
             request, selective_result, selective_repeat_result
-        ),
-    )
+        )
+        if any(
+            item.verdict is OrderingQualificationVerdict.REFUSED
+            for item in (
+                primary_execution,
+                oracle_repeat_execution,
+                selective_repeat_execution,
+            )
+        ):
+            result = _with_repeat_evidence(
+                primary_execution,
+                oracle_repeat=oracle_repeat_execution,
+                selective_repeat=selective_repeat_execution,
+            )
+        else:
+            projection = _joint_canonical_projection(
+                _provider(model),
+                request,
+                captures,
+            )
+            primary = _with_canonical_pair_evidence(
+                request,
+                primary_execution,
+                projection,
+                oracle_engine="oracle",
+                selective_engine="selective",
+                require_non_vacuity=True,
+            )
+            oracle_repeat = _with_canonical_pair_evidence(
+                request,
+                oracle_repeat_execution,
+                projection,
+                oracle_engine="oracle",
+                selective_engine="oracle_repeat",
+                require_non_vacuity=False,
+            )
+            selective_repeat = _with_canonical_pair_evidence(
+                request,
+                selective_repeat_execution,
+                projection,
+                oracle_engine="selective",
+                selective_engine="selective_repeat",
+                require_non_vacuity=False,
+            )
+            result = _with_repeat_evidence(
+                primary,
+                oracle_repeat=oracle_repeat,
+                selective_repeat=selective_repeat,
+            )
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        message = f"{type(error).__name__}: {error}"
+        result = OrderingQualificationResult(
+            OrderingQualificationVerdict.REFUSED,
+            (),
+            ("canonical_projection_refused",),
+            (
+                captures[1][1].result.status.value
+                if len(captures) > 1
+                else RuntimeExecutionStatus.REFUSED.value
+            ),
+            (
+                captures[0][1].result.status.value
+                if captures
+                else RuntimeExecutionStatus.REFUSED.value
+            ),
+            bool(len(captures) > 1 and captures[1][1].result.cleanup_completed),
+            bool(captures and captures[0][1].result.cleanup_completed),
+            (
+                OrderingRefusalDiagnostic(
+                    "canonical_projection",
+                    "invalid_feature_input_capture",
+                    type(error).__name__,
+                    message[:MAX_REFUSAL_MESSAGE_CHARS],
+                    None,
+                ),
+            ),
+        )
+    finally:
+        if projection is not None:
+            projection.clear()
+        for _label, capture in captures:
+            capture.clear()
     request_evidence = _request_payload(request)
     request_fingerprint = _fingerprint(request_evidence)
     qualification_evidence = _qualification_evidence(

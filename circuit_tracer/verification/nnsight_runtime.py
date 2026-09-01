@@ -64,6 +64,18 @@ class SelectiveProbeCapture:
     origin: "CaptureOrigin"
     retained_state: object | None = None
     propagation_probe: "PropagationProbeCapture | None" = None
+    selected_feature_inputs: tuple[tuple[int, int, Any], ...] = ()
+
+
+@dataclass
+class QualificationExecutionCapture:
+    """Transient selected hidden vectors from one qualification execution."""
+
+    result: InterventionExecutionResult
+    selected_feature_inputs: dict[str, tuple[tuple[int, int, torch.Tensor], ...]]
+
+    def clear(self) -> None:
+        self.selected_feature_inputs.clear()
 
 
 @dataclass(frozen=True)
@@ -137,6 +149,7 @@ class SelectiveNNSightProbeModel(Protocol):
         target_token_id: int,
         retain_attention_state: bool,
         retain_direct_freeze_state: bool,
+        selected_feature_input_nodes: tuple[FeatureNode, ...] = (),
     ) -> SelectiveProbeCapture: ...
 
     def _verification_run_variant(
@@ -147,6 +160,7 @@ class SelectiveNNSightProbeModel(Protocol):
         *,
         target_position: int,
         target_token_id: int,
+        selected_feature_input_nodes: tuple[FeatureNode, ...] = (),
     ) -> SelectiveProbeCapture: ...
 
     def _verification_release(self, baseline_state: object | None) -> None: ...
@@ -255,6 +269,17 @@ def _float(value: Any) -> float:
 
 def _feature_values(capture: SelectiveProbeCapture) -> tuple[FeatureValue, ...]:
     return tuple(FeatureValue(node, _float(value)) for node, value in capture.feature_values)
+
+
+def _selected_feature_inputs(
+    capture: SelectiveProbeCapture,
+) -> tuple[tuple[int, int, torch.Tensor], ...]:
+    values: list[tuple[int, int, torch.Tensor]] = []
+    for layer, position, value in capture.selected_feature_inputs:
+        if not isinstance(value, torch.Tensor):
+            raise RuntimeError("selected feature-input capture is not a tensor")
+        values.append((layer, position, value.detach()))
+    return tuple(values)
 
 
 def _provider_activation_delta(
@@ -383,17 +408,42 @@ class NNSightInterventionRuntime:
         return None
 
     def evaluate(self, request: InterventionExecutionRequest) -> InterventionExecutionResult:
+        return self._evaluate(request, selected_feature_input_nodes=()).result
+
+    def evaluate_for_ordering_qualification(
+        self,
+        request: InterventionExecutionRequest,
+        *,
+        selected_feature_input_nodes: tuple[FeatureNode, ...],
+    ) -> QualificationExecutionCapture:
+        """Run the ordinary engine while retaining only qualification-selected vectors."""
+
+        return self._evaluate(
+            request,
+            selected_feature_input_nodes=selected_feature_input_nodes,
+        )
+
+    def _evaluate(
+        self,
+        request: InterventionExecutionRequest,
+        *,
+        selected_feature_input_nodes: tuple[FeatureNode, ...],
+    ) -> QualificationExecutionCapture:
         started = self._clock()
+        selected_captures: dict[str, tuple[tuple[int, int, torch.Tensor], ...]] = {}
         refusal = self._unsupported(request)
         if refusal is not None:
-            return InterventionExecutionResult(
-                RuntimeExecutionStatus.REFUSED,
-                None,
-                (),
-                refusal,
-                0.0,
-                True,
-                ordering_admission_mode=self._ordering_admission_mode,
+            return QualificationExecutionCapture(
+                InterventionExecutionResult(
+                    RuntimeExecutionStatus.REFUSED,
+                    None,
+                    (),
+                    refusal,
+                    0.0,
+                    True,
+                    ordering_admission_mode=self._ordering_admission_mode,
+                ),
+                selected_captures,
             )
 
         provider = _provider(self._model)
@@ -403,14 +453,17 @@ class NNSightInterventionRuntime:
             d_transcoder = int(getattr(provider, "d_transcoder"))
             vocab_size = _hf_config_dimension(self._model.config, "vocab_size")
         except (AttributeError, TypeError, ValueError) as error:
-            return InterventionExecutionResult(
-                RuntimeExecutionStatus.REFUSED,
-                None,
-                (),
-                RuntimeRefusal("unsupported_backend", f"model dimensions unavailable: {error}"),
-                self._clock() - started,
-                True,
-                ordering_admission_mode=self._ordering_admission_mode,
+            return QualificationExecutionCapture(
+                InterventionExecutionResult(
+                    RuntimeExecutionStatus.REFUSED,
+                    None,
+                    (),
+                    RuntimeRefusal("unsupported_backend", f"model dimensions unavailable: {error}"),
+                    self._clock() - started,
+                    True,
+                    ordering_admission_mode=self._ordering_admission_mode,
+                ),
+                selected_captures,
             )
         prompt_length = len(request.identity.prompt_token_ids)
         raw_zero_positions = getattr(self._model, "zero_positions", ())
@@ -428,37 +481,46 @@ class NNSightInterventionRuntime:
         }
         for node in all_nodes:
             if node.layer >= n_layers or node.position >= prompt_length or node.feature >= d_transcoder:
-                return InterventionExecutionResult(
-                    RuntimeExecutionStatus.REFUSED,
-                    None,
-                    (),
-                    RuntimeRefusal("invalid_bounds", f"feature node is outside loaded dimensions: {node}"),
-                    self._clock() - started,
-                    True,
-                    ordering_admission_mode=self._ordering_admission_mode,
+                return QualificationExecutionCapture(
+                    InterventionExecutionResult(
+                        RuntimeExecutionStatus.REFUSED,
+                        None,
+                        (),
+                        RuntimeRefusal("invalid_bounds", f"feature node is outside loaded dimensions: {node}"),
+                        self._clock() - started,
+                        True,
+                        ordering_admission_mode=self._ordering_admission_mode,
+                    ),
+                    selected_captures,
                 )
             if node.position in zero_positions:
-                return InterventionExecutionResult(
+                return QualificationExecutionCapture(
+                    InterventionExecutionResult(
+                        RuntimeExecutionStatus.REFUSED,
+                        None,
+                        (),
+                        RuntimeRefusal(
+                            "canonical_zero_position",
+                            f"behavioral evidence is unavailable at canonical zero position: {node}",
+                        ),
+                        self._clock() - started,
+                        True,
+                        ordering_admission_mode=self._ordering_admission_mode,
+                    ),
+                    selected_captures,
+                )
+        if request.identity.target_token_id >= vocab_size:
+            return QualificationExecutionCapture(
+                InterventionExecutionResult(
                     RuntimeExecutionStatus.REFUSED,
                     None,
                     (),
-                    RuntimeRefusal(
-                        "canonical_zero_position",
-                        f"behavioral evidence is unavailable at canonical zero position: {node}",
-                    ),
+                    RuntimeRefusal("invalid_bounds", "target token exceeds loaded vocabulary"),
                     self._clock() - started,
                     True,
                     ordering_admission_mode=self._ordering_admission_mode,
-                )
-        if request.identity.target_token_id >= vocab_size:
-            return InterventionExecutionResult(
-                RuntimeExecutionStatus.REFUSED,
-                None,
-                (),
-                RuntimeRefusal("invalid_bounds", "target token exceeds loaded vocabulary"),
-                self._clock() - started,
-                True,
-                ordering_admission_mode=self._ordering_admission_mode,
+                ),
+                selected_captures,
             )
         try:
             plans = tuple(
@@ -472,14 +534,17 @@ class NNSightInterventionRuntime:
                 for variant in request.variants
             )
         except (TypeError, ValueError) as error:
-            return InterventionExecutionResult(
-                RuntimeExecutionStatus.REFUSED,
-                None,
-                (),
-                RuntimeRefusal("unsupported_plan", str(error)),
-                self._clock() - started,
-                True,
-                ordering_admission_mode=self._ordering_admission_mode,
+            return QualificationExecutionCapture(
+                InterventionExecutionResult(
+                    RuntimeExecutionStatus.REFUSED,
+                    None,
+                    (),
+                    RuntimeRefusal("unsupported_plan", str(error)),
+                    self._clock() - started,
+                    True,
+                    ordering_admission_mode=self._ordering_admission_mode,
+                ),
+                selected_captures,
             )
 
         retained_nodes = tuple(
@@ -505,21 +570,29 @@ class NNSightInterventionRuntime:
             request.predicted_baseline_seconds + request.cleanup_reserve_seconds
             > request.deadline_seconds
         ):
-            return self._finish(
-                request,
-                started,
-                status,
-                baseline,
-                observations,
-                RuntimeRefusal(
-                    "deadline_admission", "baseline predicted over cooperative budget"
+            return QualificationExecutionCapture(
+                self._finish(
+                    request,
+                    started,
+                    status,
+                    baseline,
+                    observations,
+                    RuntimeRefusal(
+                        "deadline_admission", "baseline predicted over cooperative budget"
+                    ),
+                    True,
                 ),
-                True,
+                selected_captures,
             )
 
         try:
             self._synchronize(self._model)
             baseline_started = self._clock()
+            capture_kwargs = (
+                {"selected_feature_input_nodes": selected_feature_input_nodes}
+                if selected_feature_input_nodes
+                else {}
+            )
             captured = self._model._verification_capture_baseline(
                 request.identity.prompt_token_ids,
                 retained_nodes,
@@ -527,6 +600,7 @@ class NNSightInterventionRuntime:
                 target_token_id=request.identity.target_token_id,
                 retain_attention_state=any(plan.freeze_attention for plan in plans),
                 retain_direct_freeze_state=need_direct_state,
+                **capture_kwargs,
             )
             baseline_state = captured.retained_state
             if captured.origin is not CaptureOrigin.BASELINE_FORWARD:
@@ -540,6 +614,8 @@ class NNSightInterventionRuntime:
                 (target_logit, mean_logit),
                 _feature_values(captured),
             )
+            if selected_feature_input_nodes:
+                selected_captures["baseline"] = _selected_feature_inputs(captured)
             if self._clock() - started + request.cleanup_reserve_seconds > request.deadline_seconds:
                 runtime_refusal = RuntimeRefusal(
                     "deadline_in_flight_overrun",
@@ -572,6 +648,7 @@ class NNSightInterventionRuntime:
                         baseline_state,
                         target_position=request.identity.target_position,
                         target_token_id=request.identity.target_token_id,
+                        **capture_kwargs,
                     )
                     if capture.origin is not CaptureOrigin.INTERVENED_FORWARD:
                         raise RuntimeError(
@@ -595,6 +672,10 @@ class NNSightInterventionRuntime:
                             tuple(item for item in all_features if item.node in intervention_set),
                         )
                     )
+                    if selected_feature_input_nodes:
+                        selected_captures[plan.variant_id] = _selected_feature_inputs(
+                            capture
+                        )
                     if (
                         self._clock() - started + request.cleanup_reserve_seconds
                         > request.deadline_seconds
@@ -631,14 +712,17 @@ class NNSightInterventionRuntime:
 
         if status is not RuntimeExecutionStatus.COMPLETE and runtime_refusal is None:
             runtime_refusal = RuntimeRefusal("runtime_failure", "verification ended without completion")
-        return self._finish(
-            request,
-            started,
-            status,
-            baseline,
-            observations,
-            runtime_refusal,
-            cleanup_completed,
+        return QualificationExecutionCapture(
+            self._finish(
+                request,
+                started,
+                status,
+                baseline,
+                observations,
+                runtime_refusal,
+                cleanup_completed,
+            ),
+            selected_captures,
         )
 
     def _finish(
