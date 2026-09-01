@@ -283,11 +283,64 @@ def test_model_backed_gate_qualifies_independent_oracle_against_production() -> 
     assert receipt.to_dict()["status"] == "qualified"
     assert (
         receipt.to_dict()["qualification_claim"]
-        == "intervened_forward_capture_ordering_only"
+        == "intervened_forward_capture_ordering_with_graph_pinned_mutations_only"
     )
+    assert receipt.request_evidence["qualification_policy"] == {
+        "propagated_mutation": "graph_pinned_preactivation_v1"
+    }
     assert receipt.qualification_fingerprint.startswith("sha256:")
     validate_ordering_qualification_receipt(_request(), receipt)
     validate_serialized_ordering_qualification_receipt(receipt.to_dict())
+
+
+class _RecordingQualificationHost(_TinyGemma3PLTHost):
+    def __init__(self) -> None:
+        super().__init__()
+        self.qualification_plans = []
+
+    def _verification_run_variant(self, prompt_token_ids, plan, baseline_state, **kwargs):
+        self.qualification_plans.append(plan)
+        return NNSightReplacementModel._verification_run_variant(
+            self,
+            prompt_token_ids,
+            plan,
+            baseline_state,
+            **kwargs,
+        )
+
+
+def test_public_gate_executes_graph_pinned_propagated_mutation_in_selective_runtime() -> None:
+    host = _RecordingQualificationHost()
+    request = _request()
+
+    qualify_nnsight_ordering(host, request)
+
+    propagated = tuple(
+        plan for plan in host.qualification_plans if plan.variant_id == "propagated"
+    )
+    assert len(propagated) == 2
+    assert all(plan.interventions[0].exact_graph_delta == 5.0 for plan in propagated)
+    assert all(plan.retain_live_source_for_schedule for plan in propagated)
+
+
+def test_qualification_refuses_propagated_mutation_without_graph_evidence() -> None:
+    request = _request()
+    variants = list(request.execution.variants)
+    propagated = variants[2]
+    source = propagated.interventions[0].node
+    variants[2] = replace(
+        propagated,
+        interventions=(PreactivationIntervention(source, 5.0),),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="qualification propagated mutation requires graph baseline and delta",
+    ):
+        OrderingQualificationRequest(
+            replace(request.execution, variants=tuple(variants)),
+            scope=request.scope,
+        )
 
 
 def test_propagation_diagnostic_runs_common_delta_through_production_engines() -> None:
@@ -321,10 +374,58 @@ def test_receipt_validators_reject_typed_and_serialized_tampering() -> None:
     with pytest.raises(ValueError, match="request fingerprint"):
         validate_serialized_ordering_qualification_receipt(payload)
 
+    with pytest.raises(ValueError, match="must use current schema"):
+        validate_ordering_qualification_receipt(
+            request,
+            replace(receipt, schema_version=1),
+        )
+
+    payload = receipt.to_dict()
+    payload["request_evidence"]["qualification_policy"]["propagated_mutation"] = (
+        "native_live_activation_v1"
+    )
+    with pytest.raises(ValueError, match="propagated mutation policy"):
+        validate_serialized_ordering_qualification_receipt(payload)
+
     payload = receipt.to_dict()
     payload["request_evidence"]["execution_policy"]["deadline_seconds"] = 1.0
     with pytest.raises(ValueError, match="request fingerprint"):
         validate_serialized_ordering_qualification_receipt(payload)
+
+
+def test_offline_validator_preserves_historical_v1_receipt_verification() -> None:
+    request_evidence = {
+        "scope": {},
+        "scope_bindings": {},
+        "tolerance": {},
+        "identity": {},
+        "target": {},
+        "variants": [],
+        "observed_downstream_nodes": [],
+        "execution_policy": {},
+    }
+    legacy = {
+        "schema": "nnsight_intervened_forward_ordering_qualification",
+        "schema_version": 1,
+        "qualification_claim": "intervened_forward_capture_ordering_only",
+        "status": "qualified",
+        "scope": {},
+        "scope_bindings": {},
+        "result": {"verdict": "qualified"},
+        "provenance": {},
+        "request_evidence": request_evidence,
+        "request_fingerprint": (
+            "sha256:9c8a665dc460b277afdf9f19d344a2f1440bcbdec1ac5b7bd7d760d09134182c"
+        ),
+        "qualification_fingerprint": (
+            "sha256:7e26ddf409ab4610e7d83a66b2655d7a0f84755ce4dbaf796af2a56646ef4742"
+        ),
+        "evidence_fingerprint": (
+            "sha256:52e104f3719fd4703be3e83df6b79499efa2530c357a08a67fdad5e9efb4e11e"
+        ),
+    }
+
+    validate_serialized_ordering_qualification_receipt(legacy)
 
 
 def test_eager_oracle_encodes_only_requested_layers_and_positions() -> None:

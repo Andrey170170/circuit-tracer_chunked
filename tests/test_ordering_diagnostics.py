@@ -182,6 +182,7 @@ def test_diagnostic_separates_native_source_form_drift_from_common_delta_control
         item.common_injection_identity.max_abs_error == 0.0
         for item in receipt.result.source_writes
     )
+    assert "qualification_policy" not in receipt.request_evidence
     validate_propagated_ordering_diagnostic_receipt(_request(), receipt)
     validate_serialized_propagated_ordering_diagnostic_receipt(receipt.to_dict())
 

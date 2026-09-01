@@ -89,6 +89,13 @@ class CaptureOrigin(str, Enum):
     INTERVENED_FORWARD = "intervened_forward"
 
 
+class PropagatedMutationMode(str, Enum):
+    """Select the preactivation baseline used by propagated interventions."""
+
+    LIVE_RUNTIME = "live_runtime"
+    GRAPH_PINNED = "graph_pinned"
+
+
 def _invoke_ordered_hook_families(
     tracer: Any,
     *,
@@ -158,6 +165,7 @@ def _translate_variant(
     architecture: str,
     n_layers: int,
     observed_nodes: tuple[FeatureNode, ...],
+    propagated_mutation_mode: PropagatedMutationMode = PropagatedMutationMode.LIVE_RUNTIME,
 ) -> NNSightVariantPlan:
     if architecture not in ("clt", "plt"):
         raise ValueError(f"unsupported transcoder architecture: {architecture}")
@@ -168,6 +176,12 @@ def _translate_variant(
         if variant.semantics is InterventionSemantics.DIRECT_FROZEN:
             if intervention.graph_delta is None or intervention.graph_baseline_value is None:
                 raise ValueError("DIRECT_FROZEN requires graph baseline and exact delta")
+            exact_delta = intervention.graph_delta
+        elif propagated_mutation_mode is PropagatedMutationMode.GRAPH_PINNED:
+            if intervention.graph_delta is None or intervention.graph_baseline_value is None:
+                raise ValueError(
+                    "graph-pinned propagated intervention requires graph baseline and delta"
+                )
             exact_delta = intervention.graph_delta
         else:
             exact_delta = None
@@ -186,6 +200,10 @@ def _translate_variant(
             )
         )
     direct = variant.semantics is InterventionSemantics.DIRECT_FROZEN and bool(interventions)
+    graph_pinned_propagated = bool(interventions) and (
+        variant.semantics is InterventionSemantics.PROPAGATED_FROZEN_ATTENTION
+        and propagated_mutation_mode is PropagatedMutationMode.GRAPH_PINNED
+    )
     return NNSightVariantPlan(
         variant_id=variant.variant_id,
         semantics=variant.semantics,
@@ -195,6 +213,7 @@ def _translate_variant(
         freeze_attention=bool(interventions),
         freeze_feature_outputs=direct,
         freeze_layernorm_denominators=direct,
+        retain_live_source_for_schedule=graph_pinned_propagated,
     )
 
 
@@ -291,15 +310,21 @@ class NNSightInterventionRuntime:
         clock: Callable[[], float] = time.perf_counter,
         synchronize: Callable[[Any], None] = _default_synchronize,
         ordering_admission_mode: OrderingAdmissionMode | None = None,
+        propagated_mutation_mode: PropagatedMutationMode = (
+            PropagatedMutationMode.LIVE_RUNTIME
+        ),
     ) -> None:
         if ordering_admission_mode is not None and not isinstance(
             ordering_admission_mode, OrderingAdmissionMode
         ):
             raise ValueError("ordering_admission_mode must be candidate_smoke or qualified")
+        if not isinstance(propagated_mutation_mode, PropagatedMutationMode):
+            raise ValueError("propagated_mutation_mode must be live_runtime or graph_pinned")
         self._model = model
         self._clock = clock
         self._synchronize = synchronize
         self._ordering_admission_mode = ordering_admission_mode
+        self._propagated_mutation_mode = propagated_mutation_mode
 
     def _unsupported(self, request: InterventionExecutionRequest) -> RuntimeRefusal | None:
         if getattr(self._model, "backend", None) != "nnsight":
@@ -442,6 +467,7 @@ class NNSightInterventionRuntime:
                     architecture=capabilities.architecture,
                     n_layers=n_layers,
                     observed_nodes=request.observed_downstream_nodes,
+                    propagated_mutation_mode=self._propagated_mutation_mode,
                 )
                 for variant in request.variants
             )

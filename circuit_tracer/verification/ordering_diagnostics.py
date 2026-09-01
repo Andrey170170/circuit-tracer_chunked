@@ -19,9 +19,9 @@ import torch
 from .ordering_qualification import (
     OrderingQualificationRequest,
     _bf16_ulp,
+    _execution_request_payload,
     _fingerprint,
     _json_value,
-    _request_payload,
 )
 
 
@@ -398,7 +398,7 @@ def diagnose_propagated_ordering(
     oracle_capture = oracle_engine.capture(request)
     selective_capture = selective_engine.capture(request)
     result = _compare_captures(request, oracle_capture, selective_capture)
-    request_evidence = _request_payload(request)
+    request_evidence = _execution_request_payload(request)
     request_fingerprint = _fingerprint(request_evidence)
     scope = asdict(request.scope)
     diagnostic_evidence = _diagnostic_evidence(
@@ -465,7 +465,9 @@ def validate_propagated_ordering_diagnostic_receipt(
     request: OrderingQualificationRequest,
     receipt: PropagationOrderingDiagnosticReceipt,
 ) -> None:
-    if _json_value(receipt.request_evidence) != _json_value(_request_payload(request)):
+    if _json_value(receipt.request_evidence) != _json_value(
+        _execution_request_payload(request)
+    ):
         raise ValueError("propagated ordering diagnostic request evidence mismatch")
     validate_serialized_propagated_ordering_diagnostic_receipt(receipt.to_dict())
 

@@ -1239,6 +1239,31 @@ def test_nnsight_adapter_retains_only_selective_union_isolates_variants_and_clea
     )
 
 
+def test_public_behavioral_runtime_keeps_propagated_mutation_live() -> None:
+    execution = _execution_request(_request(max_variants=3))
+    model = _MockSelectiveNNSightModel()
+
+    result = NNSightInterventionRuntime(
+        model,
+        synchronize=lambda model: None,
+        ordering_admission_mode=OrderingAdmissionMode.QUALIFIED,
+    ).evaluate(execution)
+
+    assert result.status is RuntimeExecutionStatus.COMPLETE
+    propagated_plans = tuple(
+        plan
+        for plan in model.variant_plans
+        if plan.semantics is InterventionSemantics.PROPAGATED_FROZEN_ATTENTION
+    )
+    assert propagated_plans
+    assert all(
+        intervention.exact_graph_delta is None
+        for plan in propagated_plans
+        for intervention in plan.interventions
+    )
+    assert all(not plan.retain_live_source_for_schedule for plan in propagated_plans)
+
+
 def test_nnsight_adapter_executes_with_gemma3_nested_text_config() -> None:
     request = _execution_request(_request(max_variants=1))
     model = _MockSelectiveNNSightModel()

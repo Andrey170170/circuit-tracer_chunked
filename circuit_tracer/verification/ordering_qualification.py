@@ -46,6 +46,7 @@ from .contracts import (
 )
 from .nnsight_runtime import (
     NNSightInterventionRuntime,
+    PropagatedMutationMode,
     PropagationProbeCapture,
     PropagationProbeSpec,
     _provider_activation_delta,
@@ -54,8 +55,13 @@ from .runtime import InterventionRuntimePort
 
 
 RECEIPT_SCHEMA = "nnsight_intervened_forward_ordering_qualification"
-RECEIPT_SCHEMA_VERSION = 1
-QUALIFICATION_CLAIM = "intervened_forward_capture_ordering_only"
+RECEIPT_SCHEMA_VERSION = 2
+LEGACY_RECEIPT_SCHEMA_VERSION = 1
+QUALIFICATION_CLAIM = (
+    "intervened_forward_capture_ordering_with_graph_pinned_mutations_only"
+)
+LEGACY_QUALIFICATION_CLAIM = "intervened_forward_capture_ordering_only"
+PROPAGATED_MUTATION_POLICY = "graph_pinned_preactivation_v1"
 MAX_REFUSAL_MESSAGE_CHARS = 2_048
 
 
@@ -123,6 +129,14 @@ class OrderingQualificationRequest:
         source = direct.interventions[0].node
         if propagated.interventions[0].node != source:
             raise ValueError("qualification direct and propagated sources must match")
+        propagated_intervention = propagated.interventions[0]
+        if (
+            propagated_intervention.graph_baseline_value is None
+            or propagated_intervention.graph_delta is None
+        ):
+            raise ValueError(
+                "qualification propagated mutation requires graph baseline and delta"
+            )
         observed = self.execution.observed_downstream_nodes
         if not observed or any(node.layer <= source.layer for node in observed):
             raise ValueError("qualification observations must be strictly downstream")
@@ -309,7 +323,7 @@ class OrderingQualificationReceipt:
     def to_dict(self) -> dict[str, Any]:
         payload = _json_value(asdict(self))
         payload["status"] = self.result.verdict.value
-        payload["qualification_claim"] = QUALIFICATION_CLAIM
+        payload["qualification_claim"] = _claim_for_schema_version(self.schema_version)
         return payload
 
 
@@ -348,7 +362,7 @@ def _fingerprint(value: Any) -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _request_payload(request: OrderingQualificationRequest) -> dict[str, Any]:
+def _execution_request_payload(request: OrderingQualificationRequest) -> dict[str, Any]:
     execution = request.execution
     return {
         "scope": asdict(request.scope),
@@ -367,10 +381,29 @@ def _request_payload(request: OrderingQualificationRequest) -> dict[str, Any]:
     }
 
 
-def _science_request_payload(request_evidence: Mapping[str, Any]) -> dict[str, Any]:
+def _request_payload(request: OrderingQualificationRequest) -> dict[str, Any]:
+    return {
+        **_execution_request_payload(request),
+        "qualification_policy": {
+            "propagated_mutation": PROPAGATED_MUTATION_POLICY,
+        },
+    }
+
+
+def _claim_for_schema_version(schema_version: int) -> str:
+    if schema_version == LEGACY_RECEIPT_SCHEMA_VERSION:
+        return LEGACY_QUALIFICATION_CLAIM
+    if schema_version == RECEIPT_SCHEMA_VERSION:
+        return QUALIFICATION_CLAIM
+    raise ValueError("ordering qualification receipt schema version mismatch")
+
+
+def _science_request_payload(
+    request_evidence: Mapping[str, Any], *, schema_version: int
+) -> dict[str, Any]:
     """Return only execution semantics that may affect qualification evidence."""
 
-    return {
+    payload = {
         key: request_evidence.get(key)
         for key in (
             "scope",
@@ -381,6 +414,9 @@ def _science_request_payload(request_evidence: Mapping[str, Any]) -> dict[str, A
             "observed_downstream_nodes",
         )
     }
+    if schema_version >= 2:
+        payload["qualification_policy"] = request_evidence.get("qualification_policy")
+    return payload
 
 
 def _qualification_evidence(
@@ -388,13 +424,14 @@ def _qualification_evidence(
     scope: Any,
     result: Any,
     request_evidence: Mapping[str, Any],
+    schema_version: int = RECEIPT_SCHEMA_VERSION,
 ) -> dict[str, Any]:
     return {
         "schema": RECEIPT_SCHEMA,
-        "schema_version": RECEIPT_SCHEMA_VERSION,
-        "qualification_claim": QUALIFICATION_CLAIM,
+        "schema_version": schema_version,
+        "qualification_claim": _claim_for_schema_version(schema_version),
         "science_request_fingerprint": _fingerprint(
-            _science_request_payload(request_evidence)
+            _science_request_payload(request_evidence, schema_version=schema_version)
         ),
         "scope": scope,
         "result": result,
@@ -409,9 +446,15 @@ def validate_serialized_ordering_qualification_receipt(
     serialized = _json_value(dict(payload))
     if serialized.get("schema") != RECEIPT_SCHEMA:
         raise ValueError("ordering qualification receipt schema mismatch")
-    if serialized.get("schema_version") != RECEIPT_SCHEMA_VERSION:
+    schema_version = serialized.get("schema_version")
+    if schema_version not in {
+        LEGACY_RECEIPT_SCHEMA_VERSION,
+        RECEIPT_SCHEMA_VERSION,
+    }:
         raise ValueError("ordering qualification receipt schema version mismatch")
-    if serialized.get("qualification_claim") != QUALIFICATION_CLAIM:
+    if serialized.get("qualification_claim") != _claim_for_schema_version(
+        schema_version
+    ):
         raise ValueError("ordering qualification receipt claim mismatch")
     result = serialized.get("result")
     if not isinstance(result, Mapping):
@@ -421,6 +464,14 @@ def validate_serialized_ordering_qualification_receipt(
     request_evidence = serialized.get("request_evidence")
     if not isinstance(request_evidence, Mapping):
         raise ValueError("ordering qualification receipt request evidence is missing")
+    if schema_version == RECEIPT_SCHEMA_VERSION:
+        policy = request_evidence.get("qualification_policy")
+        if not isinstance(policy, Mapping) or policy.get(
+            "propagated_mutation"
+        ) != PROPAGATED_MUTATION_POLICY:
+            raise ValueError(
+                "ordering qualification receipt propagated mutation policy mismatch"
+            )
     if request_evidence.get("scope") != serialized.get("scope"):
         raise ValueError("ordering qualification receipt request scope mismatch")
     if request_evidence.get("scope_bindings") != serialized.get("scope_bindings"):
@@ -432,6 +483,7 @@ def validate_serialized_ordering_qualification_receipt(
         scope=serialized.get("scope"),
         result=result,
         request_evidence=request_evidence,
+        schema_version=schema_version,
     )
     qualification_fingerprint = serialized.get("qualification_fingerprint")
     if qualification_fingerprint != _fingerprint(qualification_evidence):
@@ -452,6 +504,8 @@ def validate_ordering_qualification_receipt(
 ) -> None:
     """Validate a live typed receipt against its exact qualification request."""
 
+    if receipt.schema_version != RECEIPT_SCHEMA_VERSION:
+        raise ValueError("live ordering qualification receipt must use current schema")
     expected_request = _request_payload(request)
     if _json_value(receipt.request_evidence) != _json_value(expected_request):
         raise ValueError("ordering qualification receipt request evidence mismatch")
@@ -855,6 +909,7 @@ class Gemma3PLTEagerHookOracle(InterventionRuntimePort):
                     architecture=capabilities.architecture,
                     n_layers=len(self._layers),
                     observed_nodes=request.observed_downstream_nodes,
+                    propagated_mutation_mode=PropagatedMutationMode.GRAPH_PINNED,
                 )
                 for variant in request.variants
             )
@@ -1240,6 +1295,7 @@ def qualify_intervened_forward_ordering(
     selective_adapter = selective_runtime or NNSightInterventionRuntime(
         model,
         ordering_admission_mode=OrderingAdmissionMode.CANDIDATE_SMOKE,
+        propagated_mutation_mode=PropagatedMutationMode.GRAPH_PINNED,
     )
     # A-B-B-A ordering makes within-process recovery and repeatability evidence
     # part of the qualification instead of relying only on fresh-process repeats.
